@@ -10,6 +10,7 @@ from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
+from biblade_fusion.calibration import HandEyeCalibrationError, load_hand_eye_calibration
 from biblade_fusion.core.settings import AppSettings
 
 
@@ -146,6 +147,30 @@ def _check_thermal(settings: AppSettings) -> CheckResult:
     )
 
 
+def _check_hand_eye(settings: AppSettings) -> CheckResult:
+    if settings.hand_eye.calibration_path is None:
+        return CheckResult(
+            "hand_eye",
+            CheckLevel.WARN,
+            "not configured; base-frame reconstruction and view planning are unavailable",
+        )
+    try:
+        calibration = load_hand_eye_calibration(settings.hand_eye)
+    except HandEyeCalibrationError as exc:
+        return CheckResult("hand_eye", CheckLevel.FAIL, str(exc))
+    return CheckResult(
+        "hand_eye",
+        CheckLevel.PASS,
+        f"validated {calibration.method} calibration",
+        {
+            "path": str(calibration.source_path),
+            "sample_count": calibration.sample_count,
+            "translation_rmse_m": calibration.translation_rmse_m,
+            "rotation_rmse_deg": calibration.rotation_rmse_deg,
+        },
+    )
+
+
 def run_doctor(settings: AppSettings) -> list[CheckResult]:
     """Run non-moving local checks. This function never connects to the robot."""
 
@@ -156,4 +181,5 @@ def run_doctor(settings: AppSettings) -> list[CheckResult]:
         _check_robot_configuration(settings),
         _check_robot_address(settings),
         _check_thermal(settings),
+        _check_hand_eye(settings),
     ]

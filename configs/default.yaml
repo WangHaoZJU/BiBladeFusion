@@ -57,3 +57,10 @@ point_cloud:
   maximum_depth_m: 1.5
   pixel_stride: 1
   minimum_valid_points: 100
+
+hand_eye:
+  calibration_path: null
+  minimum_samples: 15
+  maximum_translation_rmse_m: 0.002
+  maximum_rotation_rmse_deg: 0.5
+  require_quality_metrics: true

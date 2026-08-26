@@ -120,6 +120,16 @@ class PointCloudConfig(BaseModel):
         return self
 
 
+class HandEyeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    calibration_path: Path | None = None
+    minimum_samples: int = Field(default=15, ge=3)
+    maximum_translation_rmse_m: float = Field(default=0.002, gt=0.0)
+    maximum_rotation_rmse_deg: float = Field(default=0.5, gt=0.0)
+    require_quality_metrics: bool = True
+
+
 class AppSettings(BaseModel):
     """Top-level BiBladeFusion settings."""
 
@@ -133,6 +143,7 @@ class AppSettings(BaseModel):
     foundation_stereo: FoundationStereoConfig = Field(default_factory=FoundationStereoConfig)
     proxy_model: ProxyModelConfig = Field(default_factory=ProxyModelConfig)
     point_cloud: PointCloudConfig = Field(default_factory=PointCloudConfig)
+    hand_eye: HandEyeConfig = Field(default_factory=HandEyeConfig)
 
 
 def load_settings(path: str | Path) -> AppSettings:
