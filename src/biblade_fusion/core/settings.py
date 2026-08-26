@@ -65,6 +65,18 @@ class AcquisitionConfig(BaseModel):
     max_tcp_rotation_delta_rad: float = Field(default=0.001, ge=0.0)
 
 
+class FoundationStereoConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repository_path: Path = Path("third_party/FoundationStereo")
+    checkpoint_path: Path = Path("models/foundation_stereo/23-51-11/model_best_bp2.pth")
+    device: Literal["cuda", "cpu"] = "cuda"
+    scale: float = Field(default=1.0, gt=0.0, le=1.0)
+    valid_iterations: int = Field(default=32, gt=0, le=128)
+    hierarchical: bool = False
+    remove_invisible: bool = True
+
+
 class AppSettings(BaseModel):
     """Top-level BiBladeFusion settings."""
 
@@ -75,6 +87,7 @@ class AppSettings(BaseModel):
     realsense: RealSenseConfig
     thermal: ThermalConfig
     acquisition: AcquisitionConfig = Field(default_factory=AcquisitionConfig)
+    foundation_stereo: FoundationStereoConfig = Field(default_factory=FoundationStereoConfig)
 
 
 def load_settings(path: str | Path) -> AppSettings:

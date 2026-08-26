@@ -30,3 +30,12 @@ acquisition:
   max_joint_delta_rad: 0.001
   max_tcp_translation_delta_m: 0.0005
   max_tcp_rotation_delta_rad: 0.001
+
+foundation_stereo:
+  repository_path: third_party/FoundationStereo
+  checkpoint_path: models/foundation_stereo/23-51-11/model_best_bp2.pth
+  device: cuda
+  scale: 1.0
+  valid_iterations: 32
+  hierarchical: false
+  remove_invisible: true

@@ -16,6 +16,7 @@ from biblade_fusion.devices.depth_camera import RealSenseD435i, list_realsense_d
 from biblade_fusion.devices.robot import EliteReadOnlyRobot
 from biblade_fusion.devices.thermal_camera import NullThermalCamera
 from biblade_fusion.diagnostics import CheckLevel, run_doctor
+from biblade_fusion.perception.stereo import run_foundation_stereo_doctor
 from biblade_fusion.storage import SessionWriter
 
 app = typer.Typer(
@@ -26,9 +27,11 @@ app = typer.Typer(
 robot_app = typer.Typer(help="Safe Elite CS68 state tools.", no_args_is_help=True)
 camera_app = typer.Typer(help="Intel RealSense D435i tools.", no_args_is_help=True)
 acquire_app = typer.Typer(help="Synchronized read-only acquisition.", no_args_is_help=True)
+stereo_app = typer.Typer(help="Stereo inference tools.", no_args_is_help=True)
 app.add_typer(robot_app, name="robot")
 app.add_typer(camera_app, name="camera")
 app.add_typer(acquire_app, name="acquire")
+app.add_typer(stereo_app, name="stereo")
 
 
 @app.callback()
@@ -276,8 +279,41 @@ def acquire_snapshot(
     typer.echo(f"Saved view: {view_path}")
 
 
+@stereo_app.command("doctor")
+def stereo_doctor(
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+    output_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Validate FoundationStereo source, weights, dependencies, and CUDA."""
 
-
+    settings = load_settings(config)
+    results = run_foundation_stereo_doctor(settings.foundation_stereo)
+    if output_json:
+        typer.echo(json.dumps([asdict(result) for result in results], indent=2))
+    else:
+        table = Table(title="FoundationStereo doctor")
+        table.add_column("Check")
+        table.add_column("Status")
+        table.add_column("Message")
+        for result in results:
+            style = {
+                CheckLevel.PASS: "green",
+                CheckLevel.WARN: "yellow",
+                CheckLevel.FAIL: "red",
+            }[result.level]
+            table.add_row(result.name, f"[{style}]{result.level.upper()}[/]", result.message)
+        Console().print(table)
+    if any(result.level is CheckLevel.FAIL for result in results):
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":
