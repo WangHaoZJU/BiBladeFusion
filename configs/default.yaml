@@ -83,3 +83,9 @@ view_filter:
   maximum_standoff_error_m: 0.005
   duplicate_translation_tolerance_m: 0.005
   duplicate_rotation_tolerance_deg: 2.0
+
+kinematics:
+  model_path: null
+  plugin_path: null
+  primary_timeout_ms: 1000
+  ik_timeout_s: 0.05

@@ -53,6 +53,9 @@ def _evaluation_payload(item: EvaluatedCandidate) -> dict[str, Any]:
         "view_id": item.candidate.view_id,
         "status": item.status.value,
         "reasons": list(item.reasons),
+        "joint_positions_rad": (
+            item.joint_positions_rad.tolist() if item.joint_positions_rad is not None else None
+        ),
         "metrics": {
             "look_at_cosine": item.metrics.look_at_cosine,
             "incidence_cosine": item.metrics.incidence_cosine,
@@ -183,6 +186,7 @@ def read_view_plan(path: str | Path) -> StoredViewPlan:
                         float(metrics["geometric_score"]),
                     ),
                     tuple(str(reason) for reason in item["reasons"]),
+                    item.get("joint_positions_rad"),
                 )
             )
         filtered = FilteredViewPlan(

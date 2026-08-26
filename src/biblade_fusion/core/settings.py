@@ -172,6 +172,15 @@ class ViewFilterConfig(BaseModel):
     duplicate_rotation_tolerance_deg: float = Field(default=2.0, ge=0.0, le=180.0)
 
 
+class KinematicsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_path: Path | None = None
+    plugin_path: Path | None = None
+    primary_timeout_ms: int = Field(default=1000, gt=0, le=30000)
+    ik_timeout_s: float = Field(default=0.05, gt=0.0, le=5.0)
+
+
 class AppSettings(BaseModel):
     """Top-level BiBladeFusion settings."""
 
@@ -188,6 +197,7 @@ class AppSettings(BaseModel):
     hand_eye: HandEyeConfig = Field(default_factory=HandEyeConfig)
     view_planning: ViewPlanningConfig = Field(default_factory=ViewPlanningConfig)
     view_filter: ViewFilterConfig = Field(default_factory=ViewFilterConfig)
+    kinematics: KinematicsConfig = Field(default_factory=KinematicsConfig)
 
 
 def load_settings(path: str | Path) -> AppSettings:

@@ -26,6 +26,8 @@ def test_default_settings_load_safely() -> None:
     assert settings.view_filter.workspace is None
     assert settings.view_filter.camera_clearance_radius_m == 0.05
     assert settings.view_filter.minimum_incidence_cosine == 0.95
+    assert settings.kinematics.model_path is None
+    assert settings.kinematics.ik_timeout_s == 0.05
 
 
 def test_unknown_configuration_key_is_rejected() -> None:

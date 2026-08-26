@@ -11,13 +11,19 @@ from rich.table import Table
 
 from biblade_fusion import __version__
 from biblade_fusion.acquisition import SynchronizedAcquirer
-from biblade_fusion.calibration import load_hand_eye_calibration
+from biblade_fusion.calibration import (
+    fetch_cs68_kinematics,
+    load_cs68_kinematics,
+    load_hand_eye_calibration,
+    write_cs68_kinematics,
+)
 from biblade_fusion.core.settings import load_settings
 from biblade_fusion.devices.depth_camera import RealSenseD435i, list_realsense_devices
 from biblade_fusion.devices.robot import EliteReadOnlyRobot
 from biblade_fusion.devices.thermal_camera import NullThermalCamera
 from biblade_fusion.diagnostics import CheckLevel, run_doctor
 from biblade_fusion.perception.stereo import run_foundation_stereo_doctor
+from biblade_fusion.planning import EliteCs68IkChecker
 from biblade_fusion.storage import (
     SessionReader,
     SessionWriter,
@@ -159,6 +165,42 @@ def robot_status(
     console.print("[bold]Elite CS68 read-only RTSI status[/bold]")
     for key, value in result.items():
         console.print(f"{key}: {value}")
+
+
+@robot_app.command("export-kinematics")
+def robot_export_kinematics(
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+    robot_ip: Annotated[
+        str | None,
+        typer.Option("--ip", help="Temporary robot IP override."),
+    ] = None,
+) -> None:
+    """Read and store CS68 MDH parameters; this command cannot move the robot."""
+
+    try:
+        settings = load_settings(config)
+        address = robot_ip or settings.robot.robot_ip
+        if address is None:
+            raise ValueError("Robot IP is not configured")
+        model = fetch_cs68_kinematics(
+            address,
+            timeout_ms=settings.kinematics.primary_timeout_ms,
+        )
+        destination = write_cs68_kinematics(output, model)
+    except Exception as exc:
+        typer.echo(f"Kinematics export failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved read-only CS68 kinematics artifact: {destination}")
 
 
 @camera_app.command("list")
@@ -423,10 +465,20 @@ def plan_views(
     try:
         settings = load_settings(config)
         stored = read_initialization(initialization)
+        reachability_checker = None
+        if settings.kinematics.model_path is not None:
+            kinematics = load_cs68_kinematics(settings.kinematics.model_path)
+            reachability_checker = EliteCs68IkChecker(
+                kinematics,
+                stored.hand_eye,
+                stored.observation.seed_joint_positions_rad,
+                settings.kinematics,
+            )
         result = plan_initial_observation(
             stored.observation,
             settings.view_planning,
             settings.view_filter,
+            reachability_checker,
         )
         destination = write_view_plan(
             output,

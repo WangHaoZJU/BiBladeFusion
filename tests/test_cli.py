@@ -31,3 +31,10 @@ def test_plan_command_is_exposed() -> None:
 
     assert result.exit_code == 0
     assert "views" in result.stdout
+
+
+def test_robot_kinematics_export_is_exposed() -> None:
+    result = runner.invoke(app, ["robot", "--help"])
+
+    assert result.exit_code == 0
+    assert "export-kinematics" in result.stdout

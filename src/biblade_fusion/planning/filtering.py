@@ -8,6 +8,7 @@ from math import acos, degrees
 from typing import Protocol, runtime_checkable
 
 import numpy as np
+from numpy.typing import NDArray
 
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import AxisAlignedBoxConfig, ViewFilterConfig
@@ -25,6 +26,16 @@ class ReachabilityState(StrEnum):
 class ReachabilityResult:
     state: ReachabilityState
     message: str
+    joint_positions_rad: NDArray[np.float64] | None = None
+
+    def __post_init__(self) -> None:
+        if self.joint_positions_rad is None:
+            return
+        joints = np.array(self.joint_positions_rad, dtype=np.float64, copy=True)
+        if joints.shape != (6,) or not np.isfinite(joints).all():
+            raise ValueError("Reachability joint solution must be a finite six-vector")
+        joints.setflags(write=False)
+        object.__setattr__(self, "joint_positions_rad", joints)
 
 
 @runtime_checkable
@@ -57,6 +68,16 @@ class EvaluatedCandidate:
     status: CandidateStatus
     metrics: CandidateMetrics
     reasons: tuple[str, ...]
+    joint_positions_rad: NDArray[np.float64] | None = None
+
+    def __post_init__(self) -> None:
+        if self.joint_positions_rad is None:
+            return
+        joints = np.array(self.joint_positions_rad, dtype=np.float64, copy=True)
+        if joints.shape != (6,) or not np.isfinite(joints).all():
+            raise ValueError("Evaluated candidate joints must be a finite six-vector")
+        joints.setflags(write=False)
+        object.__setattr__(self, "joint_positions_rad", joints)
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +222,7 @@ def filter_candidate_views(
                 reasons.append(f"camera intersects forbidden volume {volume.name}")
 
         reachability_verified = False
+        joint_solution = None
         if reachability_checker is None:
             reasons.append("robot endpoint reachability is not checked")
         else:
@@ -216,6 +238,7 @@ def filter_candidate_views(
                     reasons.append(result.message or "robot endpoint reachability is unknown")
                 else:
                     reachability_verified = True
+                    joint_solution = result.joint_positions_rad
 
         status = (
             CandidateStatus.REJECTED
@@ -226,7 +249,13 @@ def filter_candidate_views(
                 else CandidateStatus.GEOMETRY_ONLY
             )
         )
-        item = EvaluatedCandidate(candidate, status, metrics, tuple(reasons))
+        item = EvaluatedCandidate(
+            candidate,
+            status,
+            metrics,
+            tuple(reasons),
+            joint_solution,
+        )
         if item.status is not CandidateStatus.REJECTED:
             duplicate_index = next(
                 (

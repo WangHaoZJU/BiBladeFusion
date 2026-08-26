@@ -1,5 +1,6 @@
 """Geometric view planning without robot motion execution."""
 
+from biblade_fusion.planning.elite_ik import EliteCs68IkChecker, EliteIkError
 from biblade_fusion.planning.filtering import (
     CandidateMetrics,
     CandidateStatus,
@@ -26,6 +27,8 @@ __all__ = [
     "CandidateMetrics",
     "CandidateStatus",
     "EvaluatedCandidate",
+    "EliteCs68IkChecker",
+    "EliteIkError",
     "FilteredViewPlan",
     "ReachabilityChecker",
     "ReachabilityResult",

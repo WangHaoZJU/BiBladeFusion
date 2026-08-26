@@ -10,7 +10,12 @@ from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
-from biblade_fusion.calibration import HandEyeCalibrationError, load_hand_eye_calibration
+from biblade_fusion.calibration import (
+    HandEyeCalibrationError,
+    RobotKinematicsError,
+    load_cs68_kinematics,
+    load_hand_eye_calibration,
+)
 from biblade_fusion.core.settings import AppSettings
 
 
@@ -171,6 +176,26 @@ def _check_hand_eye(settings: AppSettings) -> CheckResult:
     )
 
 
+def _check_kinematics(settings: AppSettings) -> CheckResult:
+    path = settings.kinematics.model_path
+    if path is None:
+        return CheckResult(
+            "cs68_kinematics",
+            CheckLevel.WARN,
+            "controller MDH artifact is not configured; offline IK is unavailable",
+        )
+    try:
+        model = load_cs68_kinematics(path)
+    except RobotKinematicsError as exc:
+        return CheckResult("cs68_kinematics", CheckLevel.FAIL, str(exc))
+    return CheckResult(
+        "cs68_kinematics",
+        CheckLevel.PASS,
+        "validated controller-specific CS68 MDH artifact",
+        {"path": str(path), "source": model.source},
+    )
+
+
 def run_doctor(settings: AppSettings) -> list[CheckResult]:
     """Run non-moving local checks. This function never connects to the robot."""
 
@@ -182,4 +207,5 @@ def run_doctor(settings: AppSettings) -> list[CheckResult]:
         _check_robot_address(settings),
         _check_thermal(settings),
         _check_hand_eye(settings),
+        _check_kinematics(settings),
     ]

@@ -21,12 +21,13 @@ from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import BilateralBladeProxy
 from biblade_fusion.workflows import InitialObservation
 
-INITIALIZATION_SCHEMA_VERSION = 3
+INITIALIZATION_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
 class StoredInitialization:
     observation: InitialObservation
+    hand_eye: HandEyeCalibration
     blade_mask: NDArray[np.bool_]
     metadata: dict[str, Any]
 
@@ -143,6 +144,7 @@ def write_initialization(
         "hand_eye": {
             "source_path": str(hand_eye.source_path.resolve()),
             "method": hand_eye.method,
+            "tcp_T_left_ir": hand_eye.tcp_t_left_ir.matrix.tolist(),
             "sample_count": hand_eye.sample_count,
             "translation_rmse_m": hand_eye.translation_rmse_m,
             "rotation_rmse_deg": hand_eye.rotation_rmse_deg,
@@ -207,6 +209,27 @@ def read_initialization(path: str | Path) -> StoredInitialization:
             base_cloud=cloud,
             proxy=proxy,
         )
-        return StoredInitialization(observation, mask, metadata)
+        hand_eye_data = metadata["hand_eye"]
+        hand_eye = HandEyeCalibration(
+            tcp_t_left_ir=PoseSE3("tcp", "left_ir", hand_eye_data["tcp_T_left_ir"]),
+            method=str(hand_eye_data["method"]),
+            sample_count=(
+                int(hand_eye_data["sample_count"])
+                if hand_eye_data.get("sample_count") is not None
+                else None
+            ),
+            translation_rmse_m=(
+                float(hand_eye_data["translation_rmse_m"])
+                if hand_eye_data.get("translation_rmse_m") is not None
+                else None
+            ),
+            rotation_rmse_deg=(
+                float(hand_eye_data["rotation_rmse_deg"])
+                if hand_eye_data.get("rotation_rmse_deg") is not None
+                else None
+            ),
+            source_path=Path(str(hand_eye_data["source_path"])),
+        )
+        return StoredInitialization(observation, hand_eye, mask, metadata)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid initialization artifact {root}: {exc}") from exc

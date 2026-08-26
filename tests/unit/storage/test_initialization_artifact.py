@@ -67,6 +67,7 @@ def test_initialization_artifact_round_trip(tmp_path: Path) -> None:
     assert stored.observation.source_view_id == "seed"
     assert stored.observation.left_intrinsics.fx == 100
     np.testing.assert_allclose(stored.observation.seed_joint_positions_rad, np.zeros(6))
+    np.testing.assert_allclose(stored.hand_eye.tcp_t_left_ir.matrix, np.eye(4))
     np.testing.assert_allclose(
         stored.observation.base_cloud.points_m,
         make_observation().base_cloud.points_m,
@@ -105,7 +106,7 @@ def test_initialization_reader_rejects_path_escape(tmp_path: Path) -> None:
     (artifact / "metadata.json").write_text(
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "files": {
                     "base_points_m": "../outside.npy",
                     "pixel_uv": "pixels.npy",
