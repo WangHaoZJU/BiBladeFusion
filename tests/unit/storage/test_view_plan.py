@@ -25,6 +25,7 @@ def test_view_plan_round_trip_is_explicitly_non_executable(tmp_path: Path) -> No
     observation = InitialObservation(
         "seed",
         CameraIntrinsics(101, 101, 50, 50, 50, 50, "none", ()),
+        np.zeros(6),
         PoseSE3.identity("base", "left_ir"),
         PoseSE3.identity("base", "depth"),
         PointCloud("base", np.zeros((3, 3)), np.array([[0, 0], [1, 0], [2, 0]]), (101, 101)),

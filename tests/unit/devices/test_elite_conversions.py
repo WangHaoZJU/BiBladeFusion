@@ -2,7 +2,9 @@ import numpy as np
 
 from biblade_fusion.devices.robot.conversions import (
     elite_tcp_pose_to_se3,
+    matrix_to_rotation_vector,
     rotation_vector_to_matrix,
+    se3_to_elite_tcp_pose,
 )
 
 
@@ -27,3 +29,27 @@ def test_elite_tcp_pose_conversion_preserves_frames_and_translation() -> None:
     assert pose.child_frame == "tcp"
     np.testing.assert_allclose(pose.translation_m, [0.1, 0.2, 0.3])
 
+
+def test_rotation_vector_round_trip_including_pi_rotation() -> None:
+    for vector in (
+        np.array([0.2, -0.3, 0.4]),
+        np.array([0.0, np.pi, 0.0]),
+        np.array([1e-10, -2e-10, 3e-10]),
+    ):
+        rotation = rotation_vector_to_matrix(vector)
+        recovered = matrix_to_rotation_vector(rotation)
+        np.testing.assert_allclose(
+            rotation_vector_to_matrix(recovered),
+            rotation,
+            atol=1e-9,
+        )
+
+
+def test_se3_to_elite_pose_round_trip() -> None:
+    original = elite_tcp_pose_to_se3([0.1, 0.2, 0.3, 0.2, -0.3, 0.4])
+
+    encoded = se3_to_elite_tcp_pose(original)
+    decoded = elite_tcp_pose_to_se3(encoded)
+
+    np.testing.assert_allclose(decoded.matrix, original.matrix, atol=1e-10)
+    assert encoded.flags.writeable is False

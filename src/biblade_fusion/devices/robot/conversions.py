@@ -35,6 +35,42 @@ def rotation_vector_to_matrix(rotation_vector: ArrayLike) -> NDArray[np.float64]
     return np.eye(3) + a * skew + b * (skew @ skew)
 
 
+def matrix_to_rotation_vector(rotation: ArrayLike) -> NDArray[np.float64]:
+    """Convert a proper rotation matrix to an axis-angle rotation vector."""
+
+    matrix = np.asarray(rotation, dtype=np.float64)
+    if matrix.shape != (3, 3):
+        raise ValueError("Rotation matrix must have shape (3, 3)")
+    if not np.isfinite(matrix).all():
+        raise ValueError("Rotation matrix must be finite")
+    if not np.allclose(matrix.T @ matrix, np.eye(3), atol=1e-7) or not np.isclose(
+        np.linalg.det(matrix), 1.0, atol=1e-7
+    ):
+        raise ValueError("Rotation matrix must be orthonormal with determinant +1")
+
+    cosine = float(np.clip((np.trace(matrix) - 1.0) / 2.0, -1.0, 1.0))
+    theta = float(np.arccos(cosine))
+    skew_vector = np.array(
+        [
+            matrix[2, 1] - matrix[1, 2],
+            matrix[0, 2] - matrix[2, 0],
+            matrix[1, 0] - matrix[0, 1],
+        ],
+        dtype=np.float64,
+    )
+    if theta < 1e-8:
+        return skew_vector / 2.0
+    if np.pi - theta < 1e-6:
+        symmetric = (matrix + matrix.T) / 2.0
+        _, eigenvectors = np.linalg.eigh(symmetric)
+        axis = eigenvectors[:, -1]
+        dominant = int(np.argmax(np.abs(axis)))
+        if axis[dominant] < 0.0:
+            axis = -axis
+        return axis * theta
+    return skew_vector * (theta / (2.0 * np.sin(theta)))
+
+
 def elite_tcp_pose_to_se3(
     tcp_pose: ArrayLike,
     *,
@@ -56,3 +92,10 @@ def elite_tcp_pose_to_se3(
         pose[:3],
     )
 
+
+def se3_to_elite_tcp_pose(pose: PoseSE3) -> NDArray[np.float64]:
+    """Convert a frame-aware pose into Elite ``[x,y,z,rx,ry,rz]`` form."""
+
+    result = np.concatenate((pose.translation_m, matrix_to_rotation_vector(pose.rotation)))
+    result.setflags(write=False)
+    return result

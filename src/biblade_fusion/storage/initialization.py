@@ -21,7 +21,7 @@ from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import BilateralBladeProxy
 from biblade_fusion.workflows import InitialObservation
 
-INITIALIZATION_SCHEMA_VERSION = 2
+INITIALIZATION_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +125,7 @@ def write_initialization(
         },
         "source_image_shape": list(observation.base_cloud.source_image_shape),
         "left_intrinsics": _intrinsics_payload(observation.left_intrinsics),
+        "seed_joint_positions_rad": observation.seed_joint_positions_rad.tolist(),
         "transforms": {
             "base_T_left_ir": observation.base_t_left_ir.matrix.tolist(),
             "base_T_depth": observation.base_t_depth.matrix.tolist(),
@@ -200,6 +201,7 @@ def read_initialization(path: str | Path) -> StoredInitialization:
         observation = InitialObservation(
             source_view_id=str(metadata["source"]["view_id"]),
             left_intrinsics=_intrinsics_from_payload(metadata["left_intrinsics"]),
+            seed_joint_positions_rad=metadata["seed_joint_positions_rad"],
             base_t_left_ir=base_t_left_ir,
             base_t_depth=base_t_depth,
             base_cloud=cloud,

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from numpy.typing import ArrayLike
+import numpy as np
+from numpy.typing import ArrayLike, NDArray
 
 from biblade_fusion.acquisition.bundle import SynchronizedFrameBundle
 from biblade_fusion.calibration.hand_eye import HandEyeCalibration
@@ -27,12 +28,18 @@ class InitializationError(ValueError):
 class InitialObservation:
     source_view_id: str
     left_intrinsics: CameraIntrinsics
+    seed_joint_positions_rad: NDArray[np.float64]
     base_t_left_ir: PoseSE3
     base_t_depth: PoseSE3
     base_cloud: PointCloud
     proxy: BilateralBladeProxy
 
     def __post_init__(self) -> None:
+        joints = np.array(self.seed_joint_positions_rad, dtype=np.float64, copy=True)
+        if joints.shape != (6,) or not np.isfinite(joints).all():
+            raise ValueError("Initial seed joints must be a finite six-vector")
+        joints.setflags(write=False)
+        object.__setattr__(self, "seed_joint_positions_rad", joints)
         if (
             self.base_t_left_ir.parent_frame != "base"
             or self.base_t_left_ir.child_frame != "left_ir"
@@ -83,6 +90,7 @@ def initialize_native_depth(
     return InitialObservation(
         source_view_id=bundle.view_id,
         left_intrinsics=calibration.left,
+        seed_joint_positions_rad=bundle.selected_robot_state.joint_positions_rad,
         base_t_left_ir=base_t_left_ir,
         base_t_depth=base_t_depth,
         base_cloud=base_cloud,
