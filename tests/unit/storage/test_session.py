@@ -13,7 +13,7 @@ from biblade_fusion.devices.depth_camera.base import (
     StereoFrame,
 )
 from biblade_fusion.devices.robot.base import RobotState
-from biblade_fusion.storage import SessionWriter
+from biblade_fusion.storage import SessionFormatError, SessionReader, SessionWriter
 
 
 def make_state(time_ns: int) -> RobotState:
@@ -92,3 +92,38 @@ def test_session_rejects_duplicate_view(tmp_path: Path) -> None:
         writer.write_bundle(bundle)
 
     writer.close("aborted")
+
+
+def test_session_reader_round_trips_a_bundle(tmp_path: Path) -> None:
+    settings = load_settings("configs/default.yaml")
+    with SessionWriter.create(tmp_path, settings, label="roundtrip") as writer:
+        writer.write_bundle(make_bundle())
+
+    reader = SessionReader(writer.path)
+    loaded = reader.load_bundle("seed/front")
+
+    assert reader.schema_version == 2
+    assert reader.views[0].sequence_index == 0
+    np.testing.assert_array_equal(loaded.stereo.native_depth, make_bundle().stereo.native_depth)
+    np.testing.assert_allclose(
+        loaded.stereo.calibration.left_t_depth.matrix,
+        make_bundle().stereo.calibration.left_t_depth.matrix,
+    )
+    np.testing.assert_allclose(loaded.selected_robot_state.base_t_tcp.matrix, np.eye(4))
+
+
+def test_session_reader_rejects_manifest_path_escape(tmp_path: Path) -> None:
+    session = tmp_path / "session"
+    session.mkdir()
+    (session / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "views": [{"sequence_index": 0, "view_id": "seed", "path": "../outside"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SessionFormatError, match="escapes"):
+        SessionReader(session)
