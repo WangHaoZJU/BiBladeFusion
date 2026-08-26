@@ -11,13 +11,15 @@ from rich.table import Table
 
 from biblade_fusion import __version__
 from biblade_fusion.acquisition import SynchronizedAcquirer
+from biblade_fusion.calibration import load_hand_eye_calibration
 from biblade_fusion.core.settings import load_settings
 from biblade_fusion.devices.depth_camera import RealSenseD435i, list_realsense_devices
 from biblade_fusion.devices.robot import EliteReadOnlyRobot
 from biblade_fusion.devices.thermal_camera import NullThermalCamera
 from biblade_fusion.diagnostics import CheckLevel, run_doctor
 from biblade_fusion.perception.stereo import run_foundation_stereo_doctor
-from biblade_fusion.storage import SessionWriter
+from biblade_fusion.storage import SessionReader, SessionWriter, write_initialization
+from biblade_fusion.workflows import initialize_native_depth
 
 app = typer.Typer(
     name="bbf",
@@ -28,10 +30,12 @@ robot_app = typer.Typer(help="Safe Elite CS68 state tools.", no_args_is_help=Tru
 camera_app = typer.Typer(help="Intel RealSense D435i tools.", no_args_is_help=True)
 acquire_app = typer.Typer(help="Synchronized read-only acquisition.", no_args_is_help=True)
 stereo_app = typer.Typer(help="Stereo inference tools.", no_args_is_help=True)
+initialize_app = typer.Typer(help="Offline initial-model construction.", no_args_is_help=True)
 app.add_typer(robot_app, name="robot")
 app.add_typer(camera_app, name="camera")
 app.add_typer(acquire_app, name="acquire")
 app.add_typer(stereo_app, name="stereo")
+app.add_typer(initialize_app, name="initialize")
 
 
 @app.callback()
@@ -329,6 +333,63 @@ def stereo_doctor(
         Console().print(table)
     if any(result.level is CheckLevel.FAIL for result in results):
         raise typer.Exit(code=1)
+
+
+@initialize_app.command("native-depth")
+def initialize_from_native_depth(
+    session: Annotated[
+        Path,
+        typer.Option("--session", exists=True, file_okay=False, readable=True),
+    ],
+    mask: Annotated[
+        Path,
+        typer.Option("--mask", exists=True, dir_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    view_id: Annotated[str, typer.Option("--view-id")] = "seed",
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Build a base-frame initial proxy from one stored, masked D435i depth view."""
+
+    import numpy as np
+
+    try:
+        settings = load_settings(config)
+        hand_eye = load_hand_eye_calibration(settings.hand_eye)
+        bundle = SessionReader(session).load_bundle(view_id)
+        blade_mask = np.load(mask, allow_pickle=False)
+        if not isinstance(blade_mask, np.ndarray):
+            blade_mask.close()
+            raise ValueError("Blade mask must be a single .npy array")
+        observation = initialize_native_depth(
+            bundle,
+            blade_mask,
+            hand_eye,
+            settings.point_cloud,
+            settings.proxy_model,
+        )
+        destination = write_initialization(
+            output,
+            observation,
+            blade_mask,
+            hand_eye,
+            settings.point_cloud,
+            settings.proxy_model,
+            source_session=session,
+        )
+    except Exception as exc:
+        typer.echo(f"Initialization failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved initialization artifact: {destination}")
 
 
 if __name__ == "__main__":

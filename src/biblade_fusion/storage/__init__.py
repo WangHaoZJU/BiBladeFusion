@@ -1,5 +1,10 @@
 """Reproducible acquisition-session storage."""
 
+from biblade_fusion.storage.initialization import (
+    StoredInitialization,
+    read_initialization,
+    write_initialization,
+)
 from biblade_fusion.storage.reader import (
     SessionFormatError,
     SessionReader,
@@ -7,4 +12,12 @@ from biblade_fusion.storage.reader import (
 )
 from biblade_fusion.storage.session import SessionWriter
 
-__all__ = ["SessionFormatError", "SessionReader", "SessionWriter", "StoredViewDescriptor"]
+__all__ = [
+    "SessionFormatError",
+    "SessionReader",
+    "SessionWriter",
+    "StoredInitialization",
+    "StoredViewDescriptor",
+    "read_initialization",
+    "write_initialization",
+]
