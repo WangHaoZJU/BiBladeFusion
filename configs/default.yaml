@@ -40,6 +40,11 @@ foundation_stereo:
   hierarchical: false
   remove_invisible: true
 
+stereo_rectification:
+  alpha: 0.0
+  zero_disparity: true
+  interpolation: linear
+
 # The thickness must be measured or conservatively estimated before constructing a
 # bilateral proxy. Planar extents are optional because a good initial view observes them.
 proxy_model:

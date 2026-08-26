@@ -78,6 +78,14 @@ class FoundationStereoConfig(BaseModel):
     remove_invisible: bool = True
 
 
+class StereoRectificationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    alpha: float = Field(default=0.0, ge=-1.0, le=1.0)
+    zero_disparity: bool = True
+    interpolation: Literal["linear", "nearest"] = "linear"
+
+
 class ProxyModelConfig(BaseModel):
     """Conservative single-view geometry assumptions for bilateral planning."""
 
@@ -192,6 +200,9 @@ class AppSettings(BaseModel):
     thermal: ThermalConfig
     acquisition: AcquisitionConfig = Field(default_factory=AcquisitionConfig)
     foundation_stereo: FoundationStereoConfig = Field(default_factory=FoundationStereoConfig)
+    stereo_rectification: StereoRectificationConfig = Field(
+        default_factory=StereoRectificationConfig
+    )
     proxy_model: ProxyModelConfig = Field(default_factory=ProxyModelConfig)
     point_cloud: PointCloudConfig = Field(default_factory=PointCloudConfig)
     hand_eye: HandEyeConfig = Field(default_factory=HandEyeConfig)

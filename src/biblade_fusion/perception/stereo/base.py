@@ -9,6 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from biblade_fusion.devices.depth_camera.base import StereoCalibrationSnapshot
+from biblade_fusion.perception.stereo.rectification import RectifiedStereoCalibration
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,13 +42,15 @@ class StereoResult:
         object.__setattr__(self, "valid_mask", valid)
         object.__setattr__(self, "confidence", confidence)
 
-    def depth_m(self, calibration: StereoCalibrationSnapshot) -> NDArray[np.float32]:
+    def depth_m(
+        self, calibration: StereoCalibrationSnapshot | RectifiedStereoCalibration
+    ) -> NDArray[np.float32]:
         return disparity_to_depth_m(self.disparity_px, calibration, self.valid_mask)
 
 
 def disparity_to_depth_m(
     disparity_px: NDArray[np.floating[Any]],
-    calibration: StereoCalibrationSnapshot,
+    calibration: StereoCalibrationSnapshot | RectifiedStereoCalibration,
     valid_mask: NDArray[np.bool_] | None = None,
 ) -> NDArray[np.float32]:
     """Convert rectified disparity into metric axial depth.
