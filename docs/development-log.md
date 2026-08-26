@@ -55,8 +55,8 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Achieved-pose experiment labeling composes robot, hand-eye, and rectification
   transforms to derive proxy side and incidence; ambiguous mid-plane/away-facing views
   are rejected, and generated manifests bind the fixed initialization metadata.
-- Current verification: 117 tests and Ruff pass. Through commit `741f1c6`, all prior
-  commits, package build, and Elite SDK import were verified and pushed.
+- Current verification: 117 tests, Ruff, package build, and Elite SDK import pass.
+  Through commit `a41ec12`, all implementation commits were pushed to GitHub `main`.
 
 ## In progress
 
