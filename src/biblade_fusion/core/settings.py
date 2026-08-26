@@ -74,7 +74,7 @@ class AppSettings(BaseModel):
     robot: RobotConfig
     realsense: RealSenseConfig
     thermal: ThermalConfig
-    acquisition: AcquisitionConfig = AcquisitionConfig()
+    acquisition: AcquisitionConfig = Field(default_factory=AcquisitionConfig)
 
 
 def load_settings(path: str | Path) -> AppSettings:

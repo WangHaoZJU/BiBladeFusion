@@ -10,10 +10,13 @@ from rich.console import Console
 from rich.table import Table
 
 from biblade_fusion import __version__
+from biblade_fusion.acquisition import SynchronizedAcquirer
 from biblade_fusion.core.settings import load_settings
 from biblade_fusion.devices.depth_camera import RealSenseD435i, list_realsense_devices
 from biblade_fusion.devices.robot import EliteReadOnlyRobot
+from biblade_fusion.devices.thermal_camera import NullThermalCamera
 from biblade_fusion.diagnostics import CheckLevel, run_doctor
+from biblade_fusion.storage import SessionWriter
 
 app = typer.Typer(
     name="bbf",
@@ -22,8 +25,10 @@ app = typer.Typer(
 )
 robot_app = typer.Typer(help="Safe Elite CS68 state tools.", no_args_is_help=True)
 camera_app = typer.Typer(help="Intel RealSense D435i tools.", no_args_is_help=True)
+acquire_app = typer.Typer(help="Synchronized read-only acquisition.", no_args_is_help=True)
 app.add_typer(robot_app, name="robot")
 app.add_typer(camera_app, name="camera")
+app.add_typer(acquire_app, name="acquire")
 
 
 @app.callback()
@@ -225,6 +230,51 @@ def camera_capture(
         arrays["native_depth"] = frame.native_depth
     np.savez_compressed(destination, **arrays)
     typer.echo(f"Saved D435i frame bundle: {destination}")
+
+
+@acquire_app.command("snapshot")
+def acquire_snapshot(
+    view_id: Annotated[str, typer.Option("--view-id")] = "seed",
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+    robot_ip: Annotated[
+        str | None,
+        typer.Option("--ip", help="Temporary robot IP override."),
+    ] = None,
+) -> None:
+    """Capture one D435i frame bracketed by read-only CS68 states."""
+
+    settings = load_settings(config)
+    if robot_ip is not None:
+        settings.robot = type(settings.robot).model_validate(
+            {**settings.robot.model_dump(), "robot_ip": robot_ip}
+        )
+    thermal = NullThermalCamera()
+    with (
+        SessionWriter.create(settings.project.data_root, settings, label=view_id) as session,
+        EliteReadOnlyRobot(settings.robot) as robot,
+        RealSenseD435i(settings.realsense) as camera,
+    ):
+        acquirer = SynchronizedAcquirer(
+            robot,
+            camera,
+            thermal,
+            settings.acquisition,
+            require_thermal=settings.thermal.enabled,
+        )
+        bundle = acquirer.capture(view_id, 0)
+        view_path = session.write_bundle(bundle)
+    typer.echo(f"Saved synchronized session: {session.path}")
+    typer.echo(f"Saved view: {view_path}")
+
 
 
 
