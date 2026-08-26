@@ -45,6 +45,8 @@ class RealSenseConfig(BaseModel):
     infrared_height: int = Field(default=720, gt=0)
     frames_per_second: int = Field(default=30, gt=0, le=90)
     enable_native_depth: bool = True
+    warmup_frames: int = Field(default=15, ge=0, le=300)
+    timeout_ms: int = Field(default=5000, gt=0, le=60000)
 
 
 class ThermalConfig(BaseModel):
@@ -74,4 +76,3 @@ def load_settings(path: str | Path) -> AppSettings:
     if not isinstance(raw, dict):
         raise ValueError(f"Configuration root must be a mapping: {config_path}")
     return AppSettings.model_validate(raw)
-

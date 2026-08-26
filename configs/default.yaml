@@ -18,8 +18,9 @@ realsense:
   infrared_height: 720
   frames_per_second: 30
   enable_native_depth: true
+  warmup_frames: 15
+  timeout_ms: 5000
 
 thermal:
   enabled: false
   driver: null
-

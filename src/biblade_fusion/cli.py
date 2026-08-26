@@ -11,6 +11,7 @@ from rich.table import Table
 
 from biblade_fusion import __version__
 from biblade_fusion.core.settings import load_settings
+from biblade_fusion.devices.depth_camera import RealSenseD435i, list_realsense_devices
 from biblade_fusion.devices.robot import EliteReadOnlyRobot
 from biblade_fusion.diagnostics import CheckLevel, run_doctor
 
@@ -20,7 +21,9 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 robot_app = typer.Typer(help="Safe Elite CS68 state tools.", no_args_is_help=True)
+camera_app = typer.Typer(help="Intel RealSense D435i tools.", no_args_is_help=True)
 app.add_typer(robot_app, name="robot")
+app.add_typer(camera_app, name="camera")
 
 
 @app.callback()
@@ -136,6 +139,93 @@ def robot_status(
     console.print("[bold]Elite CS68 read-only RTSI status[/bold]")
     for key, value in result.items():
         console.print(f"{key}: {value}")
+
+
+@camera_app.command("list")
+def camera_list(output_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """List connected RealSense devices without starting image streams."""
+
+    try:
+        devices = list_realsense_devices()
+    except Exception as exc:
+        typer.echo(f"RealSense enumeration failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    rows = [asdict(device) for device in devices]
+    if output_json:
+        typer.echo(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        typer.echo("No RealSense devices detected.")
+        return
+    table = Table(title="RealSense devices")
+    table.add_column("Serial")
+    table.add_column("Name")
+    table.add_column("Product line")
+    for row in rows:
+        table.add_row(row["serial_number"], row["name"], row["product_line"])
+    Console().print(table)
+
+
+@camera_app.command("capture")
+def camera_capture(
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Destination .npz file."),
+    ],
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Capture one synchronized raw D435i frame bundle."""
+
+    import numpy as np
+
+    settings = load_settings(config)
+    destination = output if output.suffix == ".npz" else output.with_suffix(".npz")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    with RealSenseD435i(settings.realsense) as camera:
+        frame = camera.capture()
+
+    arrays: dict[str, object] = {
+        "left_ir": frame.left_ir,
+        "right_ir": frame.right_ir,
+        "monotonic_time_ns": frame.monotonic_time_ns,
+        "frame_number": frame.frame_number,
+        "left_device_time_ms": frame.left_device_time_ms,
+        "right_device_time_ms": frame.right_device_time_ms,
+        "left_intrinsics": [
+            frame.calibration.left.fx,
+            frame.calibration.left.fy,
+            frame.calibration.left.cx,
+            frame.calibration.left.cy,
+        ],
+        "right_intrinsics": [
+            frame.calibration.right.fx,
+            frame.calibration.right.fy,
+            frame.calibration.right.cx,
+            frame.calibration.right.cy,
+        ],
+        "right_T_left": frame.calibration.right_t_left.matrix,
+        "native_depth_scale_m": (
+            frame.calibration.native_depth_scale_m
+            if frame.calibration.native_depth_scale_m is not None
+            else np.nan
+        ),
+    }
+    if frame.native_depth is not None:
+        arrays["native_depth"] = frame.native_depth
+    np.savez_compressed(destination, **arrays)
+    typer.echo(f"Saved D435i frame bundle: {destination}")
+
 
 
 
