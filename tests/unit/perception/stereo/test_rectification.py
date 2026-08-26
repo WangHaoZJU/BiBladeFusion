@@ -8,7 +8,12 @@ from biblade_fusion.devices.depth_camera.base import (
     StereoFrame,
 )
 from biblade_fusion.devices.robot.conversions import rotation_vector_to_matrix
-from biblade_fusion.perception.stereo import StereoRectifier
+from biblade_fusion.perception.stereo import (
+    RectifiedStereoCalibration,
+    StereoRectifier,
+    StereoResult,
+    constrain_to_rectified_valid_regions,
+)
 
 
 def calibration(rotation=None, translation=(-0.05, 0.0, 0.0)):
@@ -75,3 +80,30 @@ def test_rectified_frame_chain_preserves_original_stereo_transform() -> None:
     translation = rectified.right_rectified_t_left_rectified.translation_m
     assert abs(translation[1]) < 1e-9
     assert abs(translation[2]) < 1e-9
+
+
+def test_stereo_validity_requires_both_rectified_regions() -> None:
+    intrinsics = CameraIntrinsics(5, 3, 50.0, 50.0, 2.0, 1.0, "none", ())
+    rectified_calibration = RectifiedStereoCalibration(
+        intrinsics,
+        intrinsics,
+        PoseSE3.from_rotation_translation(
+            "right_rectified", "left_rectified", np.eye(3), [-0.05, 0, 0]
+        ),
+        PoseSE3.identity("left_rectified", "left_ir"),
+        PoseSE3.identity("right_rectified", "right_ir"),
+        np.eye(4),
+        (1, 0, 4, 3),
+        (1, 1, 3, 2),
+    )
+    result = StereoResult(
+        np.ones((3, 5), dtype=np.float32),
+        np.ones((3, 5), dtype=bool),
+    )
+
+    constrained = constrain_to_rectified_valid_regions(result, rectified_calibration)
+
+    expected = np.zeros((3, 5), dtype=bool)
+    expected[1:, 2:] = True
+    np.testing.assert_array_equal(constrained.valid_mask, expected)
+    assert constrained.metadata["rectified_valid_regions_applied"] is True

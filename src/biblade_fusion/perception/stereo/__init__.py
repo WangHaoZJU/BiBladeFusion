@@ -3,6 +3,7 @@
 from biblade_fusion.perception.stereo.base import (
     StereoBackend,
     StereoResult,
+    constrain_to_rectified_valid_regions,
     disparity_to_depth_m,
 )
 from biblade_fusion.perception.stereo.foundation_stereo import (
@@ -24,6 +25,7 @@ __all__ = [
     "StereoResult",
     "RectifiedStereoCalibration",
     "RectifiedStereoFrame",
+    "constrain_to_rectified_valid_regions",
     "disparity_to_depth_m",
     "run_foundation_stereo_doctor",
 ]

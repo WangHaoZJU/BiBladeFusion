@@ -77,6 +77,44 @@ def disparity_to_depth_m(
     return depth
 
 
+def constrain_to_rectified_valid_regions(
+    result: StereoResult,
+    calibration: RectifiedStereoCalibration,
+) -> StereoResult:
+    """Reject pixels outside either rectified image's calibrated valid region."""
+
+    height, width = result.disparity_px.shape
+    expected_shape = (calibration.left.height, calibration.left.width)
+    if (height, width) != expected_shape:
+        raise ValueError(
+            f"Disparity shape {(height, width)} does not match calibration {expected_shape}"
+        )
+    vertical, horizontal = np.indices((height, width), dtype=np.float32)
+    right_horizontal = horizontal - result.disparity_px
+    left_x, left_y, left_width, left_height = calibration.left_valid_roi
+    right_x, right_y, right_width, right_height = calibration.right_valid_roi
+    valid = result.valid_mask.copy()
+    valid &= (
+        (horizontal >= left_x)
+        & (horizontal < left_x + left_width)
+        & (vertical >= left_y)
+        & (vertical < left_y + left_height)
+    )
+    valid &= (
+        (right_horizontal >= right_x)
+        & (right_horizontal < right_x + right_width)
+        & (vertical >= right_y)
+        & (vertical < right_y + right_height)
+    )
+    metadata = {
+        **result.metadata,
+        "rectified_valid_regions_applied": True,
+        "left_valid_roi": list(calibration.left_valid_roi),
+        "right_valid_roi": list(calibration.right_valid_roi),
+    }
+    return StereoResult(result.disparity_px, valid, result.confidence, metadata)
+
+
 @runtime_checkable
 class StereoBackend(Protocol):
     """A stereo backend consuming rectified left/right images."""
