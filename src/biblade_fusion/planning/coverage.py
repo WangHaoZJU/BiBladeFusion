@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
@@ -17,6 +19,19 @@ from biblade_fusion.planning.views import BilateralViewPlan, BladeSide
 
 class CoverageError(ValueError):
     """Coverage evidence is inconsistent, empty, or not registered in the base frame."""
+
+
+def coverage_observation_id(
+    source_session: str | Path,
+    view_id: str,
+    sequence_index: int,
+    frame_number: int,
+) -> str:
+    """Build a stable identity so one physical frame cannot be counted twice."""
+
+    session = str(Path(source_session).resolve())
+    session_key = hashlib.sha256(session.encode("utf-8")).hexdigest()[:8]
+    return f"{Path(session).name}-{session_key}:{sequence_index:04d}:{frame_number}:{view_id}"
 
 
 @dataclass(frozen=True, slots=True)

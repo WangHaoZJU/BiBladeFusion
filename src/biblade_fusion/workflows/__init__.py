@@ -10,6 +10,12 @@ from biblade_fusion.workflows.initialization import (
     initialize_foundation_stereo_depth,
     initialize_native_depth,
 )
+from biblade_fusion.workflows.reconstruction import (
+    ReconstructedBladeView,
+    ReconstructionError,
+    reconstruct_foundation_stereo_view,
+    reconstruct_native_depth_view,
+)
 from biblade_fusion.workflows.stereo_inference import (
     StereoInferenceObservation,
     infer_rectified_stereo,
@@ -24,10 +30,14 @@ __all__ = [
     "HandEyeExtractionResult",
     "InitializationError",
     "OfflineViewPlanningResult",
+    "ReconstructedBladeView",
+    "ReconstructionError",
     "StereoInferenceObservation",
     "initialize_native_depth",
     "initialize_foundation_stereo_depth",
     "extract_hand_eye_samples",
     "infer_rectified_stereo",
     "plan_initial_observation",
+    "reconstruct_foundation_stereo_view",
+    "reconstruct_native_depth_view",
 ]

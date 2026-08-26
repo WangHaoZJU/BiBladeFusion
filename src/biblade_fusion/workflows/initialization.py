@@ -13,13 +13,12 @@ from biblade_fusion.calibration.hand_eye import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import PointCloudConfig, ProxyModelConfig
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
-from biblade_fusion.perception.pointcloud import (
-    PointCloud,
-    depth_image_to_point_cloud,
-    native_depth_to_meters,
-    realsense_depth_image_to_point_cloud,
-)
+from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import BilateralBladeProxy, build_bilateral_proxy
+from biblade_fusion.workflows.reconstruction import (
+    reconstruct_foundation_stereo_view,
+    reconstruct_native_depth_view,
+)
 from biblade_fusion.workflows.stereo_inference import StereoInferenceObservation
 
 
@@ -37,6 +36,8 @@ class InitialObservation:
     base_cloud: PointCloud
     proxy: BilateralBladeProxy
     depth_source: Literal["native_realsense", "foundation_stereo"] = "native_realsense"
+    source_sequence_index: int = 0
+    source_frame_number: int = 0
 
     def __post_init__(self) -> None:
         joints = np.array(self.seed_joint_positions_rad, dtype=np.float64, copy=True)
@@ -63,6 +64,8 @@ class InitialObservation:
             raise ValueError("Initial point cloud must be in the base frame")
         if self.proxy.frame_T_proxy.parent_frame != "base":
             raise ValueError("Initial proxy must be in the base frame")
+        if self.source_sequence_index < 0 or self.source_frame_number < 0:
+            raise ValueError("Initial source sequence and frame numbers must be non-negative")
 
 
 def initialize_native_depth(
@@ -74,39 +77,27 @@ def initialize_native_depth(
 ) -> InitialObservation:
     """Build a base-frame cloud and conservative proxy from one masked native depth view."""
 
-    stereo = bundle.stereo
-    calibration = stereo.calibration
-    if stereo.native_depth is None:
-        raise InitializationError("Stored view has no native depth")
-    if calibration.native_depth_scale_m is None:
-        raise InitializationError("Stored view has no native depth scale")
-    if calibration.depth is None or calibration.left_t_depth is None:
-        raise InitializationError("Stored view has no depth-stream calibration")
-
-    depth_m = native_depth_to_meters(stereo.native_depth, calibration.native_depth_scale_m)
-    depth_cloud = realsense_depth_image_to_point_cloud(
-        depth_m,
-        calibration.depth,
+    reconstructed = reconstruct_native_depth_view(
+        bundle,
+        blade_mask,
+        hand_eye,
         point_cloud_config,
-        frame="depth",
-        valid_mask=blade_mask,
     )
-    base_t_left_ir = bundle.selected_robot_state.base_t_tcp.compose(hand_eye.tcp_t_left_ir)
-    base_t_depth = base_t_left_ir.compose(calibration.left_t_depth)
-    base_cloud = depth_cloud.transformed(base_t_depth)
     proxy = build_bilateral_proxy(
-        base_cloud.points_m,
-        base_t_left_ir,
+        reconstructed.base_cloud.points_m,
+        reconstructed.base_t_projection_camera,
         proxy_config,
     )
     return InitialObservation(
-        source_view_id=bundle.view_id,
-        planning_intrinsics=calibration.left,
-        seed_joint_positions_rad=bundle.selected_robot_state.joint_positions_rad,
-        base_t_left_ir=base_t_left_ir,
-        base_t_projection_camera=base_t_depth,
-        base_cloud=base_cloud,
+        source_view_id=reconstructed.source_view_id,
+        planning_intrinsics=reconstructed.planning_intrinsics,
+        seed_joint_positions_rad=reconstructed.joint_positions_rad,
+        base_t_left_ir=reconstructed.base_t_left_ir,
+        base_t_projection_camera=reconstructed.base_t_projection_camera,
+        base_cloud=reconstructed.base_cloud,
         proxy=proxy,
+        source_sequence_index=reconstructed.source_sequence_index,
+        source_frame_number=reconstructed.source_frame_number,
     )
 
 
@@ -120,42 +111,27 @@ def initialize_foundation_stereo_depth(
 ) -> InitialObservation:
     """Build the same bilateral proxy from calibrated FoundationStereo depth."""
 
-    if (
-        stereo_observation.source_view_id != bundle.view_id
-        or stereo_observation.source_sequence_index != bundle.sequence_index
-        or stereo_observation.rectified.source_frame_number != bundle.stereo.frame_number
-    ):
-        raise InitializationError("Stereo inference artifact does not match the stored view")
-    mask = np.asarray(blade_mask, dtype=np.bool_)
-    if mask.shape != stereo_observation.depth_m.shape:
-        raise InitializationError("Blade mask must match the rectified stereo depth image")
-
-    calibration = stereo_observation.rectified.calibration
-    combined_valid = mask & stereo_observation.result.valid_mask
-    projection_cloud = depth_image_to_point_cloud(
-        stereo_observation.depth_m,
-        calibration.left,
+    reconstructed = reconstruct_foundation_stereo_view(
+        bundle,
+        stereo_observation,
+        blade_mask,
+        hand_eye,
         point_cloud_config,
-        frame="left_rectified",
-        valid_mask=combined_valid,
     )
-    base_t_left_ir = bundle.selected_robot_state.base_t_tcp.compose(hand_eye.tcp_t_left_ir)
-    base_t_left_rectified = base_t_left_ir.compose(
-        calibration.left_rectified_t_left_ir.inverse()
-    )
-    base_cloud = projection_cloud.transformed(base_t_left_rectified)
     proxy = build_bilateral_proxy(
-        base_cloud.points_m,
-        base_t_left_rectified,
+        reconstructed.base_cloud.points_m,
+        reconstructed.base_t_projection_camera,
         proxy_config,
     )
     return InitialObservation(
-        source_view_id=bundle.view_id,
-        planning_intrinsics=calibration.left,
-        seed_joint_positions_rad=bundle.selected_robot_state.joint_positions_rad,
-        base_t_left_ir=base_t_left_ir,
-        base_t_projection_camera=base_t_left_rectified,
-        base_cloud=base_cloud,
+        source_view_id=reconstructed.source_view_id,
+        planning_intrinsics=reconstructed.planning_intrinsics,
+        seed_joint_positions_rad=reconstructed.joint_positions_rad,
+        base_t_left_ir=reconstructed.base_t_left_ir,
+        base_t_projection_camera=reconstructed.base_t_projection_camera,
+        base_cloud=reconstructed.base_cloud,
         proxy=proxy,
         depth_source="foundation_stereo",
+        source_sequence_index=reconstructed.source_sequence_index,
+        source_frame_number=reconstructed.source_frame_number,
     )

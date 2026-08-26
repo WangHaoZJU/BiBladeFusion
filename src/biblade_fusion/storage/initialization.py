@@ -119,6 +119,8 @@ def write_initialization(
         "source": {
             "session": str(Path(source_session).resolve()),
             "view_id": observation.source_view_id,
+            "sequence_index": observation.source_sequence_index,
+            "frame_number": observation.source_frame_number,
             "stereo_inference": (
                 str(Path(source_stereo_inference).resolve())
                 if source_stereo_inference is not None
@@ -233,6 +235,8 @@ def read_initialization(path: str | Path) -> StoredInitialization:
             base_cloud=cloud,
             proxy=proxy,
             depth_source=depth_source,
+            source_sequence_index=int(metadata["source"].get("sequence_index", 0)),
+            source_frame_number=int(metadata["source"].get("frame_number", 0)),
         )
         hand_eye_data = metadata["hand_eye"]
         hand_eye = HandEyeCalibration(

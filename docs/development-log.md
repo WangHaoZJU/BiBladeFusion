@@ -39,13 +39,17 @@ authoritative fine-grained record; this page records the experiment-facing state
   path. Initialization schema 5 records depth source/projection frame and reads schema 4.
 - Bilateral per-patch coverage grids, independent front/back evidence, incomplete versus
   blocked replanning state, and immutable checksummed seed-coverage artifacts.
-- Current working tree: 102 tests, Ruff, package build, and Elite SDK import pass.
-  Through commit `66947e4`, all earlier commits were pushed to GitHub `main`.
+- Native and FoundationStereo pose-registered view artifacts, with source identity,
+  checksummed clouds/masks, hand-eye provenance, duplicate-frame prevention, and
+  immutable coverage-ledger append support.
+- Current verification: 105 tests, Ruff, package build, and Elite SDK import pass.
+  Through commit `66947e4`, all earlier commits were pushed to GitHub `main`;
+  the newer small commits are pushed together after this integration checkpoint.
 
 ## In progress
 
-- Persist later pose-registered native/stereo observations and append them to immutable
-  coverage ledgers, then export the reduced non-executable next-view plan.
+- Export the reduced coverage-driven next-view plan as a separate non-executable
+  artifact, including completed, remaining, and blocked patch identities.
 
 ## Pending, in priority order
 

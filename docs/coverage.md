@@ -33,5 +33,34 @@ metric provenance and avoids unconstrained ICP on a thin, locally smooth blade, 
 sliding or front/back convergence is a serious failure mode. Pairwise geometric
 refinement will only be added with explicit correspondence/uncertainty checks.
 
-The current CLI seeds coverage from the initialization view. Persisting and adding later
-registered observations is the next increment; no coverage command moves the robot.
+For every later captured view, first create a pose-registered artifact. Choose the depth
+source used by that experiment:
+
+```bash
+uv run bbf reconstruct native-depth \
+  --session data/<later-session> --view-id front_r00_c01 \
+  --mask data/<later-mask>.npy --config configs/local.yaml \
+  --output outputs/registered_front_r00_c01
+
+uv run bbf reconstruct stereo-depth \
+  --session data/<later-session> --view-id front_r00_c01 \
+  --stereo outputs/<later-stereo> --mask data/<later-rectified-mask>.npy \
+  --config configs/local.yaml --output outputs/registered_front_r00_c01_stereo
+```
+
+Append exactly one registered artifact to a new immutable ledger:
+
+```bash
+uv run bbf coverage add \
+  --ledger outputs/coverage_000 \
+  --plan outputs/view_plan \
+  --initialization outputs/initialization \
+  --view outputs/registered_front_r00_c01 \
+  --output outputs/coverage_001
+```
+
+The update validates plan/initialization provenance and requires the same hand-eye
+matrix used by the reference initialization. A stable identity derived from source
+session, sequence, camera frame number, and view ID prevents counting one physical frame
+twice—even if it was reconstructed once with native depth and once with stereo depth.
+No reconstruction or coverage command moves the robot.

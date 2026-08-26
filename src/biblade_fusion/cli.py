@@ -32,6 +32,7 @@ from biblade_fusion.perception.stereo import (
 )
 from biblade_fusion.planning import (
     EliteCs68IkChecker,
+    coverage_observation_id,
     create_coverage_ledger,
     select_uncovered_candidates,
     update_coverage,
@@ -39,11 +40,14 @@ from biblade_fusion.planning import (
 from biblade_fusion.storage import (
     SessionReader,
     SessionWriter,
+    read_coverage_ledger,
     read_initialization,
+    read_reconstructed_view,
     read_stereo_inference,
     read_view_plan,
     write_coverage_ledger,
     write_initialization,
+    write_reconstructed_view,
     write_stereo_inference,
     write_view_plan,
 )
@@ -53,6 +57,8 @@ from biblade_fusion.workflows import (
     initialize_foundation_stereo_depth,
     initialize_native_depth,
     plan_initial_observation,
+    reconstruct_foundation_stereo_view,
+    reconstruct_native_depth_view,
 )
 
 app = typer.Typer(
@@ -68,6 +74,7 @@ stereo_app = typer.Typer(help="Stereo inference tools.", no_args_is_help=True)
 initialize_app = typer.Typer(help="Offline initial-model construction.", no_args_is_help=True)
 plan_app = typer.Typer(help="Offline bilateral view planning.", no_args_is_help=True)
 coverage_app = typer.Typer(help="Offline bilateral coverage tracking.", no_args_is_help=True)
+reconstruct_app = typer.Typer(help="Pose-register stored blade depth views.", no_args_is_help=True)
 app.add_typer(robot_app, name="robot")
 app.add_typer(camera_app, name="camera")
 app.add_typer(acquire_app, name="acquire")
@@ -76,6 +83,7 @@ app.add_typer(stereo_app, name="stereo")
 app.add_typer(initialize_app, name="initialize")
 app.add_typer(plan_app, name="plan")
 app.add_typer(coverage_app, name="coverage")
+app.add_typer(reconstruct_app, name="reconstruct")
 
 
 @app.callback()
@@ -668,6 +676,123 @@ def initialize_from_stereo_depth(
     typer.echo(f"Saved FoundationStereo initialization artifact: {destination}")
 
 
+@reconstruct_app.command("native-depth")
+def reconstruct_from_native_depth(
+    session: Annotated[
+        Path,
+        typer.Option("--session", exists=True, file_okay=False, readable=True),
+    ],
+    mask: Annotated[
+        Path,
+        typer.Option("--mask", exists=True, dir_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    view_id: Annotated[str, typer.Option("--view-id")],
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Pose-register a stored native-depth blade view without changing the proxy."""
+
+    import numpy as np
+
+    try:
+        settings = load_settings(config)
+        hand_eye = load_hand_eye_calibration(settings.hand_eye)
+        bundle = SessionReader(session).load_bundle(view_id)
+        blade_mask = np.load(mask, allow_pickle=False)
+        if not isinstance(blade_mask, np.ndarray):
+            blade_mask.close()
+            raise ValueError("Blade mask must be a single .npy array")
+        view = reconstruct_native_depth_view(
+            bundle,
+            blade_mask,
+            hand_eye,
+            settings.point_cloud,
+        )
+        destination = write_reconstructed_view(
+            output,
+            view,
+            blade_mask,
+            hand_eye,
+            settings.point_cloud,
+            source_session=session,
+        )
+    except Exception as exc:
+        typer.echo(f"View reconstruction failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved pose-registered blade view: {destination}")
+
+
+@reconstruct_app.command("stereo-depth")
+def reconstruct_from_stereo_depth(
+    session: Annotated[
+        Path,
+        typer.Option("--session", exists=True, file_okay=False, readable=True),
+    ],
+    stereo: Annotated[
+        Path,
+        typer.Option("--stereo", exists=True, file_okay=False, readable=True),
+    ],
+    mask: Annotated[
+        Path,
+        typer.Option("--mask", exists=True, dir_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    view_id: Annotated[str, typer.Option("--view-id")],
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Pose-register a stored FoundationStereo blade view without changing the proxy."""
+
+    import numpy as np
+
+    try:
+        settings = load_settings(config)
+        hand_eye = load_hand_eye_calibration(settings.hand_eye)
+        bundle = SessionReader(session).load_bundle(view_id)
+        stereo_observation = read_stereo_inference(stereo).observation
+        blade_mask = np.load(mask, allow_pickle=False)
+        if not isinstance(blade_mask, np.ndarray):
+            blade_mask.close()
+            raise ValueError("Blade mask must be a single .npy array")
+        view = reconstruct_foundation_stereo_view(
+            bundle,
+            stereo_observation,
+            blade_mask,
+            hand_eye,
+            settings.point_cloud,
+        )
+        destination = write_reconstructed_view(
+            output,
+            view,
+            blade_mask,
+            hand_eye,
+            settings.point_cloud,
+            source_session=session,
+            source_stereo_inference=stereo,
+        )
+    except Exception as exc:
+        typer.echo(f"View reconstruction failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved pose-registered stereo blade view: {destination}")
+
+
 @plan_app.command("views")
 def plan_views(
     initialization: Annotated[
@@ -769,7 +894,12 @@ def coverage_seed(
             observation.proxy,
             observation.base_cloud,
             observation.base_t_projection_camera,
-            f"initialization:{observation.source_view_id}",
+            coverage_observation_id(
+                stored_initialization.metadata["source"]["session"],
+                observation.source_view_id,
+                observation.source_sequence_index,
+                observation.source_frame_number,
+            ),
         )
         remaining = select_uncovered_candidates(stored_plan.result.filtered_plan, ledger)
         destination = write_coverage_ledger(
@@ -782,6 +912,82 @@ def coverage_seed(
         typer.echo(f"Coverage initialization failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Saved bilateral coverage ledger: {destination}")
+    typer.echo(
+        f"Completed patches: {len(remaining.completed_patch_ids)}; "
+        f"remaining accepted views: {len(remaining.remaining)}; "
+        f"blocked patches: {len(remaining.blocked_patch_ids)}"
+    )
+    typer.echo("Motion authorized: no")
+
+
+@coverage_app.command("add")
+def coverage_add(
+    ledger: Annotated[
+        Path,
+        typer.Option("--ledger", exists=True, file_okay=False, readable=True),
+    ],
+    plan: Annotated[
+        Path,
+        typer.Option("--plan", exists=True, file_okay=False, readable=True),
+    ],
+    initialization: Annotated[
+        Path,
+        typer.Option("--initialization", exists=True, file_okay=False, readable=True),
+    ],
+    view: Annotated[
+        Path,
+        typer.Option("--view", exists=True, file_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+) -> None:
+    """Append one immutable pose-registered view to a new coverage ledger."""
+
+    import numpy as np
+
+    try:
+        stored_ledger = read_coverage_ledger(ledger)
+        stored_plan = read_view_plan(plan)
+        stored_initialization = read_initialization(initialization)
+        stored_view = read_reconstructed_view(view)
+        if Path(str(stored_ledger.metadata["source_plan"])).resolve() != plan.resolve():
+            raise ValueError("Coverage ledger does not belong to the supplied view plan")
+        if (
+            Path(str(stored_ledger.metadata["source_initialization"])).resolve()
+            != initialization.resolve()
+        ):
+            raise ValueError("Coverage ledger does not belong to the supplied initialization")
+        if not np.allclose(
+            stored_view.metadata["hand_eye"]["tcp_T_left_ir"],
+            stored_initialization.hand_eye.tcp_t_left_ir.matrix,
+            atol=1e-9,
+        ):
+            raise ValueError("Reconstructed view uses a different hand-eye calibration")
+        source = stored_view.metadata["source"]
+        updated = update_coverage(
+            stored_ledger.ledger,
+            stored_plan.result.geometric_plan,
+            stored_initialization.observation.proxy,
+            stored_view.view.base_cloud,
+            stored_view.view.base_t_projection_camera,
+            coverage_observation_id(
+                source["session"],
+                stored_view.view.source_view_id,
+                stored_view.view.source_sequence_index,
+                stored_view.view.source_frame_number,
+            ),
+        )
+        remaining = select_uncovered_candidates(stored_plan.result.filtered_plan, updated)
+        destination = write_coverage_ledger(
+            output,
+            updated,
+            source_plan=plan,
+            source_initialization=initialization,
+            previous_ledger=ledger,
+        )
+    except Exception as exc:
+        typer.echo(f"Coverage update failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved updated bilateral coverage ledger: {destination}")
     typer.echo(
         f"Completed patches: {len(remaining.completed_patch_ids)}; "
         f"remaining accepted views: {len(remaining.remaining)}; "

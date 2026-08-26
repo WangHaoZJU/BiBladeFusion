@@ -15,6 +15,11 @@ from biblade_fusion.storage.reader import (
     SessionReader,
     StoredViewDescriptor,
 )
+from biblade_fusion.storage.reconstructed_view import (
+    StoredReconstructedBladeView,
+    read_reconstructed_view,
+    write_reconstructed_view,
+)
 from biblade_fusion.storage.session import SessionWriter
 from biblade_fusion.storage.stereo_inference import (
     StoredStereoInference,
@@ -33,14 +38,17 @@ __all__ = [
     "SessionWriter",
     "StoredCoverageLedger",
     "StoredInitialization",
+    "StoredReconstructedBladeView",
     "StoredStereoInference",
     "StoredViewPlan",
     "StoredViewDescriptor",
     "read_initialization",
+    "read_reconstructed_view",
     "read_coverage_ledger",
     "read_stereo_inference",
     "read_view_plan",
     "write_initialization",
+    "write_reconstructed_view",
     "write_coverage_ledger",
     "write_stereo_inference",
     "write_view_plan",

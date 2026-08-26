@@ -54,6 +54,15 @@ def test_coverage_command_is_exposed() -> None:
 
     assert result.exit_code == 0
     assert "seed" in result.stdout
+    assert "add" in result.stdout
+
+
+def test_reconstruction_commands_are_exposed() -> None:
+    result = runner.invoke(app, ["reconstruct", "--help"])
+
+    assert result.exit_code == 0
+    assert "native-depth" in result.stdout
+    assert "stereo-depth" in result.stdout
 
 
 def test_robot_kinematics_export_is_exposed() -> None:
