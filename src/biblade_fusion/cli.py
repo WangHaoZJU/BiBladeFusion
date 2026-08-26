@@ -40,11 +40,13 @@ from biblade_fusion.planning import (
 from biblade_fusion.storage import (
     SessionReader,
     SessionWriter,
+    read_coverage_driven_plan,
     read_coverage_ledger,
     read_initialization,
     read_reconstructed_view,
     read_stereo_inference,
     read_view_plan,
+    write_coverage_driven_plan,
     write_coverage_ledger,
     write_initialization,
     write_reconstructed_view,
@@ -992,6 +994,39 @@ def coverage_add(
         f"Completed patches: {len(remaining.completed_patch_ids)}; "
         f"remaining accepted views: {len(remaining.remaining)}; "
         f"blocked patches: {len(remaining.blocked_patch_ids)}"
+    )
+    typer.echo("Motion authorized: no")
+
+
+@coverage_app.command("next-plan")
+def coverage_next_plan(
+    ledger: Annotated[
+        Path,
+        typer.Option("--ledger", exists=True, file_okay=False, readable=True),
+    ],
+    plan: Annotated[
+        Path,
+        typer.Option("--plan", exists=True, file_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+) -> None:
+    """Export remaining, completed, and blocked patches without authorizing motion."""
+
+    try:
+        destination = write_coverage_driven_plan(
+            output,
+            source_plan=plan,
+            source_coverage=ledger,
+        )
+        stored = read_coverage_driven_plan(destination)
+    except Exception as exc:
+        typer.echo(f"Coverage-driven planning failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved coverage-driven view plan: {destination}")
+    typer.echo(
+        f"Completed patches: {len(stored.plan.completed_patch_ids)}; "
+        f"remaining views: {len(stored.plan.remaining)}; "
+        f"blocked patches: {len(stored.plan.blocked_patch_ids)}"
     )
     typer.echo("Motion authorized: no")
 

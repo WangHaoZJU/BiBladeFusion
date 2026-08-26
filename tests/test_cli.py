@@ -55,6 +55,7 @@ def test_coverage_command_is_exposed() -> None:
     assert result.exit_code == 0
     assert "seed" in result.stdout
     assert "add" in result.stdout
+    assert "next-plan" in result.stdout
 
 
 def test_reconstruction_commands_are_exposed() -> None:

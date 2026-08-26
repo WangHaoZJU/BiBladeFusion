@@ -5,6 +5,11 @@ from biblade_fusion.storage.coverage import (
     read_coverage_ledger,
     write_coverage_ledger,
 )
+from biblade_fusion.storage.coverage_plan import (
+    StoredCoverageDrivenPlan,
+    read_coverage_driven_plan,
+    write_coverage_driven_plan,
+)
 from biblade_fusion.storage.initialization import (
     StoredInitialization,
     read_initialization,
@@ -37,17 +42,20 @@ __all__ = [
     "SessionReader",
     "SessionWriter",
     "StoredCoverageLedger",
+    "StoredCoverageDrivenPlan",
     "StoredInitialization",
     "StoredReconstructedBladeView",
     "StoredStereoInference",
     "StoredViewPlan",
     "StoredViewDescriptor",
     "read_initialization",
+    "read_coverage_driven_plan",
     "read_reconstructed_view",
     "read_coverage_ledger",
     "read_stereo_inference",
     "read_view_plan",
     "write_initialization",
+    "write_coverage_driven_plan",
     "write_reconstructed_view",
     "write_coverage_ledger",
     "write_stereo_inference",

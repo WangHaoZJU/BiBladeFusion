@@ -42,22 +42,23 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Native and FoundationStereo pose-registered view artifacts, with source identity,
   checksummed clouds/masks, hand-eye provenance, duplicate-frame prevention, and
   immutable coverage-ledger append support.
-- Current verification: 105 tests, Ruff, package build, and Elite SDK import pass.
-  Through commit `66947e4`, all earlier commits were pushed to GitHub `main`;
-  the newer small commits are pushed together after this integration checkpoint.
+- Coverage-driven next-view artifacts that cryptographically bind the source plan and
+  ledger, re-derive their contents on read, distinguish completed/remaining/blocked
+  patches, and explicitly forbid motion.
+- Current verification: 107 tests and Ruff pass. Through commit `b5811b5`, all prior
+  commits, package build, and Elite SDK import were verified and pushed to GitHub `main`.
 
 ## In progress
 
-- Export the reduced coverage-driven next-view plan as a separate non-executable
-  artifact, including completed, remaining, and blocked patch identities.
+- Build reproducible paired native-RealSense versus FoundationStereo depth metrics in
+  the calibrated left-rectified frame for later blade experiments.
 
 ## Pending, in priority order
 
 1. Run a real FoundationStereo checkpoint/CUDA smoke test; no compatible checkpoint or
    CUDA device is currently available in this workspace.
-2. Compare FoundationStereo and native RealSense depth experimentally on the blade.
-3. Add multi-view registration, bilateral coverage accounting, and coverage-driven
-   replanning while preserving the front/back surface identity.
-4. Add robot-body/workcell collision and continuous trajectory validation before any
+2. Collect paired blade observations and compare FoundationStereo with native RealSense
+   depth using the offline evaluator.
+3. Add robot-body/workcell collision and continuous trajectory validation before any
    future motion-execution feature is considered.
-5. Implement the thermal-camera adapter after its model and radiometric SDK are known.
+4. Implement the thermal-camera adapter after its model and radiometric SDK are known.

@@ -63,4 +63,17 @@ The update validates plan/initialization provenance and requires the same hand-e
 matrix used by the reference initialization. A stable identity derived from source
 session, sequence, camera frame number, and view ID prevents counting one physical frame
 twice—even if it was reconstructed once with native depth and once with stereo depth.
-No reconstruction or coverage command moves the robot.
+
+Export the next offline view set from any ledger version:
+
+```bash
+uv run bbf coverage next-plan \
+  --ledger outputs/coverage_001 \
+  --plan outputs/view_plan \
+  --output outputs/next_view_plan_001
+```
+
+The resulting JSON references SHA-256-verified plan and coverage sources and separates
+completed patches, remaining non-rejected views, and blocked patches. Reading it derives
+the selection again from its sources and rejects stale or edited summaries. No
+reconstruction or coverage command moves the robot.
