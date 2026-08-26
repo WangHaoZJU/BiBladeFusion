@@ -130,6 +130,16 @@ class HandEyeConfig(BaseModel):
     require_quality_metrics: bool = True
 
 
+class ViewPlanningConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    standoff_distance_m: float | None = Field(default=None, gt=0.0)
+    overlap_fraction: float = Field(default=0.3, ge=0.0, lt=0.9)
+    footprint_utilization: float = Field(default=0.8, gt=0.0, le=1.0)
+    edge_margin_m: float = Field(default=0.005, ge=0.0)
+    maximum_candidates: int = Field(default=200, ge=2, le=10000)
+
+
 class AppSettings(BaseModel):
     """Top-level BiBladeFusion settings."""
 
@@ -144,6 +154,7 @@ class AppSettings(BaseModel):
     proxy_model: ProxyModelConfig = Field(default_factory=ProxyModelConfig)
     point_cloud: PointCloudConfig = Field(default_factory=PointCloudConfig)
     hand_eye: HandEyeConfig = Field(default_factory=HandEyeConfig)
+    view_planning: ViewPlanningConfig = Field(default_factory=ViewPlanningConfig)
 
 
 def load_settings(path: str | Path) -> AppSettings:

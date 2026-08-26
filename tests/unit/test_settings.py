@@ -21,6 +21,8 @@ def test_default_settings_load_safely() -> None:
     assert settings.point_cloud.minimum_depth_m == 0.15
     assert settings.point_cloud.maximum_depth_m == 1.5
     assert settings.hand_eye.calibration_path is None
+    assert settings.view_planning.standoff_distance_m is None
+    assert settings.view_planning.overlap_fraction == 0.3
 
 
 def test_unknown_configuration_key_is_rejected() -> None:
