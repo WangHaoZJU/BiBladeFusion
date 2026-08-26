@@ -42,18 +42,21 @@ from biblade_fusion.storage import (
     SessionWriter,
     read_coverage_driven_plan,
     read_coverage_ledger,
+    read_depth_comparison,
     read_initialization,
     read_reconstructed_view,
     read_stereo_inference,
     read_view_plan,
     write_coverage_driven_plan,
     write_coverage_ledger,
+    write_depth_comparison,
     write_initialization,
     write_reconstructed_view,
     write_stereo_inference,
     write_view_plan,
 )
 from biblade_fusion.workflows import (
+    compare_paired_depth,
     extract_hand_eye_samples,
     infer_rectified_stereo,
     initialize_foundation_stereo_depth,
@@ -77,6 +80,7 @@ initialize_app = typer.Typer(help="Offline initial-model construction.", no_args
 plan_app = typer.Typer(help="Offline bilateral view planning.", no_args_is_help=True)
 coverage_app = typer.Typer(help="Offline bilateral coverage tracking.", no_args_is_help=True)
 reconstruct_app = typer.Typer(help="Pose-register stored blade depth views.", no_args_is_help=True)
+evaluate_app = typer.Typer(help="Offline experiment evaluation.", no_args_is_help=True)
 app.add_typer(robot_app, name="robot")
 app.add_typer(camera_app, name="camera")
 app.add_typer(acquire_app, name="acquire")
@@ -86,6 +90,7 @@ app.add_typer(initialize_app, name="initialize")
 app.add_typer(plan_app, name="plan")
 app.add_typer(coverage_app, name="coverage")
 app.add_typer(reconstruct_app, name="reconstruct")
+app.add_typer(evaluate_app, name="evaluate")
 
 
 @app.callback()
@@ -1029,6 +1034,76 @@ def coverage_next_plan(
         f"blocked patches: {len(stored.plan.blocked_patch_ids)}"
     )
     typer.echo("Motion authorized: no")
+
+
+@evaluate_app.command("depth-pair")
+def evaluate_depth_pair(
+    session: Annotated[
+        Path,
+        typer.Option("--session", exists=True, file_okay=False, readable=True),
+    ],
+    stereo: Annotated[
+        Path,
+        typer.Option("--stereo", exists=True, file_okay=False, readable=True),
+    ],
+    mask: Annotated[
+        Path,
+        typer.Option("--mask", exists=True, dir_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    view_id: Annotated[str, typer.Option("--view-id")],
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Compare native and stereo depth in the calibrated left-rectified frame."""
+
+    import numpy as np
+
+    try:
+        settings = load_settings(config)
+        bundle = SessionReader(session).load_bundle(view_id)
+        stereo_observation = read_stereo_inference(stereo).observation
+        blade_mask = np.load(mask, allow_pickle=False)
+        if not isinstance(blade_mask, np.ndarray):
+            blade_mask.close()
+            raise ValueError("Blade mask must be a single .npy array")
+        comparison = compare_paired_depth(
+            bundle,
+            stereo_observation,
+            blade_mask,
+            settings.point_cloud,
+            settings.depth_comparison,
+        )
+        destination = write_depth_comparison(
+            output,
+            comparison,
+            settings.point_cloud,
+            settings.depth_comparison,
+            source_session=session,
+            source_stereo_inference=stereo,
+            source_blade_mask=mask,
+        )
+        verified = read_depth_comparison(destination).comparison
+    except Exception as exc:
+        typer.echo(f"Paired depth evaluation failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    metrics = verified.metrics
+    typer.echo(f"Saved paired depth comparison: {destination}")
+    typer.echo(
+        f"Overlap: {metrics.overlap_pixel_count}/{metrics.blade_pixel_count} pixels; "
+        f"MAE: {metrics.mean_absolute_error_m * 1000.0:.3f} mm; "
+        f"RMSE: {metrics.root_mean_square_error_m * 1000.0:.3f} mm; "
+        f"P95: {metrics.p95_absolute_error_m * 1000.0:.3f} mm"
+    )
+    typer.echo("Native RealSense depth is a comparison reference, not ground truth")
 
 
 if __name__ == "__main__":

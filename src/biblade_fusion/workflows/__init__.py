@@ -1,5 +1,11 @@
 """Auditable end-to-end project workflows."""
 
+from biblade_fusion.workflows.depth_evaluation import (
+    DepthComparisonError,
+    DepthComparisonMetrics,
+    PairedDepthComparison,
+    compare_paired_depth,
+)
 from biblade_fusion.workflows.hand_eye_extraction import (
     HandEyeExtractionResult,
     extract_hand_eye_samples,
@@ -26,6 +32,10 @@ from biblade_fusion.workflows.view_planning import (
 )
 
 __all__ = [
+    "DepthComparisonError",
+    "DepthComparisonMetrics",
+    "PairedDepthComparison",
+    "compare_paired_depth",
     "InitialObservation",
     "HandEyeExtractionResult",
     "InitializationError",

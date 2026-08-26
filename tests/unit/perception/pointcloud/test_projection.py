@@ -6,8 +6,10 @@ from biblade_fusion.core.settings import PointCloudConfig
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.perception.pointcloud import (
     DepthProjectionError,
+    PointCloud,
     depth_image_to_point_cloud,
     native_depth_to_meters,
+    point_cloud_to_depth_image,
 )
 
 
@@ -86,3 +88,17 @@ def test_projection_rejects_too_few_valid_points() -> None:
             config(),
             frame="depth",
         )
+
+
+def test_cloud_projection_uses_nearest_depth_z_buffer() -> None:
+    cloud = PointCloud(
+        "camera",
+        np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 0.5], [10.0, 0.0, 1.0]]),
+        np.array([[0, 0], [1, 0], [2, 0]]),
+        (2, 3),
+    )
+
+    depth = point_cloud_to_depth_image(cloud, intrinsics())
+
+    assert depth[0, 1] == 0.5
+    assert np.count_nonzero(np.isfinite(depth)) == 1

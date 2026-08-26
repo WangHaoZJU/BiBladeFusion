@@ -114,6 +114,11 @@ coverage:
   minimum_camera_side_offset_m: 0.02
   minimum_surface_points_per_view: 50
 
+depth_comparison:
+  minimum_overlap_points: 100
+  # Report the fraction of shared blade pixels agreeing within each metric threshold.
+  agreement_thresholds_m: [0.005, 0.01, 0.02]
+
 kinematics:
   model_path: null
   plugin_path: null

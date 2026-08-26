@@ -91,3 +91,30 @@ def depth_image_to_point_cloud(
     points = np.column_stack((x, y, z))
     pixels = np.column_stack((u, v)).astype(np.int32)
     return PointCloud(frame, points, pixels, expected_shape)
+
+
+def point_cloud_to_depth_image(
+    cloud: PointCloud,
+    intrinsics: CameraIntrinsics,
+) -> NDArray[np.float32]:
+    """Project a camera-frame cloud with a nearest-depth z-buffer."""
+
+    if not _is_rectified(intrinsics):
+        raise DepthProjectionError(
+            f"Pinhole projection requires rectified intrinsics; got {intrinsics.distortion_model}"
+        )
+    points = cloud.points_m
+    finite = np.isfinite(points).all(axis=1) & (points[:, 2] > 0.0)
+    points = points[finite]
+    shape = (intrinsics.height, intrinsics.width)
+    depth = np.full(shape[0] * shape[1], np.inf, dtype=np.float64)
+    if len(points):
+        u = np.rint(intrinsics.fx * points[:, 0] / points[:, 2] + intrinsics.cx).astype(int)
+        v = np.rint(intrinsics.fy * points[:, 1] / points[:, 2] + intrinsics.cy).astype(int)
+        inside = (u >= 0) & (u < shape[1]) & (v >= 0) & (v < shape[0])
+        indices = v[inside] * shape[1] + u[inside]
+        np.minimum.at(depth, indices, points[inside, 2])
+    depth[~np.isfinite(depth)] = np.nan
+    result = depth.reshape(shape).astype(np.float32)
+    result.setflags(write=False)
+    return result

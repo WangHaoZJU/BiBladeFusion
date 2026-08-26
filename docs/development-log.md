@@ -45,20 +45,23 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Coverage-driven next-view artifacts that cryptographically bind the source plan and
   ledger, re-derive their contents on read, distinguish completed/remaining/blocked
   patches, and explicitly forbid motion.
-- Current verification: 107 tests and Ruff pass. Through commit `b5811b5`, all prior
+- Calibrated paired native/stereo depth comparison in `left_rectified`, including
+  z-buffered native reprojection, shared-valid-pixel metrics, checksummed arrays, source
+  verification, and explicit non-ground-truth interpretation.
+- Current verification: 112 tests and Ruff pass. Through commit `31707d6`, all prior
   commits, package build, and Elite SDK import were verified and pushed to GitHub `main`.
 
 ## In progress
 
-- Build reproducible paired native-RealSense versus FoundationStereo depth metrics in
-  the calibrated left-rectified frame for later blade experiments.
+- Add aggregation across paired depth artifacts, retaining front/back and incidence
+  strata instead of hiding view-dependent behavior in one pooled metric.
 
 ## Pending, in priority order
 
 1. Run a real FoundationStereo checkpoint/CUDA smoke test; no compatible checkpoint or
    CUDA device is currently available in this workspace.
 2. Collect paired blade observations and compare FoundationStereo with native RealSense
-   depth using the offline evaluator.
+   depth using the offline evaluator and aggregate report.
 3. Add robot-body/workcell collision and continuous trajectory validation before any
    future motion-execution feature is considered.
 4. Implement the thermal-camera adapter after its model and radiometric SDK are known.

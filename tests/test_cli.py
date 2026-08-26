@@ -66,6 +66,13 @@ def test_reconstruction_commands_are_exposed() -> None:
     assert "stereo-depth" in result.stdout
 
 
+def test_evaluation_command_is_exposed() -> None:
+    result = runner.invoke(app, ["evaluate", "--help"])
+
+    assert result.exit_code == 0
+    assert "depth-pair" in result.stdout
+
+
 def test_robot_kinematics_export_is_exposed() -> None:
     result = runner.invoke(app, ["robot", "--help"])
 

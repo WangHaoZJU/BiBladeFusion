@@ -6,9 +6,9 @@ system for thin-walled blades.
 The current development stage provides a Python 3.12 application, validated
 configuration, safe read-only integration with an Elite CS68 robot, synchronized raw
 stereo acquisition from an Intel RealSense D435i, reproducible session storage, a
-calibrated FoundationStereo inference path, a conservative single-view blade proxy,
-bilateral surface partitioning, and offline Elite KDL endpoint IK. Robot motion is
-disabled by default.
+calibrated FoundationStereo inference path, paired native/stereo depth evaluation, a
+conservative single-view blade proxy, bilateral surface partitioning, and offline Elite
+KDL endpoint IK. Robot motion is disabled by default.
 
 ## Bootstrap
 
@@ -55,6 +55,9 @@ uv run bbf stereo infer-session \
 
 The output stores rectified images, full-resolution-pixel disparity, metric depth,
 validity masks, calibration transforms, model provenance, and per-array SHA-256 values.
+Use the [paired depth evaluator](docs/depth-comparison.md) to compare it against native
+D435i depth in calibrated rectified-left coordinates without treating either source as
+metrology ground truth.
 Use a Boolean mask in rectified-left coordinates to initialize the same conservative
 blade proxy from this depth source:
 

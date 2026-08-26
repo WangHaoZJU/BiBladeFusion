@@ -231,6 +231,26 @@ class CoverageConfig(BaseModel):
     minimum_surface_points_per_view: int = Field(default=50, ge=1)
 
 
+class DepthComparisonConfig(BaseModel):
+    """Reproducible native-versus-stereo comparison settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_overlap_points: int = Field(default=100, ge=3)
+    agreement_thresholds_m: tuple[float, ...] = (0.005, 0.01, 0.02)
+
+    @field_validator("agreement_thresholds_m")
+    @classmethod
+    def validate_agreement_thresholds(
+        cls, value: tuple[float, ...]
+    ) -> tuple[float, ...]:
+        if not value or not np.isfinite(value).all() or any(item <= 0.0 for item in value):
+            raise ValueError("Depth agreement thresholds must be finite and positive")
+        if tuple(sorted(set(value))) != value:
+            raise ValueError("Depth agreement thresholds must be unique and increasing")
+        return value
+
+
 class KinematicsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -260,6 +280,7 @@ class AppSettings(BaseModel):
     view_planning: ViewPlanningConfig = Field(default_factory=ViewPlanningConfig)
     view_filter: ViewFilterConfig = Field(default_factory=ViewFilterConfig)
     coverage: CoverageConfig = Field(default_factory=CoverageConfig)
+    depth_comparison: DepthComparisonConfig = Field(default_factory=DepthComparisonConfig)
     kinematics: KinematicsConfig = Field(default_factory=KinematicsConfig)
 
 
