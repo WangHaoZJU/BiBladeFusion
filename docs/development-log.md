@@ -50,13 +50,15 @@ authoritative fine-grained record; this page records the experiment-facing state
   verification, and explicit non-ground-truth interpretation.
 - Manifest-driven depth aggregation with duplicate-frame rejection, view-balanced and
   pixel-pooled metrics, plus retained front/back and incidence-angle strata.
-- Current verification: 115 tests and Ruff pass. Through commit `202b7e7`, all prior
+- Initialization schema 6 adds SHA-256, dtype, and shape manifests for base clouds,
+  pixel provenance, and masks while retaining schema 4/5 read compatibility.
+- Current verification: 115 tests and Ruff pass. Through commit `860840d`, all prior
   commits, package build, and Elite SDK import were verified and pushed.
 
 ## In progress
 
-- Add checksums to legacy initialization artifacts so all downstream planning and
-  experimental provenance has consistent tamper detection.
+- Derive front/back and incidence labels from the achieved synchronized camera pose and
+  fixed proxy, removing manual labels from the normal experiment path.
 
 ## Pending, in priority order
 

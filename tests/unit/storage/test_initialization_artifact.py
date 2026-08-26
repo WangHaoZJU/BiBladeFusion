@@ -76,6 +76,14 @@ def test_initialization_artifact_round_trip(tmp_path: Path) -> None:
     )
     np.testing.assert_array_equal(stored.blade_mask, mask)
     assert stored.metadata["processing"]["proxy_model"]["estimated_thickness_m"] == 0.01
+    assert stored.metadata["schema_version"] == 6
+    assert stored.metadata["files"]["base_points_m"]["sha256"]
+
+    points = np.load(output / "base_points_m.npy", allow_pickle=False)
+    points[0, 0] += 1.0
+    np.save(output / "base_points_m.npy", points, allow_pickle=False)
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        read_initialization(output)
 
 
 def test_initialization_writer_refuses_overwrite(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import BilateralBladeProxy
 from biblade_fusion.workflows import InitialObservation
 
-INITIALIZATION_SCHEMA_VERSION = 5
+INITIALIZATION_SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +48,29 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def _load_contained_array(root: Path, relative_path: Any) -> np.ndarray:
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _array_record(path: Path) -> dict[str, Any]:
+    array = np.load(path, mmap_mode="r", allow_pickle=False)
+    try:
+        return {
+            "path": path.name,
+            "sha256": _sha256(path),
+            "dtype": str(array.dtype),
+            "shape": list(array.shape),
+        }
+    finally:
+        del array
+
+
+def _load_contained_array(root: Path, record: Any) -> np.ndarray:
+    relative_path = record["path"] if isinstance(record, dict) else record
     stored_path = Path(str(relative_path))
     if stored_path.is_absolute():
         raise ValueError(f"absolute artifact path is forbidden: {stored_path}")
@@ -55,10 +78,16 @@ def _load_contained_array(root: Path, relative_path: Any) -> np.ndarray:
     path = (resolved_root / stored_path).resolve()
     if not path.is_relative_to(resolved_root):
         raise ValueError(f"artifact path escapes output directory: {stored_path}")
+    if isinstance(record, dict) and _sha256(path) != str(record["sha256"]):
+        raise ValueError(f"initialization checksum mismatch: {stored_path}")
     array = np.load(path, allow_pickle=False)
     if not isinstance(array, np.ndarray):
         array.close()
         raise ValueError(f"artifact file must be a single .npy array: {stored_path}")
+    if isinstance(record, dict) and (
+        str(array.dtype) != str(record["dtype"]) or list(array.shape) != record["shape"]
+    ):
+        raise ValueError(f"initialization array manifest mismatch: {stored_path}")
     return array
 
 
@@ -128,11 +157,7 @@ def write_initialization(
             ),
             "depth_source": observation.depth_source,
         },
-        "files": {
-            "base_points_m": "base_points_m.npy",
-            "pixel_uv": "pixel_uv.npy",
-            "blade_mask": "blade_mask.npy",
-        },
+        "files": {},
         "source_image_shape": list(observation.base_cloud.source_image_shape),
         "planning_intrinsics": _intrinsics_payload(observation.planning_intrinsics),
         "seed_joint_positions_rad": observation.seed_joint_positions_rad.tolist(),
@@ -175,6 +200,14 @@ def write_initialization(
         )
         np.save(temporary / "pixel_uv.npy", observation.base_cloud.pixel_uv, allow_pickle=False)
         np.save(temporary / "blade_mask.npy", mask, allow_pickle=False)
+        metadata["files"] = {
+            name: _array_record(temporary / filename)
+            for name, filename in {
+                "base_points_m": "base_points_m.npy",
+                "pixel_uv": "pixel_uv.npy",
+                "blade_mask": "blade_mask.npy",
+            }.items()
+        }
         _atomic_json(temporary / "metadata.json", metadata)
         temporary.replace(output_path)
     except Exception:
@@ -192,7 +225,7 @@ def read_initialization(path: str | Path) -> StoredInitialization:
         if not isinstance(metadata, dict):
             raise TypeError("metadata root must be an object")
         schema_version = int(metadata["schema_version"])
-        if schema_version not in {4, INITIALIZATION_SCHEMA_VERSION}:
+        if schema_version not in {4, 5, INITIALIZATION_SCHEMA_VERSION}:
             raise ValueError(f"unsupported schema {schema_version}")
         files = metadata["files"]
         points = _load_contained_array(root, files["base_points_m"])
