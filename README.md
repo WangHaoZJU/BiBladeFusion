@@ -136,6 +136,12 @@ uv run bbf plan views \
   --initialization outputs/initialization \
   --config configs/local.yaml \
   --output outputs/view_plan
+
+uv run bbf coverage seed \
+  --plan outputs/view_plan \
+  --initialization outputs/initialization \
+  --config configs/local.yaml \
+  --output outputs/coverage_000
 ```
 
 The planner creates both front and back partitions from the conservative proxy. Each
@@ -145,3 +151,7 @@ IK. A `geometry_only` view has not passed IK/workspace validation. An
 `endpoint_feasible` view still has **not** passed robot-body collision or trajectory
 validation. Every exported plan contains `motion_authorized: false`; no current command
 executes a planned pose.
+
+The coverage ledger uses pose-registered base-frame blade points to fill independent
+front/back per-patch occupancy grids. See [coverage and replanning](docs/coverage.md) for
+its evidence rules and current limitations.

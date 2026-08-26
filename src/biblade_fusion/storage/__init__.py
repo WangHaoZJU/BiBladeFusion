@@ -1,5 +1,10 @@
 """Reproducible acquisition-session storage."""
 
+from biblade_fusion.storage.coverage import (
+    StoredCoverageLedger,
+    read_coverage_ledger,
+    write_coverage_ledger,
+)
 from biblade_fusion.storage.initialization import (
     StoredInitialization,
     read_initialization,
@@ -26,14 +31,17 @@ __all__ = [
     "SessionFormatError",
     "SessionReader",
     "SessionWriter",
+    "StoredCoverageLedger",
     "StoredInitialization",
     "StoredStereoInference",
     "StoredViewPlan",
     "StoredViewDescriptor",
     "read_initialization",
+    "read_coverage_ledger",
     "read_stereo_inference",
     "read_view_plan",
     "write_initialization",
+    "write_coverage_ledger",
     "write_stereo_inference",
     "write_view_plan",
 ]

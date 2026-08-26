@@ -37,13 +37,15 @@ authoritative fine-grained record; this page records the experiment-facing state
 - FoundationStereo-depth proxy initialization with source-identity checks, correct
   `base_T_left_rectified` geometry, and an end-to-end raw-session-to-plan integration
   path. Initialization schema 5 records depth source/projection frame and reads schema 4.
-- Current working tree: 96 tests and Ruff pass. Through commit `66947e4`, package build,
-  Elite SDK import, and all commits passed and were pushed to GitHub `main`.
+- Bilateral per-patch coverage grids, independent front/back evidence, incomplete versus
+  blocked replanning state, and immutable checksummed seed-coverage artifacts.
+- Current working tree: 102 tests, Ruff, package build, and Elite SDK import pass.
+  Through commit `66947e4`, all earlier commits were pushed to GitHub `main`.
 
 ## In progress
 
-- Multi-view registration, bilateral coverage accounting, and coverage-driven
-  replanning while preserving front/back surface identity.
+- Persist later pose-registered native/stereo observations and append them to immutable
+  coverage ledgers, then export the reduced non-executable next-view plan.
 
 ## Pending, in priority order
 

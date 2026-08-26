@@ -220,6 +220,17 @@ class ViewFilterConfig(BaseModel):
     duplicate_rotation_tolerance_deg: float = Field(default=2.0, ge=0.0, le=180.0)
 
 
+class CoverageConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    bins_per_axis: int = Field(default=8, ge=2, le=64)
+    minimum_points_per_bin: int = Field(default=2, ge=1, le=1000)
+    completed_fraction: float = Field(default=0.8, gt=0.0, le=1.0)
+    maximum_surface_distance_m: float = Field(default=0.02, gt=0.0)
+    minimum_camera_side_offset_m: float = Field(default=0.02, gt=0.0)
+    minimum_surface_points_per_view: int = Field(default=50, ge=1)
+
+
 class KinematicsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -248,6 +259,7 @@ class AppSettings(BaseModel):
     hand_eye: HandEyeConfig = Field(default_factory=HandEyeConfig)
     view_planning: ViewPlanningConfig = Field(default_factory=ViewPlanningConfig)
     view_filter: ViewFilterConfig = Field(default_factory=ViewFilterConfig)
+    coverage: CoverageConfig = Field(default_factory=CoverageConfig)
     kinematics: KinematicsConfig = Field(default_factory=KinematicsConfig)
 
 

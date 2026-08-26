@@ -30,12 +30,19 @@ from biblade_fusion.perception.stereo import (
     FoundationStereoBackend,
     run_foundation_stereo_doctor,
 )
-from biblade_fusion.planning import EliteCs68IkChecker
+from biblade_fusion.planning import (
+    EliteCs68IkChecker,
+    create_coverage_ledger,
+    select_uncovered_candidates,
+    update_coverage,
+)
 from biblade_fusion.storage import (
     SessionReader,
     SessionWriter,
     read_initialization,
     read_stereo_inference,
+    read_view_plan,
+    write_coverage_ledger,
     write_initialization,
     write_stereo_inference,
     write_view_plan,
@@ -60,6 +67,7 @@ calibration_app = typer.Typer(help="Offline calibration tools.", no_args_is_help
 stereo_app = typer.Typer(help="Stereo inference tools.", no_args_is_help=True)
 initialize_app = typer.Typer(help="Offline initial-model construction.", no_args_is_help=True)
 plan_app = typer.Typer(help="Offline bilateral view planning.", no_args_is_help=True)
+coverage_app = typer.Typer(help="Offline bilateral coverage tracking.", no_args_is_help=True)
 app.add_typer(robot_app, name="robot")
 app.add_typer(camera_app, name="camera")
 app.add_typer(acquire_app, name="acquire")
@@ -67,6 +75,7 @@ app.add_typer(calibration_app, name="calibration")
 app.add_typer(stereo_app, name="stereo")
 app.add_typer(initialize_app, name="initialize")
 app.add_typer(plan_app, name="plan")
+app.add_typer(coverage_app, name="coverage")
 
 
 @app.callback()
@@ -712,6 +721,71 @@ def plan_views(
         f"Candidates: {len(result.geometric_plan.candidates)}, "
         f"geometry accepted: {len(result.filtered_plan.accepted)}, "
         f"endpoint feasible: {len(result.filtered_plan.endpoint_feasible)}"
+    )
+    typer.echo("Motion authorized: no")
+
+
+@coverage_app.command("seed")
+def coverage_seed(
+    plan: Annotated[
+        Path,
+        typer.Option("--plan", exists=True, file_okay=False, readable=True),
+    ],
+    initialization: Annotated[
+        Path,
+        typer.Option("--initialization", exists=True, file_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Create coverage state from the pose-registered initial blade observation."""
+
+    try:
+        settings = load_settings(config)
+        stored_plan = read_view_plan(plan)
+        stored_initialization = read_initialization(initialization)
+        expected_initialization = Path(
+            str(stored_plan.metadata["source_initialization"])
+        ).resolve()
+        if expected_initialization != initialization.resolve():
+            raise ValueError("View plan was not generated from the supplied initialization")
+        observation = stored_initialization.observation
+        ledger = create_coverage_ledger(
+            stored_plan.result.geometric_plan,
+            settings.coverage,
+        )
+        ledger = update_coverage(
+            ledger,
+            stored_plan.result.geometric_plan,
+            observation.proxy,
+            observation.base_cloud,
+            observation.base_t_projection_camera,
+            f"initialization:{observation.source_view_id}",
+        )
+        remaining = select_uncovered_candidates(stored_plan.result.filtered_plan, ledger)
+        destination = write_coverage_ledger(
+            output,
+            ledger,
+            source_plan=plan,
+            source_initialization=initialization,
+        )
+    except Exception as exc:
+        typer.echo(f"Coverage initialization failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved bilateral coverage ledger: {destination}")
+    typer.echo(
+        f"Completed patches: {len(remaining.completed_patch_ids)}; "
+        f"remaining accepted views: {len(remaining.remaining)}; "
+        f"blocked patches: {len(remaining.blocked_patch_ids)}"
     )
     typer.echo("Motion authorized: no")
 

@@ -1,5 +1,14 @@
 """Geometric view planning without robot motion execution."""
 
+from biblade_fusion.planning.coverage import (
+    CoverageDrivenViewPlan,
+    CoverageError,
+    CoverageLedger,
+    PatchCoverage,
+    create_coverage_ledger,
+    select_uncovered_candidates,
+    update_coverage,
+)
 from biblade_fusion.planning.elite_ik import EliteCs68IkChecker, EliteIkError
 from biblade_fusion.planning.filtering import (
     CandidateMetrics,
@@ -26,15 +35,22 @@ __all__ = [
     "CandidateView",
     "CandidateMetrics",
     "CandidateStatus",
+    "CoverageDrivenViewPlan",
+    "CoverageError",
+    "CoverageLedger",
     "EvaluatedCandidate",
     "EliteCs68IkChecker",
     "EliteIkError",
     "FilteredViewPlan",
+    "PatchCoverage",
     "ReachabilityChecker",
     "ReachabilityResult",
     "ReachabilityState",
     "SurfacePatch",
     "ViewPlanningError",
     "filter_candidate_views",
+    "create_coverage_ledger",
     "generate_bilateral_view_plan",
+    "select_uncovered_candidates",
+    "update_coverage",
 ]

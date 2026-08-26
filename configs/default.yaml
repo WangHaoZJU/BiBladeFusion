@@ -106,6 +106,14 @@ view_filter:
   duplicate_translation_tolerance_m: 0.005
   duplicate_rotation_tolerance_deg: 2.0
 
+coverage:
+  bins_per_axis: 8
+  minimum_points_per_bin: 2
+  completed_fraction: 0.8
+  maximum_surface_distance_m: 0.02
+  minimum_camera_side_offset_m: 0.02
+  minimum_surface_points_per_view: 50
+
 kinematics:
   model_path: null
   plugin_path: null
