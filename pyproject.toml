@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "biblade-fusion"
+version = "0.1.0"
+description = "Robot-guided bilateral 3D geometry and thermal reconstruction for thin-walled blades."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "numpy>=2.0,<3",
+  "pydantic>=2.9,<3",
+  "pydantic-settings>=2.5,<3",
+  "pyrealsense2>=2.54,<3",
+  "pyyaml>=6.0,<7",
+  "rich>=13.9,<15",
+  "typer>=0.12,<1",
+]
+
+[project.scripts]
+bbf = "biblade_fusion.cli:app"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-cov>=5,<8",
+  "ruff>=0.8,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/biblade_fusion"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "hardware: requires connected physical hardware",
+  "motion: may command physical robot motion",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
