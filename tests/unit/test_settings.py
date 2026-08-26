@@ -23,6 +23,9 @@ def test_default_settings_load_safely() -> None:
     assert settings.hand_eye.calibration_path is None
     assert settings.view_planning.standoff_distance_m is None
     assert settings.view_planning.overlap_fraction == 0.3
+    assert settings.view_filter.workspace is None
+    assert settings.view_filter.camera_clearance_radius_m == 0.05
+    assert settings.view_filter.minimum_incidence_cosine == 0.95
 
 
 def test_unknown_configuration_key_is_rejected() -> None:

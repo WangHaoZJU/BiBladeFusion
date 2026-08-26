@@ -6,6 +6,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal, Self
 
+import numpy as np
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -140,6 +141,37 @@ class ViewPlanningConfig(BaseModel):
     maximum_candidates: int = Field(default=200, ge=2, le=10000)
 
 
+class AxisAlignedBoxConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    minimum_m: tuple[float, float, float]
+    maximum_m: tuple[float, float, float]
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> Self:
+        if not self.name:
+            raise ValueError("Axis-aligned box name must be non-empty")
+        if not np.isfinite((*self.minimum_m, *self.maximum_m)).all():
+            raise ValueError("Axis-aligned box bounds must be finite")
+        if any(lower >= upper for lower, upper in zip(self.minimum_m, self.maximum_m, strict=True)):
+            raise ValueError("Axis-aligned box minima must be below maxima")
+        return self
+
+
+class ViewFilterConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace: AxisAlignedBoxConfig | None = None
+    forbidden_volumes: tuple[AxisAlignedBoxConfig, ...] = ()
+    camera_clearance_radius_m: float = Field(default=0.05, gt=0.0)
+    minimum_look_at_cosine: float = Field(default=0.999, gt=0.0, le=1.0)
+    minimum_incidence_cosine: float = Field(default=0.95, gt=0.0, le=1.0)
+    maximum_standoff_error_m: float = Field(default=0.005, ge=0.0)
+    duplicate_translation_tolerance_m: float = Field(default=0.005, ge=0.0)
+    duplicate_rotation_tolerance_deg: float = Field(default=2.0, ge=0.0, le=180.0)
+
+
 class AppSettings(BaseModel):
     """Top-level BiBladeFusion settings."""
 
@@ -155,6 +187,7 @@ class AppSettings(BaseModel):
     point_cloud: PointCloudConfig = Field(default_factory=PointCloudConfig)
     hand_eye: HandEyeConfig = Field(default_factory=HandEyeConfig)
     view_planning: ViewPlanningConfig = Field(default_factory=ViewPlanningConfig)
+    view_filter: ViewFilterConfig = Field(default_factory=ViewFilterConfig)
 
 
 def load_settings(path: str | Path) -> AppSettings:

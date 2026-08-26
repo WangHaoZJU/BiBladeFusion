@@ -72,3 +72,14 @@ view_planning:
   footprint_utilization: 0.8
   edge_margin_m: 0.005
   maximum_candidates: 200
+
+view_filter:
+  # Endpoint feasibility remains geometry-only until workspace and an IK checker exist.
+  workspace: null
+  forbidden_volumes: []
+  camera_clearance_radius_m: 0.05
+  minimum_look_at_cosine: 0.999
+  minimum_incidence_cosine: 0.95
+  maximum_standoff_error_m: 0.005
+  duplicate_translation_tolerance_m: 0.005
+  duplicate_rotation_tolerance_deg: 2.0
