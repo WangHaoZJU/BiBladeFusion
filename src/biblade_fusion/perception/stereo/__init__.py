@@ -6,6 +6,8 @@ from biblade_fusion.perception.stereo.base import (
     disparity_to_depth_m,
 )
 from biblade_fusion.perception.stereo.foundation_stereo import (
+    FoundationStereoBackend,
+    FoundationStereoError,
     run_foundation_stereo_doctor,
 )
 from biblade_fusion.perception.stereo.rectification import (
@@ -16,6 +18,8 @@ from biblade_fusion.perception.stereo.rectification import (
 
 __all__ = [
     "StereoBackend",
+    "FoundationStereoBackend",
+    "FoundationStereoError",
     "StereoRectifier",
     "StereoResult",
     "RectifiedStereoCalibration",

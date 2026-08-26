@@ -19,6 +19,17 @@ dependencies = [
   "typer>=0.12,<1",
 ]
 
+[project.optional-dependencies]
+foundation-stereo = [
+  "einops>=0.8,<1",
+  "huggingface-hub>=0.24,<2",
+  "omegaconf>=2.3,<3",
+  "scipy>=1.14,<2",
+  "timm>=1.0,<2",
+  "torch==2.4.1",
+  "torchvision==0.19.1",
+]
+
 [project.scripts]
 bbf = "biblade_fusion.cli:app"
 
@@ -27,6 +38,12 @@ dev = [
   "pytest>=8.3,<10",
   "pytest-cov>=5,<8",
   "ruff>=0.8,<1",
+]
+
+[tool.hatch.build]
+exclude = [
+  "/.uv-cache",
+  "/third_party/FoundationStereo",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -43,6 +60,7 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["third_party"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

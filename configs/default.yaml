@@ -34,6 +34,8 @@ acquisition:
 foundation_stereo:
   repository_path: third_party/FoundationStereo
   checkpoint_path: models/foundation_stereo/23-51-11/model_best_bp2.pth
+  # null resolves to cfg.yaml beside checkpoint_path, matching the official release.
+  model_config_path: null
   device: cuda
   scale: 1.0
   valid_iterations: 32

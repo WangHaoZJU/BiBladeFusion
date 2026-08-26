@@ -71,6 +71,7 @@ class FoundationStereoConfig(BaseModel):
 
     repository_path: Path = Path("third_party/FoundationStereo")
     checkpoint_path: Path = Path("models/foundation_stereo/23-51-11/model_best_bp2.pth")
+    model_config_path: Path | None = None
     device: Literal["cuda", "cpu"] = "cuda"
     scale: float = Field(default=1.0, gt=0.0, le=1.0)
     valid_iterations: int = Field(default=32, gt=0, le=128)
