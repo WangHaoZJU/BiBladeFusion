@@ -33,10 +33,10 @@ def make_bundle() -> SynchronizedFrameBundle:
     calibration = StereoCalibrationSnapshot(
         intrinsics,
         intrinsics,
-        PoseSE3.from_rotation_translation(
-            "right_ir", "left_ir", np.eye(3), [-0.05, 0, 0]
-        ),
+        PoseSE3.from_rotation_translation("right_ir", "left_ir", np.eye(3), [-0.05, 0, 0]),
         0.001,
+        intrinsics,
+        PoseSE3.identity("left_ir", "depth"),
     )
     image = np.arange(12, dtype=np.uint8).reshape(3, 4)
     depth = np.full((3, 4), 1000, dtype=np.uint16)
@@ -69,11 +69,15 @@ def test_session_writer_preserves_raw_data_and_metadata(tmp_path: Path) -> None:
     assert (view_path / "right_ir.npy").is_file()
     assert (view_path / "native_depth.npy").is_file()
     metadata = json.loads((view_path / "metadata.json").read_text())
+    assert metadata["schema_version"] == 2
     assert metadata["view_id"] == "seed/front"
     assert metadata["stereo"]["calibration"]["native_depth_scale_m"] == 0.001
+    assert metadata["stereo"]["calibration"]["depth"]["width"] == 4
+    assert metadata["stereo"]["calibration"]["left_T_depth"] == np.eye(4).tolist()
     assert metadata["thermal"] is None
 
     manifest = json.loads((writer.path / "manifest.json").read_text())
+    assert manifest["schema_version"] == 2
     assert manifest["status"] == "completed"
     assert manifest["views"][0]["path"] == "views/0000_seed_front"
 

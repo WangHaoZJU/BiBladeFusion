@@ -18,6 +18,8 @@ def make_calibration() -> StereoCalibrationSnapshot:
             "right_ir", "left_ir", np.eye(3), [-0.05, 0, 0]
         ),
         native_depth_scale_m=0.001,
+        depth=intrinsics,
+        left_t_depth=PoseSE3.identity("left_ir", "depth"),
     )
 
 
@@ -43,4 +45,3 @@ def test_stereo_frame_rejects_mismatched_shapes() -> None:
             None,
             make_calibration(),
         )
-

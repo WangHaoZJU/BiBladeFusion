@@ -18,6 +18,8 @@ def test_default_settings_load_safely() -> None:
     assert settings.foundation_stereo.valid_iterations == 32
     assert settings.proxy_model.estimated_thickness_m is None
     assert settings.proxy_model.tangential_margin_m == 0.01
+    assert settings.point_cloud.minimum_depth_m == 0.15
+    assert settings.point_cloud.maximum_depth_m == 1.5
 
 
 def test_unknown_configuration_key_is_rejected() -> None:

@@ -181,9 +181,7 @@ class RealSenseD435i:
 
         left_to_right = left_profile.get_extrinsics_to(right_profile)
         # librealsense exposes rs2_extrinsics.rotation as a column-major array.
-        rotation = np.asarray(left_to_right.rotation, dtype=np.float64).reshape(
-            (3, 3), order="F"
-        )
+        rotation = np.asarray(left_to_right.rotation, dtype=np.float64).reshape((3, 3), order="F")
         translation = np.asarray(left_to_right.translation, dtype=np.float64)
         right_t_left = PoseSE3.from_rotation_translation(
             "right_ir",
@@ -193,7 +191,21 @@ class RealSenseD435i:
         )
 
         depth_scale = None
+        depth_intrinsics = None
+        left_t_depth = None
         if self._config.enable_native_depth:
+            depth_profile = pipeline_profile.get_stream(rs.stream.depth).as_video_stream_profile()
+            depth_intrinsics = _intrinsics_from_profile(depth_profile)
+            depth_to_left = depth_profile.get_extrinsics_to(left_profile)
+            depth_rotation = np.asarray(depth_to_left.rotation, dtype=np.float64).reshape(
+                (3, 3), order="F"
+            )
+            left_t_depth = PoseSE3.from_rotation_translation(
+                "left_ir",
+                "depth",
+                depth_rotation,
+                depth_to_left.translation,
+            )
             depth_sensor = pipeline_profile.get_device().first_depth_sensor()
             depth_scale = float(depth_sensor.get_depth_scale())
         return StereoCalibrationSnapshot(
@@ -201,6 +213,8 @@ class RealSenseD435i:
             right=right_intrinsics,
             right_t_left=right_t_left,
             native_depth_scale_m=depth_scale,
+            depth=depth_intrinsics,
+            left_t_depth=left_t_depth,
         )
 
 

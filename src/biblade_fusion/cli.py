@@ -223,6 +223,21 @@ def camera_capture(
             frame.calibration.right.cy,
         ],
         "right_T_left": frame.calibration.right_t_left.matrix,
+        "depth_intrinsics": (
+            [
+                frame.calibration.depth.fx,
+                frame.calibration.depth.fy,
+                frame.calibration.depth.cx,
+                frame.calibration.depth.cy,
+            ]
+            if frame.calibration.depth is not None
+            else np.full(4, np.nan)
+        ),
+        "left_T_depth": (
+            frame.calibration.left_t_depth.matrix
+            if frame.calibration.left_t_depth is not None
+            else np.full((4, 4), np.nan)
+        ),
         "native_depth_scale_m": (
             frame.calibration.native_depth_scale_m
             if frame.calibration.native_depth_scale_m is not None

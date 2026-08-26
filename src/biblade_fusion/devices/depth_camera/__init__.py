@@ -19,4 +19,3 @@ __all__ = [
     "StereoFrame",
     "list_realsense_devices",
 ]
-

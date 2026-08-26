@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ProjectConfig(BaseModel):
@@ -105,6 +105,21 @@ class ProxyModelConfig(BaseModel):
         return value
 
 
+class PointCloudConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_depth_m: float = Field(default=0.15, gt=0.0)
+    maximum_depth_m: float = Field(default=1.5, gt=0.0)
+    pixel_stride: int = Field(default=1, ge=1, le=16)
+    minimum_valid_points: int = Field(default=100, ge=3)
+
+    @model_validator(mode="after")
+    def validate_depth_range(self) -> Self:
+        if self.maximum_depth_m <= self.minimum_depth_m:
+            raise ValueError("maximum_depth_m must exceed minimum_depth_m")
+        return self
+
+
 class AppSettings(BaseModel):
     """Top-level BiBladeFusion settings."""
 
@@ -117,6 +132,7 @@ class AppSettings(BaseModel):
     acquisition: AcquisitionConfig = Field(default_factory=AcquisitionConfig)
     foundation_stereo: FoundationStereoConfig = Field(default_factory=FoundationStereoConfig)
     proxy_model: ProxyModelConfig = Field(default_factory=ProxyModelConfig)
+    point_cloud: PointCloudConfig = Field(default_factory=PointCloudConfig)
 
 
 def load_settings(path: str | Path) -> AppSettings:

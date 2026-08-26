@@ -18,7 +18,7 @@ from biblade_fusion.core.settings import AppSettings
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.devices.robot.base import RobotState
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _atomic_json(path: Path, payload: Any) -> None:
@@ -198,6 +198,16 @@ class SessionWriter:
                     "right": _intrinsics_payload(calibration.right),
                     "right_T_left": calibration.right_t_left.matrix.tolist(),
                     "native_depth_scale_m": calibration.native_depth_scale_m,
+                    "depth": (
+                        _intrinsics_payload(calibration.depth)
+                        if calibration.depth is not None
+                        else None
+                    ),
+                    "left_T_depth": (
+                        calibration.left_t_depth.matrix.tolist()
+                        if calibration.left_t_depth is not None
+                        else None
+                    ),
                 },
             },
             "thermal": thermal_payload,
@@ -211,9 +221,6 @@ class SessionWriter:
                 "max_joint_delta_rad": bundle.metrics.max_joint_delta_rad,
                 "tcp_translation_delta_m": bundle.metrics.tcp_translation_delta_m,
                 "tcp_rotation_delta_rad": bundle.metrics.tcp_rotation_delta_rad,
-                "selected_robot_state_offset_ms": (
-                    bundle.metrics.selected_robot_state_offset_ms
-                ),
+                "selected_robot_state_offset_ms": (bundle.metrics.selected_robot_state_offset_ms),
             },
         }
-

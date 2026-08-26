@@ -38,6 +38,8 @@ class StereoCalibrationSnapshot:
     right: CameraIntrinsics
     right_t_left: PoseSE3
     native_depth_scale_m: float | None
+    depth: CameraIntrinsics | None = None
+    left_t_depth: PoseSE3 | None = None
 
     def __post_init__(self) -> None:
         if self.right_t_left.parent_frame != "right_ir":
@@ -46,6 +48,15 @@ class StereoCalibrationSnapshot:
             raise ValueError("Stereo extrinsic child frame must be left_ir")
         if self.native_depth_scale_m is not None and self.native_depth_scale_m <= 0:
             raise ValueError("Native depth scale must be positive")
+        if (self.depth is None) != (self.left_t_depth is None):
+            raise ValueError("Depth intrinsics and left_T_depth must be provided together")
+        if self.native_depth_scale_m is not None and self.depth is None:
+            raise ValueError("Native depth scale requires depth-stream calibration")
+        if self.left_t_depth is not None:
+            if self.left_t_depth.parent_frame != "left_ir":
+                raise ValueError("Depth extrinsic parent frame must be left_ir")
+            if self.left_t_depth.child_frame != "depth":
+                raise ValueError("Depth extrinsic child frame must be depth")
 
     @property
     def baseline_m(self) -> float:
@@ -77,8 +88,16 @@ class StereoFrame:
         depth: NDArray[np.uint16] | None = None
         if self.native_depth is not None:
             depth = np.array(self.native_depth, dtype=np.uint16, copy=True)
-            if depth.shape != left.shape:
-                raise ValueError("Native depth shape must match infrared images")
+            if self.calibration.depth is None:
+                raise ValueError("Native depth requires depth-stream calibration")
+            expected_depth_shape = (
+                self.calibration.depth.height,
+                self.calibration.depth.width,
+            )
+            if depth.shape != expected_depth_shape:
+                raise ValueError(
+                    f"Native depth shape {depth.shape} does not match {expected_depth_shape}"
+                )
             depth.setflags(write=False)
 
         if self.monotonic_time_ns < 0 or self.frame_number < 0:
@@ -100,4 +119,3 @@ class StereoCamera(Protocol):
     def close(self) -> None: ...
 
     def capture(self) -> StereoFrame: ...
-

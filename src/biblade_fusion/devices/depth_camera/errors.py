@@ -15,4 +15,3 @@ class DepthCameraNotOpenError(DepthCameraError):
 
 class DepthCameraFrameError(DepthCameraError):
     """A synchronized camera frame was incomplete or invalid."""
-

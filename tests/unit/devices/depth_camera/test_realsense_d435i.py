@@ -39,7 +39,7 @@ class FakeFrames:
 
 
 class FakeVideoProfile:
-    def __init__(self, index: int) -> None:
+    def __init__(self, index: int | str) -> None:
         self.index = index
 
     def as_video_stream_profile(self):
@@ -58,18 +58,25 @@ class FakeVideoProfile:
         )
 
     def get_extrinsics_to(self, target):
-        assert self.index == 1
-        assert target.index == 2
-        expected_rotation = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
+        if self.index == "depth":
+            assert target.index == 1
+            return SimpleNamespace(
+                rotation=np.eye(3).reshape(-1, order="F").tolist(),
+                translation=[0.001, 0.0, 0.0],
+            )
+        assert self.index == 1 and target.index == 2
+        rotation = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
         return SimpleNamespace(
-            rotation=expected_rotation.reshape(-1, order="F").tolist(),
+            rotation=rotation.reshape(-1, order="F").tolist(),
             translation=[-0.05, 0.0, 0.0],
         )
 
 
 class FakePipelineProfile:
-    def get_stream(self, stream, index: int):
-        assert stream == "infrared"
+    def get_stream(self, stream, index: int | None = None):
+        if stream == "depth":
+            return FakeVideoProfile("depth")
+        assert stream == "infrared" and index is not None
         return FakeVideoProfile(index)
 
     def get_device(self):
@@ -135,6 +142,9 @@ def test_realsense_capture_returns_calibrated_stereo_bundle() -> None:
         assert frame.right_ir[0, 0] == 2
         assert frame.native_depth[0, 0] == 1000
         assert frame.calibration.native_depth_scale_m == 0.001
+        assert frame.calibration.depth is not None
+        assert frame.calibration.left_t_depth is not None
+        np.testing.assert_allclose(frame.calibration.left_t_depth.translation_m, [0.001, 0, 0])
         assert frame.calibration.baseline_m == 0.05
         np.testing.assert_allclose(
             frame.calibration.right_t_left.rotation,
