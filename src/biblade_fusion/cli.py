@@ -18,8 +18,14 @@ from biblade_fusion.devices.robot import EliteReadOnlyRobot
 from biblade_fusion.devices.thermal_camera import NullThermalCamera
 from biblade_fusion.diagnostics import CheckLevel, run_doctor
 from biblade_fusion.perception.stereo import run_foundation_stereo_doctor
-from biblade_fusion.storage import SessionReader, SessionWriter, write_initialization
-from biblade_fusion.workflows import initialize_native_depth
+from biblade_fusion.storage import (
+    SessionReader,
+    SessionWriter,
+    read_initialization,
+    write_initialization,
+    write_view_plan,
+)
+from biblade_fusion.workflows import initialize_native_depth, plan_initial_observation
 
 app = typer.Typer(
     name="bbf",
@@ -31,11 +37,13 @@ camera_app = typer.Typer(help="Intel RealSense D435i tools.", no_args_is_help=Tr
 acquire_app = typer.Typer(help="Synchronized read-only acquisition.", no_args_is_help=True)
 stereo_app = typer.Typer(help="Stereo inference tools.", no_args_is_help=True)
 initialize_app = typer.Typer(help="Offline initial-model construction.", no_args_is_help=True)
+plan_app = typer.Typer(help="Offline bilateral view planning.", no_args_is_help=True)
 app.add_typer(robot_app, name="robot")
 app.add_typer(camera_app, name="camera")
 app.add_typer(acquire_app, name="acquire")
 app.add_typer(stereo_app, name="stereo")
 app.add_typer(initialize_app, name="initialize")
+app.add_typer(plan_app, name="plan")
 
 
 @app.callback()
@@ -390,6 +398,53 @@ def initialize_from_native_depth(
         typer.echo(f"Initialization failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Saved initialization artifact: {destination}")
+
+
+@plan_app.command("views")
+def plan_views(
+    initialization: Annotated[
+        Path,
+        typer.Option("--initialization", exists=True, file_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Create a non-executable bilateral view plan from an initialization artifact."""
+
+    try:
+        settings = load_settings(config)
+        stored = read_initialization(initialization)
+        result = plan_initial_observation(
+            stored.observation,
+            settings.view_planning,
+            settings.view_filter,
+        )
+        destination = write_view_plan(
+            output,
+            result,
+            settings.view_planning,
+            settings.view_filter,
+            source_initialization=initialization,
+        )
+    except Exception as exc:
+        typer.echo(f"View planning failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved offline view plan: {destination}")
+    typer.echo(
+        f"Candidates: {len(result.geometric_plan.candidates)}, "
+        f"geometry accepted: {len(result.filtered_plan.accepted)}, "
+        f"endpoint feasible: {len(result.filtered_plan.endpoint_feasible)}"
+    )
+    typer.echo("Motion authorized: no")
 
 
 if __name__ == "__main__":
