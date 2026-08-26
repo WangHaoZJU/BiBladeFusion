@@ -1,0 +1,25 @@
+project:
+  data_root: data
+  log_root: logs
+
+robot:
+  model: cs68
+  robot_ip: null
+  local_ip: null
+  headless_mode: false
+  motion_enabled: false
+  rtsi_frequency_hz: 250.0
+  settle_time_s: 1.0
+  sdk_wheel: /home/vale/Documents/Elite_Robots_CS_SDK_Python/dist/elite_cs_sdk-1.0.0-cp312-cp312-linux_x86_64.whl
+
+realsense:
+  serial_number: null
+  infrared_width: 1280
+  infrared_height: 720
+  frames_per_second: 30
+  enable_native_depth: true
+
+thermal:
+  enabled: false
+  driver: null
+
