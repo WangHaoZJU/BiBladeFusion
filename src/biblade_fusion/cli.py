@@ -11,6 +11,7 @@ from rich.table import Table
 
 from biblade_fusion import __version__
 from biblade_fusion.core.settings import load_settings
+from biblade_fusion.devices.robot import EliteReadOnlyRobot
 from biblade_fusion.diagnostics import CheckLevel, run_doctor
 
 app = typer.Typer(
@@ -18,6 +19,8 @@ app = typer.Typer(
     help="BiBladeFusion development and acquisition tools.",
     no_args_is_help=True,
 )
+robot_app = typer.Typer(help="Safe Elite CS68 state tools.", no_args_is_help=True)
+app.add_typer(robot_app, name="robot")
 
 
 @app.callback()
@@ -81,6 +84,59 @@ def doctor(
 
     if any(result.level is CheckLevel.FAIL for result in results):
         raise typer.Exit(code=1)
+
+
+@robot_app.command("status")
+def robot_status(
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Validated YAML configuration file.",
+        ),
+    ] = Path("configs/default.yaml"),
+    robot_ip: Annotated[
+        str | None,
+        typer.Option("--ip", help="Temporary robot IP override."),
+    ] = None,
+    output_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON."),
+    ] = False,
+) -> None:
+    """Read one CS68 RTSI state snapshot; this command cannot move the robot."""
+
+    settings = load_settings(config)
+    if robot_ip is not None:
+        settings.robot = type(settings.robot).model_validate(
+            {**settings.robot.model_dump(), "robot_ip": robot_ip}
+        )
+
+    with EliteReadOnlyRobot(settings.robot) as robot:
+        state = robot.read_state()
+        result = {
+            "controller_version": robot.controller_version(),
+            "controller_time_s": state.controller_time_s,
+            "joint_positions_rad": state.joint_positions_rad.tolist(),
+            "base_T_tcp": state.base_t_tcp.matrix.tolist(),
+            "robot_mode": state.robot_mode,
+            "safety_status": state.safety_status,
+            "speed_scaling": state.speed_scaling,
+        }
+
+    if output_json:
+        typer.echo(json.dumps(result, indent=2))
+        return
+
+    console = Console()
+    console.print("[bold]Elite CS68 read-only RTSI status[/bold]")
+    for key, value in result.items():
+        console.print(f"{key}: {value}")
+
 
 
 
