@@ -77,6 +77,34 @@ class FoundationStereoConfig(BaseModel):
     remove_invisible: bool = True
 
 
+class ProxyModelConfig(BaseModel):
+    """Conservative single-view geometry assumptions for bilateral planning."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    voxel_size_m: float = Field(default=0.002, gt=0.0)
+    minimum_points: int = Field(default=100, ge=6)
+    estimated_planar_extents_m: tuple[float, float] | None = None
+    estimated_thickness_m: float | None = Field(default=None, gt=0.0)
+    tangential_margin_m: float = Field(default=0.01, ge=0.0)
+    visible_side_margin_m: float = Field(default=0.003, ge=0.0)
+    hidden_side_margin_m: float = Field(default=0.005, ge=0.0)
+    minimum_camera_normal_cosine: float = Field(default=0.2, ge=0.0, le=1.0)
+
+    @field_validator("estimated_planar_extents_m")
+    @classmethod
+    def validate_planar_extents(
+        cls, value: tuple[float, float] | None
+    ) -> tuple[float, float] | None:
+        if value is None:
+            return None
+        if value[0] <= 0.0 or value[1] <= 0.0:
+            raise ValueError("Estimated planar extents must be positive")
+        if value[0] < value[1]:
+            raise ValueError("Estimated planar extents must be ordered major then minor")
+        return value
+
+
 class AppSettings(BaseModel):
     """Top-level BiBladeFusion settings."""
 
@@ -88,6 +116,7 @@ class AppSettings(BaseModel):
     thermal: ThermalConfig
     acquisition: AcquisitionConfig = Field(default_factory=AcquisitionConfig)
     foundation_stereo: FoundationStereoConfig = Field(default_factory=FoundationStereoConfig)
+    proxy_model: ProxyModelConfig = Field(default_factory=ProxyModelConfig)
 
 
 def load_settings(path: str | Path) -> AppSettings:

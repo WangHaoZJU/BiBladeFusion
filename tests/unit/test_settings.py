@@ -16,6 +16,8 @@ def test_default_settings_load_safely() -> None:
     assert settings.acquisition.max_bracket_ms == 250.0
     assert settings.foundation_stereo.device == "cuda"
     assert settings.foundation_stereo.valid_iterations == 32
+    assert settings.proxy_model.estimated_thickness_m is None
+    assert settings.proxy_model.tangential_margin_m == 0.01
 
 
 def test_unknown_configuration_key_is_rejected() -> None:

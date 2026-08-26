@@ -39,3 +39,15 @@ foundation_stereo:
   valid_iterations: 32
   hierarchical: false
   remove_invisible: true
+
+# The thickness must be measured or conservatively estimated before constructing a
+# bilateral proxy. Planar extents are optional because a good initial view observes them.
+proxy_model:
+  voxel_size_m: 0.002
+  minimum_points: 100
+  estimated_planar_extents_m: null
+  estimated_thickness_m: null
+  tangential_margin_m: 0.01
+  visible_side_margin_m: 0.003
+  hidden_side_margin_m: 0.005
+  minimum_camera_normal_cosine: 0.2
