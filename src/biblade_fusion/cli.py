@@ -35,6 +35,7 @@ from biblade_fusion.storage import (
     SessionReader,
     SessionWriter,
     read_initialization,
+    read_stereo_inference,
     write_initialization,
     write_stereo_inference,
     write_view_plan,
@@ -42,6 +43,7 @@ from biblade_fusion.storage import (
 from biblade_fusion.workflows import (
     extract_hand_eye_samples,
     infer_rectified_stereo,
+    initialize_foundation_stereo_depth,
     initialize_native_depth,
     plan_initial_observation,
 )
@@ -591,6 +593,70 @@ def initialize_from_native_depth(
         typer.echo(f"Initialization failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Saved initialization artifact: {destination}")
+
+
+@initialize_app.command("stereo-depth")
+def initialize_from_stereo_depth(
+    session: Annotated[
+        Path,
+        typer.Option("--session", exists=True, file_okay=False, readable=True),
+    ],
+    stereo: Annotated[
+        Path,
+        typer.Option("--stereo", exists=True, file_okay=False, readable=True),
+    ],
+    mask: Annotated[
+        Path,
+        typer.Option("--mask", exists=True, dir_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    view_id: Annotated[str, typer.Option("--view-id")] = "seed",
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Build an initial proxy from a stored calibrated FoundationStereo result."""
+
+    import numpy as np
+
+    try:
+        settings = load_settings(config)
+        hand_eye = load_hand_eye_calibration(settings.hand_eye)
+        bundle = SessionReader(session).load_bundle(view_id)
+        stereo_observation = read_stereo_inference(stereo).observation
+        blade_mask = np.load(mask, allow_pickle=False)
+        if not isinstance(blade_mask, np.ndarray):
+            blade_mask.close()
+            raise ValueError("Blade mask must be a single .npy array")
+        observation = initialize_foundation_stereo_depth(
+            bundle,
+            stereo_observation,
+            blade_mask,
+            hand_eye,
+            settings.point_cloud,
+            settings.proxy_model,
+        )
+        destination = write_initialization(
+            output,
+            observation,
+            blade_mask,
+            hand_eye,
+            settings.point_cloud,
+            settings.proxy_model,
+            source_session=session,
+            source_stereo_inference=stereo,
+        )
+    except Exception as exc:
+        typer.echo(f"Initialization failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved FoundationStereo initialization artifact: {destination}")
 
 
 @plan_app.command("views")

@@ -35,7 +35,7 @@ def plan_initial_observation(
 
     geometric = generate_bilateral_view_plan(
         observation.proxy,
-        observation.left_intrinsics,
+        observation.planning_intrinsics,
         planning_config,
     )
     filtered = filter_candidate_views(

@@ -21,7 +21,7 @@ from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import BilateralBladeProxy
 from biblade_fusion.workflows import InitialObservation
 
-INITIALIZATION_SCHEMA_VERSION = 4
+INITIALIZATION_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +97,7 @@ def write_initialization(
     proxy_config: ProxyModelConfig,
     *,
     source_session: str | Path,
+    source_stereo_inference: str | Path | None = None,
 ) -> Path:
     """Atomically write an initialization result without overwriting prior work."""
 
@@ -118,6 +119,12 @@ def write_initialization(
         "source": {
             "session": str(Path(source_session).resolve()),
             "view_id": observation.source_view_id,
+            "stereo_inference": (
+                str(Path(source_stereo_inference).resolve())
+                if source_stereo_inference is not None
+                else None
+            ),
+            "depth_source": observation.depth_source,
         },
         "files": {
             "base_points_m": "base_points_m.npy",
@@ -125,11 +132,12 @@ def write_initialization(
             "blade_mask": "blade_mask.npy",
         },
         "source_image_shape": list(observation.base_cloud.source_image_shape),
-        "left_intrinsics": _intrinsics_payload(observation.left_intrinsics),
+        "planning_intrinsics": _intrinsics_payload(observation.planning_intrinsics),
         "seed_joint_positions_rad": observation.seed_joint_positions_rad.tolist(),
         "transforms": {
             "base_T_left_ir": observation.base_t_left_ir.matrix.tolist(),
-            "base_T_depth": observation.base_t_depth.matrix.tolist(),
+            "base_T_projection_camera": observation.base_t_projection_camera.matrix.tolist(),
+            "projection_camera_frame": observation.base_t_projection_camera.child_frame,
         },
         "proxy": {
             "base_T_proxy": proxy.frame_T_proxy.matrix.tolist(),
@@ -181,8 +189,9 @@ def read_initialization(path: str | Path) -> StoredInitialization:
         metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
         if not isinstance(metadata, dict):
             raise TypeError("metadata root must be an object")
-        if int(metadata["schema_version"]) != INITIALIZATION_SCHEMA_VERSION:
-            raise ValueError(f"unsupported schema {metadata['schema_version']}")
+        schema_version = int(metadata["schema_version"])
+        if schema_version not in {4, INITIALIZATION_SCHEMA_VERSION}:
+            raise ValueError(f"unsupported schema {schema_version}")
         files = metadata["files"]
         points = _load_contained_array(root, files["base_points_m"])
         pixels = _load_contained_array(root, files["pixel_uv"])
@@ -191,7 +200,19 @@ def read_initialization(path: str | Path) -> StoredInitialization:
         transforms = metadata["transforms"]
         proxy_data = metadata["proxy"]
         base_t_left_ir = PoseSE3("base", "left_ir", transforms["base_T_left_ir"])
-        base_t_depth = PoseSE3("base", "depth", transforms["base_T_depth"])
+        if schema_version == 4:
+            planning_intrinsics_data = metadata["left_intrinsics"]
+            base_t_projection_camera = PoseSE3("base", "depth", transforms["base_T_depth"])
+            depth_source = "native_realsense"
+        else:
+            planning_intrinsics_data = metadata["planning_intrinsics"]
+            projection_frame = str(transforms["projection_camera_frame"])
+            base_t_projection_camera = PoseSE3(
+                "base",
+                projection_frame,
+                transforms["base_T_projection_camera"],
+            )
+            depth_source = str(metadata["source"]["depth_source"])
         cloud = PointCloud("base", points, pixels, source_shape)
         proxy = BilateralBladeProxy(
             frame_T_proxy=PoseSE3("base", "blade_proxy", proxy_data["base_T_proxy"]),
@@ -205,12 +226,13 @@ def read_initialization(path: str | Path) -> StoredInitialization:
         )
         observation = InitialObservation(
             source_view_id=str(metadata["source"]["view_id"]),
-            left_intrinsics=_intrinsics_from_payload(metadata["left_intrinsics"]),
+            planning_intrinsics=_intrinsics_from_payload(planning_intrinsics_data),
             seed_joint_positions_rad=metadata["seed_joint_positions_rad"],
             base_t_left_ir=base_t_left_ir,
-            base_t_depth=base_t_depth,
+            base_t_projection_camera=base_t_projection_camera,
             base_cloud=cloud,
             proxy=proxy,
+            depth_source=depth_source,
         )
         hand_eye_data = metadata["hand_eye"]
         hand_eye = HandEyeCalibration(

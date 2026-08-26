@@ -24,6 +24,7 @@ def test_initialize_command_is_exposed() -> None:
 
     assert result.exit_code == 0
     assert "native-depth" in result.stdout
+    assert "stereo-depth" in result.stdout
 
 
 def test_stereo_inference_command_is_exposed() -> None:

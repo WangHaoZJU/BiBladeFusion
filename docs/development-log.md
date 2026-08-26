@@ -34,13 +34,16 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Identified ChArUco detection from raw stored left-IR frames, positive-depth IPPE pose
   selection, planar-ambiguity/reprojection gates, automatic sample extraction, and
   durable rejection reasons.
-- Current working tree: 93 tests, Ruff, package build, and Elite SDK import pass. Through
-  commit `d813411`, all earlier commits were pushed to GitHub `main`.
+- FoundationStereo-depth proxy initialization with source-identity checks, correct
+  `base_T_left_rectified` geometry, and an end-to-end raw-session-to-plan integration
+  path. Initialization schema 5 records depth source/projection frame and reads schema 4.
+- Current working tree: 96 tests and Ruff pass. Through commit `66947e4`, package build,
+  Elite SDK import, and all commits passed and were pushed to GitHub `main`.
 
 ## In progress
 
-- FoundationStereo-depth blade initialization, parallel to the existing native-depth
-  path, without duplicating proxy or planning logic.
+- Multi-view registration, bilateral coverage accounting, and coverage-driven
+  replanning while preserving front/back surface identity.
 
 ## Pending, in priority order
 

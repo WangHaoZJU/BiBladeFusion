@@ -7,6 +7,7 @@ from biblade_fusion.workflows.hand_eye_extraction import (
 from biblade_fusion.workflows.initialization import (
     InitializationError,
     InitialObservation,
+    initialize_foundation_stereo_depth,
     initialize_native_depth,
 )
 from biblade_fusion.workflows.stereo_inference import (
@@ -25,6 +26,7 @@ __all__ = [
     "OfflineViewPlanningResult",
     "StereoInferenceObservation",
     "initialize_native_depth",
+    "initialize_foundation_stereo_depth",
     "extract_hand_eye_samples",
     "infer_rectified_stereo",
     "plan_initial_observation",

@@ -55,6 +55,18 @@ uv run bbf stereo infer-session \
 
 The output stores rectified images, full-resolution-pixel disparity, metric depth,
 validity masks, calibration transforms, model provenance, and per-array SHA-256 values.
+Use a Boolean mask in rectified-left coordinates to initialize the same conservative
+blade proxy from this depth source:
+
+```bash
+uv run bbf initialize stereo-depth \
+  --session data/<session> \
+  --stereo outputs/stereo_seed \
+  --view-id seed \
+  --mask data/blade_mask_rectified.npy \
+  --config configs/local.yaml \
+  --output outputs/initialization_stereo
+```
 
 ## Read-only acquisition
 
@@ -107,7 +119,8 @@ uv run bbf calibration solve-hand-eye \
 
 ## Offline planning workflow
 
-Create a Boolean `.npy` blade mask in the native depth-image coordinate system. Then set
+For the native-depth path, create a Boolean `.npy` blade mask in the native depth-image
+coordinate system. Then set
 `hand_eye.calibration_path`, `kinematics.model_path`, `proxy_model.estimated_thickness_m`,
 `view_planning.standoff_distance_m`, and measured workcell bounds in the local config.
 

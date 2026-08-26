@@ -65,7 +65,9 @@ def test_initialization_artifact_round_trip(tmp_path: Path) -> None:
     stored = read_initialization(output)
 
     assert stored.observation.source_view_id == "seed"
-    assert stored.observation.left_intrinsics.fx == 100
+    assert stored.observation.planning_intrinsics.fx == 100
+    assert stored.observation.depth_source == "native_realsense"
+    assert stored.observation.base_t_projection_camera.child_frame == "depth"
     np.testing.assert_allclose(stored.observation.seed_joint_positions_rad, np.zeros(6))
     np.testing.assert_allclose(stored.hand_eye.tcp_t_left_ir.matrix, np.eye(4))
     np.testing.assert_allclose(
@@ -106,7 +108,7 @@ def test_initialization_reader_rejects_path_escape(tmp_path: Path) -> None:
     (artifact / "metadata.json").write_text(
         json.dumps(
             {
-                "schema_version": 4,
+                "schema_version": 5,
                 "files": {
                     "base_points_m": "../outside.npy",
                     "pixel_uv": "pixels.npy",
@@ -119,3 +121,39 @@ def test_initialization_reader_rejects_path_escape(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="escapes"):
         read_initialization(artifact)
+
+
+def test_initialization_reader_migrates_schema_four_native_depth(tmp_path: Path) -> None:
+    hand_eye = HandEyeCalibration(
+        PoseSE3.identity("tcp", "left_ir"),
+        "test",
+        20,
+        0.001,
+        0.2,
+        tmp_path / "he.yaml",
+    )
+    output = write_initialization(
+        tmp_path / "initialization",
+        make_observation(),
+        np.ones((2, 2), dtype=bool),
+        hand_eye,
+        PointCloudConfig(minimum_valid_points=3),
+        ProxyModelConfig(estimated_thickness_m=0.01),
+        source_session=tmp_path / "session",
+    )
+    metadata_path = output / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["schema_version"] = 4
+    metadata["left_intrinsics"] = metadata.pop("planning_intrinsics")
+    metadata["transforms"]["base_T_depth"] = metadata["transforms"].pop(
+        "base_T_projection_camera"
+    )
+    metadata["transforms"].pop("projection_camera_frame")
+    metadata["source"].pop("depth_source")
+    metadata["source"].pop("stereo_inference")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    stored = read_initialization(output)
+
+    assert stored.observation.depth_source == "native_realsense"
+    assert stored.observation.base_t_projection_camera.child_frame == "depth"
