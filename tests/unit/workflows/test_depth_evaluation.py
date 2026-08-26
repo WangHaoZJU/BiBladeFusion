@@ -1,7 +1,11 @@
+from dataclasses import replace
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from biblade_fusion.acquisition import CaptureMetrics, SynchronizedFrameBundle
+from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     DepthComparisonConfig,
@@ -14,10 +18,12 @@ from biblade_fusion.devices.depth_camera import (
     StereoFrame,
 )
 from biblade_fusion.devices.robot import RobotState
+from biblade_fusion.perception.proxy import BilateralBladeProxy
 from biblade_fusion.perception.stereo import StereoRectifier, StereoResult
 from biblade_fusion.workflows import (
     DepthComparisonError,
     StereoInferenceObservation,
+    classify_depth_view_geometry,
     compare_paired_depth,
 )
 
@@ -115,3 +121,55 @@ def test_paired_depth_comparison_rejects_mismatched_source() -> None:
             PointCloudConfig(minimum_valid_points=100),
             DepthComparisonConfig(minimum_overlap_points=100),
         )
+
+
+def test_depth_view_geometry_uses_achieved_pose_and_proxy_normal() -> None:
+    bundle = make_bundle()
+    state = replace(
+        bundle.selected_robot_state,
+        base_t_tcp=PoseSE3.from_rotation_translation(
+            "base", "tcp", np.diag([1.0, -1.0, -1.0]), [0.0, 0.0, 0.2]
+        ),
+    )
+    bundle = replace(
+        bundle,
+        robot_state_before=state,
+        robot_state_after=state,
+        selected_robot_state=state,
+    )
+    rectified = StereoRectifier(
+        bundle.stereo.calibration, StereoRectificationConfig()
+    ).rectify(bundle.stereo)
+    result = StereoResult(
+        np.full((20, 20), 10.0, dtype=np.float32),
+        np.ones((20, 20), dtype=bool),
+    )
+    observation = StereoInferenceObservation(
+        "seed", 0, rectified, result, result.depth_m(rectified.calibration)
+    )
+    proxy = BilateralBladeProxy(
+        PoseSE3.identity("base", "blade_proxy"),
+        np.array([0.4, 0.2, 0.02]),
+        np.zeros(3),
+        np.array([1.0, 0.5, 0.0]),
+        100,
+        100,
+        100,
+        1.0,
+    )
+    hand_eye = HandEyeCalibration(
+        PoseSE3.identity("tcp", "left_ir"),
+        "test",
+        20,
+        0.001,
+        0.2,
+        Path("hand_eye.yaml"),
+    )
+
+    geometry = classify_depth_view_geometry(
+        bundle, observation, proxy, hand_eye, 0.02
+    )
+
+    assert geometry.side.value == "front"
+    assert geometry.camera_side_offset_m == pytest.approx(0.2)
+    assert geometry.incidence_angle_deg == pytest.approx(0.0)

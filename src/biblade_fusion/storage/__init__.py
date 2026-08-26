@@ -14,6 +14,7 @@ from biblade_fusion.storage.depth_aggregate import (
     StoredDepthAggregate,
     read_depth_aggregate,
     write_depth_aggregate,
+    write_depth_aggregate_manifest,
 )
 from biblade_fusion.storage.depth_comparison import (
     StoredDepthComparison,
@@ -72,6 +73,7 @@ __all__ = [
     "write_coverage_driven_plan",
     "write_depth_comparison",
     "write_depth_aggregate",
+    "write_depth_aggregate_manifest",
     "write_reconstructed_view",
     "write_coverage_ledger",
     "write_stereo_inference",

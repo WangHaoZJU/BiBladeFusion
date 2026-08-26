@@ -58,10 +58,23 @@ Likewise, paired agreement cannot detect a bias shared by both depth methods.
 
 ## Stratified aggregation
 
-Create a version-controlled YAML manifest. Side and incidence are explicit experimental
-labels; do not infer them from an arbitrary filename. Until the acquisition executor
-records achieved poses, compute incidence from the calibrated camera pose and the fixed
-proxy normal, and retain that calculation in the experiment notebook.
+Generate a version-controlled YAML manifest from the synchronized achieved poses and the
+fixed initialization proxy. Repeat `--comparison` for every paired artifact:
+
+```bash
+uv run bbf evaluate make-depth-manifest \
+  --comparison outputs/depth_comparison_front_000 \
+  --comparison outputs/depth_comparison_back_000 \
+  --initialization outputs/initialization \
+  --config configs/local.yaml \
+  --output experiments/depth_comparison.yaml
+```
+
+The generator composes synchronized `base_T_tcp`, quality-gated `tcp_T_left_ir`, and the
+rectification rotation. It classifies the camera center against the fixed proxy mid-plane
+and computes incidence from the achieved rectified optical axis and selected face normal.
+Ambiguous mid-plane views and cameras pointing away from the selected face are rejected.
+The generated manifest resembles:
 
 ```yaml
 schema_version: 1
@@ -70,12 +83,18 @@ comparisons:
   - artifact: ../outputs/depth_comparison_front_000
     side: front
     incidence_angle_deg: 4.2
+    camera_side_offset_m: 0.31
+    incidence_cosine: 0.997314
   - artifact: ../outputs/depth_comparison_back_000
     side: back
     incidence_angle_deg: 5.1
+    camera_side_offset_m: -0.30
+    incidence_cosine: 0.996042
 ```
 
-Paths are resolved relative to the manifest. Generate the aggregate with:
+Hand-authored manifests remain accepted for imported legacy experiments, but generated
+labels are preferred and include initialization-checksum provenance. Relative artifact
+paths are resolved from the manifest. Generate the aggregate with:
 
 ```bash
 uv run bbf evaluate aggregate-depth \

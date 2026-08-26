@@ -52,13 +52,16 @@ authoritative fine-grained record; this page records the experiment-facing state
   pixel-pooled metrics, plus retained front/back and incidence-angle strata.
 - Initialization schema 6 adds SHA-256, dtype, and shape manifests for base clouds,
   pixel provenance, and masks while retaining schema 4/5 read compatibility.
-- Current verification: 115 tests and Ruff pass. Through commit `860840d`, all prior
+- Achieved-pose experiment labeling composes robot, hand-eye, and rectification
+  transforms to derive proxy side and incidence; ambiguous mid-plane/away-facing views
+  are rejected, and generated manifests bind the fixed initialization metadata.
+- Current verification: 117 tests and Ruff pass. Through commit `741f1c6`, all prior
   commits, package build, and Elite SDK import were verified and pushed.
 
 ## In progress
 
-- Derive front/back and incidence labels from the achieved synchronized camera pose and
-  fixed proxy, removing manual labels from the normal experiment path.
+- No partial implementation is left at this checkpoint. The next software target is a
+  non-executable robot-body/workcell collision contract and continuous path validator.
 
 ## Pending, in priority order
 

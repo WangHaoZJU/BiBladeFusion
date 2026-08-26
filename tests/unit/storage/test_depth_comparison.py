@@ -2,13 +2,16 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 from biblade_fusion.acquisition import CaptureMetrics, SynchronizedFrameBundle
+from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     DepthComparisonConfig,
     FoundationStereoConfig,
     PointCloudConfig,
+    ProxyModelConfig,
     StereoRectificationConfig,
     load_settings,
 )
@@ -20,14 +23,21 @@ from biblade_fusion.devices.depth_camera import (
 from biblade_fusion.devices.robot import RobotState
 from biblade_fusion.perception.stereo import StereoRectifier, StereoResult
 from biblade_fusion.storage import (
+    SessionReader,
     SessionWriter,
     read_depth_aggregate,
     read_depth_comparison,
     write_depth_aggregate,
+    write_depth_aggregate_manifest,
     write_depth_comparison,
+    write_initialization,
     write_stereo_inference,
 )
-from biblade_fusion.workflows import StereoInferenceObservation, compare_paired_depth
+from biblade_fusion.workflows import (
+    StereoInferenceObservation,
+    compare_paired_depth,
+    initialize_native_depth,
+)
 
 
 def _bundle() -> SynchronizedFrameBundle:
@@ -175,3 +185,62 @@ def test_depth_aggregate_manifest_round_trip(tmp_path: Path) -> None:
     groups = {group.group_id for group in stored.report.groups}
     assert groups == {"all", "side:front", "incidence:[0,15]deg"}
     assert "weight views equally" in stored.metadata["interpretation"]
+
+
+def test_depth_manifest_labels_achieved_pose_from_initialization(tmp_path: Path) -> None:
+    session, stereo, mask, comparison, point_config, comparison_config = _sources(
+        tmp_path
+    )
+    comparison_path = write_depth_comparison(
+        tmp_path / "comparison",
+        comparison,
+        point_config,
+        comparison_config,
+        source_session=session,
+        source_stereo_inference=stereo,
+        source_blade_mask=mask,
+    )
+    bundle = SessionReader(session).load_bundle("seed")
+    hand_eye = HandEyeCalibration(
+        PoseSE3.identity("tcp", "left_ir"),
+        "test",
+        20,
+        0.001,
+        0.2,
+        tmp_path / "hand_eye.yaml",
+    )
+    proxy_config = ProxyModelConfig(
+        voxel_size_m=0.0001,
+        minimum_points=100,
+        estimated_thickness_m=0.01,
+    )
+    observation = initialize_native_depth(
+        bundle,
+        np.ones((20, 20), dtype=bool),
+        hand_eye,
+        point_config,
+        proxy_config,
+    )
+    initialization = write_initialization(
+        tmp_path / "initialization",
+        observation,
+        np.ones((20, 20), dtype=bool),
+        hand_eye,
+        point_config,
+        proxy_config,
+        source_session=session,
+    )
+
+    manifest = write_depth_aggregate_manifest(
+        tmp_path / "generated.yaml",
+        (comparison_path,),
+        initialization,
+        comparison_config,
+    )
+    payload = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+
+    assert payload["labeling"]["method"] == "achieved_pose_against_fixed_proxy_v1"
+    assert payload["comparisons"][0]["side"] == "front"
+    assert payload["comparisons"][0]["incidence_angle_deg"] == pytest.approx(0.0)
+    aggregate = write_depth_aggregate(tmp_path / "generated-aggregate", manifest)
+    assert read_depth_aggregate(aggregate).report.groups[0].metrics.view_count == 1

@@ -238,6 +238,8 @@ class DepthComparisonConfig(BaseModel):
 
     minimum_overlap_points: int = Field(default=100, ge=3)
     agreement_thresholds_m: tuple[float, ...] = (0.005, 0.01, 0.02)
+    minimum_camera_side_offset_m: float = Field(default=0.02, gt=0.0)
+    incidence_bin_edges_deg: tuple[float, ...] = (0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0)
 
     @field_validator("agreement_thresholds_m")
     @classmethod
@@ -248,6 +250,22 @@ class DepthComparisonConfig(BaseModel):
             raise ValueError("Depth agreement thresholds must be finite and positive")
         if tuple(sorted(set(value))) != value:
             raise ValueError("Depth agreement thresholds must be unique and increasing")
+        return value
+
+    @field_validator("incidence_bin_edges_deg")
+    @classmethod
+    def validate_incidence_edges(cls, value: tuple[float, ...]) -> tuple[float, ...]:
+        if (
+            len(value) < 2
+            or value[0] != 0.0
+            or value[-1] != 90.0
+            or not np.isfinite(value).all()
+            or any(
+                first >= second
+                for first, second in zip(value, value[1:], strict=False)
+            )
+        ):
+            raise ValueError("Incidence bin edges must increase from 0 to 90 degrees")
         return value
 
 

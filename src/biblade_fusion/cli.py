@@ -51,6 +51,7 @@ from biblade_fusion.storage import (
     write_coverage_driven_plan,
     write_coverage_ledger,
     write_depth_aggregate,
+    write_depth_aggregate_manifest,
     write_depth_comparison,
     write_initialization,
     write_reconstructed_view,
@@ -1133,6 +1134,44 @@ def evaluate_aggregate_depth(
         f"pooled MAE: {overall.metrics.pooled_mean_absolute_error_m * 1000.0:.3f} mm"
     )
     typer.echo("Native RealSense depth is a comparison reference, not ground truth")
+
+
+@evaluate_app.command("make-depth-manifest")
+def evaluate_make_depth_manifest(
+    comparisons: Annotated[
+        list[Path],
+        typer.Option(
+            "--comparison",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Repeat for every paired depth-comparison artifact.",
+        ),
+    ],
+    initialization: Annotated[
+        Path,
+        typer.Option("--initialization", exists=True, file_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Label paired comparisons from achieved poses and the fixed blade proxy."""
+
+    try:
+        settings = load_settings(config)
+        destination = write_depth_aggregate_manifest(
+            output,
+            tuple(comparisons),
+            initialization,
+            settings.depth_comparison,
+        )
+    except Exception as exc:
+        typer.echo(f"Depth manifest generation failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved achieved-pose depth manifest: {destination}")
 
 
 if __name__ == "__main__":

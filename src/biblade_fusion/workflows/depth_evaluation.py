@@ -8,12 +8,15 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from biblade_fusion.acquisition import SynchronizedFrameBundle
+from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.settings import DepthComparisonConfig, PointCloudConfig
 from biblade_fusion.perception.pointcloud import (
     native_depth_to_meters,
     point_cloud_to_depth_image,
     realsense_depth_image_to_point_cloud,
 )
+from biblade_fusion.perception.proxy import BilateralBladeProxy
+from biblade_fusion.planning import BladeSide
 from biblade_fusion.workflows.stereo_inference import StereoInferenceObservation
 
 
@@ -40,6 +43,14 @@ class DepthComparisonMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class DepthViewGeometry:
+    side: BladeSide
+    camera_side_offset_m: float
+    incidence_cosine: float
+    incidence_angle_deg: float
+
+
+@dataclass(frozen=True, slots=True)
 class PairedDepthComparison:
     source_view_id: str
     source_sequence_index: int
@@ -63,6 +74,44 @@ class PairedDepthComparison:
         object.__setattr__(self, "native_depth_left_rectified_m", native)
         object.__setattr__(self, "comparison_mask", mask)
         object.__setattr__(self, "signed_error_m", error)
+
+
+def classify_depth_view_geometry(
+    bundle: SynchronizedFrameBundle,
+    stereo: StereoInferenceObservation,
+    proxy: BilateralBladeProxy,
+    hand_eye: HandEyeCalibration,
+    minimum_camera_side_offset_m: float,
+) -> DepthViewGeometry:
+    """Classify achieved rectified-camera pose against the fixed bilateral proxy."""
+
+    if (
+        stereo.source_view_id != bundle.view_id
+        or stereo.source_sequence_index != bundle.sequence_index
+        or stereo.rectified.source_frame_number != bundle.stereo.frame_number
+    ):
+        raise DepthComparisonError("Stereo inference artifact does not match the stored view")
+    if minimum_camera_side_offset_m <= 0.0:
+        raise DepthComparisonError("Minimum camera side offset must be positive")
+    base_t_left_ir = bundle.selected_robot_state.base_t_tcp.compose(hand_eye.tcp_t_left_ir)
+    base_t_left_rectified = base_t_left_ir.compose(
+        stereo.rectified.calibration.left_rectified_t_left_ir.inverse()
+    )
+    proxy_t_base = proxy.frame_T_proxy.inverse()
+    camera_local = proxy_t_base.transform_points(base_t_left_rectified.translation_m)
+    offset = float(camera_local[2])
+    if abs(offset) < minimum_camera_side_offset_m:
+        raise DepthComparisonError(
+            "Camera is too close to the proxy mid-plane to classify blade side"
+        )
+    side = BladeSide.FRONT if offset > 0.0 else BladeSide.BACK
+    outward = proxy.outward_normal * (1.0 if side is BladeSide.FRONT else -1.0)
+    optical_axis = base_t_left_rectified.rotation[:, 2]
+    incidence_cosine = float(np.clip((-optical_axis) @ outward, -1.0, 1.0))
+    incidence_angle_deg = float(np.degrees(np.arccos(incidence_cosine)))
+    if incidence_angle_deg > 90.0:
+        raise DepthComparisonError("Camera optical axis points away from the blade face")
+    return DepthViewGeometry(side, offset, incidence_cosine, incidence_angle_deg)
 
 
 def compare_paired_depth(

@@ -11,7 +11,9 @@ from biblade_fusion.workflows.depth_aggregation import (
 from biblade_fusion.workflows.depth_evaluation import (
     DepthComparisonError,
     DepthComparisonMetrics,
+    DepthViewGeometry,
     PairedDepthComparison,
+    classify_depth_view_geometry,
     compare_paired_depth,
 )
 from biblade_fusion.workflows.hand_eye_extraction import (
@@ -42,8 +44,10 @@ from biblade_fusion.workflows.view_planning import (
 __all__ = [
     "DepthComparisonError",
     "DepthComparisonMetrics",
+    "DepthViewGeometry",
     "PairedDepthComparison",
     "compare_paired_depth",
+    "classify_depth_view_geometry",
     "DepthAggregateGroup",
     "DepthAggregateMetrics",
     "DepthAggregateReport",
