@@ -26,6 +26,13 @@ def test_initialize_command_is_exposed() -> None:
     assert "native-depth" in result.stdout
 
 
+def test_stereo_inference_command_is_exposed() -> None:
+    result = runner.invoke(app, ["stereo", "--help"])
+
+    assert result.exit_code == 0
+    assert "infer-session" in result.stdout
+
+
 def test_plan_command_is_exposed() -> None:
     result = runner.invoke(app, ["plan", "--help"])
 

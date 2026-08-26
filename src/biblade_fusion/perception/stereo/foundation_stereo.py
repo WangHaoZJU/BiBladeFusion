@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from importlib import import_module
 from importlib.util import find_spec
@@ -135,6 +136,23 @@ class FoundationStereoRuntime(Protocol):
         valid_iterations: int,
         hierarchical: bool,
     ) -> NDArray[np.float32]: ...
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _plain_scalar(value: Any) -> bool | int | float | str | None:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    item = getattr(value, "item", None)
+    if callable(item):
+        return _plain_scalar(item())
+    return str(value)
 
 
 def _ensure_upstream_import_path(repository_path: Path) -> None:
@@ -305,8 +323,11 @@ class _OfficialFoundationStereoRuntime:
             "repository_path": str(repository),
             "checkpoint_path": str(checkpoint),
             "model_config_path": str(model_config),
-            "checkpoint_global_step": checkpoint_payload.get("global_step"),
-            "checkpoint_epoch": checkpoint_payload.get("epoch"),
+            "source_sha256": _sha256(repository / "core/foundation_stereo.py"),
+            "checkpoint_sha256": _sha256(checkpoint),
+            "model_config_sha256": _sha256(model_config),
+            "checkpoint_global_step": _plain_scalar(checkpoint_payload.get("global_step")),
+            "checkpoint_epoch": _plain_scalar(checkpoint_payload.get("epoch")),
         }
 
     @property

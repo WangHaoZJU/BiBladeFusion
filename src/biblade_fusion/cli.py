@@ -22,16 +22,24 @@ from biblade_fusion.devices.depth_camera import RealSenseD435i, list_realsense_d
 from biblade_fusion.devices.robot import EliteReadOnlyRobot
 from biblade_fusion.devices.thermal_camera import NullThermalCamera
 from biblade_fusion.diagnostics import CheckLevel, run_doctor
-from biblade_fusion.perception.stereo import run_foundation_stereo_doctor
+from biblade_fusion.perception.stereo import (
+    FoundationStereoBackend,
+    run_foundation_stereo_doctor,
+)
 from biblade_fusion.planning import EliteCs68IkChecker
 from biblade_fusion.storage import (
     SessionReader,
     SessionWriter,
     read_initialization,
     write_initialization,
+    write_stereo_inference,
     write_view_plan,
 )
-from biblade_fusion.workflows import initialize_native_depth, plan_initial_observation
+from biblade_fusion.workflows import (
+    infer_rectified_stereo,
+    initialize_native_depth,
+    plan_initial_observation,
+)
 
 app = typer.Typer(
     name="bbf",
@@ -383,6 +391,51 @@ def stereo_doctor(
         Console().print(table)
     if any(result.level is CheckLevel.FAIL for result in results):
         raise typer.Exit(code=1)
+
+
+@stereo_app.command("infer-session")
+def stereo_infer_session(
+    session: Annotated[
+        Path,
+        typer.Option("--session", exists=True, file_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    view_id: Annotated[str, typer.Option("--view-id")] = "seed",
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Infer and persist calibrated stereo depth from a stored view; no hardware is used."""
+
+    try:
+        settings = load_settings(config)
+        bundle = SessionReader(session).load_bundle(view_id)
+        backend = FoundationStereoBackend(settings.foundation_stereo)
+        observation = infer_rectified_stereo(
+            bundle,
+            backend,
+            settings.stereo_rectification,
+        )
+        destination = write_stereo_inference(
+            output,
+            observation,
+            settings.foundation_stereo,
+            settings.stereo_rectification,
+            source_session=session,
+        )
+    except Exception as exc:
+        typer.echo(f"Stereo inference failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    valid_count = int(observation.result.valid_mask.sum())
+    typer.echo(f"Saved calibrated stereo inference: {destination}")
+    typer.echo(f"Valid depth pixels: {valid_count}/{observation.result.valid_mask.size}")
 
 
 @initialize_app.command("native-depth")
