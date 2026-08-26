@@ -91,6 +91,20 @@ Hand-eye input is quality-gated and must explicitly describe `tcp_T_left_ir`. Se
 Current implementation status and the prioritized remaining work are tracked in the
 [development log](docs/development-log.md).
 
+Stored calibration sessions can be converted to an auditable ChArUco sample set and
+solved entirely offline:
+
+```bash
+uv run bbf calibration extract-hand-eye \
+  --session data/<calibration-session> \
+  --config configs/local.yaml \
+  --output data/calibrations/hand_eye_samples.yaml
+uv run bbf calibration solve-hand-eye \
+  --samples data/calibrations/hand_eye_samples.yaml \
+  --config configs/local.yaml \
+  --output data/calibrations/hand_eye.yaml
+```
+
 ## Offline planning workflow
 
 Create a Boolean `.npy` blade mask in the native depth-image coordinate system. Then set

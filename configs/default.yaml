@@ -75,6 +75,17 @@ hand_eye:
   minimum_rotation_axis_diversity: 0.1
   require_quality_metrics: true
   require_observability_metrics: true
+  target:
+    squares_x: 7
+    squares_y: 5
+    # These must match the physically printed board before sample extraction.
+    square_length_m: null
+    marker_length_m: null
+    dictionary: DICT_5X5_100
+    legacy_pattern: false
+    minimum_corners: 12
+    maximum_reprojection_rmse_px: 0.8
+    minimum_pose_ambiguity_ratio: 1.5
 
 view_planning:
   # Must be selected from the required spatial resolution and workcell clearance.

@@ -28,6 +28,10 @@ class HandEyeSample:
     sample_id: str
     base_t_tcp: PoseSE3
     left_ir_t_target: PoseSE3
+    source_session: str | None = None
+    charuco_corner_count: int | None = None
+    reprojection_rmse_px: float | None = None
+    pose_ambiguity_ratio: float | None = None
 
     def __post_init__(self) -> None:
         if not self.sample_id:
@@ -39,6 +43,24 @@ class HandEyeSample:
             "target",
         ):
             raise ValueError("Hand-eye sample requires left_ir_T_target")
+        if self.charuco_corner_count is not None and self.charuco_corner_count < 4:
+            raise ValueError("Hand-eye ChArUco sample needs at least four corners")
+        if self.reprojection_rmse_px is not None and self.reprojection_rmse_px < 0.0:
+            raise ValueError("Hand-eye reprojection RMSE must be non-negative")
+        if (self.charuco_corner_count is None) != (self.reprojection_rmse_px is None):
+            raise ValueError("Hand-eye detection metrics must be provided together")
+        if self.pose_ambiguity_ratio is not None and self.pose_ambiguity_ratio < 1.0:
+            raise ValueError("Hand-eye pose ambiguity ratio must be at least one")
+
+
+@dataclass(frozen=True, slots=True)
+class HandEyeSampleRejection:
+    sample_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.sample_id or not self.reason:
+            raise ValueError("Rejected hand-eye samples require an ID and reason")
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +235,23 @@ def read_hand_eye_samples(path: str | Path) -> tuple[HandEyeSample, ...]:
                 str(item["sample_id"]),
                 PoseSE3("base", "tcp", item["base_T_tcp"]),
                 PoseSE3("left_ir", "target", item["left_ir_T_target"]),
+                str(item["source_session"]) if item.get("source_session") is not None else None,
+                (
+                    int(item["detection"]["charuco_corner_count"])
+                    if item.get("detection") is not None
+                    else None
+                ),
+                (
+                    float(item["detection"]["reprojection_rmse_px"])
+                    if item.get("detection") is not None
+                    else None
+                ),
+                (
+                    float(item["detection"]["pose_ambiguity_ratio"])
+                    if item.get("detection") is not None
+                    and item["detection"].get("pose_ambiguity_ratio") is not None
+                    else None
+                ),
             )
             for item in raw_samples
         )
@@ -256,7 +295,11 @@ def write_hand_eye_calibration(output: str | Path, solution: HandEyeSolution) ->
     return destination
 
 
-def write_hand_eye_samples(output: str | Path, samples: Sequence[HandEyeSample]) -> Path:
+def write_hand_eye_samples(
+    output: str | Path,
+    samples: Sequence[HandEyeSample],
+    rejected: Sequence[HandEyeSampleRejection] = (),
+) -> Path:
     """Write auditable solver inputs without overwriting an earlier sample set."""
 
     destination = Path(output)
@@ -270,8 +313,22 @@ def write_hand_eye_samples(output: str | Path, samples: Sequence[HandEyeSample])
                 "sample_id": sample.sample_id,
                 "base_T_tcp": sample.base_t_tcp.matrix.tolist(),
                 "left_ir_T_target": sample.left_ir_t_target.matrix.tolist(),
+                "source_session": sample.source_session,
+                "detection": (
+                    {
+                        "charuco_corner_count": sample.charuco_corner_count,
+                        "reprojection_rmse_px": sample.reprojection_rmse_px,
+                        "pose_ambiguity_ratio": sample.pose_ambiguity_ratio,
+                    }
+                    if sample.charuco_corner_count is not None
+                    else None
+                ),
             }
             for sample in samples
+        ],
+        "rejected": [
+            {"sample_id": rejection.sample_id, "reason": rejection.reason}
+            for rejection in rejected
         ],
     }
     # JSON is valid YAML and avoids implementation-specific YAML matrix tags.

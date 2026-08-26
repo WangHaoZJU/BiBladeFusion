@@ -45,6 +45,25 @@ samples:
     left_ir_T_target: [[...], [...], [...], [0.0, 0.0, 0.0, 1.0]]
 ```
 
+Configure `hand_eye.target.square_length_m` and `marker_length_m` from physical
+measurements of the printed ChArUco board. Board square counts, dictionary, and
+`legacy_pattern` must match the generated print exactly. Then extract samples from one
+or more stored sessions (repeat `--session` as needed):
+
+```bash
+uv run bbf calibration extract-hand-eye \
+  --session data/<calibration-session-1> \
+  --session data/<calibration-session-2> \
+  --config configs/local.yaml \
+  --output data/calibrations/hand_eye_samples.yaml
+```
+
+Extraction never connects to hardware. It uses each view's selected synchronized robot
+state, raw left-IR intrinsics/distortion, identified ChArUco corners, and planar IPPE
+pose estimation. Views are rejected when corner count, reprojection RMSE, positive-depth
+geometry, or the primary/secondary planar-pose separation is inadequate. Both accepted
+samples and rejection reasons are saved.
+
 Solve it without connecting to any device:
 
 ```bash
@@ -58,9 +77,8 @@ The default Park-Martin solution is accepted only when the dataset meets sample-
 rotation-span, translation-span, and rotation-axis-diversity thresholds. Quality is the
 fixed-target closure RMSE: each sample reconstructs
 `base_T_target = base_T_tcp · tcp_T_left_ir · left_ir_T_target`, and those reconstructed
-target poses must agree. Calibration-target detection and sample extraction from stored
-sessions are the next pending calibration increment; manually assembled samples must
-therefore be independently checked before real motion planning.
+target poses must agree. A real calibration still requires independent validation on
+held-out poses before any motion planning result is trusted.
 
 ## Controller-specific CS68 kinematics
 

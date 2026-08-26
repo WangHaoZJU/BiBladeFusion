@@ -1,5 +1,10 @@
 """Calibration artifacts and quality validation."""
 
+from biblade_fusion.calibration.charuco import (
+    CharucoDetection,
+    CharucoDetectionError,
+    CharucoTargetDetector,
+)
 from biblade_fusion.calibration.hand_eye import (
     HandEyeCalibration,
     HandEyeCalibrationError,
@@ -8,6 +13,7 @@ from biblade_fusion.calibration.hand_eye import (
 from biblade_fusion.calibration.hand_eye_solver import (
     HandEyeObservability,
     HandEyeSample,
+    HandEyeSampleRejection,
     HandEyeSolution,
     HandEyeSolveError,
     read_hand_eye_samples,
@@ -24,11 +30,15 @@ from biblade_fusion.calibration.robot_kinematics import (
 )
 
 __all__ = [
+    "CharucoDetection",
+    "CharucoDetectionError",
+    "CharucoTargetDetector",
     "Cs68KinematicsModel",
     "HandEyeCalibration",
     "HandEyeCalibrationError",
     "HandEyeObservability",
     "HandEyeSample",
+    "HandEyeSampleRejection",
     "HandEyeSolution",
     "HandEyeSolveError",
     "RobotKinematicsError",

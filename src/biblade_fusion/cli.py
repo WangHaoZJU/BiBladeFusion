@@ -19,6 +19,7 @@ from biblade_fusion.calibration import (
     solve_hand_eye,
     write_cs68_kinematics,
     write_hand_eye_calibration,
+    write_hand_eye_samples,
 )
 from biblade_fusion.core.settings import load_settings
 from biblade_fusion.devices.depth_camera import RealSenseD435i, list_realsense_devices
@@ -39,6 +40,7 @@ from biblade_fusion.storage import (
     write_view_plan,
 )
 from biblade_fusion.workflows import (
+    extract_hand_eye_samples,
     infer_rectified_stereo,
     initialize_native_depth,
     plan_initial_observation,
@@ -482,6 +484,56 @@ def calibration_solve_hand_eye(
         f"rotation RMSE={solution.rotation_rmse_deg:.3f} deg, "
         f"samples={solution.sample_count}"
     )
+
+
+@calibration_app.command("extract-hand-eye")
+def calibration_extract_hand_eye(
+    sessions: Annotated[
+        list[Path],
+        typer.Option(
+            "--session",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Stored session directory; repeat for multiple sessions.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Extract eye-in-hand samples from stored views; no hardware is used."""
+
+    try:
+        settings = load_settings(config)
+        observations = []
+        for session in sessions:
+            reader = SessionReader(session)
+            observations.extend(
+                (session, reader.load_bundle(descriptor.sequence_index))
+                for descriptor in reader.views
+            )
+        result = extract_hand_eye_samples(observations, settings.hand_eye.target)
+        destination = write_hand_eye_samples(output, result.samples, result.rejected)
+    except Exception as exc:
+        typer.echo(f"Hand-eye sample extraction failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved hand-eye sample set: {destination}")
+    typer.echo(f"Accepted views: {len(result.samples)}; rejected views: {len(result.rejected)}")
+    if len(result.samples) < settings.hand_eye.minimum_samples:
+        typer.echo(
+            f"Need at least {settings.hand_eye.minimum_samples} accepted samples before solving.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
 
 
 @initialize_app.command("native-depth")

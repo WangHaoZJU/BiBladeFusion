@@ -31,20 +31,22 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Atomic, checksummed stereo inference artifacts and `bbf stereo infer-session`.
 - Offline Park-Martin/Tsai/Horaud/Andreff/Daniilidis eye-in-hand solving, motion
   observability gates, fixed-target closure RMSE, atomic artifacts, and CLI integration.
-- Current working tree: 89 tests and Ruff pass. Through commit `d813411`, package build
-  and Elite SDK import also passed and all earlier commits were pushed to GitHub `main`.
+- Identified ChArUco detection from raw stored left-IR frames, positive-depth IPPE pose
+  selection, planar-ambiguity/reprojection gates, automatic sample extraction, and
+  durable rejection reasons.
+- Current working tree: 93 tests, Ruff, package build, and Elite SDK import pass. Through
+  commit `d813411`, all earlier commits were pushed to GitHub `main`.
 
 ## In progress
 
-- Identified calibration-target detection in stored left-IR frames and automatic
-  construction of hand-eye samples without commanding robot motion.
+- FoundationStereo-depth blade initialization, parallel to the existing native-depth
+  path, without duplicating proxy or planning logic.
 
 ## Pending, in priority order
 
 1. Run a real FoundationStereo checkpoint/CUDA smoke test; no compatible checkpoint or
    CUDA device is currently available in this workspace.
-2. Initialize the blade proxy from FoundationStereo depth as an alternative to native
-   RealSense depth, then compare both depth sources experimentally.
+2. Compare FoundationStereo and native RealSense depth experimentally on the blade.
 3. Add multi-view registration, bilateral coverage accounting, and coverage-driven
    replanning while preserving the front/back surface identity.
 4. Add robot-body/workcell collision and continuous trajectory validation before any

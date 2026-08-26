@@ -1,5 +1,9 @@
 """Auditable end-to-end project workflows."""
 
+from biblade_fusion.workflows.hand_eye_extraction import (
+    HandEyeExtractionResult,
+    extract_hand_eye_samples,
+)
 from biblade_fusion.workflows.initialization import (
     InitializationError,
     InitialObservation,
@@ -16,10 +20,12 @@ from biblade_fusion.workflows.view_planning import (
 
 __all__ = [
     "InitialObservation",
+    "HandEyeExtractionResult",
     "InitializationError",
     "OfflineViewPlanningResult",
     "StereoInferenceObservation",
     "initialize_native_depth",
+    "extract_hand_eye_samples",
     "infer_rectified_stereo",
     "plan_initial_observation",
 ]

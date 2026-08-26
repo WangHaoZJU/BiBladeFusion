@@ -130,6 +130,40 @@ class PointCloudConfig(BaseModel):
         return self
 
 
+class CharucoTargetConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    squares_x: int = Field(default=7, ge=3, le=30)
+    squares_y: int = Field(default=5, ge=3, le=30)
+    square_length_m: float | None = Field(default=None, gt=0.0)
+    marker_length_m: float | None = Field(default=None, gt=0.0)
+    dictionary: Literal[
+        "DICT_4X4_50",
+        "DICT_5X5_100",
+        "DICT_6X6_250",
+        "DICT_APRILTAG_36h11",
+    ] = "DICT_5X5_100"
+    legacy_pattern: bool = False
+    minimum_corners: int = Field(default=12, ge=4)
+    maximum_reprojection_rmse_px: float = Field(default=0.8, gt=0.0)
+    minimum_pose_ambiguity_ratio: float = Field(default=1.5, gt=1.0)
+
+    @model_validator(mode="after")
+    def validate_lengths(self) -> Self:
+        if (self.square_length_m is None) != (self.marker_length_m is None):
+            raise ValueError("ChArUco square and marker lengths must be configured together")
+        if (
+            self.square_length_m is not None
+            and self.marker_length_m is not None
+            and self.marker_length_m >= self.square_length_m
+        ):
+            raise ValueError("ChArUco marker length must be below square length")
+        maximum_corners = (self.squares_x - 1) * (self.squares_y - 1)
+        if self.minimum_corners > maximum_corners:
+            raise ValueError("ChArUco minimum corners exceeds the board's available corners")
+        return self
+
+
 class HandEyeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -142,6 +176,7 @@ class HandEyeConfig(BaseModel):
     minimum_rotation_axis_diversity: float = Field(default=0.1, gt=0.0, le=1.0)
     require_quality_metrics: bool = True
     require_observability_metrics: bool = True
+    target: CharucoTargetConfig = Field(default_factory=CharucoTargetConfig)
 
 
 class ViewPlanningConfig(BaseModel):
