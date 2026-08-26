@@ -6,8 +6,9 @@ system for thin-walled blades.
 The current development stage provides a Python 3.12 application, validated
 configuration, safe read-only integration with an Elite CS68 robot, synchronized raw
 stereo acquisition from an Intel RealSense D435i, reproducible session storage, a
-FoundationStereo integration boundary, and a conservative single-view blade proxy.
-Robot motion is disabled by default.
+FoundationStereo integration boundary, a conservative single-view blade proxy,
+bilateral surface partitioning, and offline Elite KDL endpoint IK. Robot motion is
+disabled by default.
 
 ## Bootstrap
 
@@ -41,6 +42,9 @@ Set `robot.robot_ip` in a Git-ignored `configs/local.yaml`, then run:
 uv run bbf robot status --config configs/local.yaml
 uv run bbf camera list
 uv run bbf acquire snapshot --config configs/local.yaml --view-id seed
+uv run bbf robot export-kinematics \
+  --config configs/local.yaml \
+  --output data/calibrations/cs68_mdh.yaml
 ```
 
 The synchronized snapshot brackets the D435i capture with two RTSI robot states and
@@ -59,3 +63,34 @@ thickness prior is unset, the cloud is degenerate, or the initial view is too gr
 the proxy uses the larger of the observed dimensions and these conservative prior
 dimensions. The resulting proxy center is a planning-volume center, not a claim about
 the blade's physical center of mass.
+
+Hand-eye input is quality-gated and must explicitly describe `tcp_T_left_ir`. See
+[calibration and frame conventions](docs/calibration.md) before processing real data.
+
+## Offline planning workflow
+
+Create a Boolean `.npy` blade mask in the native depth-image coordinate system. Then set
+`hand_eye.calibration_path`, `kinematics.model_path`, `proxy_model.estimated_thickness_m`,
+`view_planning.standoff_distance_m`, and measured workcell bounds in the local config.
+
+```bash
+uv run bbf initialize native-depth \
+  --session data/<session> \
+  --view-id seed \
+  --mask data/blade_mask.npy \
+  --config configs/local.yaml \
+  --output outputs/initialization
+
+uv run bbf plan views \
+  --initialization outputs/initialization \
+  --config configs/local.yaml \
+  --output outputs/view_plan
+```
+
+The planner creates both front and back partitions from the conservative proxy. Each
+view is checked for optical alignment, incidence, coverage, standoff, camera clearance,
+workspace bounds, forbidden volumes, duplicate poses, and—when configured—offline CS68
+IK. A `geometry_only` view has not passed IK/workspace validation. An
+`endpoint_feasible` view still has **not** passed robot-body collision or trajectory
+validation. Every exported plan contains `motion_authorized: false`; no current command
+executes a planned pose.
