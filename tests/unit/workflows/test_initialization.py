@@ -86,6 +86,7 @@ def test_native_depth_initialization_reaches_base_frame_proxy() -> None:
     )
 
     assert result.base_cloud.frame == "base"
+    assert result.left_intrinsics.width == 20
     assert result.base_cloud.points_m.shape == (400, 3)
     np.testing.assert_allclose(result.base_t_left_ir.translation_m, [1, 0, 0])
     np.testing.assert_allclose(result.base_cloud.points_m[:, 2], 0.5)

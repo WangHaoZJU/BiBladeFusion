@@ -16,11 +16,12 @@ from numpy.typing import ArrayLike, NDArray
 from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import PointCloudConfig, ProxyModelConfig
+from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import BilateralBladeProxy
 from biblade_fusion.workflows import InitialObservation
 
-INITIALIZATION_SCHEMA_VERSION = 1
+INITIALIZATION_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,32 @@ def _load_contained_array(root: Path, relative_path: Any) -> np.ndarray:
     return array
 
 
+def _intrinsics_payload(intrinsics: CameraIntrinsics) -> dict[str, Any]:
+    return {
+        "width": intrinsics.width,
+        "height": intrinsics.height,
+        "fx": intrinsics.fx,
+        "fy": intrinsics.fy,
+        "cx": intrinsics.cx,
+        "cy": intrinsics.cy,
+        "distortion_model": intrinsics.distortion_model,
+        "distortion_coefficients": list(intrinsics.distortion_coefficients),
+    }
+
+
+def _intrinsics_from_payload(payload: dict[str, Any]) -> CameraIntrinsics:
+    return CameraIntrinsics(
+        int(payload["width"]),
+        int(payload["height"]),
+        float(payload["fx"]),
+        float(payload["fy"]),
+        float(payload["cx"]),
+        float(payload["cy"]),
+        str(payload["distortion_model"]),
+        tuple(float(value) for value in payload["distortion_coefficients"]),
+    )
+
+
 def write_initialization(
     output_dir: str | Path,
     observation: InitialObservation,
@@ -97,6 +124,7 @@ def write_initialization(
             "blade_mask": "blade_mask.npy",
         },
         "source_image_shape": list(observation.base_cloud.source_image_shape),
+        "left_intrinsics": _intrinsics_payload(observation.left_intrinsics),
         "transforms": {
             "base_T_left_ir": observation.base_t_left_ir.matrix.tolist(),
             "base_T_depth": observation.base_t_depth.matrix.tolist(),
@@ -171,6 +199,7 @@ def read_initialization(path: str | Path) -> StoredInitialization:
         )
         observation = InitialObservation(
             source_view_id=str(metadata["source"]["view_id"]),
+            left_intrinsics=_intrinsics_from_payload(metadata["left_intrinsics"]),
             base_t_left_ir=base_t_left_ir,
             base_t_depth=base_t_depth,
             base_cloud=cloud,

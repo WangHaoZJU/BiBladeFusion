@@ -10,6 +10,7 @@ from biblade_fusion.acquisition.bundle import SynchronizedFrameBundle
 from biblade_fusion.calibration.hand_eye import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import PointCloudConfig, ProxyModelConfig
+from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.perception.pointcloud import (
     PointCloud,
     native_depth_to_meters,
@@ -25,6 +26,7 @@ class InitializationError(ValueError):
 @dataclass(frozen=True, slots=True)
 class InitialObservation:
     source_view_id: str
+    left_intrinsics: CameraIntrinsics
     base_t_left_ir: PoseSE3
     base_t_depth: PoseSE3
     base_cloud: PointCloud
@@ -80,6 +82,7 @@ def initialize_native_depth(
     )
     return InitialObservation(
         source_view_id=bundle.view_id,
+        left_intrinsics=calibration.left,
         base_t_left_ir=base_t_left_ir,
         base_t_depth=base_t_depth,
         base_cloud=base_cloud,
