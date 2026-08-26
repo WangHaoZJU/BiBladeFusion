@@ -13,6 +13,9 @@ def write_calibration(path: Path, **quality_overrides: object) -> None:
         "sample_count": 20,
         "translation_rmse_m": 0.001,
         "rotation_rmse_deg": 0.2,
+        "rotation_span_deg": 45.0,
+        "translation_span_m": 0.1,
+        "rotation_axis_diversity": 0.5,
     }
     quality.update(quality_overrides)
     payload = {
@@ -40,6 +43,7 @@ def test_load_hand_eye_calibration_with_quality_gate(tmp_path: Path) -> None:
 
     assert calibration.method == "Park-Martin"
     assert calibration.sample_count == 20
+    assert calibration.rotation_span_deg == 45.0
     assert calibration.tcp_t_left_ir.parent_frame == "tcp"
     assert calibration.tcp_t_left_ir.child_frame == "left_ir"
     np.testing.assert_allclose(calibration.tcp_t_left_ir.matrix, np.eye(4))
@@ -67,3 +71,11 @@ def test_hand_eye_rejects_wrong_frame_convention(tmp_path: Path) -> None:
 def test_hand_eye_requires_configured_path() -> None:
     with pytest.raises(HandEyeCalibrationError, match="not configured"):
         load_hand_eye_calibration(HandEyeConfig())
+
+
+def test_hand_eye_requires_observable_motion_metrics(tmp_path: Path) -> None:
+    path = tmp_path / "hand_eye.yaml"
+    write_calibration(path, rotation_axis_diversity=0.01)
+
+    with pytest.raises(HandEyeCalibrationError, match="rotation-axis diversity"):
+        load_hand_eye_calibration(config(path))

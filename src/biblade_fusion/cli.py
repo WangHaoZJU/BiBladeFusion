@@ -15,7 +15,10 @@ from biblade_fusion.calibration import (
     fetch_cs68_kinematics,
     load_cs68_kinematics,
     load_hand_eye_calibration,
+    read_hand_eye_samples,
+    solve_hand_eye,
     write_cs68_kinematics,
+    write_hand_eye_calibration,
 )
 from biblade_fusion.core.settings import load_settings
 from biblade_fusion.devices.depth_camera import RealSenseD435i, list_realsense_devices
@@ -49,12 +52,14 @@ app = typer.Typer(
 robot_app = typer.Typer(help="Safe Elite CS68 state tools.", no_args_is_help=True)
 camera_app = typer.Typer(help="Intel RealSense D435i tools.", no_args_is_help=True)
 acquire_app = typer.Typer(help="Synchronized read-only acquisition.", no_args_is_help=True)
+calibration_app = typer.Typer(help="Offline calibration tools.", no_args_is_help=True)
 stereo_app = typer.Typer(help="Stereo inference tools.", no_args_is_help=True)
 initialize_app = typer.Typer(help="Offline initial-model construction.", no_args_is_help=True)
 plan_app = typer.Typer(help="Offline bilateral view planning.", no_args_is_help=True)
 app.add_typer(robot_app, name="robot")
 app.add_typer(camera_app, name="camera")
 app.add_typer(acquire_app, name="acquire")
+app.add_typer(calibration_app, name="calibration")
 app.add_typer(stereo_app, name="stereo")
 app.add_typer(initialize_app, name="initialize")
 app.add_typer(plan_app, name="plan")
@@ -436,6 +441,47 @@ def stereo_infer_session(
     valid_count = int(observation.result.valid_mask.sum())
     typer.echo(f"Saved calibrated stereo inference: {destination}")
     typer.echo(f"Valid depth pixels: {valid_count}/{observation.result.valid_mask.size}")
+
+
+@calibration_app.command("solve-hand-eye")
+def calibration_solve_hand_eye(
+    samples: Annotated[
+        Path,
+        typer.Option("--samples", exists=True, dir_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    method: Annotated[
+        str,
+        typer.Option(help="OpenCV method: park, tsai, horaud, andreff, or daniilidis."),
+    ] = "park",
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Solve and quality-gate eye-in-hand calibration from an offline sample set."""
+
+    try:
+        settings = load_settings(config)
+        sample_set = read_hand_eye_samples(samples)
+        solution = solve_hand_eye(sample_set, settings.hand_eye, method=method)
+        destination = write_hand_eye_calibration(output, solution)
+    except Exception as exc:
+        typer.echo(f"Hand-eye calibration failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved hand-eye calibration: {destination}")
+    typer.echo(
+        "Quality: "
+        f"translation RMSE={solution.translation_rmse_m:.6f} m, "
+        f"rotation RMSE={solution.rotation_rmse_deg:.3f} deg, "
+        f"samples={solution.sample_count}"
+    )
 
 
 @initialize_app.command("native-depth")

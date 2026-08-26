@@ -33,6 +33,13 @@ def test_stereo_inference_command_is_exposed() -> None:
     assert "infer-session" in result.stdout
 
 
+def test_hand_eye_solver_command_is_exposed() -> None:
+    result = runner.invoke(app, ["calibration", "--help"])
+
+    assert result.exit_code == 0
+    assert "solve-hand-eye" in result.stdout
+
+
 def test_plan_command_is_exposed() -> None:
     result = runner.invoke(app, ["plan", "--help"])
 

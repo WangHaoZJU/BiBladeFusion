@@ -24,12 +24,43 @@ quality:
   sample_count: <integer>
   translation_rmse_m: <metres>
   rotation_rmse_deg: <degrees>
+  rotation_span_deg: <degrees>
+  translation_span_m: <metres>
+  rotation_axis_diversity: <ratio from 0 to 1>
 ```
 
 The loader checks the rigid transform, frame names, sample count, and configured RMSE
-limits. The repository does not currently estimate hand-eye calibration; importing an
-identity transform as a placeholder is unsafe and intentionally unsupported by the
-real-data workflow.
+limits. An identity transform used as a placeholder is unsafe and intentionally
+unsupported by the real-data workflow.
+
+The offline solver consumes a fixed-target eye-in-hand sample set. For every sample,
+`base_T_tcp` comes from the synchronized Elite state and `left_ir_T_target` comes from a
+calibration-target pose estimate in the raw left infrared camera frame:
+
+```yaml
+schema_version: 1
+samples:
+  - sample_id: pose-000
+    base_T_tcp: [[...], [...], [...], [0.0, 0.0, 0.0, 1.0]]
+    left_ir_T_target: [[...], [...], [...], [0.0, 0.0, 0.0, 1.0]]
+```
+
+Solve it without connecting to any device:
+
+```bash
+uv run bbf calibration solve-hand-eye \
+  --samples data/calibrations/hand_eye_samples.yaml \
+  --config configs/local.yaml \
+  --output data/calibrations/hand_eye.yaml
+```
+
+The default Park-Martin solution is accepted only when the dataset meets sample-count,
+rotation-span, translation-span, and rotation-axis-diversity thresholds. Quality is the
+fixed-target closure RMSE: each sample reconstructs
+`base_T_target = base_T_tcp · tcp_T_left_ir · left_ir_T_target`, and those reconstructed
+target poses must agree. Calibration-target detection and sample extraction from stored
+sessions are the next pending calibration increment; manually assembled samples must
+therefore be independently checked before real motion planning.
 
 ## Controller-specific CS68 kinematics
 

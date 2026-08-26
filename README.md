@@ -6,7 +6,7 @@ system for thin-walled blades.
 The current development stage provides a Python 3.12 application, validated
 configuration, safe read-only integration with an Elite CS68 robot, synchronized raw
 stereo acquisition from an Intel RealSense D435i, reproducible session storage, a
-FoundationStereo integration boundary, a conservative single-view blade proxy,
+calibrated FoundationStereo inference path, a conservative single-view blade proxy,
 bilateral surface partitioning, and offline Elite KDL endpoint IK. Robot motion is
 disabled by default.
 
@@ -18,6 +18,14 @@ disabled by default.
 
 The bootstrap script creates the project virtual environment with `uv`, synchronizes
 the locked dependencies, and installs the local Elite CS SDK wheel.
+
+Initialize the pinned official stereo source and install its optional runtime only on a
+FoundationStereo inference machine:
+
+```bash
+git submodule update --init --recursive
+uv sync --extra foundation-stereo
+```
 
 ## Verify
 
@@ -33,6 +41,20 @@ uv run ruff check .
 checkpoint, inference dependencies, and requested CUDA device are present. The main
 project remains on Python 3.12; the upstream Python 3.11 environment is treated as a
 tested baseline, not as a hard-coded interpreter restriction.
+
+After placing the official checkpoint and its adjacent `cfg.yaml` at the configured
+paths, infer from an immutable stored session without touching hardware:
+
+```bash
+uv run bbf stereo infer-session \
+  --session data/<session> \
+  --view-id seed \
+  --config configs/local.yaml \
+  --output outputs/stereo_seed
+```
+
+The output stores rectified images, full-resolution-pixel disparity, metric depth,
+validity masks, calibration transforms, model provenance, and per-array SHA-256 values.
 
 ## Read-only acquisition
 
@@ -66,6 +88,8 @@ the blade's physical center of mass.
 
 Hand-eye input is quality-gated and must explicitly describe `tcp_T_left_ir`. See
 [calibration and frame conventions](docs/calibration.md) before processing real data.
+Current implementation status and the prioritized remaining work are tracked in the
+[development log](docs/development-log.md).
 
 ## Offline planning workflow
 

@@ -148,6 +148,9 @@ def write_initialization(
             "sample_count": hand_eye.sample_count,
             "translation_rmse_m": hand_eye.translation_rmse_m,
             "rotation_rmse_deg": hand_eye.rotation_rmse_deg,
+            "rotation_span_deg": hand_eye.rotation_span_deg,
+            "translation_span_m": hand_eye.translation_span_m,
+            "rotation_axis_diversity": hand_eye.rotation_axis_diversity,
         },
         "processing": {
             "point_cloud": point_cloud_config.model_dump(mode="json"),
@@ -229,6 +232,21 @@ def read_initialization(path: str | Path) -> StoredInitialization:
                 else None
             ),
             source_path=Path(str(hand_eye_data["source_path"])),
+            rotation_span_deg=(
+                float(hand_eye_data["rotation_span_deg"])
+                if hand_eye_data.get("rotation_span_deg") is not None
+                else None
+            ),
+            translation_span_m=(
+                float(hand_eye_data["translation_span_m"])
+                if hand_eye_data.get("translation_span_m") is not None
+                else None
+            ),
+            rotation_axis_diversity=(
+                float(hand_eye_data["rotation_axis_diversity"])
+                if hand_eye_data.get("rotation_axis_diversity") is not None
+                else None
+            ),
         )
         return StoredInitialization(observation, hand_eye, mask, metadata)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:

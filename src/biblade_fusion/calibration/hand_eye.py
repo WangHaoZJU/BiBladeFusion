@@ -26,6 +26,9 @@ class HandEyeCalibration:
     translation_rmse_m: float | None
     rotation_rmse_deg: float | None
     source_path: Path
+    rotation_span_deg: float | None = None
+    translation_span_m: float | None = None
+    rotation_axis_diversity: float | None = None
 
     def __post_init__(self) -> None:
         if self.tcp_t_left_ir.parent_frame != "tcp":
@@ -40,6 +43,15 @@ class HandEyeCalibration:
             raise ValueError("Hand-eye translation RMSE must be non-negative")
         if self.rotation_rmse_deg is not None and self.rotation_rmse_deg < 0.0:
             raise ValueError("Hand-eye rotation RMSE must be non-negative")
+        if self.rotation_span_deg is not None and self.rotation_span_deg < 0.0:
+            raise ValueError("Hand-eye rotation span must be non-negative")
+        if self.translation_span_m is not None and self.translation_span_m < 0.0:
+            raise ValueError("Hand-eye translation span must be non-negative")
+        if (
+            self.rotation_axis_diversity is not None
+            and not 0.0 <= self.rotation_axis_diversity <= 1.0
+        ):
+            raise ValueError("Hand-eye rotation-axis diversity must be in [0, 1]")
 
 
 def load_hand_eye_calibration(config: HandEyeConfig) -> HandEyeCalibration:
@@ -67,6 +79,21 @@ def load_hand_eye_calibration(config: HandEyeConfig) -> HandEyeCalibration:
         sample_count = int(quality["sample_count"]) if quality is not None else None
         translation_rmse_m = float(quality["translation_rmse_m"]) if quality is not None else None
         rotation_rmse_deg = float(quality["rotation_rmse_deg"]) if quality is not None else None
+        rotation_span_deg = (
+            float(quality["rotation_span_deg"])
+            if quality is not None and quality.get("rotation_span_deg") is not None
+            else None
+        )
+        translation_span_m = (
+            float(quality["translation_span_m"])
+            if quality is not None and quality.get("translation_span_m") is not None
+            else None
+        )
+        rotation_axis_diversity = (
+            float(quality["rotation_axis_diversity"])
+            if quality is not None and quality.get("rotation_axis_diversity") is not None
+            else None
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise HandEyeCalibrationError(f"Hand-eye calibration fields are invalid: {exc}") from exc
 
@@ -80,6 +107,9 @@ def load_hand_eye_calibration(config: HandEyeConfig) -> HandEyeCalibration:
             translation_rmse_m=translation_rmse_m,
             rotation_rmse_deg=rotation_rmse_deg,
             source_path=path.resolve(),
+            rotation_span_deg=rotation_span_deg,
+            translation_span_m=translation_span_m,
+            rotation_axis_diversity=rotation_axis_diversity,
         )
     except ValueError as exc:
         raise HandEyeCalibrationError(str(exc)) from exc
@@ -91,6 +121,15 @@ def load_hand_eye_calibration(config: HandEyeConfig) -> HandEyeCalibration:
     )
     if config.require_quality_metrics and any(value is None for value in metrics):
         raise HandEyeCalibrationError("Hand-eye quality metrics are required")
+    observability_metrics = (
+        calibration.rotation_span_deg,
+        calibration.translation_span_m,
+        calibration.rotation_axis_diversity,
+    )
+    if config.require_observability_metrics and any(
+        value is None for value in observability_metrics
+    ):
+        raise HandEyeCalibrationError("Hand-eye observability metrics are required")
     if calibration.sample_count is not None and calibration.sample_count < config.minimum_samples:
         raise HandEyeCalibrationError(
             f"Hand-eye sample count {calibration.sample_count} is below {config.minimum_samples}"
@@ -110,5 +149,30 @@ def load_hand_eye_calibration(config: HandEyeConfig) -> HandEyeCalibration:
         raise HandEyeCalibrationError(
             f"Hand-eye rotation RMSE {calibration.rotation_rmse_deg:.3f} deg exceeds "
             f"{config.maximum_rotation_rmse_deg:.3f} deg"
+        )
+    if (
+        calibration.rotation_span_deg is not None
+        and calibration.rotation_span_deg < config.minimum_rotation_span_deg
+    ):
+        raise HandEyeCalibrationError(
+            f"Hand-eye rotation span {calibration.rotation_span_deg:.3f} deg is below "
+            f"{config.minimum_rotation_span_deg:.3f} deg"
+        )
+    if (
+        calibration.translation_span_m is not None
+        and calibration.translation_span_m < config.minimum_translation_span_m
+    ):
+        raise HandEyeCalibrationError(
+            f"Hand-eye translation span {calibration.translation_span_m:.6f} m is below "
+            f"{config.minimum_translation_span_m:.6f} m"
+        )
+    if (
+        calibration.rotation_axis_diversity is not None
+        and calibration.rotation_axis_diversity < config.minimum_rotation_axis_diversity
+    ):
+        raise HandEyeCalibrationError(
+            "Hand-eye rotation-axis diversity "
+            f"{calibration.rotation_axis_diversity:.4f} is below "
+            f"{config.minimum_rotation_axis_diversity:.4f}"
         )
     return calibration

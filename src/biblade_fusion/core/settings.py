@@ -137,7 +137,11 @@ class HandEyeConfig(BaseModel):
     minimum_samples: int = Field(default=15, ge=3)
     maximum_translation_rmse_m: float = Field(default=0.002, gt=0.0)
     maximum_rotation_rmse_deg: float = Field(default=0.5, gt=0.0)
+    minimum_rotation_span_deg: float = Field(default=20.0, gt=0.0, le=180.0)
+    minimum_translation_span_m: float = Field(default=0.03, gt=0.0)
+    minimum_rotation_axis_diversity: float = Field(default=0.1, gt=0.0, le=1.0)
     require_quality_metrics: bool = True
+    require_observability_metrics: bool = True
 
 
 class ViewPlanningConfig(BaseModel):
