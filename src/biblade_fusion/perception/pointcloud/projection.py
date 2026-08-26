@@ -36,23 +36,14 @@ def _is_rectified(intrinsics: CameraIntrinsics) -> bool:
     return model in {"none", "distortion_none"} or not any(intrinsics.distortion_coefficients)
 
 
-def depth_image_to_point_cloud(
+def _select_depth_samples(
     depth_m: ArrayLike,
     intrinsics: CameraIntrinsics,
     config: PointCloudConfig,
-    *,
-    frame: str,
-    valid_mask: ArrayLike | None = None,
-) -> PointCloud:
-    """Back-project rectified axial depth into camera-frame metric points."""
-
+    valid_mask: ArrayLike | None,
+) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.float64]]:
     if config.maximum_depth_m <= config.minimum_depth_m:
         raise DepthProjectionError("maximum_depth_m must exceed minimum_depth_m")
-    if not _is_rectified(intrinsics):
-        raise DepthProjectionError(
-            f"Pinhole projection requires rectified intrinsics; got {intrinsics.distortion_model}"
-        )
-
     depth = np.asarray(depth_m, dtype=np.float64)
     expected_shape = (intrinsics.height, intrinsics.width)
     if depth.shape != expected_shape:
@@ -67,8 +58,7 @@ def depth_image_to_point_cloud(
         valid &= supplied_mask
 
     stride = config.pixel_stride
-    sampled_valid = valid[::stride, ::stride]
-    sampled_v, sampled_u = np.nonzero(sampled_valid)
+    sampled_v, sampled_u = np.nonzero(valid[::stride, ::stride])
     v = sampled_v * stride
     u = sampled_u * stride
     if u.size < config.minimum_valid_points:
@@ -76,8 +66,26 @@ def depth_image_to_point_cloud(
             f"Depth image has {u.size} usable points; "
             f"at least {config.minimum_valid_points} are required"
         )
+    return u, v, depth[v, u]
 
-    z = depth[v, u]
+
+def depth_image_to_point_cloud(
+    depth_m: ArrayLike,
+    intrinsics: CameraIntrinsics,
+    config: PointCloudConfig,
+    *,
+    frame: str,
+    valid_mask: ArrayLike | None = None,
+) -> PointCloud:
+    """Back-project rectified axial depth into camera-frame metric points."""
+
+    if not _is_rectified(intrinsics):
+        raise DepthProjectionError(
+            f"Pinhole projection requires rectified intrinsics; got {intrinsics.distortion_model}"
+        )
+
+    expected_shape = (intrinsics.height, intrinsics.width)
+    u, v, z = _select_depth_samples(depth_m, intrinsics, config, valid_mask)
     x = (u.astype(np.float64) - intrinsics.cx) * z / intrinsics.fx
     y = (v.astype(np.float64) - intrinsics.cy) * z / intrinsics.fy
     points = np.column_stack((x, y, z))
