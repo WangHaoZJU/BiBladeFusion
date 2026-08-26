@@ -2,6 +2,8 @@
 .uv-cache/
 dist/
 .pytest_cache/
+.coverage
+htmlcov/
 .ruff_cache/
 __pycache__/
 *.py[cod]
