@@ -42,6 +42,7 @@ from biblade_fusion.storage import (
     SessionWriter,
     read_coverage_driven_plan,
     read_coverage_ledger,
+    read_depth_aggregate,
     read_depth_comparison,
     read_initialization,
     read_reconstructed_view,
@@ -49,6 +50,7 @@ from biblade_fusion.storage import (
     read_view_plan,
     write_coverage_driven_plan,
     write_coverage_ledger,
+    write_depth_aggregate,
     write_depth_comparison,
     write_initialization,
     write_reconstructed_view,
@@ -1102,6 +1104,33 @@ def evaluate_depth_pair(
         f"MAE: {metrics.mean_absolute_error_m * 1000.0:.3f} mm; "
         f"RMSE: {metrics.root_mean_square_error_m * 1000.0:.3f} mm; "
         f"P95: {metrics.p95_absolute_error_m * 1000.0:.3f} mm"
+    )
+    typer.echo("Native RealSense depth is a comparison reference, not ground truth")
+
+
+@evaluate_app.command("aggregate-depth")
+def evaluate_aggregate_depth(
+    manifest: Annotated[
+        Path,
+        typer.Option("--manifest", exists=True, dir_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+) -> None:
+    """Aggregate paired comparisons while retaining side and incidence strata."""
+
+    try:
+        destination = write_depth_aggregate(output, manifest)
+        stored = read_depth_aggregate(destination)
+    except Exception as exc:
+        typer.echo(f"Depth aggregation failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    overall = next(group for group in stored.report.groups if group.group_id == "all")
+    typer.echo(f"Saved stratified depth aggregate: {destination}")
+    typer.echo(
+        f"Views: {overall.metrics.view_count}; "
+        f"shared pixels: {overall.metrics.overlap_pixel_count}; "
+        f"view-mean MAE: {overall.metrics.view_mean_absolute_error_m * 1000.0:.3f} mm; "
+        f"pooled MAE: {overall.metrics.pooled_mean_absolute_error_m * 1000.0:.3f} mm"
     )
     typer.echo("Native RealSense depth is a comparison reference, not ground truth")
 

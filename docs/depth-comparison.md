@@ -55,3 +55,37 @@ front and back views separately before pooling them because incidence, edge occl
 infrared texture, and material response can differ by side. A method with lower error on
 the shared subset but much lower valid-pixel coverage is not unconditionally better.
 Likewise, paired agreement cannot detect a bias shared by both depth methods.
+
+## Stratified aggregation
+
+Create a version-controlled YAML manifest. Side and incidence are explicit experimental
+labels; do not infer them from an arbitrary filename. Until the acquisition executor
+records achieved poses, compute incidence from the calibrated camera pose and the fixed
+proxy normal, and retain that calculation in the experiment notebook.
+
+```yaml
+schema_version: 1
+incidence_bin_edges_deg: [0, 15, 30, 45, 60, 75, 90]
+comparisons:
+  - artifact: ../outputs/depth_comparison_front_000
+    side: front
+    incidence_angle_deg: 4.2
+  - artifact: ../outputs/depth_comparison_back_000
+    side: back
+    incidence_angle_deg: 5.1
+```
+
+Paths are resolved relative to the manifest. Generate the aggregate with:
+
+```bash
+uv run bbf evaluate aggregate-depth \
+  --manifest experiments/depth_comparison.yaml \
+  --output outputs/depth_aggregate
+```
+
+The report always contains an overall group and preserves every populated side and
+incidence bin. It reports both view-balanced averages and pixel-pooled errors because
+the latter can be dominated by a small number of high-resolution/high-coverage views.
+Duplicate physical source frames and mixed agreement thresholds are rejected. The
+aggregate cryptographically binds its manifest and comparison metadata, then reopens
+and re-evaluates every source whenever it is read.

@@ -71,6 +71,7 @@ def test_evaluation_command_is_exposed() -> None:
 
     assert result.exit_code == 0
     assert "depth-pair" in result.stdout
+    assert "aggregate-depth" in result.stdout
 
 
 def test_robot_kinematics_export_is_exposed() -> None:

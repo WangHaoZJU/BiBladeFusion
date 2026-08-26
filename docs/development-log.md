@@ -48,13 +48,15 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Calibrated paired native/stereo depth comparison in `left_rectified`, including
   z-buffered native reprojection, shared-valid-pixel metrics, checksummed arrays, source
   verification, and explicit non-ground-truth interpretation.
-- Current verification: 112 tests and Ruff pass. Through commit `31707d6`, all prior
-  commits, package build, and Elite SDK import were verified and pushed to GitHub `main`.
+- Manifest-driven depth aggregation with duplicate-frame rejection, view-balanced and
+  pixel-pooled metrics, plus retained front/back and incidence-angle strata.
+- Current verification: 115 tests and Ruff pass. Through commit `202b7e7`, all prior
+  commits, package build, and Elite SDK import were verified and pushed.
 
 ## In progress
 
-- Add aggregation across paired depth artifacts, retaining front/back and incidence
-  strata instead of hiding view-dependent behavior in one pooled metric.
+- Add checksums to legacy initialization artifacts so all downstream planning and
+  experimental provenance has consistent tamper detection.
 
 ## Pending, in priority order
 

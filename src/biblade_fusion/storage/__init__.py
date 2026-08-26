@@ -10,6 +10,11 @@ from biblade_fusion.storage.coverage_plan import (
     read_coverage_driven_plan,
     write_coverage_driven_plan,
 )
+from biblade_fusion.storage.depth_aggregate import (
+    StoredDepthAggregate,
+    read_depth_aggregate,
+    write_depth_aggregate,
+)
 from biblade_fusion.storage.depth_comparison import (
     StoredDepthComparison,
     read_depth_comparison,
@@ -49,6 +54,7 @@ __all__ = [
     "StoredCoverageLedger",
     "StoredCoverageDrivenPlan",
     "StoredDepthComparison",
+    "StoredDepthAggregate",
     "StoredInitialization",
     "StoredReconstructedBladeView",
     "StoredStereoInference",
@@ -57,6 +63,7 @@ __all__ = [
     "read_initialization",
     "read_coverage_driven_plan",
     "read_depth_comparison",
+    "read_depth_aggregate",
     "read_reconstructed_view",
     "read_coverage_ledger",
     "read_stereo_inference",
@@ -64,6 +71,7 @@ __all__ = [
     "write_initialization",
     "write_coverage_driven_plan",
     "write_depth_comparison",
+    "write_depth_aggregate",
     "write_reconstructed_view",
     "write_coverage_ledger",
     "write_stereo_inference",

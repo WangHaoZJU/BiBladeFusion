@@ -1,5 +1,13 @@
 """Auditable end-to-end project workflows."""
 
+from biblade_fusion.workflows.depth_aggregation import (
+    DepthAggregateGroup,
+    DepthAggregateMetrics,
+    DepthAggregateReport,
+    DepthAggregationError,
+    LabeledDepthComparison,
+    aggregate_depth_comparisons,
+)
 from biblade_fusion.workflows.depth_evaluation import (
     DepthComparisonError,
     DepthComparisonMetrics,
@@ -36,6 +44,12 @@ __all__ = [
     "DepthComparisonMetrics",
     "PairedDepthComparison",
     "compare_paired_depth",
+    "DepthAggregateGroup",
+    "DepthAggregateMetrics",
+    "DepthAggregateReport",
+    "DepthAggregationError",
+    "LabeledDepthComparison",
+    "aggregate_depth_comparisons",
     "InitialObservation",
     "HandEyeExtractionResult",
     "InitializationError",

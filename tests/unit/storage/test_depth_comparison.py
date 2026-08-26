@@ -21,7 +21,9 @@ from biblade_fusion.devices.robot import RobotState
 from biblade_fusion.perception.stereo import StereoRectifier, StereoResult
 from biblade_fusion.storage import (
     SessionWriter,
+    read_depth_aggregate,
     read_depth_comparison,
+    write_depth_aggregate,
     write_depth_comparison,
     write_stereo_inference,
 )
@@ -141,3 +143,35 @@ def test_depth_comparison_artifact_round_trip_and_checksum(tmp_path: Path) -> No
     )
     with pytest.raises(ValueError, match="checksum mismatch"):
         read_depth_comparison(output)
+
+
+def test_depth_aggregate_manifest_round_trip(tmp_path: Path) -> None:
+    session, stereo, mask, comparison, point_config, comparison_config = _sources(
+        tmp_path
+    )
+    comparison_path = write_depth_comparison(
+        tmp_path / "comparison",
+        comparison,
+        point_config,
+        comparison_config,
+        source_session=session,
+        source_stereo_inference=stereo,
+        source_blade_mask=mask,
+    )
+    manifest = tmp_path / "aggregate.yaml"
+    manifest.write_text(
+        "schema_version: 1\n"
+        "incidence_bin_edges_deg: [0, 15, 30, 90]\n"
+        "comparisons:\n"
+        f"  - artifact: {comparison_path}\n"
+        "    side: front\n"
+        "    incidence_angle_deg: 5\n",
+        encoding="utf-8",
+    )
+    output = write_depth_aggregate(tmp_path / "aggregate", manifest)
+
+    stored = read_depth_aggregate(output)
+
+    groups = {group.group_id for group in stored.report.groups}
+    assert groups == {"all", "side:front", "incidence:[0,15]deg"}
+    assert "weight views equally" in stored.metadata["interpretation"]
