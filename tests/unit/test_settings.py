@@ -13,6 +13,7 @@ def test_default_settings_load_safely() -> None:
     assert settings.robot.motion_enabled is False
     assert settings.thermal.enabled is False
     assert settings.realsense.infrared_width == 1280
+    assert settings.acquisition.max_bracket_ms == 250.0
 
 
 def test_unknown_configuration_key_is_rejected() -> None:

@@ -24,3 +24,9 @@ realsense:
 thermal:
   enabled: false
   driver: null
+
+acquisition:
+  max_bracket_ms: 250.0
+  max_joint_delta_rad: 0.001
+  max_tcp_translation_delta_m: 0.0005
+  max_tcp_rotation_delta_rad: 0.001

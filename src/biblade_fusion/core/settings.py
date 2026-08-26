@@ -56,6 +56,15 @@ class ThermalConfig(BaseModel):
     driver: str | None = None
 
 
+class AcquisitionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_bracket_ms: float = Field(default=250.0, gt=0.0)
+    max_joint_delta_rad: float = Field(default=0.001, ge=0.0)
+    max_tcp_translation_delta_m: float = Field(default=0.0005, ge=0.0)
+    max_tcp_rotation_delta_rad: float = Field(default=0.001, ge=0.0)
+
+
 class AppSettings(BaseModel):
     """Top-level BiBladeFusion settings."""
 
@@ -65,6 +74,7 @@ class AppSettings(BaseModel):
     robot: RobotConfig
     realsense: RealSenseConfig
     thermal: ThermalConfig
+    acquisition: AcquisitionConfig = AcquisitionConfig()
 
 
 def load_settings(path: str | Path) -> AppSettings:
