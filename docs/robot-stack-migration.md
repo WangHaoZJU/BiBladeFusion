@@ -69,15 +69,15 @@ license and attribution.
    provenance checks.
 2. **Complete:** align robot state and command conversion with the HoloRobot Elite path.
 3. **Complete:** resolve copied CS68 URDF/STL/limits and cross-check FK fixtures.
-4. **Partially complete:** HoloRobot Pinocchio/FCL self-collision is implemented;
-   workcell environment collision still uses the legacy conservative capsule prefilter.
-5. **Partially complete:** ordered endpoint-feasible view sequences now produce an
-   immutable, source-bound, re-derived mesh-collision and ServoJ preflight artifact.
-   Camera/tool motion-goal conversion and sequence cost optimization remain.
+4. **Complete for the configured workcell:** HoloRobot Pinocchio/FCL checks CS68/D435i
+   self-collision and clearance-expanded AABB workcell obstacles. Voxel occupancy is a
+   future extension for unmodeled or changing objects.
+5. **Complete:** ordered endpoint-feasible view sequences produce immutable,
+   source-bound, re-derived tool goals, mesh collision evidence, velocity-limited
+   ServoJ trajectories, and motion-cost summaries.
 6. **Library layer complete:** guarded execution is behind default-off configuration,
    exact hash confirmation, expiring one-shot permits, and live revalidation. No motion
-   CLI is exposed before the remaining step-5 work and supervised hardware acceptance
-   are complete.
+   CLI is exposed before supervised hardware acceptance is complete.
 7. Remove superseded MDH/capsule code only after artifact compatibility and regression
    tests cover existing offline workflows.
 

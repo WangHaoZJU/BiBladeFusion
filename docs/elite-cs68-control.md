@@ -40,9 +40,9 @@ procedure are complete.
 
 ## Known limitations
 
-- The current Pinocchio/FCL backend covers CS68 and D435i-mount self-collision. Existing
-  capsule/workcell validation remains the environment-collision prefilter until the
-  workcell is migrated to HoloRobot occupancy or primitive/hybrid geometry.
+- The current Pinocchio/FCL backend covers CS68/D435i self-collision and configured
+  clearance-expanded AABB workcell obstacles. A voxel occupancy backend is not yet
+  available for unmodeled or changing objects.
 - Elite's copied public joint-limit profile has velocity limits but marks acceleration
   limits unavailable. Preflight therefore records `acceleration_limits_unavailable`.
 - Unit tests use SDK doubles and never connect to hardware, power on a controller,

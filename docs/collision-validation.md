@@ -67,3 +67,20 @@ or the controller's time-parameterized trajectory. Before any future execution f
 the measured capsule model must be validated against CS68/workcell CAD and the final
 controller trajectory must pass a higher-fidelity continuous collision and dynamics
 check. A collision-free report always retains `motion_authorized: false`.
+
+## HoloRobot mesh motion preflight
+
+`bbf safety preflight-path` is the higher-fidelity successor for motion preparation. It
+uses the copied HoloRobot CS68 collision STL meshes, the D435i wrist-mount mesh, and
+Pinocchio/hpp-fcl. Configured `collision.obstacles` become clearance-expanded FCL boxes
+in the robot `base` frame and are paired against every robot geometry. A required but
+empty obstacle list is blocking.
+
+For each ordered leg, this preflight records the calibrated `base_T_tcp` goal, samples
+joint motion by `motion_preflight.maximum_joint_step_rad`, generates a velocity-limited
+ServoJ stream, and reports estimated duration and joint-travel cost. The output binds
+the view plan and initialization by SHA-256 and fully re-derives the report when read.
+
+The original `validate-path` artifact remains for compatibility and for comparing the
+conservative capsule model with the mesh model. Neither command connects to hardware or
+authorizes execution.
