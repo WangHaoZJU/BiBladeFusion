@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import time
 from importlib import import_module
-from pathlib import Path
 from threading import RLock
 from types import ModuleType
 from typing import Any
@@ -22,6 +21,15 @@ from biblade_fusion.devices.robot.errors import (
     RobotConfigurationError,
     RobotConnectionError,
     RobotNotConnectedError,
+)
+
+_READ_ONLY_OUTPUT_RECIPE: tuple[str, ...] = (
+    "timestamp",
+    "actual_joint_positions",
+    "actual_TCP_pose",
+    "robot_mode",
+    "safety_status",
+    "speed_scaling",
 )
 
 
@@ -61,11 +69,10 @@ class EliteReadOnlyRobot:
                 raise RobotConfigurationError("robot.robot_ip must be configured")
 
             sdk = self._sdk_module or import_module("elite_cs_sdk")
-            resource_dir = Path(__file__).resolve().parent / "resources"
             rtsi = sdk.RtsiIOInterface(
-                str(resource_dir / "output_recipe.txt"),
-                str(resource_dir / "input_recipe.txt"),
-                self._config.rtsi_frequency_hz,
+                output_recipe=list(_READ_ONLY_OUTPUT_RECIPE),
+                input_recipe=(),
+                frequency=self._config.rtsi_frequency_hz,
             )
             if not rtsi.connect(self._config.robot_ip):
                 try:

@@ -18,6 +18,9 @@ authoritative fine-grained record; this page records the experiment-facing state
 
 ## Completed and verified
 
+- ES68 read-only hardware bring-up now follows HoloRobot's RTSI ownership contract:
+  the status adapter subscribes to an explicit output-variable list and passes an empty
+  input recipe, so observation cannot claim speed-slider or I/O write channels.
 - Added a HoloRobot-style, manifest-driven ES68+D435i articulated collision template.
   It reserves independent STL slots for all seven collision links and the flange-mounted
   camera/bracket assembly, records units and transforms explicitly, materializes the

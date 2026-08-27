@@ -1,4 +1,3 @@
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,9 +14,22 @@ from biblade_fusion.devices.robot.errors import (
 class FakeRtsi:
     disconnected = False
 
-    def __init__(self, output_recipe: str, input_recipe: str, frequency: float) -> None:
-        assert Path(output_recipe).is_file()
-        assert Path(input_recipe).is_file()
+    def __init__(
+        self,
+        *,
+        output_recipe: list[str],
+        input_recipe: tuple[()],
+        frequency: float,
+    ) -> None:
+        assert output_recipe == [
+            "timestamp",
+            "actual_joint_positions",
+            "actual_TCP_pose",
+            "robot_mode",
+            "safety_status",
+            "speed_scaling",
+        ]
+        assert input_recipe == ()
         assert frequency == 125.0
 
     def connect(self, ip: str) -> bool:
@@ -51,7 +63,7 @@ class FakeRtsi:
 def make_config(robot_ip: str | None) -> RobotConfig:
     return RobotConfig(
         robot_ip=robot_ip,
-        sdk_wheel=Path("/tmp/elite.whl"),
+        sdk_wheel="/tmp/elite.whl",
     )
 
 
