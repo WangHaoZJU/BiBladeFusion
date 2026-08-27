@@ -19,11 +19,14 @@ authoritative fine-grained record; this page records the experiment-facing state
 ## Completed and verified
 
 - D435i IR stereo calibration now separates responsive raw acquisition from offline
-  ChArUco detection and solving. Every launch creates a unique append-only asset session;
+  ChArUco detection and solving. Every operator-started run creates a unique append-only
+  asset session;
   it records the copied board definition, device identity, synchronized frame provenance,
   raw pairs, detection overlays and accept/reject reasons, analysis attempts and final
   calibration under a SHA-256-bound manifest. The preview retains only the latest frame
   rather than accumulating GUI events, and completed sessions reject further writes.
+  The GUI starts idle; only an explicit operator click on **开始** connects the camera,
+  creates the session and starts sample statistics at zero.
 - ES68 read-only hardware bring-up now follows HoloRobot's RTSI ownership contract:
   the status adapter subscribes to an explicit output-variable list and passes an empty
   input recipe, so observation cannot claim speed-slider or I/O write channels.

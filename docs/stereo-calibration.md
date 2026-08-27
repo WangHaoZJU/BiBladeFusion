@@ -19,8 +19,11 @@ Install the optional desktop dependency and launch the application:
 ```
 
 `--output` is an asset collection root, not one overwriteable result directory. Every
-launch creates a unique UTC-named session below it. The GUI preview intentionally does
-not run corner detection. Place the board, hold it still, and click **保存最新同步原始双目帧**.
+GUI launch initially opens an idle window: it does not connect the camera, create a
+session or count samples until the operator clicks **开始**. That action creates a unique
+UTC-named session below the collection root and starts the count at zero. The preview
+intentionally does not run corner detection. Place the board, hold it still, and click
+**保存最新同步原始双目帧**.
 Collect 50 to 60 raw poses near the image center, four corners and four edges, at
 multiple distances, with substantial pitch, yaw, and roll. Avoid consecutive nearly
 identical poses. When finished, choose a model and click the offline detection, Zhang

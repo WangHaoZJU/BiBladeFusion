@@ -134,23 +134,20 @@ def launch_stereo_calibration_gui(
     )
 
     StereoCharucoBoard.read(target_path)
-    mailbox = LatestStereoFrameMailbox()
-    session = StereoCalibrationAssetSession.create(
-        output_dir,
-        target_path=target_path,
-        image_size=(realsense_config.infrared_width, realsense_config.infrared_height),
-        frames_per_second=realsense_config.frames_per_second,
-        serial_number=realsense_config.serial_number,
-        emitter_enabled=realsense_config.infrared_emitter_enabled,
-    )
 
     class CaptureWorker(QObject):
         frame_available = Signal()
         failed = Signal(str)
         finished = Signal()
 
-        def __init__(self) -> None:
+        def __init__(
+            self,
+            session: StereoCalibrationAssetSession,
+            mailbox: LatestStereoFrameMailbox,
+        ) -> None:
             super().__init__()
+            self.session = session
+            self.mailbox = mailbox
             self.stop_requested = threading.Event()
             self.camera = RawD435iInfraredCapture(realsense_config)
 
@@ -158,13 +155,13 @@ def launch_stereo_calibration_gui(
         def run(self) -> None:
             try:
                 self.camera.open()
-                session.record_device_info(self.camera.device_info)
+                self.session.record_device_info(self.camera.device_info)
                 while not self.stop_requested.is_set():
                     frame = self.camera.capture()
-                    if mailbox.publish(frame):
+                    if self.mailbox.publish(frame):
                         self.frame_available.emit()
             except Exception as exc:
-                session.mark_capture_failed(str(exc))
+                self.session.mark_capture_failed(str(exc))
                 self.failed.emit(str(exc))
             finally:
                 self.camera.close()
@@ -178,8 +175,14 @@ def launch_stereo_calibration_gui(
         failed = Signal(str)
         finished = Signal()
 
-        def __init__(self, minimum_samples: int, selected_model: str) -> None:
+        def __init__(
+            self,
+            session: StereoCalibrationAssetSession,
+            minimum_samples: int,
+            selected_model: str,
+        ) -> None:
             super().__init__()
+            self.session = session
             self.minimum_samples = minimum_samples
             self.selected_model = selected_model
 
@@ -187,7 +190,7 @@ def launch_stereo_calibration_gui(
         def run(self) -> None:
             try:
                 _detection_run, result, output = solve_stereo_asset_session(
-                    session,
+                    self.session,
                     minimum_samples=self.minimum_samples,
                     distortion_model=self.selected_model,
                 )
@@ -198,16 +201,19 @@ def launch_stereo_calibration_gui(
                 self.finished.emit()
 
     class Window(QMainWindow):
-        def __init__(self, capture_worker: CaptureWorker) -> None:
+        def __init__(self) -> None:
             super().__init__()
-            self.capture_worker = capture_worker
             self.setWindowTitle("BiBladeFusion · D435i IR Stereo ChArUco Calibration")
             self.resize(1500, 760)
+            self.session: StereoCalibrationAssetSession | None = None
+            self.mailbox: LatestStereoFrameMailbox | None = None
+            self.capture_thread: QThread | None = None
+            self.capture_worker: CaptureWorker | None = None
             self.result: SolvedStereoCalibration | None = None
             self.analysis_thread: QThread | None = None
             self.analysis_worker: AnalysisWorker | None = None
-            self.left_label = QLabel("Waiting for left IR")
-            self.right_label = QLabel("Waiting for right IR")
+            self.left_label = QLabel("点击“开始”后连接左红外相机")
+            self.right_label = QLabel("点击“开始”后连接右红外相机")
             for label in (self.left_label, self.right_label):
                 label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 label.setMinimumSize(600, 400)
@@ -215,6 +221,8 @@ def launch_stereo_calibration_gui(
             images = QHBoxLayout()
             images.addWidget(self.left_label)
             images.addWidget(self.right_label)
+            self.start_button = QPushButton("开始")
+            self.start_button.clicked.connect(self.start_capture)
             self.capture_button = QPushButton("保存最新同步原始双目帧")
             self.capture_button.setEnabled(False)
             self.capture_button.clicked.connect(self.accept_sample)
@@ -230,6 +238,7 @@ def launch_stereo_calibration_gui(
             self.solve_button.setEnabled(False)
             self.solve_button.clicked.connect(self.start_offline_analysis)
             controls = QHBoxLayout()
+            controls.addWidget(self.start_button)
             controls.addWidget(self.capture_button)
             controls.addWidget(QLabel("最少样本数"))
             controls.addWidget(self.minimum)
@@ -243,9 +252,7 @@ def launch_stereo_calibration_gui(
             layout.addLayout(controls)
             self.setCentralWidget(central)
             self.setStatusBar(QStatusBar())
-            self.statusBar().showMessage(
-                f"资产会话：{session.root}；请覆盖中心、四角、不同距离和三轴姿态"
-            )
+            self.statusBar().showMessage("等待开始；尚未连接相机、创建会话或统计样本")
 
         @staticmethod
         def pixmap(rgb: np.ndarray, label: QLabel) -> QPixmap:
@@ -264,8 +271,49 @@ def launch_stereo_calibration_gui(
             )
 
         @Slot()
+        def start_capture(self) -> None:
+            if self.capture_thread is not None or self.analysis_thread is not None:
+                return
+            try:
+                session = StereoCalibrationAssetSession.create(
+                    output_dir,
+                    target_path=target_path,
+                    image_size=(
+                        realsense_config.infrared_width,
+                        realsense_config.infrared_height,
+                    ),
+                    frames_per_second=realsense_config.frames_per_second,
+                    serial_number=realsense_config.serial_number,
+                    emitter_enabled=realsense_config.infrared_emitter_enabled,
+                )
+            except Exception as exc:
+                QMessageBox.critical(self, "无法开始", str(exc))
+                return
+            mailbox = LatestStereoFrameMailbox()
+            thread = QThread()
+            worker = CaptureWorker(session, mailbox)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.frame_available.connect(self.on_frame_available)
+            worker.failed.connect(self.capture_failed)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(self.capture_thread_finished)
+            self.session = session
+            self.mailbox = mailbox
+            self.capture_thread = thread
+            self.capture_worker = worker
+            self.start_button.setEnabled(False)
+            self.capture_button.setEnabled(False)
+            self.solve_button.setEnabled(False)
+            self.statusBar().showMessage(f"正在连接 D435i；统计从 0 开始；资产会话：{session.root}")
+            thread.start()
+
+        @Slot()
         def on_frame_available(self) -> None:
-            frame = mailbox.take_for_preview()
+            if self.mailbox is None or self.session is None:
+                return
+            frame = self.mailbox.take_for_preview()
             if frame is None:
                 return
             self.left_label.setPixmap(
@@ -274,26 +322,53 @@ def launch_stereo_calibration_gui(
             self.right_label.setPixmap(
                 self.pixmap(_preview(frame.right, frame.right_frame_number), self.right_label)
             )
-            self.capture_button.setEnabled(True)
+            if self.analysis_thread is None and self.result is None:
+                self.capture_button.setEnabled(True)
+                self.statusBar().showMessage(
+                    f"采集中：已保存 {self.session.raw_pair_count} 组；"
+                    f"资产会话：{self.session.root}"
+                )
+
+        @Slot(str)
+        def capture_failed(self, message: str) -> None:
+            self.capture_button.setEnabled(False)
+            QMessageBox.critical(self, "D435i采集失败", message)
+
+        @Slot()
+        def capture_thread_finished(self) -> None:
+            if self.capture_thread is not None:
+                self.capture_thread.deleteLater()
+            self.capture_thread = None
+            self.capture_worker = None
+            if (
+                self.result is None
+                and self.session is not None
+                and self.session.raw_pair_count == 0
+            ):
+                self.start_button.setEnabled(True)
+                self.statusBar().showMessage("采集未开始或连接失败；可再次点击“开始”创建新会话")
 
         @Slot()
         def accept_sample(self) -> None:
-            frame = mailbox.snapshot()
+            if self.mailbox is None or self.session is None:
+                return
+            frame = self.mailbox.snapshot()
             if frame is None:
                 return
             try:
-                pair_id = session.record_pair(frame)
+                pair_id = self.session.record_pair(frame)
             except StereoCalibrationAssetError as exc:
                 self.statusBar().showMessage(str(exc))
                 return
-            self.solve_button.setEnabled(session.raw_pair_count >= self.minimum.value())
+            self.solve_button.setEnabled(self.session.raw_pair_count >= self.minimum.value())
             self.statusBar().showMessage(
-                f"已保存 {session.raw_pair_count} 组原始资产（{pair_id}）；目录：{session.root}"
+                f"已保存 {self.session.raw_pair_count} 组原始资产（{pair_id}）；"
+                f"目录：{self.session.root}"
             )
 
         @Slot()
         def start_offline_analysis(self) -> None:
-            if self.analysis_thread is not None:
+            if self.analysis_thread is not None or self.session is None:
                 return
             minimum = self.minimum.value()
             selected = str(self.distortion_model.currentData())
@@ -305,10 +380,10 @@ def launch_stereo_calibration_gui(
             self.minimum.setEnabled(False)
             self.distortion_model.setEnabled(False)
             self.statusBar().showMessage(
-                f"正在对 {session.raw_pair_count} 组原始资产进行离线检测与求解……"
+                f"正在对 {self.session.raw_pair_count} 组原始资产进行离线检测与求解……"
             )
             thread = QThread()
-            worker = AnalysisWorker(minimum, selected)
+            worker = AnalysisWorker(self.session, minimum, selected)
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
             worker.succeeded.connect(self.analysis_succeeded)
@@ -327,7 +402,8 @@ def launch_stereo_calibration_gui(
             output: str,
         ) -> None:
             self.result = result
-            self.capture_worker.request_stop()
+            if self.capture_worker is not None:
+                self.capture_worker.request_stop()
             metrics = self.result.metrics
             comparison = ""
             if self.result.model_comparison:
@@ -341,7 +417,7 @@ def launch_stereo_calibration_gui(
             QMessageBox.information(
                 self,
                 "标定完成",
-                f"资产会话: {session.root}\n"
+                f"资产会话: {self.session.root if self.session is not None else 'unknown'}\n"
                 f"配置文件: {output}\n"
                 f"选定模型: {self.result.distortion_model.value}\n"
                 f"左目 RMS: {metrics.left_monocular_rms_px:.4f} px\n"
@@ -367,15 +443,15 @@ def launch_stereo_calibration_gui(
             self.analysis_thread = None
             self.analysis_worker = None
             completed = self.result is not None
-            self.capture_button.setEnabled(not completed and mailbox.snapshot() is not None)
-            self.solve_button.setEnabled(
-                not completed and session.raw_pair_count >= self.minimum.value()
-            )
+            has_frame = self.mailbox is not None and self.mailbox.snapshot() is not None
+            pair_count = self.session.raw_pair_count if self.session is not None else 0
+            self.capture_button.setEnabled(not completed and has_frame)
+            self.solve_button.setEnabled(not completed and pair_count >= self.minimum.value())
             self.minimum.setEnabled(not completed)
             self.distortion_model.setEnabled(not completed)
             if not completed:
                 self.statusBar().showMessage(
-                    f"离线分析未完成；原始资产共 {session.raw_pair_count} 组，可补充后重试"
+                    f"离线分析未完成；原始资产共 {pair_count} 组，可补充后重试"
                 )
 
         def closeEvent(self, event: Any) -> None:
@@ -383,23 +459,19 @@ def launch_stereo_calibration_gui(
                 QMessageBox.information(self, "正在处理", "请等待离线检测与标定完成后再关闭窗口")
                 event.ignore()
                 return
-            self.capture_worker.request_stop()
-            session.mark_capture_closed()
+            if self.capture_worker is not None:
+                self.capture_worker.request_stop()
+            if self.session is not None:
+                self.session.mark_capture_closed()
             event.accept()
 
     application = QApplication.instance() or QApplication(sys.argv)
-    thread = QThread()
-    worker = CaptureWorker()
-    window = Window(worker)
-    worker.moveToThread(thread)
-    thread.started.connect(worker.run)
-    worker.frame_available.connect(window.on_frame_available)
-    worker.failed.connect(lambda message: QMessageBox.critical(window, "D435i采集失败", message))
-    worker.finished.connect(thread.quit)
-    thread.start()
+    window = Window()
     window.show()
     result = application.exec()
-    worker.request_stop()
-    thread.quit()
-    thread.wait(6000)
+    if window.capture_worker is not None:
+        window.capture_worker.request_stop()
+    if window.capture_thread is not None:
+        window.capture_thread.quit()
+        window.capture_thread.wait(6000)
     return result
