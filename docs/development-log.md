@@ -1,5 +1,12 @@
 # Development log
 
+## 2026-08-27 — native-depth validation acquisition override
+
+- Added `--emitter/--no-emitter` to synchronized `acquire snapshot` and standalone
+  `camera capture`. The override is command-scoped, leaves the hand-eye/stereo default
+  configuration unchanged, and is preserved in synchronized session configuration
+  snapshots so native-depth experiments remain reproducible.
+
 ## 2026-08-27 — Park+BA ES68/D435i hand-eye calibration closure
 
 - Rebuilt the PySide6 hand-eye application as an idle-first, operator-controlled

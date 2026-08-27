@@ -84,6 +84,20 @@ from biblade_fusion.workflows import (
     registered_cloud_view,
 )
 
+
+def _with_emitter_override(settings, emitter_enabled: bool | None):
+    """Return settings with an optional one-command RealSense emitter override."""
+
+    if emitter_enabled is None:
+        return settings
+    return settings.model_copy(
+        update={
+            "realsense": settings.realsense.model_copy(
+                update={"infrared_emitter_enabled": emitter_enabled}
+            )
+        }
+    )
+
 app = typer.Typer(
     name="bbf",
     help="BiBladeFusion development and acquisition tools.",
@@ -306,12 +320,19 @@ def camera_capture(
             readable=True,
         ),
     ] = Path("configs/default.yaml"),
+    emitter: Annotated[
+        bool | None,
+        typer.Option(
+            "--emitter/--no-emitter",
+            help="Temporarily override the D435i projector for this capture only.",
+        ),
+    ] = None,
 ) -> None:
     """Capture one synchronized raw D435i frame bundle."""
 
     import numpy as np
 
-    settings = load_settings(config)
+    settings = _with_emitter_override(load_settings(config), emitter)
     destination = output if output.suffix == ".npz" else output.with_suffix(".npz")
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -382,10 +403,17 @@ def acquire_snapshot(
         str | None,
         typer.Option("--ip", help="Temporary robot IP override."),
     ] = None,
+    emitter: Annotated[
+        bool | None,
+        typer.Option(
+            "--emitter/--no-emitter",
+            help="Temporarily override the D435i projector for this session only.",
+        ),
+    ] = None,
 ) -> None:
     """Capture one D435i frame bracketed by read-only ES68 states."""
 
-    settings = load_settings(config)
+    settings = _with_emitter_override(load_settings(config), emitter)
     if robot_ip is not None:
         settings.robot = type(settings.robot).model_validate(
             {**settings.robot.model_dump(), "robot_ip": robot_ip}

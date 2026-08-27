@@ -1,6 +1,7 @@
 from typer.testing import CliRunner
 
-from biblade_fusion.cli import app
+from biblade_fusion.cli import _with_emitter_override, app
+from biblade_fusion.core.settings import load_settings
 
 runner = CliRunner()
 
@@ -66,6 +67,24 @@ def test_reconstruction_commands_are_exposed() -> None:
     assert result.exit_code == 0
     assert "native-depth" in result.stdout
     assert "stereo-depth" in result.stdout
+
+
+def test_acquire_snapshot_exposes_temporary_emitter_override() -> None:
+    result = runner.invoke(app, ["acquire", "snapshot", "--help"])
+
+    assert result.exit_code == 0
+    assert "--emitter" in result.stdout
+    assert "--no-emitter" in result.stdout
+
+
+def test_emitter_override_does_not_mutate_loaded_settings() -> None:
+    settings = load_settings("configs/default.yaml")
+
+    overridden = _with_emitter_override(settings, True)
+
+    assert settings.realsense.infrared_emitter_enabled is False
+    assert overridden.realsense.infrared_emitter_enabled is True
+    assert _with_emitter_override(settings, None) is settings
 
 
 def test_evaluation_command_is_exposed() -> None:
