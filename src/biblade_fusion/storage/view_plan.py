@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -23,13 +24,21 @@ from biblade_fusion.planning import (
 )
 from biblade_fusion.workflows import OfflineViewPlanningResult
 
-VIEW_PLAN_SCHEMA_VERSION = 1
+VIEW_PLAN_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
 class StoredViewPlan:
     result: OfflineViewPlanningResult
     metadata: dict[str, Any]
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _candidate_payload(candidate: CandidateView) -> dict[str, Any]:
@@ -75,6 +84,7 @@ def write_view_plan(
     filter_config: ViewFilterConfig,
     *,
     source_initialization: str | Path,
+    source_kinematics: str | Path | None = None,
 ) -> Path:
     """Write an offline-only plan without overwriting an existing artifact."""
 
@@ -86,10 +96,25 @@ def write_view_plan(
     temporary.mkdir()
     geometric = result.geometric_plan
     filtered = result.filtered_plan
+    has_endpoint_solutions = bool(filtered.endpoint_feasible)
+    if has_endpoint_solutions and source_kinematics is None:
+        raise ValueError(
+            "Endpoint-feasible plans must record their controller kinematics artifact"
+        )
+    kinematics_record = None
+    if source_kinematics is not None:
+        kinematics_path = Path(source_kinematics).resolve()
+        if not kinematics_path.is_file():
+            raise ValueError(f"Kinematics source does not exist: {kinematics_path}")
+        kinematics_record = {
+            "path": str(kinematics_path),
+            "sha256": _sha256(kinematics_path),
+        }
     payload: dict[str, Any] = {
         "schema_version": VIEW_PLAN_SCHEMA_VERSION,
         "created_at_utc": datetime.now(UTC).isoformat(),
         "source_initialization": str(Path(source_initialization).resolve()),
+        "source_kinematics": kinematics_record,
         "motion_authorized": False,
         "grid": {
             "rows": geometric.rows,
@@ -155,7 +180,8 @@ def read_view_plan(path: str | Path) -> StoredViewPlan:
         payload = json.loads((root / "view_plan.json").read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise TypeError("view plan root must be an object")
-        if int(payload["schema_version"]) != VIEW_PLAN_SCHEMA_VERSION:
+        schema_version = int(payload["schema_version"])
+        if schema_version not in {1, VIEW_PLAN_SCHEMA_VERSION}:
             raise ValueError(f"unsupported schema {payload['schema_version']}")
         if payload.get("motion_authorized") is not False:
             raise ValueError("stored view plan must explicitly forbid motion")
@@ -193,6 +219,17 @@ def read_view_plan(path: str | Path) -> StoredViewPlan:
             tuple(evaluations),
             tuple(str(view_id) for view_id in payload["duplicate_view_ids"]),
         )
+        kinematics_record = payload.get("source_kinematics")
+        if kinematics_record is not None:
+            kinematics_path = Path(str(kinematics_record["path"])).resolve()
+            if _sha256(kinematics_path) != str(kinematics_record["sha256"]):
+                raise ValueError("view-plan kinematics checksum mismatch")
+        if (
+            filtered.endpoint_feasible
+            and kinematics_record is None
+            and schema_version == VIEW_PLAN_SCHEMA_VERSION
+        ):
+            raise ValueError("endpoint-feasible plan lacks kinematics provenance")
         return StoredViewPlan(OfflineViewPlanningResult(geometric, filtered), payload)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid view-plan artifact {root}: {exc}") from exc

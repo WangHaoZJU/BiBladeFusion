@@ -84,6 +84,13 @@ def _derive(
     ).resolve()
     if expected_initialization != initialization.resolve():
         raise ValueError("View plan does not belong to the supplied initialization")
+    plan_kinematics = stored_plan.metadata.get("source_kinematics")
+    if plan_kinematics is None:
+        raise ValueError(
+            "View plan lacks controller-kinematics provenance; regenerate the plan"
+        )
+    if Path(str(plan_kinematics["path"])).resolve() != kinematics.resolve():
+        raise ValueError("View plan was generated with a different kinematics artifact")
     return validate_view_sequence_collision(
         stored_plan.result.filtered_plan,
         view_ids,

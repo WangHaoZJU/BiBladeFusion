@@ -47,6 +47,10 @@ uv run bbf safety validate-path \
   --output outputs/path_validation_000
 ```
 
+View-plan schema 2 binds every endpoint-feasible joint solution to the exact
+controller-specific MDH file used by IK. The validator rejects legacy endpoint plans
+without this provenance and rejects a supplied MDH path that differs from the plan.
+
 Each leg is linearly interpolated in joint space so no sampled joint changes by more
 than `collision.maximum_joint_step_rad`. Every sample is checked against configured
 joint limits, non-adjacent self-collision, and workcell boxes with

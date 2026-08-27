@@ -62,7 +62,10 @@ authoritative fine-grained record; this page records the experiment-facing state
   validation, and immutable reports that always forbid motion.
 - `bbf doctor` collision-readiness diagnostics enumerate missing radii, tool geometry,
   joint limits, and required workcell obstacles before path validation is attempted.
-- Current verification: 129 tests and Ruff pass. Through commit `60973bf`, all prior
+- View-plan schema 2 cryptographically binds endpoint-feasible IK solutions to their
+  controller-specific MDH artifact; safety validation rejects legacy or mismatched
+  kinematics provenance while retaining schema-1 geometry-only read compatibility.
+- Current verification: 131 tests and Ruff pass. Through commit `e57bc56`, all prior
   commits, package build, and Elite SDK import were verified and pushed.
 
 ## In progress

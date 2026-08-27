@@ -102,16 +102,17 @@ def _sources(tmp_path: Path):
     )
     result = OfflineViewPlanningResult(geometric, FilteredViewPlan(evaluated, ()))
     filtering = ViewFilterConfig(camera_clearance_radius_m=0.01)
+    kinematics = write_cs68_kinematics(
+        tmp_path / "kinematics.yaml",
+        Cs68KinematicsModel(np.zeros(6), np.full(6, 0.2), np.zeros(6), "test"),
+    )
     plan = write_view_plan(
         tmp_path / "plan",
         result,
         planning,
         filtering,
         source_initialization=initialization,
-    )
-    kinematics = write_cs68_kinematics(
-        tmp_path / "kinematics.yaml",
-        Cs68KinematicsModel(np.zeros(6), np.full(6, 0.2), np.zeros(6), "test"),
+        source_kinematics=kinematics,
     )
     collision = CollisionConfig(
         link_radii_m=(0.01,) * 6,
@@ -169,4 +170,24 @@ def test_path_validation_refuses_unknown_view(tmp_path: Path) -> None:
             source_plan=plan,
             source_initialization=initialization,
             source_kinematics=kinematics,
+        )
+
+
+def test_path_validation_refuses_different_kinematics_artifact(tmp_path: Path) -> None:
+    initialization, plan, _, collision, view_id = _sources(tmp_path)
+    other_kinematics = write_cs68_kinematics(
+        tmp_path / "other_kinematics.yaml",
+        Cs68KinematicsModel(
+            np.zeros(6), np.full(6, 0.25), np.zeros(6), "different-controller"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="different kinematics"):
+        write_path_validation(
+            tmp_path / "validation",
+            (view_id,),
+            collision,
+            source_plan=plan,
+            source_initialization=initialization,
+            source_kinematics=other_kinematics,
         )

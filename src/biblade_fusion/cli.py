@@ -851,6 +851,7 @@ def plan_views(
             settings.view_planning,
             settings.view_filter,
             source_initialization=initialization,
+            source_kinematics=settings.kinematics.model_path,
         )
     except Exception as exc:
         typer.echo(f"View planning failed: {exc}", err=True)
