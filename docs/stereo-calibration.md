@@ -89,13 +89,19 @@ The GUI provides four distortion choices:
 Automatic comparison requires at least 20 accepted observations. Model selection never
 uses the factory calibration and never relies only on training RMS.
 
-To use the completed result for normal capture and FoundationStereo rectification, add
-the actual session/result path to the local application configuration:
+After a successful solve, the program automatically verifies and atomically publishes
+the result to the fixed runtime path used by later workflows:
 
 ```yaml
 realsense:
-  stereo_calibration_path: data/calibrations/d435i_ir_20260827/session_.../analyses/analysis_001/result/d435i_ir_stereo_calibration.yaml
+  stereo_calibration_path: data/calibrations/d435i_ir_active.yaml
 ```
+
+The timestamped session result remains the authoritative digital asset. The fixed
+runtime copy removes manual path editing: stereo rectification, FoundationStereo,
+hand-eye capture, reconstruction and calibrated view planning load it through the
+normal application settings. If it is missing or invalid, D435i production capture
+fails closed; factory IR intrinsics/extrinsics are never used as a fallback.
 
 The loader rejects artifacts that do not explicitly record
 `factory_intrinsics_used: false` and rejects a stream resolution that differs from the

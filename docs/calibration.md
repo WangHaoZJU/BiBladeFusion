@@ -60,8 +60,10 @@ produced by the new workflow.
 
 ### Live capture
 
-First generate the raw IR stereo YAML with `bbf calibration stereo-gui`. Then set these
-values in a Git-ignored local config:
+First generate the raw IR stereo YAML with `bbf calibration stereo-gui`. A successful
+solve automatically publishes the verified result to
+`data/calibrations/d435i_ir_active.yaml`, which the default configuration already uses.
+Only machine-specific robot addresses need to be set in a Git-ignored local config:
 
 ```yaml
 robot:
@@ -69,7 +71,7 @@ robot:
   robot_ip: <ES68 address>
 realsense:
   serial_number: <D435i serial>
-  stereo_calibration_path: data/calibrations/d435i_ir_stereo_calibration.yaml
+  stereo_calibration_path: data/calibrations/d435i_ir_active.yaml
   infrared_emitter_enabled: false
 ```
 

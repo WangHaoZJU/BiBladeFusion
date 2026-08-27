@@ -35,6 +35,7 @@ from biblade_fusion.calibration.stereo_assets import (
     StereoCalibrationAssetError,
     StereoCalibrationAssetSession,
     StereoDetectionRun,
+    publish_runtime_stereo_calibration,
     solve_stereo_asset_session,
 )
 from biblade_fusion.calibration.stereo_charuco import (
@@ -66,6 +67,7 @@ __all__ = [
     "StereoCalibrationAssetError",
     "StereoCalibrationAssetSession",
     "StereoDetectionRun",
+    "publish_runtime_stereo_calibration",
     "solve_stereo_asset_session",
     "CharucoDetection",
     "CharucoDetectionError",

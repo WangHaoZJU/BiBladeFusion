@@ -1,8 +1,12 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
+import yaml
 
 from biblade_fusion.core.settings import RealSenseConfig
+from biblade_fusion.devices.depth_camera.errors import DepthCameraConnectionError
 from biblade_fusion.devices.depth_camera.realsense_d435i import RealSenseD435i
 
 
@@ -44,6 +48,12 @@ class FakeVideoProfile:
 
     def as_video_stream_profile(self):
         return self
+
+    def width(self):
+        return 4
+
+    def height(self):
+        return 3
 
     def get_intrinsics(self):
         return SimpleNamespace(
@@ -125,13 +135,38 @@ class FakeRs:
         return FakeConfig()
 
 
-def test_realsense_capture_returns_calibrated_stereo_bundle() -> None:
+def _write_user_stereo_calibration(path: Path) -> Path:
+    intrinsics = {
+        "width": 4,
+        "height": 3,
+        "camera_matrix": [[100.0, 0.0, 2.0], [0.0, 101.0, 1.5], [0.0, 0.0, 1.0]],
+        "opencv_distortion_model": "brown_conrady",
+        "distortion_coefficients": [0.0, 0.0, 0.0, 0.0, 0.0],
+    }
+    payload = {
+        "calibration_type": "d435i_ir_stereo_charuco",
+        "factory_intrinsics_used": False,
+        "left_ir": intrinsics,
+        "right_ir": intrinsics,
+        "right_ir_T_left_ir": [
+            [1.0, 0.0, 0.0, -0.05],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+    }
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    return path
+
+
+def test_realsense_capture_returns_user_calibrated_stereo_bundle(tmp_path: Path) -> None:
     fake_rs = FakeRs()
     config = RealSenseConfig(
         infrared_width=4,
         infrared_height=3,
         warmup_frames=0,
         enable_native_depth=True,
+        stereo_calibration_path=_write_user_stereo_calibration(tmp_path / "stereo.yaml"),
     )
     camera = RealSenseD435i(config, rs_module=fake_rs)
 
@@ -146,10 +181,23 @@ def test_realsense_capture_returns_calibrated_stereo_bundle() -> None:
         assert frame.calibration.left_t_depth is not None
         np.testing.assert_allclose(frame.calibration.left_t_depth.translation_m, [0.001, 0, 0])
         assert frame.calibration.baseline_m == 0.05
-        np.testing.assert_allclose(
-            frame.calibration.right_t_left.rotation,
-            [[0, -1, 0], [1, 0, 0], [0, 0, 1]],
-        )
+        np.testing.assert_allclose(frame.calibration.right_t_left.rotation, np.eye(3))
 
     assert camera.is_open is False
+    assert fake_rs.pipeline_instance.stopped is True
+
+
+def test_realsense_refuses_factory_ir_calibration_fallback() -> None:
+    fake_rs = FakeRs()
+    config = RealSenseConfig(
+        infrared_width=4,
+        infrared_height=3,
+        warmup_frames=0,
+        enable_native_depth=True,
+        stereo_calibration_path=None,
+    )
+    camera = RealSenseD435i(config, rs_module=fake_rs)
+
+    with pytest.raises(DepthCameraConnectionError, match="factory IR"):
+        camera.open()
     assert fake_rs.pipeline_instance.stopped is True

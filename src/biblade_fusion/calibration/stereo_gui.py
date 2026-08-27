@@ -193,6 +193,10 @@ def launch_stereo_calibration_gui(
                     self.session,
                     minimum_samples=self.minimum_samples,
                     distortion_model=self.selected_model,
+                    runtime_calibration_path=(
+                        realsense_config.stereo_calibration_path
+                        or Path("data/calibrations/d435i_ir_active.yaml")
+                    ),
                 )
                 self.succeeded.emit(result, str(output))
             except Exception as exc:

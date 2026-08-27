@@ -27,6 +27,13 @@ authoritative fine-grained record; this page records the experiment-facing state
   rather than accumulating GUI events, and completed sessions reject further writes.
   The GUI starts idle; only an explicit operator click on **开始** connects the camera,
   creates the session and starts sample statistics at zero.
+- A successful D435i IR solve now atomically publishes the verified result to
+  `data/calibrations/d435i_ir_active.yaml`, the fixed path used by the default runtime
+  configuration. All later calibrated capture paths therefore consume the latest
+  completed user result without manual path editing. Missing user calibration fails
+  closed; the RealSense adapter no longer falls back to factory IR intrinsics or stereo
+  extrinsics. A live D435i capture verified that the default path returned the published
+  left/right focal lengths and 49.990 mm user-calibrated baseline exactly.
 - ES68 read-only hardware bring-up now follows HoloRobot's RTSI ownership contract:
   the status adapter subscribes to an explicit output-variable list and passes an empty
   input recipe, so observation cannot claim speed-slider or I/O write channels.

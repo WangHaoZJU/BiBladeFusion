@@ -11,6 +11,7 @@ from biblade_fusion.calibration import (
     StereoCharucoSample,
     compare_and_solve_stereo_charuco,
     load_stereo_calibration,
+    publish_runtime_stereo_calibration,
     solve_stereo_charuco,
     write_stereo_calibration,
 )
@@ -71,6 +72,9 @@ def test_joint_solver_and_artifact_round_trip(tmp_path: Path) -> None:
     loaded = load_stereo_calibration(artifact)
     np.testing.assert_allclose(loaded.right_t_left.matrix, solved.calibration.right_t_left.matrix)
     assert loaded.left.fx == pytest.approx(solved.calibration.left.fx)
+    runtime = publish_runtime_stereo_calibration(artifact, tmp_path / "runtime/active.yaml")
+    assert runtime.read_bytes() == artifact.read_bytes()
+    assert load_stereo_calibration(runtime).left.fx == pytest.approx(solved.calibration.left.fx)
 
 
 @pytest.mark.parametrize(

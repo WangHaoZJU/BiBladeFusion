@@ -559,6 +559,7 @@ def calibration_stereo_solve_assets(
             assets,
             minimum_samples=minimum_samples,
             distortion_model=distortion_model,
+            runtime_calibration_path=Path("data/calibrations/d435i_ir_active.yaml"),
         )
     except Exception as exc:
         typer.echo(f"Stereo asset calibration failed: {exc}", err=True)

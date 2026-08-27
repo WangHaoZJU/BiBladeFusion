@@ -96,7 +96,9 @@ The raw left/right IR calibration path does not use D435i factory IR intrinsics 
 factory stereo extrinsics. A PySide6 application first stores latest-frame synchronized
 Y8 pairs as unique, checksummed digital-asset sessions, then performs ChArUco detection,
 independent Zhang initialization and joint stereo optimization offline. Raw pairs,
-accept/reject evidence and every calibration result remain traceable and non-overwriting. See
+accept/reject evidence and every calibration result remain traceable and non-overwriting.
+The verified result is automatically published to the fixed runtime path consumed by
+later workflows; missing user calibration fails closed without factory IR fallback. See
 [D435i infrared stereo calibration](docs/stereo-calibration.md).
 
 ## Bilateral initialization

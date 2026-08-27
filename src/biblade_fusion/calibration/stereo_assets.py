@@ -22,6 +22,7 @@ from biblade_fusion.calibration.stereo_charuco import (
     StereoCharucoDetector,
     StereoCharucoSample,
     compare_and_solve_stereo_charuco,
+    load_stereo_calibration,
     solve_stereo_charuco,
     write_stereo_calibration,
 )
@@ -613,6 +614,7 @@ def solve_stereo_asset_session(
     *,
     minimum_samples: int,
     distortion_model: str | DistortionModel,
+    runtime_calibration_path: str | Path | None = None,
 ) -> tuple[StereoDetectionRun, SolvedStereoCalibration, Path]:
     """Run a new immutable offline detection/solution attempt for an asset session."""
 
@@ -656,9 +658,28 @@ def solve_stereo_asset_session(
             )
         output = session.solution_path(detection_run.run_id)
         write_stereo_calibration(output, result, list(detection_run.accepted_pair_ids))
+        if runtime_calibration_path is not None:
+            publish_runtime_stereo_calibration(output, runtime_calibration_path)
         session.record_solution(detection_run.run_id, output, result)
         return detection_run, result, output
     except Exception as exc:
         if detection_run is not None:
             session.mark_analysis_failed(detection_run.run_id, str(exc))
         raise
+
+
+def publish_runtime_stereo_calibration(
+    source: str | Path,
+    destination: str | Path,
+) -> Path:
+    """Atomically publish one verified asset as the calibration used by later workflows."""
+
+    source_path = Path(source)
+    load_stereo_calibration(source_path)
+    destination_path = Path(destination)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination_path.with_suffix(destination_path.suffix + ".tmp")
+    temporary.write_bytes(source_path.read_bytes())
+    load_stereo_calibration(temporary)
+    temporary.replace(destination_path)
+    return destination_path

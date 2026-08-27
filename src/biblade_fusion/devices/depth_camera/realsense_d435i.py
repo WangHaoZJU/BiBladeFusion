@@ -181,31 +181,30 @@ class RealSenseD435i:
     def _read_calibration(self, pipeline_profile: Any, rs: Any) -> StereoCalibrationSnapshot:
         left_profile = pipeline_profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile()
         right_profile = pipeline_profile.get_stream(rs.stream.infrared, 2).as_video_stream_profile()
-        if self._config.stereo_calibration_path is not None:
-            from biblade_fusion.calibration.stereo_charuco import load_stereo_calibration
-
-            user_calibration = load_stereo_calibration(self._config.stereo_calibration_path)
-            left_intrinsics = user_calibration.left
-            right_intrinsics = user_calibration.right
-            right_t_left = user_calibration.right_t_left
-            actual_size = (left_profile.width(), left_profile.height())
-            if actual_size != (left_intrinsics.width, left_intrinsics.height):
-                raise DepthCameraConnectionError(
-                    "configured IR calibration is "
-                    f"{left_intrinsics.width}x{left_intrinsics.height}, "
-                    f"but the stream is {actual_size[0]}x{actual_size[1]}"
-                )
-        else:
-            left_intrinsics = _intrinsics_from_profile(left_profile)
-            right_intrinsics = _intrinsics_from_profile(right_profile)
-            left_to_right = left_profile.get_extrinsics_to(right_profile)
-            # librealsense exposes rs2_extrinsics.rotation as a column-major array.
-            rotation = np.asarray(left_to_right.rotation, dtype=np.float64).reshape(
-                (3, 3), order="F"
+        if self._config.stereo_calibration_path is None:
+            raise DepthCameraConnectionError(
+                "user-calibrated D435i IR stereo YAML is required; factory IR "
+                "intrinsics/extrinsics are forbidden"
             )
-            translation = np.asarray(left_to_right.translation, dtype=np.float64)
-            right_t_left = PoseSE3.from_rotation_translation(
-                "right_ir", "left_ir", rotation, translation
+
+        from biblade_fusion.calibration.stereo_charuco import load_stereo_calibration
+
+        user_calibration = load_stereo_calibration(self._config.stereo_calibration_path)
+        left_intrinsics = user_calibration.left
+        right_intrinsics = user_calibration.right
+        right_t_left = user_calibration.right_t_left
+        left_size = (left_profile.width(), left_profile.height())
+        right_size = (right_profile.width(), right_profile.height())
+        if left_size != (left_intrinsics.width, left_intrinsics.height) or right_size != (
+            right_intrinsics.width,
+            right_intrinsics.height,
+        ):
+            raise DepthCameraConnectionError(
+                "configured IR calibration/stream resolution mismatch: "
+                f"left calibration={left_intrinsics.width}x{left_intrinsics.height}, "
+                f"left stream={left_size[0]}x{left_size[1]}, "
+                f"right calibration={right_intrinsics.width}x{right_intrinsics.height}, "
+                f"right stream={right_size[0]}x{right_size[1]}"
             )
 
         depth_scale = None
