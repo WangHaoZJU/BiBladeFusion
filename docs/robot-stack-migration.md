@@ -71,11 +71,13 @@ license and attribution.
 3. **Complete:** resolve copied CS68 URDF/STL/limits and cross-check FK fixtures.
 4. **Partially complete:** HoloRobot Pinocchio/FCL self-collision is implemented;
    workcell environment collision still uses the legacy conservative capsule prefilter.
-5. Convert planned camera poses into the copied motion contracts and persist preflight
-   evidence and cost beside the BiBladeFusion view plan.
+5. **Partially complete:** ordered endpoint-feasible view sequences now produce an
+   immutable, source-bound, re-derived mesh-collision and ServoJ preflight artifact.
+   Camera/tool motion-goal conversion and sequence cost optimization remain.
 6. **Library layer complete:** guarded execution is behind default-off configuration,
    exact hash confirmation, expiring one-shot permits, and live revalidation. No motion
-   CLI is exposed before step 5 and supervised hardware acceptance are complete.
+   CLI is exposed before the remaining step-5 work and supervised hardware acceptance
+   are complete.
 7. Remove superseded MDH/capsule code only after artifact compatibility and regression
    tests cover existing offline workflows.
 

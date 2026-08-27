@@ -31,10 +31,12 @@ All of the following are mandatory:
 5. Immediately before sending commands, the executor compares live joints with the
    preflight start and repeats Pinocchio/FCL path validation.
 
-There is intentionally no motion CLI yet. Existing `bbf robot status`, acquisition,
-planning, and path-validation commands remain non-moving. Hardware enablement will be
-added only with persisted preflight artifacts, an interactive approval command, and a
-separately supervised known-safe-pose acceptance procedure.
+There is intentionally no motion CLI yet. `bbf safety preflight-path` persists and
+re-verifies the mesh-collision and ServoJ evidence for an ordered view sequence but does
+not connect to the robot. Existing robot-status, acquisition, planning, validation, and
+preflight commands remain non-moving. Hardware enablement will be added only after an
+interactive approval command and a separately supervised known-safe-pose acceptance
+procedure are complete.
 
 ## Known limitations
 

@@ -167,3 +167,19 @@ Explicit ordered view sequences can be checked offline with the fail-closed
 [CS68 collision and path validator](docs/collision-validation.md). It uses configured
 capsule/workcell geometry and controller-specific MDH data, but remains a conservative
 prefilter and never authorizes motion.
+
+After an ordered sequence has endpoint-feasible IK solutions, generate the copied
+HoloRobot mesh-collision and velocity-limited ServoJ preflight artifact:
+
+```bash
+uv run bbf safety preflight-path \
+  --plan outputs/view_plan \
+  --initialization outputs/initialization \
+  --view-id front_r00_c00 \
+  --view-id back_r00_c00 \
+  --config configs/local.yaml \
+  --output outputs/motion_preflight
+```
+
+The artifact binds and verifies its source hashes, re-derives every leg when read, and
+always stores `motion_authorized: false`. This command does not connect to the robot.

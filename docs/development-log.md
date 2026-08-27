@@ -73,15 +73,19 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Conservative linear-joint motion preflight using copied velocity limits, plus exact
   preflight-hash confirmation, expiring one-shot execution permits, live-start checks,
   and immediate collision revalidation. No motion command is exposed through the CLI.
-- Current verification: 171 tests, Ruff, wheel build, packaged robot-resource audit,
-  and Elite SDK import pass. Local implementation is through commit `304d303`; commits
+- Immutable ordered view-sequence motion-preflight artifacts bind plan/initialization
+  hashes, re-derive Pinocchio/FCL and ServoJ evidence on read, and are generated offline
+  by `bbf safety preflight-path` with `motion_authorized: false`.
+- Current verification: 172 tests, Ruff, wheel build, packaged robot-resource audit,
+  and Elite SDK import pass. Local implementation is through commit `9a95483`; commits
   after `1231f66` have not yet been pushed in this development session.
 
 ## In progress
 
 - Robot-stack migration to the pinned HoloRobot implementation is active. Model,
-  self-collision, control, ServoJ trajectory, and guarded-execution library layers are
-  copied/adapted. View-plan artifact integration and workcell collision migration remain.
+  self-collision, control, ServoJ trajectory, guarded-execution, and ordered-view
+  preflight artifact layers are copied/adapted. Motion-goal integration, sequence cost,
+  and workcell collision migration remain.
 - The migration sequence and safety boundary are recorded in
   `docs/robot-stack-migration.md`. Existing MDH/capsule code remains temporarily for
   artifact compatibility and will not receive new motion functionality.
@@ -92,7 +96,7 @@ authoritative fine-grained record; this page records the experiment-facing state
    CUDA device is currently available in this workspace.
 2. Collect paired blade observations and compare FoundationStereo with native RealSense
    depth using the offline evaluator and aggregate report.
-3. Persist HoloRobot-backed motion preflight beside ordered view plans, then migrate
-   workcell collision from the capsule prefilter to primitive/hybrid or occupancy
-   geometry before exposing an interactive execution command.
+3. Convert calibrated camera views into explicit tool motion goals, add sequence motion
+   cost, then migrate workcell collision from the capsule prefilter to primitive/hybrid
+   or occupancy geometry before exposing an interactive execution command.
 4. Implement the thermal-camera adapter after its model and radiometric SDK are known.
