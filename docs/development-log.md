@@ -80,9 +80,8 @@ authoritative fine-grained record; this page records the experiment-facing state
   configured workcell AABBs are clearance-expanded hpp-fcl geometry checked against
   all copied CS68/D435i meshes. Required missing obstacle geometry is blocking.
 - Current verification: 176 tests, Ruff, wheel build, packaged robot-resource audit,
-  and Elite/Pinocchio/hpp-fcl/trimesh imports pass. Local implementation is through
-  commit `0c68faa`; commits
-  after `1231f66` have not yet been pushed in this development session.
+  and Elite/Pinocchio/hpp-fcl/trimesh imports pass. All implementation commits in this
+  checkpoint are pushed to GitHub `main`.
 
 ## In progress
 
