@@ -31,6 +31,12 @@ from biblade_fusion.planning.views import (
 )
 
 __all__ = [
+    "Capsule",
+    "CollisionFinding",
+    "CollisionValidationError",
+    "JointPathCollisionReport",
+    "cs68_mdh_joint_origins",
+    "validate_joint_path_collision",
     "BilateralViewPlan",
     "BladeSide",
     "CandidateView",
@@ -56,3 +62,11 @@ __all__ = [
     "select_uncovered_candidates",
     "update_coverage",
 ]
+from biblade_fusion.planning.collision import (
+    Capsule,
+    CollisionFinding,
+    CollisionValidationError,
+    JointPathCollisionReport,
+    cs68_mdh_joint_origins,
+    validate_joint_path_collision,
+)

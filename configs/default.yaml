@@ -126,3 +126,16 @@ kinematics:
   plugin_path: null
   primary_timeout_ms: 1000
   ik_timeout_s: 0.05
+
+# Collision validation refuses to run until measured/conservative geometry and joint
+# limits are supplied in configs/local.yaml. Capsule 0 starts at the robot base;
+# capsule 6 spans the flange/TCP to the camera center.
+collision:
+  link_radii_m: null
+  camera_tool_radius_m: null
+  minimum_joint_positions_rad: null
+  maximum_joint_positions_rad: null
+  obstacles: []
+  require_obstacles: true
+  minimum_clearance_m: 0.01
+  maximum_joint_step_rad: 0.02

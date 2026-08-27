@@ -278,6 +278,57 @@ class KinematicsConfig(BaseModel):
     ik_timeout_s: float = Field(default=0.05, gt=0.0, le=5.0)
 
 
+class CollisionObstacleConfig(AxisAlignedBoxConfig):
+    """Conservative workcell box with explicit robot-capsule exemptions."""
+
+    ignored_capsule_indices: tuple[int, ...] = ()
+
+    @field_validator("ignored_capsule_indices")
+    @classmethod
+    def validate_ignored_capsules(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if any(index < 0 or index > 6 for index in value) or len(set(value)) != len(value):
+            raise ValueError("Ignored capsule indices must be unique values in [0, 6]")
+        return value
+
+
+class CollisionConfig(BaseModel):
+    """Fail-closed geometry required for offline CS68 path validation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    link_radii_m: tuple[float, float, float, float, float, float] | None = None
+    camera_tool_radius_m: float | None = Field(default=None, gt=0.0)
+    minimum_joint_positions_rad: tuple[float, float, float, float, float, float] | None = None
+    maximum_joint_positions_rad: tuple[float, float, float, float, float, float] | None = None
+    obstacles: tuple[CollisionObstacleConfig, ...] = ()
+    require_obstacles: bool = True
+    minimum_clearance_m: float = Field(default=0.01, ge=0.0)
+    maximum_joint_step_rad: float = Field(default=0.02, gt=0.0, le=0.2)
+
+    @model_validator(mode="after")
+    def validate_collision_geometry(self) -> Self:
+        if self.link_radii_m is not None and (
+            not np.isfinite(self.link_radii_m).all()
+            or any(radius <= 0.0 for radius in self.link_radii_m)
+        ):
+            raise ValueError("Collision link radii must be finite and positive")
+        limits = (self.minimum_joint_positions_rad, self.maximum_joint_positions_rad)
+        if (limits[0] is None) != (limits[1] is None):
+            raise ValueError("Both minimum and maximum joint limits must be configured")
+        if (
+            limits[0] is not None
+            and limits[1] is not None
+            and (
+                not np.isfinite((*limits[0], *limits[1])).all()
+                or any(
+                lower >= upper for lower, upper in zip(*limits, strict=True)
+                )
+            )
+        ):
+            raise ValueError("Collision joint limits must be finite and ordered")
+        return self
+
+
 class AppSettings(BaseModel):
     """Top-level BiBladeFusion settings."""
 
@@ -300,6 +351,7 @@ class AppSettings(BaseModel):
     coverage: CoverageConfig = Field(default_factory=CoverageConfig)
     depth_comparison: DepthComparisonConfig = Field(default_factory=DepthComparisonConfig)
     kinematics: KinematicsConfig = Field(default_factory=KinematicsConfig)
+    collision: CollisionConfig = Field(default_factory=CollisionConfig)
 
 
 def load_settings(path: str | Path) -> AppSettings:
