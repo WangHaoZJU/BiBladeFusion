@@ -173,3 +173,22 @@ def test_sample_and_solution_artifacts_round_trip(tmp_path: Path) -> None:
     assert artifact["parent_frame"] == "flange"
     assert artifact["camera_stream"] == "infrared/1"
     assert artifact["holorobot_provenance"]["source_commit"]
+    assert "joint_positions_rad" in artifact["robot_pose_source"]
+    assert artifact["controller_tcp_role"] == "validation_only_not_solver_input"
+
+
+def test_controller_tcp_pose_is_not_a_hand_eye_solver_input() -> None:
+    samples, _ = synthetic_samples()
+    baseline = solve_hand_eye(samples, solve_config())
+    arbitrary_tcp = pose("base", "tcp", [0.7, -0.4, 0.2], [9.0, -4.0, 2.0])
+    with_controller_tcp = tuple(
+        replace(sample, base_t_tcp_observed=arbitrary_tcp) for sample in samples
+    )
+
+    solved = solve_hand_eye(with_controller_tcp, solve_config())
+
+    np.testing.assert_allclose(
+        solved.flange_t_left_ir.matrix,
+        baseline.flange_t_left_ir.matrix,
+        atol=1e-12,
+    )

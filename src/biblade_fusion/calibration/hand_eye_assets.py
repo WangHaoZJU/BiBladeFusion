@@ -314,6 +314,11 @@ class HandEyeAssetSession:
             "created_at_utc": created.isoformat(),
             "camera_stream": "infrared/1",
             "robot_model": "es68",
+            "robot_pose_source": (
+                "joint_positions_rad -> HoloRobot calibrated ES68 FK (709 poses) "
+                "-> base_T_flange"
+            ),
+            "controller_tcp_role": "validation_only_not_solver_input",
             "motion_commanded": False,
             "solver": "OpenCV Park-Martin + joint LM bundle adjustment",
             "configuration": {

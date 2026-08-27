@@ -470,7 +470,7 @@ def solve_hand_eye(
     intrinsics: CameraIntrinsics | None = None,
     refine: bool | None = None,
 ) -> HandEyeSolution:
-    """Solve ``flange_T_left_ir`` with Daniilidis initialization and HoloRobot LM BA."""
+    """Solve ``flange_T_left_ir`` from calibrated-FK flange poses with Park+LM/BA."""
 
     sample_list = tuple(samples)
     if len(sample_list) < config.minimum_samples:
@@ -728,6 +728,11 @@ def write_hand_eye_calibration(
         "calibration_type": "es68_d435i_left_ir_eye_in_hand",
         "robot_model": "es68",
         "holorobot_provenance": robot_stack_provenance(),
+        "robot_pose_source": (
+            "joint_positions_rad -> HoloRobot calibrated ES68 FK (709 poses) "
+            "-> base_T_flange"
+        ),
+        "controller_tcp_role": "validation_only_not_solver_input",
         "camera_stream": "infrared/1",
         "parent_frame": "flange",
         "child_frame": "left_ir",
@@ -827,7 +832,11 @@ def write_hand_eye_samples(
         "calibration_type": "es68_d435i_left_ir_eye_in_hand_samples",
         "robot_model": "es68",
         "holorobot_provenance": robot_stack_provenance(),
-        "robot_pose_source": "HoloRobot calibrated ES68 FK (709 poses)",
+        "robot_pose_source": (
+            "joint_positions_rad -> HoloRobot calibrated ES68 FK (709 poses) "
+            "-> base_T_flange"
+        ),
+        "controller_tcp_role": "validation_only_not_solver_input",
         "camera_stream": "infrared/1",
         "samples": [
             {

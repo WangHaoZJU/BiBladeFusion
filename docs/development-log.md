@@ -12,6 +12,11 @@
 - Made Park-Martin the default initializer and retained the HoloRobot-aligned joint
   LM/BA refinement of `flange_T_left_ir` and fixed `base_T_target`, with live
   motion-observability, pose-novelty, synchronization, PnP, and ES68 FK/TCP gates.
+- Locked robot-pose semantics to the HoloRobot ES68 reference: recorded joint angles
+  drive the copied 709-pose calibrated FK and produce solver `base_T_flange`; RTSI
+  `base_T_tcp` is validation-only. Persisted samples/results state this role explicitly,
+  and a regression test proves changing controller TCP observations cannot change the
+  solved transform.
 - Added a strict held-out stage using at least five new poses. It evaluates the fixed
   candidate with board-closure and corner-reprojection metrics without refitting; only
   a passing report is atomically published to

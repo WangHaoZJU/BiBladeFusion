@@ -93,6 +93,14 @@ poses with translation, image-region, distance, and rotation diversity about mul
 axes. Keep the final joint approach direction consistent and avoid changing J6 during
 this first calibration.
 
+Robot-pose semantics intentionally match the HoloRobot ES68 calibration path: the
+solver consumes controller joint angles, evaluates the copied 709-pose calibrated ES68
+FK, and passes `base_T_flange` to Park/BA. The controller-reported `base_T_tcp` is stored
+and compared against `base_T_flange · flange_T_tcp` only as a capture-quality gate; it
+is never a hand-eye solver input. For this calibrated ES68 chain the HoloRobot reference
+uses `Δq=0`; optional `kinematics.joint_zero_offsets_rad` must therefore remain zero
+unless a newer, independently accepted ES68 calibration explicitly changes it.
+
 Every accepted pose stores raw left/right audit images, joint readings,
 `base_T_flange`, observed `base_T_tcp`, all ChArUco IDs and 2D/3D correspondences, PnP
 quality, D435i frame number, synchronization window, and FK/TCP discrepancy. The GUI

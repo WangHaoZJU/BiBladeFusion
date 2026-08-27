@@ -261,3 +261,5 @@ def test_asset_session_preserves_undo_and_publishes_only_validated_result(
     manifest = json.loads(session.manifest_path.read_text(encoding="utf-8"))
     assert manifest["status"] == "completed"
     assert manifest["motion_commanded"] is False
+    assert "joint_positions_rad" in manifest["robot_pose_source"]
+    assert manifest["controller_tcp_role"] == "validation_only_not_solver_input"
