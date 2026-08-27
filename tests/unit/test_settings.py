@@ -10,6 +10,8 @@ def test_default_settings_load_safely() -> None:
     settings = load_settings(Path("configs/default.yaml"))
 
     assert settings.robot.model == "es68"
+    assert settings.robot.robot_ip == "192.168.6.60"
+    assert settings.robot.local_ip == "192.168.6.29"
     assert settings.robot.motion_enabled is False
     assert settings.robot.headless_mode is True
     assert settings.robot.rtsi_frequency_hz == 125.0

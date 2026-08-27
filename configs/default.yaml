@@ -4,8 +4,8 @@ project:
 
 robot:
   model: es68
-  robot_ip: null
-  local_ip: null
+  robot_ip: 192.168.6.60
+  local_ip: 192.168.6.29
   sdk_import_path: elite_cs_sdk
   headless_mode: true
   motion_enabled: false
