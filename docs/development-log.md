@@ -1,5 +1,22 @@
 # Development log
 
+## 2026-08-27 — independent D435i IR stereo validation
+
+- Added the `calibration stereo-validate-gui` workflow with an idle startup window and
+  three explicit operator steps: connect, save a synchronized hold-out pair, and run
+  fixed-parameter offline validation.
+- Added a validation-only digital asset schema that copies and SHA-256 binds the
+  ChArUco target and exact stereo calibration, atomically appends raw Y8 pairs, records
+  D435i identity/timestamps, and explicitly certifies that no calibration refit was
+  performed.
+- Added offline ChArUco detection, calibrated image/point rectification, horizontal
+  epipolar-line overlays with matched corner colours, per-pair evidence, and aggregate
+  vertical-disparity RMSE/P95/max, monocular reprojection RMSE, and stereo-transfer
+  RMSE metrics with recorded pass/fail thresholds.
+- Added `calibration stereo-validate-assets` for processing a preserved session after
+  acquisition, plus unit coverage for fixed-input provenance, successful ideal
+  geometry, checksum tamper rejection, and calibration/stream resolution mismatch.
+
 Last updated: 2026-08-27
 
 This log distinguishes verified implementation from pending work. Commit history is the

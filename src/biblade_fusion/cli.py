@@ -13,6 +13,8 @@ from biblade_fusion import __version__
 from biblade_fusion.acquisition import SynchronizedAcquirer
 from biblade_fusion.calibration import (
     StereoCalibrationAssetSession,
+    StereoValidationAssetSession,
+    StereoValidationThresholds,
     fetch_cs68_kinematics,
     load_cs68_kinematics,
     load_hand_eye_calibration,
@@ -20,6 +22,7 @@ from biblade_fusion.calibration import (
     read_hand_eye_samples,
     solve_hand_eye,
     solve_stereo_asset_session,
+    validate_stereo_asset_session,
     write_cs68_kinematics,
     write_hand_eye_calibration,
     write_hand_eye_samples,
@@ -570,6 +573,141 @@ def calibration_stereo_solve_assets(
     typer.echo(f"Joint stereo RMS: {result.metrics.joint_stereo_rms_px:.6f} px")
     typer.echo(f"Epipolar RMSE: {result.metrics.epipolar_rmse_px:.6f} px")
     typer.echo(f"Saved calibration: {output}")
+
+
+@calibration_app.command("stereo-validate-gui")
+def calibration_stereo_validate_gui(
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Validation collection root; every launch creates a unique session.",
+        ),
+    ],
+    target: Annotated[
+        Path,
+        typer.Option("--target", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/charuco_dict5x5_14x9_20mm_15mm.yaml"),
+    calibration: Annotated[
+        Path | None,
+        typer.Option(
+            "--calibration",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Fixed user stereo calibration; defaults to realsense config path.",
+        ),
+    ] = None,
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+    minimum_pairs: Annotated[
+        int,
+        typer.Option("--minimum-pairs", min=3, max=100),
+    ] = 8,
+    maximum_vertical_rmse_px: Annotated[
+        float,
+        typer.Option("--maximum-vertical-rmse-px", min=0.01),
+    ] = 0.5,
+    maximum_vertical_p95_px: Annotated[
+        float,
+        typer.Option("--maximum-vertical-p95-px", min=0.01),
+    ] = 1.0,
+    maximum_reprojection_rmse_px: Annotated[
+        float,
+        typer.Option("--maximum-reprojection-rmse-px", min=0.01),
+    ] = 0.5,
+    maximum_stereo_transfer_rmse_px: Annotated[
+        float,
+        typer.Option("--maximum-stereo-transfer-rmse-px", min=0.01),
+    ] = 1.0,
+) -> None:
+    """Capture hold-out ChArUco pairs and validate fixed stereo parameters."""
+
+    try:
+        from biblade_fusion.calibration.stereo_validation_gui import (
+            launch_stereo_validation_gui,
+        )
+
+        settings = load_settings(config)
+        calibration_path = calibration or settings.realsense.stereo_calibration_path
+        if calibration_path is None:
+            raise ValueError(
+                "--calibration or realsense.stereo_calibration_path is required"
+            )
+        thresholds = StereoValidationThresholds(
+            minimum_accepted_pairs=minimum_pairs,
+            maximum_vertical_disparity_rmse_px=maximum_vertical_rmse_px,
+            maximum_vertical_disparity_p95_px=maximum_vertical_p95_px,
+            maximum_monocular_reprojection_rmse_px=maximum_reprojection_rmse_px,
+            maximum_stereo_transfer_rmse_px=maximum_stereo_transfer_rmse_px,
+        )
+        raise_code = launch_stereo_validation_gui(
+            target,
+            calibration_path,
+            output,
+            settings.realsense,
+            settings.stereo_rectification,
+            thresholds,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "PySide6":
+            typer.echo(
+                "PySide6 is not installed; run `uv sync --extra calibration-gui`.",
+                err=True,
+            )
+        else:
+            typer.echo(f"Stereo validation GUI failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        typer.echo(f"Stereo validation GUI failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if raise_code:
+        raise typer.Exit(code=raise_code)
+
+
+@calibration_app.command("stereo-validate-assets")
+def calibration_stereo_validate_assets(
+    session: Annotated[
+        Path,
+        typer.Option("--session", exists=True, file_okay=False, readable=True),
+    ],
+) -> None:
+    """Re-run fixed-parameter validation from one preserved validation session."""
+
+    try:
+        assets = StereoValidationAssetSession.open(session)
+        result = validate_stereo_asset_session(assets)
+    except Exception as exc:
+        typer.echo(f"Stereo validation failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    metrics = result.metrics
+    typer.echo(f"Result: {'PASS' if metrics.passed else 'FAIL'}")
+    typer.echo(
+        f"Accepted/rejected pairs: {metrics.accepted_pair_count}/"
+        f"{metrics.rejected_pair_count}"
+    )
+    typer.echo(
+        "Vertical disparity RMSE/P95/max: "
+        f"{metrics.vertical_disparity_rmse_px:.6f}/"
+        f"{metrics.vertical_disparity_p95_px:.6f}/"
+        f"{metrics.vertical_disparity_max_px:.6f} px"
+    )
+    typer.echo(
+        "Left/right reprojection RMSE: "
+        f"{metrics.left_reprojection_rmse_px:.6f}/"
+        f"{metrics.right_reprojection_rmse_px:.6f} px"
+    )
+    typer.echo(f"Stereo transfer RMSE: {metrics.stereo_transfer_rmse_px:.6f} px")
+    typer.echo(f"Saved report: {result.report_json}")
 
 
 @calibration_app.command("solve-hand-eye")

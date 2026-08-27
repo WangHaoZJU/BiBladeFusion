@@ -52,6 +52,14 @@ from biblade_fusion.calibration.stereo_charuco import (
     solve_stereo_charuco,
     write_stereo_calibration,
 )
+from biblade_fusion.calibration.stereo_validation import (
+    StereoValidationAssetSession,
+    StereoValidationError,
+    StereoValidationMetrics,
+    StereoValidationResult,
+    StereoValidationThresholds,
+    validate_stereo_asset_session,
+)
 
 __all__ = [
     "CharucoImageDetection",
@@ -67,6 +75,11 @@ __all__ = [
     "StereoCalibrationAssetError",
     "StereoCalibrationAssetSession",
     "StereoDetectionRun",
+    "StereoValidationAssetSession",
+    "StereoValidationError",
+    "StereoValidationMetrics",
+    "StereoValidationResult",
+    "StereoValidationThresholds",
     "publish_runtime_stereo_calibration",
     "solve_stereo_asset_session",
     "CharucoDetection",
@@ -90,6 +103,7 @@ __all__ = [
     "read_hand_eye_samples",
     "solve_hand_eye",
     "solve_stereo_charuco",
+    "validate_stereo_asset_session",
     "write_hand_eye_calibration",
     "write_hand_eye_samples",
     "write_cs68_kinematics",

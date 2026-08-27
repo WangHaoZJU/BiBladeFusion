@@ -107,3 +107,81 @@ The loader rejects artifacts that do not explicitly record
 `factory_intrinsics_used: false` and rejects a stream resolution that differs from the
 calibrated resolution. Native RealSense depth remains a separate vendor-calibrated
 sensor product; it is not used to calibrate the raw left/right infrared stereo pair.
+
+## Independent hold-out validation
+
+Do not judge a calibration only with images that participated in its solution. After
+publishing the user calibration, acquire 8 to 12 new ChArUco poses with the dedicated
+validation application:
+
+```bash
+./.venv/bin/bbf calibration stereo-validate-gui \
+  --target configs/charuco_dict5x5_14x9_20mm_15mm.yaml \
+  --config configs/default.yaml \
+  --output data/calibrations/d435i_ir_validation
+```
+
+The calibration defaults to `realsense.stereo_calibration_path`. Use
+`--calibration PATH` only when validating a different timestamped calibration asset.
+The window starts idle and its three numbered buttons define the complete workflow:
+
+1. **开始并连接相机** creates a unique validation session and starts raw preview;
+2. **保存当前同步双目图像** manually stores a new hold-out pair;
+3. **采集完成，离线验证固定标定参数** stops capture and performs detection,
+   rectification, visualization, and metric calculation.
+
+No solver is reachable from this command. The copied camera matrices, distortion
+vectors and `right_ir_T_left_ir` remain fixed, and every manifest/report explicitly
+records `calibration_refit_performed: false`.
+
+Collect poses that were not used during calibration. Cover the image center, four
+edges and corners, at least two distances, and meaningful pitch/yaw/roll. Keep the
+board still when saving. Do not select consecutive nearly identical frames merely to
+reach the minimum count.
+
+Each launch produces a self-contained digital asset:
+
+```text
+data/calibrations/d435i_ir_validation/
+└── validation_YYYYMMDDTHHMMSS_ffffffZ/
+    ├── validation_manifest.json
+    ├── configuration/
+    │   ├── charuco_target.yaml
+    │   └── fixed_stereo_calibration.yaml
+    ├── raw_pairs/pair_XXXX/
+    │   ├── left_ir.png
+    │   ├── right_ir.png
+    │   └── frame_metadata.json
+    └── analyses/analysis_001/
+        ├── validation_report.json
+        ├── validation_summary.txt
+        └── pairs/pair_XXXX/
+            ├── validation.json
+            ├── left_detection.png
+            ├── right_detection.png
+            ├── left_rectified.png
+            ├── right_rectified.png
+            └── rectified_epipolar_overlay.png
+```
+
+The default quality gates are intentionally explicit and are stored in the manifest:
+
+- at least 8 accepted independent pairs;
+- rectified vertical disparity RMSE no more than 0.5 px;
+- rectified vertical disparity P95 no more than 1.0 px;
+- left and right independent reprojection RMSE no more than 0.5 px;
+- left-to-right stereo transfer RMSE no more than 1.0 px.
+
+These are validation gates, not a substitute for examining spatial trends in the
+per-pair overlays. A systematic signed vertical offset, errors concentrated near one
+image edge, or errors increasing with board distance should be investigated even when
+the aggregate result passes. Thresholds can be overridden on the GUI command and the
+actual values used are always retained in the asset.
+
+If a captured validation session was closed before analysis, process it without the
+camera:
+
+```bash
+./.venv/bin/bbf calibration stereo-validate-assets \
+  --session data/calibrations/d435i_ir_validation/validation_YYYYMMDDTHHMMSS_ffffffZ
+```

@@ -101,6 +101,19 @@ The verified result is automatically published to the fixed runtime path consume
 later workflows; missing user calibration fails closed without factory IR fallback. See
 [D435i infrared stereo calibration](docs/stereo-calibration.md).
 
+Validate the published parameters on new images that were not used by the solver:
+
+```bash
+./.venv/bin/bbf calibration stereo-validate-gui \
+  --config configs/default.yaml \
+  --output data/calibrations/d435i_ir_validation
+```
+
+The validation command never refits calibration parameters. It archives raw hold-out
+pairs, rectified epipolar overlays, per-pair metrics, aggregate pass/fail gates, and
+SHA-256-bound provenance; see the independent-validation section in
+[D435i infrared stereo calibration](docs/stereo-calibration.md).
+
 ## Bilateral initialization
 
 The initial visible-face point cloud is reduced to a density-balanced voxel cloud and
