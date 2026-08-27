@@ -65,8 +65,8 @@ authoritative fine-grained record; this page records the experiment-facing state
 - View-plan schema 2 cryptographically binds endpoint-feasible IK solutions to their
   controller-specific MDH artifact; safety validation rejects legacy or mismatched
   kinematics provenance while retaining schema-1 geometry-only read compatibility.
-- Current verification: 131 tests and Ruff pass. Through commit `e57bc56`, all prior
-  commits, package build, and Elite SDK import were verified and pushed.
+- Current verification: 131 tests, Ruff, package build, and Elite SDK import pass.
+  Through commit `1231f66`, all implementation commits were pushed to GitHub `main`.
 
 ## In progress
 
