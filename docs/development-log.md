@@ -18,6 +18,12 @@ authoritative fine-grained record; this page records the experiment-facing state
 
 ## Completed and verified
 
+- D435i IR stereo calibration now separates responsive raw acquisition from offline
+  ChArUco detection and solving. Every launch creates a unique append-only asset session;
+  it records the copied board definition, device identity, synchronized frame provenance,
+  raw pairs, detection overlays and accept/reject reasons, analysis attempts and final
+  calibration under a SHA-256-bound manifest. The preview retains only the latest frame
+  rather than accumulating GUI events, and completed sessions reject further writes.
 - ES68 read-only hardware bring-up now follows HoloRobot's RTSI ownership contract:
   the status adapter subscribes to an explicit output-variable list and passes an empty
   input recipe, so observation cannot claim speed-slider or I/O write channels.
@@ -82,10 +88,10 @@ authoritative fine-grained record; this page records the experiment-facing state
   solves `flange_T_left_ir` with Daniilidis plus joint SE(3) LM/BA, and exports a
   flange-primary schema-2 artifact with input hashes and before/after quality metrics.
 - PySide6 raw D435i IR stereo-calibration workflow using the stored 14x9 ChArUco target:
-  synchronized Y8 capture without factory IR calibration access, independent Zhang
-  initialization, joint stereo bundle adjustment, epipolar metrics, source-image
-  retention, selectable radial2/Brown5/Rational8 distortion models, held-out automatic
-  model comparison, and user-calibration YAML export/load with resolution checks.
+  synchronized Y8 capture without factory IR calibration access, offline independent
+  Zhang initialization, joint stereo bundle adjustment, epipolar metrics, selectable
+  radial2/Brown5/Rational8 distortion models, held-out automatic model comparison, and
+  user-calibration YAML export/load with resolution checks.
 - Read-only Elite RTSI state acquisition and controller MDH export.
 - D435i synchronized infrared/native-depth capture with calibration snapshots.
 - Atomic schema-v2 session writer and validated reader.

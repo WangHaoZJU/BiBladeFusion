@@ -40,6 +40,8 @@ def test_hand_eye_solver_command_is_exposed() -> None:
     assert result.exit_code == 0
     assert "solve-hand-eye" in result.stdout
     assert "extract-hand-eye" in result.stdout
+    assert "stereo-gui" in result.stdout
+    assert "stereo-solve-assets" in result.stdout
 
 
 def test_plan_command_is_exposed() -> None:

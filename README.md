@@ -93,9 +93,10 @@ robot motion commands.
 ## User-calibrated D435i infrared stereo
 
 The raw left/right IR calibration path does not use D435i factory IR intrinsics or
-factory stereo extrinsics. A PySide6 application captures synchronized ChArUco views,
-runs independent Zhang initialization, jointly optimizes both cameras and their fixed
-stereo transform, and writes the configuration consumed by later rectification. See
+factory stereo extrinsics. A PySide6 application first stores latest-frame synchronized
+Y8 pairs as unique, checksummed digital-asset sessions, then performs ChArUco detection,
+independent Zhang initialization and joint stereo optimization offline. Raw pairs,
+accept/reject evidence and every calibration result remain traceable and non-overwriting. See
 [D435i infrared stereo calibration](docs/stereo-calibration.md).
 
 ## Bilateral initialization

@@ -3,22 +3,25 @@
 from __future__ import annotations
 
 import sys
+import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 
+from biblade_fusion.calibration.stereo_assets import (
+    LatestStereoFrameMailbox,
+    RawInfraredStereoFrame,
+    StereoCalibrationAssetError,
+    StereoCalibrationAssetSession,
+    solve_stereo_asset_session,
+)
 from biblade_fusion.calibration.stereo_charuco import (
-    CharucoImageDetection,
     DistortionModel,
     SolvedStereoCalibration,
     StereoCharucoBoard,
-    StereoCharucoDetector,
-    StereoCharucoSample,
-    compare_and_solve_stereo_charuco,
-    solve_stereo_charuco,
-    write_stereo_calibration,
 )
 from biblade_fusion.core.settings import RealSenseConfig
 
@@ -30,6 +33,7 @@ class RawD435iInfraredCapture:
         self.config = config
         self.pipeline: Any | None = None
         self.rs: Any | None = None
+        self.device_info: dict[str, str] = {}
 
     def open(self) -> None:
         import pyrealsense2 as rs
@@ -48,6 +52,11 @@ class RawD435iInfraredCapture:
                 self.config.frames_per_second,
             )
         profile = pipeline.start(stream)
+        device = profile.get_device()
+        for name in ("serial_number", "name", "firmware_version", "usb_type_descriptor"):
+            option = getattr(rs.camera_info, name, None)
+            if option is not None and device.supports(option):
+                self.device_info[name] = str(device.get_info(option))
         option_namespace = getattr(rs, "option", None)
         emitter_option = getattr(option_namespace, "emitter_enabled", None)
         if emitter_option is not None:
@@ -67,7 +76,7 @@ class RawD435iInfraredCapture:
             self.pipeline.stop()
             self.pipeline = None
 
-    def capture(self) -> tuple[np.ndarray, np.ndarray, int]:
+    def capture(self) -> RawInfraredStereoFrame:
         if self.pipeline is None:
             raise RuntimeError("D435i raw infrared capture is not open")
         frames = self.pipeline.wait_for_frames(self.config.timeout_ms)
@@ -75,23 +84,23 @@ class RawD435iInfraredCapture:
         right = frames.get_infrared_frame(2)
         if not left or not right:
             raise RuntimeError("D435i returned an incomplete infrared stereo pair")
-        return (
-            np.asanyarray(left.get_data()).copy(),
-            np.asanyarray(right.get_data()).copy(),
-            int(left.get_frame_number()),
+        return RawInfraredStereoFrame(
+            left=np.asanyarray(left.get_data()).copy(),
+            right=np.asanyarray(right.get_data()).copy(),
+            left_frame_number=int(left.get_frame_number()),
+            right_frame_number=int(right.get_frame_number()),
+            left_timestamp_ms=float(left.get_timestamp()),
+            right_timestamp_ms=float(right.get_timestamp()),
+            timestamp_domain=str(left.get_frame_timestamp_domain()),
+            captured_at_utc=datetime.now(UTC).isoformat(),
         )
 
 
-def _annotate(image: np.ndarray, detection: CharucoImageDetection | None) -> np.ndarray:
+def _preview(image: np.ndarray, frame_number: int) -> np.ndarray:
     output = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-    if detection is None:
-        cv2.putText(output, "NO BOARD", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 60, 60), 2)
-        return output
-    for point in detection.image_points_px:
-        cv2.circle(output, tuple(np.rint(point).astype(int)), 3, (30, 255, 80), -1)
     cv2.putText(
         output,
-        f"corners={detection.corner_count}",
+        f"RAW Y8  frame={frame_number}",
         (20, 35),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
@@ -124,52 +133,79 @@ def launch_stereo_calibration_gui(
         QWidget,
     )
 
-    target = StereoCharucoBoard.read(target_path)
-    detector = StereoCharucoDetector(target)
-    root = Path(output_dir)
-    image_root = root / "samples"
-    image_root.mkdir(parents=True, exist_ok=True)
+    StereoCharucoBoard.read(target_path)
+    mailbox = LatestStereoFrameMailbox()
+    session = StereoCalibrationAssetSession.create(
+        output_dir,
+        target_path=target_path,
+        image_size=(realsense_config.infrared_width, realsense_config.infrared_height),
+        frames_per_second=realsense_config.frames_per_second,
+        serial_number=realsense_config.serial_number,
+        emitter_enabled=realsense_config.infrared_emitter_enabled,
+    )
 
     class CaptureWorker(QObject):
-        frame = Signal(object, object, int)
+        frame_available = Signal()
         failed = Signal(str)
         finished = Signal()
 
         def __init__(self) -> None:
             super().__init__()
-            self.running = True
+            self.stop_requested = threading.Event()
             self.camera = RawD435iInfraredCapture(realsense_config)
 
         @Slot()
         def run(self) -> None:
             try:
                 self.camera.open()
-                while self.running:
-                    left, right, number = self.camera.capture()
-                    self.frame.emit(left, right, number)
+                session.record_device_info(self.camera.device_info)
+                while not self.stop_requested.is_set():
+                    frame = self.camera.capture()
+                    if mailbox.publish(frame):
+                        self.frame_available.emit()
             except Exception as exc:
+                session.mark_capture_failed(str(exc))
                 self.failed.emit(str(exc))
             finally:
                 self.camera.close()
                 self.finished.emit()
 
+        def request_stop(self) -> None:
+            self.stop_requested.set()
+
+    class AnalysisWorker(QObject):
+        succeeded = Signal(object, str)
+        failed = Signal(str)
+        finished = Signal()
+
+        def __init__(self, minimum_samples: int, selected_model: str) -> None:
+            super().__init__()
+            self.minimum_samples = minimum_samples
+            self.selected_model = selected_model
+
         @Slot()
-        def stop(self) -> None:
-            self.running = False
+        def run(self) -> None:
+            try:
+                _detection_run, result, output = solve_stereo_asset_session(
+                    session,
+                    minimum_samples=self.minimum_samples,
+                    distortion_model=self.selected_model,
+                )
+                self.succeeded.emit(result, str(output))
+            except Exception as exc:
+                self.failed.emit(str(exc))
+            finally:
+                self.finished.emit()
 
     class Window(QMainWindow):
-        stop_capture = Signal()
-
-        def __init__(self) -> None:
+        def __init__(self, capture_worker: CaptureWorker) -> None:
             super().__init__()
+            self.capture_worker = capture_worker
             self.setWindowTitle("BiBladeFusion · D435i IR Stereo ChArUco Calibration")
             self.resize(1500, 760)
-            self.samples: list[StereoCharucoSample] = []
-            self.current: tuple[np.ndarray, np.ndarray, int] | None = None
-            self.current_detections: tuple[
-                CharucoImageDetection | None, CharucoImageDetection | None
-            ] = (None, None)
             self.result: SolvedStereoCalibration | None = None
+            self.analysis_thread: QThread | None = None
+            self.analysis_worker: AnalysisWorker | None = None
             self.left_label = QLabel("Waiting for left IR")
             self.right_label = QLabel("Waiting for right IR")
             for label in (self.left_label, self.right_label):
@@ -179,7 +215,7 @@ def launch_stereo_calibration_gui(
             images = QHBoxLayout()
             images.addWidget(self.left_label)
             images.addWidget(self.right_label)
-            self.capture_button = QPushButton("采集当前双目样本")
+            self.capture_button = QPushButton("保存最新同步原始双目帧")
             self.capture_button.setEnabled(False)
             self.capture_button.clicked.connect(self.accept_sample)
             self.minimum = QSpinBox()
@@ -190,9 +226,9 @@ def launch_stereo_calibration_gui(
             self.distortion_model.addItem("径向二参数", DistortionModel.RADIAL2.value)
             self.distortion_model.addItem("Rational八参数", DistortionModel.RATIONAL8.value)
             self.distortion_model.addItem("自动比较（独立验证集）", "auto")
-            self.solve_button = QPushButton("张正友初始化 + 双目联合BA")
+            self.solve_button = QPushButton("采集完成：离线检测 + 张正友初始化 + 双目联合BA")
             self.solve_button.setEnabled(False)
-            self.solve_button.clicked.connect(self.solve)
+            self.solve_button.clicked.connect(self.start_offline_analysis)
             controls = QHBoxLayout()
             controls.addWidget(self.capture_button)
             controls.addWidget(QLabel("最少样本数"))
@@ -208,7 +244,7 @@ def launch_stereo_calibration_gui(
             self.setCentralWidget(central)
             self.setStatusBar(QStatusBar())
             self.statusBar().showMessage(
-                "请覆盖中心、四角、不同距离及明显俯仰/偏航/滚转；仅双方同时检测合格时采集"
+                f"资产会话：{session.root}；请覆盖中心、四角、不同距离和三轴姿态"
             )
 
         @staticmethod
@@ -224,82 +260,74 @@ def launch_stereo_calibration_gui(
             return QPixmap.fromImage(image).scaled(
                 label.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
+                Qt.TransformationMode.FastTransformation,
             )
 
-        @Slot(object, object, int)
-        def on_frame(self, left: np.ndarray, right: np.ndarray, number: int) -> None:
-            left_detection = detector.detect(left)
-            right_detection = detector.detect(right)
-            self.current = (left, right, number)
-            self.current_detections = (left_detection, right_detection)
-            self.left_label.setPixmap(self.pixmap(_annotate(left, left_detection), self.left_label))
+        @Slot()
+        def on_frame_available(self) -> None:
+            frame = mailbox.take_for_preview()
+            if frame is None:
+                return
+            self.left_label.setPixmap(
+                self.pixmap(_preview(frame.left, frame.left_frame_number), self.left_label)
+            )
             self.right_label.setPixmap(
-                self.pixmap(_annotate(right, right_detection), self.right_label)
+                self.pixmap(_preview(frame.right, frame.right_frame_number), self.right_label)
             )
-            valid = (
-                left_detection is not None
-                and right_detection is not None
-                and min(left_detection.corner_count, right_detection.corner_count)
-                >= target.minimum_corners_per_camera
-            )
-            self.capture_button.setEnabled(valid)
+            self.capture_button.setEnabled(True)
 
         @Slot()
         def accept_sample(self) -> None:
-            if self.current is None:
+            frame = mailbox.snapshot()
+            if frame is None:
                 return
-            left, right, number = self.current
-            sample = detector.detect_pair(f"frame_{number:08d}", left, right)
-            if sample is None:
-                self.statusBar().showMessage("当前双目检测未达到共同采样要求")
+            try:
+                pair_id = session.record_pair(frame)
+            except StereoCalibrationAssetError as exc:
+                self.statusBar().showMessage(str(exc))
                 return
-            if any(item.sample_id == sample.sample_id for item in self.samples):
-                self.statusBar().showMessage("该帧已经采集，请改变标定板姿态")
-                return
-            sample_dir = image_root / f"{len(self.samples):03d}_{sample.sample_id}"
-            sample_dir.mkdir(parents=True)
-            cv2.imwrite(str(sample_dir / "left_ir.png"), left)
-            cv2.imwrite(str(sample_dir / "right_ir.png"), right)
-            self.samples.append(sample)
-            self.solve_button.setEnabled(len(self.samples) >= self.minimum.value())
+            self.solve_button.setEnabled(session.raw_pair_count >= self.minimum.value())
             self.statusBar().showMessage(
-                f"已采集 {len(self.samples)} 组；请继续改变距离、图像位置和三轴姿态"
+                f"已保存 {session.raw_pair_count} 组原始资产（{pair_id}）；目录：{session.root}"
             )
 
         @Slot()
-        def solve(self) -> None:
-            try:
-                image_size = (
-                    realsense_config.infrared_width,
-                    realsense_config.infrared_height,
-                )
-                selected = str(self.distortion_model.currentData())
-                if selected == "auto":
-                    if self.minimum.value() < 20:
-                        raise ValueError("自动比较至少需要20组样本，以保留独立验证视图")
-                    self.result = compare_and_solve_stereo_charuco(
-                        self.samples,
-                        image_size,
-                        target,
-                        minimum_samples=max(20, self.minimum.value()),
-                    )
-                else:
-                    self.result = solve_stereo_charuco(
-                        self.samples,
-                        image_size,
-                        target,
-                        minimum_samples=self.minimum.value(),
-                        distortion_model=DistortionModel(selected),
-                    )
-                output = write_stereo_calibration(
-                    root / "d435i_ir_stereo_calibration.yaml",
-                    self.result,
-                    [sample.sample_id for sample in self.samples],
-                )
-            except Exception as exc:
-                QMessageBox.critical(self, "标定失败", str(exc))
+        def start_offline_analysis(self) -> None:
+            if self.analysis_thread is not None:
                 return
+            minimum = self.minimum.value()
+            selected = str(self.distortion_model.currentData())
+            if selected == "auto" and minimum < 20:
+                QMessageBox.critical(self, "无法开始", "自动比较至少需要20组原始样本")
+                return
+            self.capture_button.setEnabled(False)
+            self.solve_button.setEnabled(False)
+            self.minimum.setEnabled(False)
+            self.distortion_model.setEnabled(False)
+            self.statusBar().showMessage(
+                f"正在对 {session.raw_pair_count} 组原始资产进行离线检测与求解……"
+            )
+            thread = QThread()
+            worker = AnalysisWorker(minimum, selected)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.succeeded.connect(self.analysis_succeeded)
+            worker.failed.connect(self.analysis_failed)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(self.analysis_finished)
+            self.analysis_thread = thread
+            self.analysis_worker = worker
+            thread.start()
+
+        @Slot(object, str)
+        def analysis_succeeded(
+            self,
+            result: SolvedStereoCalibration,
+            output: str,
+        ) -> None:
+            self.result = result
+            self.capture_worker.request_stop()
             metrics = self.result.metrics
             comparison = ""
             if self.result.model_comparison:
@@ -313,6 +341,7 @@ def launch_stereo_calibration_gui(
             QMessageBox.information(
                 self,
                 "标定完成",
+                f"资产会话: {session.root}\n"
                 f"配置文件: {output}\n"
                 f"选定模型: {self.result.distortion_model.value}\n"
                 f"左目 RMS: {metrics.left_monocular_rms_px:.4f} px\n"
@@ -323,24 +352,54 @@ def launch_stereo_calibration_gui(
                 f"{comparison}",
             )
 
+        @Slot(str)
+        def analysis_failed(self, message: str) -> None:
+            QMessageBox.critical(
+                self,
+                "离线检测或标定失败",
+                f"{message}\n\n原始双目资产未被删除或覆盖，可继续采集后重新分析。",
+            )
+
+        @Slot()
+        def analysis_finished(self) -> None:
+            if self.analysis_thread is not None:
+                self.analysis_thread.deleteLater()
+            self.analysis_thread = None
+            self.analysis_worker = None
+            completed = self.result is not None
+            self.capture_button.setEnabled(not completed and mailbox.snapshot() is not None)
+            self.solve_button.setEnabled(
+                not completed and session.raw_pair_count >= self.minimum.value()
+            )
+            self.minimum.setEnabled(not completed)
+            self.distortion_model.setEnabled(not completed)
+            if not completed:
+                self.statusBar().showMessage(
+                    f"离线分析未完成；原始资产共 {session.raw_pair_count} 组，可补充后重试"
+                )
+
         def closeEvent(self, event: Any) -> None:
-            self.stop_capture.emit()
+            if self.analysis_thread is not None:
+                QMessageBox.information(self, "正在处理", "请等待离线检测与标定完成后再关闭窗口")
+                event.ignore()
+                return
+            self.capture_worker.request_stop()
+            session.mark_capture_closed()
             event.accept()
 
     application = QApplication.instance() or QApplication(sys.argv)
-    window = Window()
     thread = QThread()
     worker = CaptureWorker()
+    window = Window(worker)
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
-    window.stop_capture.connect(worker.stop)
-    worker.frame.connect(window.on_frame)
+    worker.frame_available.connect(window.on_frame_available)
     worker.failed.connect(lambda message: QMessageBox.critical(window, "D435i采集失败", message))
     worker.finished.connect(thread.quit)
     thread.start()
     window.show()
     result = application.exec()
-    worker.stop()
+    worker.request_stop()
     thread.quit()
     thread.wait(6000)
     return result

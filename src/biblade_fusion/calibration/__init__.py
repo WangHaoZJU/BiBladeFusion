@@ -29,6 +29,14 @@ from biblade_fusion.calibration.robot_kinematics import (
     load_cs68_kinematics,
     write_cs68_kinematics,
 )
+from biblade_fusion.calibration.stereo_assets import (
+    LatestStereoFrameMailbox,
+    RawInfraredStereoFrame,
+    StereoCalibrationAssetError,
+    StereoCalibrationAssetSession,
+    StereoDetectionRun,
+    solve_stereo_asset_session,
+)
 from biblade_fusion.calibration.stereo_charuco import (
     CharucoImageDetection,
     DistortionModel,
@@ -53,6 +61,12 @@ __all__ = [
     "StereoCharucoCalibrationError",
     "StereoCharucoDetector",
     "StereoCharucoSample",
+    "LatestStereoFrameMailbox",
+    "RawInfraredStereoFrame",
+    "StereoCalibrationAssetError",
+    "StereoCalibrationAssetSession",
+    "StereoDetectionRun",
+    "solve_stereo_asset_session",
     "CharucoDetection",
     "CharucoDetectionError",
     "CharucoTargetDetector",

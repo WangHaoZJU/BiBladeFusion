@@ -12,12 +12,14 @@ from rich.table import Table
 from biblade_fusion import __version__
 from biblade_fusion.acquisition import SynchronizedAcquirer
 from biblade_fusion.calibration import (
+    StereoCalibrationAssetSession,
     fetch_cs68_kinematics,
     load_cs68_kinematics,
     load_hand_eye_calibration,
     load_stereo_calibration,
     read_hand_eye_samples,
     solve_hand_eye,
+    solve_stereo_asset_session,
     write_cs68_kinematics,
     write_hand_eye_calibration,
     write_hand_eye_samples,
@@ -488,7 +490,14 @@ def stereo_infer_session(
 
 @calibration_app.command("stereo-gui")
 def calibration_stereo_gui(
-    output: Annotated[Path, typer.Option("--output", "-o")],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Asset collection root; every launch creates a unique session directory.",
+        ),
+    ],
     target: Annotated[
         Path,
         typer.Option("--target", exists=True, dir_okay=False, readable=True),
@@ -504,7 +513,7 @@ def calibration_stereo_gui(
         ),
     ] = Path("configs/default.yaml"),
 ) -> None:
-    """Open the D435i raw-IR PySide6 stereo-calibration application."""
+    """Capture raw D435i IR assets, then detect and calibrate offline."""
 
     try:
         from biblade_fusion.calibration.stereo_gui import launch_stereo_calibration_gui
@@ -522,6 +531,44 @@ def calibration_stereo_gui(
         raise typer.Exit(code=1) from exc
     if raise_code:
         raise typer.Exit(code=raise_code)
+
+
+@calibration_app.command("stereo-solve-assets")
+def calibration_stereo_solve_assets(
+    session: Annotated[
+        Path,
+        typer.Option("--session", exists=True, file_okay=False, readable=True),
+    ],
+    minimum_samples: Annotated[
+        int,
+        typer.Option("--minimum-samples", min=10, max=100),
+    ] = 20,
+    distortion_model: Annotated[
+        str,
+        typer.Option(
+            "--distortion-model",
+            help="auto, radial2, brown5, or rational8",
+        ),
+    ] = "auto",
+) -> None:
+    """Re-run offline ChArUco detection and solving from one stored asset session."""
+
+    try:
+        assets = StereoCalibrationAssetSession.open(session)
+        detection, result, output = solve_stereo_asset_session(
+            assets,
+            minimum_samples=minimum_samples,
+            distortion_model=distortion_model,
+        )
+    except Exception as exc:
+        typer.echo(f"Stereo asset calibration failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Accepted pairs: {len(detection.accepted_pair_ids)}")
+    typer.echo(f"Rejected pairs: {len(detection.rejected_pair_ids)}")
+    typer.echo(f"Selected distortion model: {result.distortion_model.value}")
+    typer.echo(f"Joint stereo RMS: {result.metrics.joint_stereo_rms_px:.6f} px")
+    typer.echo(f"Epipolar RMSE: {result.metrics.epipolar_rmse_px:.6f} px")
+    typer.echo(f"Saved calibration: {output}")
 
 
 @calibration_app.command("solve-hand-eye")
