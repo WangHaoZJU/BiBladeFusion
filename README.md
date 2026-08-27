@@ -158,3 +158,8 @@ executes a planned pose.
 The coverage ledger uses pose-registered base-frame blade points to fill independent
 front/back per-patch occupancy grids. See [coverage and replanning](docs/coverage.md) for
 its evidence rules and current limitations.
+
+Explicit ordered view sequences can be checked offline with the fail-closed
+[CS68 collision and path validator](docs/collision-validation.md). It uses configured
+capsule/workcell geometry and controller-specific MDH data, but remains a conservative
+prefilter and never authorizes motion.

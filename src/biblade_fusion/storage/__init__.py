@@ -26,6 +26,11 @@ from biblade_fusion.storage.initialization import (
     read_initialization,
     write_initialization,
 )
+from biblade_fusion.storage.path_validation import (
+    StoredPathValidation,
+    read_path_validation,
+    write_path_validation,
+)
 from biblade_fusion.storage.reader import (
     SessionFormatError,
     SessionReader,
@@ -57,11 +62,13 @@ __all__ = [
     "StoredDepthComparison",
     "StoredDepthAggregate",
     "StoredInitialization",
+    "StoredPathValidation",
     "StoredReconstructedBladeView",
     "StoredStereoInference",
     "StoredViewPlan",
     "StoredViewDescriptor",
     "read_initialization",
+    "read_path_validation",
     "read_coverage_driven_plan",
     "read_depth_comparison",
     "read_depth_aggregate",
@@ -70,6 +77,7 @@ __all__ = [
     "read_stereo_inference",
     "read_view_plan",
     "write_initialization",
+    "write_path_validation",
     "write_coverage_driven_plan",
     "write_depth_comparison",
     "write_depth_aggregate",

@@ -80,3 +80,10 @@ def test_robot_kinematics_export_is_exposed() -> None:
 
     assert result.exit_code == 0
     assert "export-kinematics" in result.stdout
+
+
+def test_safety_path_validation_is_exposed() -> None:
+    result = runner.invoke(app, ["safety", "--help"])
+
+    assert result.exit_code == 0
+    assert "validate-path" in result.stdout

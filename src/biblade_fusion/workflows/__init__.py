@@ -26,6 +26,12 @@ from biblade_fusion.workflows.initialization import (
     initialize_foundation_stereo_depth,
     initialize_native_depth,
 )
+from biblade_fusion.workflows.path_validation import (
+    PathSequenceError,
+    ValidatedPathLeg,
+    ViewSequenceCollisionReport,
+    validate_view_sequence_collision,
+)
 from biblade_fusion.workflows.reconstruction import (
     ReconstructedBladeView,
     ReconstructionError,
@@ -58,14 +64,18 @@ __all__ = [
     "HandEyeExtractionResult",
     "InitializationError",
     "OfflineViewPlanningResult",
+    "PathSequenceError",
     "ReconstructedBladeView",
     "ReconstructionError",
+    "ValidatedPathLeg",
+    "ViewSequenceCollisionReport",
     "StereoInferenceObservation",
     "initialize_native_depth",
     "initialize_foundation_stereo_depth",
     "extract_hand_eye_samples",
     "infer_rectified_stereo",
     "plan_initial_observation",
+    "validate_view_sequence_collision",
     "reconstruct_foundation_stereo_view",
     "reconstruct_native_depth_view",
 ]

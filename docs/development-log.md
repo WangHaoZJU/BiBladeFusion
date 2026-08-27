@@ -57,13 +57,16 @@ authoritative fine-grained record; this page records the experiment-facing state
   are rejected, and generated manifests bind the fixed initialization metadata.
 - Correct Elite KDL IK orientation encoding: the vendor plugin consumes roll/pitch/yaw,
   which is intentionally distinct from the controller TCP rotation-vector encoding.
-- Current verification: 119 tests and Ruff pass. Through commit `a654bd0`, all prior
+- Exact vendor-convention MDH link origins, fail-closed capsule/workcell geometry,
+  joint-limit checks, continuous joint-space sampling, explicit ordered view-sequence
+  validation, and immutable reports that always forbid motion.
+- Current verification: 127 tests and Ruff pass. Through commit `3ea4e83`, all prior
   commits, package build, and Elite SDK import were verified and pushed.
 
 ## In progress
 
-- Implementing a non-executable robot-body/workcell collision contract and continuous
-  path validator using the exact MDH chain convention in the vendor KDL source.
+- No partial implementation remains at this checkpoint. The next safety increment is
+  CAD/controller-trajectory validation beyond the conservative capsule prefilter.
 
 ## Pending, in priority order
 
@@ -71,6 +74,7 @@ authoritative fine-grained record; this page records the experiment-facing state
    CUDA device is currently available in this workspace.
 2. Collect paired blade observations and compare FoundationStereo with native RealSense
    depth using the offline evaluator and aggregate report.
-3. Add robot-body/workcell collision and continuous trajectory validation before any
-   future motion-execution feature is considered.
+3. Validate configured capsule geometry against CS68/workcell CAD, then add exact-mesh,
+   controller-timed trajectory, singularity, dynamics, and stopping-distance checks
+   before any future motion-execution feature is considered.
 4. Implement the thermal-camera adapter after its model and radiometric SDK are known.

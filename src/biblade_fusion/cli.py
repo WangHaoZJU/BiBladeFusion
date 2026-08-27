@@ -45,6 +45,7 @@ from biblade_fusion.storage import (
     read_depth_aggregate,
     read_depth_comparison,
     read_initialization,
+    read_path_validation,
     read_reconstructed_view,
     read_stereo_inference,
     read_view_plan,
@@ -54,6 +55,7 @@ from biblade_fusion.storage import (
     write_depth_aggregate_manifest,
     write_depth_comparison,
     write_initialization,
+    write_path_validation,
     write_reconstructed_view,
     write_stereo_inference,
     write_view_plan,
@@ -84,6 +86,7 @@ plan_app = typer.Typer(help="Offline bilateral view planning.", no_args_is_help=
 coverage_app = typer.Typer(help="Offline bilateral coverage tracking.", no_args_is_help=True)
 reconstruct_app = typer.Typer(help="Pose-register stored blade depth views.", no_args_is_help=True)
 evaluate_app = typer.Typer(help="Offline experiment evaluation.", no_args_is_help=True)
+safety_app = typer.Typer(help="Offline, non-executable safety validation.", no_args_is_help=True)
 app.add_typer(robot_app, name="robot")
 app.add_typer(camera_app, name="camera")
 app.add_typer(acquire_app, name="acquire")
@@ -94,6 +97,7 @@ app.add_typer(plan_app, name="plan")
 app.add_typer(coverage_app, name="coverage")
 app.add_typer(reconstruct_app, name="reconstruct")
 app.add_typer(evaluate_app, name="evaluate")
+app.add_typer(safety_app, name="safety")
 
 
 @app.callback()
@@ -1172,6 +1176,56 @@ def evaluate_make_depth_manifest(
         typer.echo(f"Depth manifest generation failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Saved achieved-pose depth manifest: {destination}")
+
+
+@safety_app.command("validate-path")
+def safety_validate_path(
+    plan: Annotated[
+        Path,
+        typer.Option("--plan", exists=True, file_okay=False, readable=True),
+    ],
+    initialization: Annotated[
+        Path,
+        typer.Option("--initialization", exists=True, file_okay=False, readable=True),
+    ],
+    view_ids: Annotated[
+        list[str],
+        typer.Option(
+            "--view-id",
+            help="Repeat in the exact traversal order to validate.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Validate an explicit sequence without connecting to or moving the robot."""
+
+    try:
+        settings = load_settings(config)
+        if settings.kinematics.model_path is None:
+            raise ValueError("kinematics.model_path must be configured")
+        destination = write_path_validation(
+            output,
+            tuple(view_ids),
+            settings.collision,
+            source_plan=plan,
+            source_initialization=initialization,
+            source_kinematics=settings.kinematics.model_path,
+        )
+        stored = read_path_validation(destination)
+    except Exception as exc:
+        typer.echo(f"Path safety validation failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finding_count = sum(len(leg.collision.findings) for leg in stored.report.legs)
+    typer.echo(f"Saved non-executable path validation: {destination}")
+    typer.echo(
+        f"Legs: {len(stored.report.legs)}; findings: {finding_count}; "
+        f"collision free: {'yes' if stored.report.collision_free else 'no'}"
+    )
+    typer.echo("Motion authorized: no")
 
 
 if __name__ == "__main__":
