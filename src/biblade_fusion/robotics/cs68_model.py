@@ -196,6 +196,22 @@ def _parse_joint_limits(path: Path) -> dict[str, tuple[float, float]]:
     return limits
 
 
+def _parse_joint_velocity_limits(path: Path) -> dict[str, float]:
+    raw = _load_yaml(path).get("joint_limits", {})
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"Missing joint_limits mapping in {path}")
+    limits: dict[str, float] = {}
+    for joint_name in CS68_JOINT_NAMES:
+        item = raw.get(joint_name)
+        if not isinstance(item, Mapping) or not item.get("has_velocity_limits", False):
+            raise ValueError(f"Missing velocity limit for {joint_name!r} in {path}")
+        value = _as_float(item["max_velocity"])
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"Invalid velocity limit for {joint_name!r} in {path}")
+        limits[joint_name] = value
+    return limits
+
+
 def _rpy_matrix(roll: float, pitch: float, yaw: float) -> NDArray[np.float64]:
     cr, sr = math.cos(roll), math.sin(roll)
     cp, sp = math.cos(pitch), math.sin(pitch)
@@ -269,6 +285,13 @@ class Cs68KinematicModel:
 
     def joint_limit_pairs(self) -> tuple[tuple[float, float], ...]:
         return tuple(self.joint_limits[name] for name in CS68_JOINT_NAMES)
+
+    def joint_velocity_limits_rad_s(self) -> tuple[float, ...]:
+        """Return copied HoloRobot controller-profile velocity limits in joint order."""
+
+        resources = Cs68ModelResources.packaged()
+        limits = _parse_joint_velocity_limits(resources.joint_limits_yaml)
+        return tuple(limits[name] for name in CS68_JOINT_NAMES)
 
     def _model_joints(self, joint_positions_rad: Sequence[float]) -> NDArray[np.float64]:
         joints = np.asarray(joint_positions_rad, dtype=np.float64)

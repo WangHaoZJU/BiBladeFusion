@@ -6,6 +6,15 @@ from biblade_fusion.robotics.cs68_model import (
     Cs68KinematicModel,
     Cs68ModelResources,
 )
+from biblade_fusion.robotics.guarded_execution import (
+    GuardedEliteExecutor,
+    MotionExecutionPermit,
+)
+from biblade_fusion.robotics.motion_preflight import (
+    JointMotionPreflight,
+    MotionPreflightStatus,
+    preflight_linear_joint_motion,
+)
 from biblade_fusion.robotics.pinocchio_collision import (
     CollisionCheckResult,
     CollisionCheckStatus,
@@ -23,5 +32,10 @@ __all__ = [
     "Cs68PinocchioCollisionChecker",
     "Cs68KinematicModel",
     "Cs68ModelResources",
+    "GuardedEliteExecutor",
     "JointPathMeshCollisionReport",
+    "JointMotionPreflight",
+    "MotionPreflightStatus",
+    "MotionExecutionPermit",
+    "preflight_linear_joint_motion",
 ]
