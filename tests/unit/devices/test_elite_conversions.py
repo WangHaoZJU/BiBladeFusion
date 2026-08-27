@@ -4,7 +4,9 @@ from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.devices.robot.conversions import (
     elite_tcp_pose_to_se3,
     matrix_to_rotation_vector,
+    matrix_to_rpy_xyz,
     rotation_vector_to_matrix,
+    rpy_xyz_to_matrix,
     se3_to_elite_kdl_pose,
     se3_to_elite_tcp_pose,
 )
@@ -24,12 +26,13 @@ def test_rotation_vector_uses_axis_angle_not_rpy() -> None:
     )
 
 
-def test_elite_tcp_pose_conversion_preserves_frames_and_translation() -> None:
-    pose = elite_tcp_pose_to_se3([0.1, 0.2, 0.3, 0, 0, 0])
+def test_elite_tcp_pose_conversion_follows_holorobot_rpy_contract() -> None:
+    pose = elite_tcp_pose_to_se3([0.1, 0.2, 0.3, 0.3, -0.4, 0.5])
 
     assert pose.parent_frame == "base"
     assert pose.child_frame == "tcp"
     np.testing.assert_allclose(pose.translation_m, [0.1, 0.2, 0.3])
+    np.testing.assert_allclose(pose.rotation, rpy_xyz_to_matrix([0.3, -0.4, 0.5]))
 
 
 def test_rotation_vector_round_trip_including_pi_rotation() -> None:
@@ -57,6 +60,14 @@ def test_se3_to_elite_pose_round_trip() -> None:
     assert encoded.flags.writeable is False
 
 
+def test_rpy_xyz_round_trip() -> None:
+    rpy = np.array([0.3, -0.4, 0.5])
+
+    recovered = matrix_to_rpy_xyz(rpy_xyz_to_matrix(rpy))
+
+    np.testing.assert_allclose(recovered, rpy, atol=1e-12)
+
+
 def test_kdl_pose_conversion_uses_rpy_not_rotation_vector() -> None:
     roll, pitch, yaw = 0.3, -0.4, 0.5
     cx, sx = np.cos(roll), np.sin(roll)
@@ -74,4 +85,4 @@ def test_kdl_pose_conversion_uses_rpy_not_rotation_vector() -> None:
     kdl_pose = se3_to_elite_kdl_pose(pose)
 
     np.testing.assert_allclose(kdl_pose, [0.1, 0.2, 0.3, roll, pitch, yaw])
-    assert not np.allclose(kdl_pose[3:], se3_to_elite_tcp_pose(pose)[3:])
+    np.testing.assert_allclose(kdl_pose, se3_to_elite_tcp_pose(pose))

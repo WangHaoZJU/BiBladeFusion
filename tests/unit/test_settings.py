@@ -11,6 +11,9 @@ def test_default_settings_load_safely() -> None:
 
     assert settings.robot.model == "cs68"
     assert settings.robot.motion_enabled is False
+    assert settings.robot.headless_mode is True
+    assert settings.robot.rtsi_frequency_hz == 125.0
+    assert settings.robot.servoj_lookahead_time_s == 0.1
     assert settings.thermal.enabled is False
     assert settings.realsense.infrared_width == 1280
     assert settings.acquisition.max_bracket_ms == 250.0

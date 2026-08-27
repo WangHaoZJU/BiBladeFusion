@@ -18,7 +18,7 @@ class FakeRtsi:
     def __init__(self, output_recipe: str, input_recipe: str, frequency: float) -> None:
         assert Path(output_recipe).is_file()
         assert Path(input_recipe).is_file()
-        assert frequency == 250.0
+        assert frequency == 125.0
 
     def connect(self, ip: str) -> bool:
         return ip == "192.168.1.10"

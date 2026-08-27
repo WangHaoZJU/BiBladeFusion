@@ -6,9 +6,26 @@ robot:
   model: cs68
   robot_ip: null
   local_ip: null
-  headless_mode: false
+  sdk_import_path: elite_cs_sdk
+  headless_mode: true
   motion_enabled: false
-  rtsi_frequency_hz: 250.0
+  script_file_path: null
+  reverse_port: 50002
+  script_sender_port: 50001
+  trajectory_port: 50003
+  script_command_port: 50004
+  servoj_time_s: 0.004
+  servoj_lookahead_time_s: 0.1
+  servoj_gain: 2000
+  stopj_acceleration_rad_s2: 2.0
+  default_speed_scaling: 0.3
+  maximum_speed_scaling: 1.0
+  default_motion_timeout_s: 15.0
+  maximum_motion_timeout_s: 60.0
+  motion_poll_period_s: 0.01
+  default_trajectory_time_s: 3.0
+  default_blend_radius_m: 0.0
+  rtsi_frequency_hz: 125.0
   settle_time_s: 1.0
   sdk_wheel: /home/vale/Documents/Elite_Robots_CS_SDK_Python/dist/elite_cs_sdk-1.0.0-cp312-cp312-linux_x86_64.whl
 

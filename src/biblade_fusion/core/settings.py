@@ -24,9 +24,26 @@ class RobotConfig(BaseModel):
     model: Literal["cs68"] = "cs68"
     robot_ip: str | None = None
     local_ip: str | None = None
-    headless_mode: bool = False
+    sdk_import_path: str = "elite_cs_sdk"
+    headless_mode: bool = True
     motion_enabled: bool = False
-    rtsi_frequency_hz: float = Field(default=250.0, gt=0.0, le=500.0)
+    script_file_path: Path | None = None
+    reverse_port: int = Field(default=50002, ge=1024, le=65535)
+    script_sender_port: int = Field(default=50001, ge=1024, le=65535)
+    trajectory_port: int = Field(default=50003, ge=1024, le=65535)
+    script_command_port: int = Field(default=50004, ge=1024, le=65535)
+    servoj_time_s: float = Field(default=0.004, gt=0.0)
+    servoj_lookahead_time_s: float = Field(default=0.1, ge=0.03, le=0.2)
+    servoj_gain: int = Field(default=2000, gt=0)
+    stopj_acceleration_rad_s2: float = Field(default=2.0, gt=0.0)
+    default_speed_scaling: float = Field(default=0.3, ge=0.0, le=1.0)
+    maximum_speed_scaling: float = Field(default=1.0, gt=0.0, le=1.0)
+    default_motion_timeout_s: float = Field(default=15.0, gt=0.0)
+    maximum_motion_timeout_s: float = Field(default=60.0, gt=0.0)
+    motion_poll_period_s: float = Field(default=0.01, gt=0.0)
+    default_trajectory_time_s: float = Field(default=3.0, gt=0.0)
+    default_blend_radius_m: float = Field(default=0.0, ge=0.0)
+    rtsi_frequency_hz: float = Field(default=125.0, gt=0.0, le=500.0)
     settle_time_s: float = Field(default=1.0, ge=0.0)
     sdk_wheel: Path
 
@@ -36,6 +53,24 @@ class RobotConfig(BaseModel):
         if value is not None:
             ip_address(value)
         return value
+
+    @model_validator(mode="after")
+    def validate_motion_control(self) -> Self:
+        ports = (
+            self.reverse_port,
+            self.script_sender_port,
+            self.trajectory_port,
+            self.script_command_port,
+        )
+        if len(set(ports)) != len(ports):
+            raise ValueError("Elite external-control ports must be unique")
+        if self.default_speed_scaling > self.maximum_speed_scaling:
+            raise ValueError("Default speed scaling exceeds the configured maximum")
+        if self.default_motion_timeout_s > self.maximum_motion_timeout_s:
+            raise ValueError("Default motion timeout exceeds the configured maximum")
+        if not self.sdk_import_path.strip():
+            raise ValueError("Elite SDK import path must be non-empty")
+        return self
 
 
 class RealSenseConfig(BaseModel):
