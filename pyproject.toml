@@ -9,13 +9,15 @@ description = "Robot-guided bilateral 3D geometry and thermal reconstruction for
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-  "numpy>=2.0,<3",
+  "numpy>=1.26,<2",
   "opencv-python-headless>=4.10,<5",
   "pydantic>=2.9,<3",
   "pydantic-settings>=2.5,<3",
+  "pin>=2.7,<3",
   "pyrealsense2>=2.54,<3",
   "pyyaml>=6.0,<7",
   "rich>=13.9,<15",
+  "trimesh>=4,<5",
   "typer>=0.12,<1",
 ]
 
