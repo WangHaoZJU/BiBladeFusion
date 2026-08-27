@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from biblade_fusion.core.settings import MotionPreflightConfig
+from biblade_fusion.core.settings import CollisionConfig, MotionPreflightConfig
 from biblade_fusion.robotics import Cs68PinocchioCollisionChecker
 from biblade_fusion.storage.initialization import read_initialization
 from biblade_fusion.storage.view_plan import read_view_plan
@@ -61,6 +61,7 @@ def _derive(
     initialization: Path,
     ordered_view_ids: tuple[str, ...],
     config: MotionPreflightConfig,
+    collision_config: CollisionConfig,
 ) -> ViewSequenceMotionPreflight:
     stored_plan = read_view_plan(plan)
     stored_initialization = read_initialization(initialization)
@@ -73,7 +74,14 @@ def _derive(
         raise ValueError(
             "View plan lacks controller-kinematics provenance; regenerate the plan"
         )
-    checker = Cs68PinocchioCollisionChecker.from_resources()
+    if collision_config.require_obstacles and not collision_config.obstacles:
+        raise ValueError(
+            "Motion preflight requires at least one configured workcell obstacle"
+        )
+    checker = Cs68PinocchioCollisionChecker.from_resources(
+        environment_obstacles=collision_config.obstacles,
+        minimum_clearance_m=collision_config.minimum_clearance_m,
+    )
     return preflight_view_sequence_motion(
         stored_plan.result.filtered_plan,
         ordered_view_ids,
@@ -88,6 +96,7 @@ def write_motion_preflight(
     output_dir: str | Path,
     ordered_view_ids: tuple[str, ...],
     config: MotionPreflightConfig,
+    collision_config: CollisionConfig,
     *,
     source_plan: str | Path,
     source_initialization: str | Path,
@@ -99,7 +108,13 @@ def write_motion_preflight(
         raise FileExistsError(f"Motion-preflight output already exists: {output}")
     plan = Path(source_plan).resolve()
     initialization = Path(source_initialization).resolve()
-    report = _derive(plan, initialization, ordered_view_ids, config)
+    report = _derive(
+        plan,
+        initialization,
+        ordered_view_ids,
+        config,
+        collision_config,
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.{uuid4().hex}.partial")
     temporary.mkdir()
@@ -115,7 +130,10 @@ def write_motion_preflight(
                     initialization, "metadata.json"
                 ),
             },
-            "configuration": config.model_dump(mode="json"),
+            "configuration": {
+                "motion_preflight": config.model_dump(mode="json"),
+                "collision": collision_config.model_dump(mode="json"),
+            },
             "ordered_view_ids": list(ordered_view_ids),
             "report": asdict(report),
         }
@@ -145,9 +163,19 @@ def read_motion_preflight(path: str | Path) -> StoredMotionPreflight:
         sources = payload["sources"]
         plan = _verify_source(sources["view_plan"])
         initialization = _verify_source(sources["initialization"])
-        config = MotionPreflightConfig.model_validate(payload["configuration"])
+        configuration = payload["configuration"]
+        config = MotionPreflightConfig.model_validate(
+            configuration["motion_preflight"]
+        )
+        collision_config = CollisionConfig.model_validate(configuration["collision"])
         ordered_view_ids = tuple(str(value) for value in payload["ordered_view_ids"])
-        report = _derive(plan, initialization, ordered_view_ids, config)
+        report = _derive(
+            plan,
+            initialization,
+            ordered_view_ids,
+            config,
+            collision_config,
+        )
         normalized = json.loads(json.dumps(asdict(report), allow_nan=False))
         if payload["report"] != normalized:
             raise ValueError("Motion-preflight report does not match its sources")

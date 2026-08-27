@@ -5,6 +5,7 @@ from xml.etree import ElementTree
 import numpy as np
 import pytest
 
+from biblade_fusion.core.settings import CollisionObstacleConfig
 from biblade_fusion.robotics import (
     CollisionCheckStatus,
     Cs68KinematicModel,
@@ -103,3 +104,45 @@ def test_pinocchio_path_sampling_catches_folded_endpoint() -> None:
     assert report.sample_count == 31
     assert report.blocked_sample_index is not None
     assert report.motion_authorized is False
+
+
+def test_pinocchio_workcell_box_is_checked_against_robot_meshes() -> None:
+    model = Cs68KinematicModel.from_resources()
+    tcp = model.forward_kinematics((0.0,) * 6)[:3, 3]
+    checker = Cs68PinocchioCollisionChecker.from_resources(
+        environment_obstacles=(
+            CollisionObstacleConfig(
+                name="tcp_keepout",
+                minimum_m=tuple(float(value - 0.02) for value in tcp),
+                maximum_m=tuple(float(value + 0.02) for value in tcp),
+            ),
+        ),
+        minimum_clearance_m=0.005,
+    )
+
+    result = checker.check((0.0,) * 6)
+
+    assert result.status is CollisionCheckStatus.BLOCKED
+    assert any(
+        reason.startswith("workcell_collision:")
+        for reason in result.blocking_reasons
+    )
+    assert result.diagnostics["environment_obstacles"] == ["tcp_keepout"]
+
+
+def test_far_workcell_box_preserves_clear_state() -> None:
+    checker = Cs68PinocchioCollisionChecker.from_resources(
+        environment_obstacles=(
+            CollisionObstacleConfig(
+                name="far",
+                minimum_m=(10.0, 10.0, 10.0),
+                maximum_m=(11.0, 11.0, 11.0),
+            ),
+        ),
+    )
+
+    result = checker.check((0.0,) * 6)
+
+    assert result.status is CollisionCheckStatus.CLEAR
+    assert checker.geometry_model.ngeoms == 9
+    assert len(checker.pair_links) == 28

@@ -1262,6 +1262,7 @@ def safety_preflight_path(
             output,
             tuple(view_ids),
             settings.motion_preflight,
+            settings.collision,
             source_plan=plan,
             source_initialization=initialization,
         )

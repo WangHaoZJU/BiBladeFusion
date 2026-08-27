@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from biblade_fusion.core.settings import CollisionObstacleConfig
 from biblade_fusion.robotics.cs68_model import (
     CS68_JOINT_NAMES,
     Cs68KinematicModel,
@@ -170,6 +171,47 @@ def _add_holorobot_collision_pairs(geometry_model: Any) -> None:
             geometry_model.addCollisionPair(pin.CollisionPair(first, second))
 
 
+def _add_environment_boxes(
+    geometry_model: Any,
+    obstacles: Sequence[CollisionObstacleConfig],
+    *,
+    minimum_clearance_m: float,
+    robot_geometry_count: int,
+) -> None:
+    """Add configured workcell AABBs and robot-to-environment FCL pairs."""
+
+    if not obstacles:
+        return
+    pin = _require_pinocchio()
+    try:
+        import hppfcl
+    except ImportError as exc:
+        raise ImportError("hpp-fcl is required for workcell collision boxes") from exc
+    clearance = float(minimum_clearance_m)
+    if not math.isfinite(clearance) or clearance < 0.0:
+        raise ValueError("minimum_clearance_m must be finite and non-negative")
+    for obstacle in obstacles:
+        lower = np.asarray(obstacle.minimum_m, dtype=np.float64) - clearance
+        upper = np.asarray(obstacle.maximum_m, dtype=np.float64) + clearance
+        size = upper - lower
+        center = (lower + upper) / 2.0
+        geometry = pin.GeometryObject(
+            f"environment::{obstacle.name}",
+            0,
+            0,
+            hppfcl.Box(size),
+            pin.SE3(np.eye(3), center),
+        )
+        environment_index = int(geometry_model.addGeometryObject(geometry))
+        ignored = set(obstacle.ignored_capsule_indices)
+        for robot_index in range(robot_geometry_count):
+            if robot_index in ignored:
+                continue
+            geometry_model.addCollisionPair(
+                pin.CollisionPair(robot_index, environment_index)
+            )
+
+
 @dataclass(slots=True)
 class Cs68PinocchioCollisionChecker:
     """Fail-closed CS68+D435i mesh collision checker copied from HoloRobot semantics."""
@@ -182,6 +224,7 @@ class Cs68PinocchioCollisionChecker:
     pair_links: tuple[tuple[str, str], ...]
     pair_geometries: tuple[tuple[str, str], ...]
     include_d435i_mount: bool
+    environment_obstacle_names: tuple[str, ...] = ()
     _temporary_directory: TemporaryDirectory[str] | None = field(
         default=None, repr=False
     )
@@ -193,6 +236,8 @@ class Cs68PinocchioCollisionChecker:
         *,
         joint_zero_offsets_rad: Sequence[float] = (),
         include_d435i_mount: bool = True,
+        environment_obstacles: Sequence[CollisionObstacleConfig] = (),
+        minimum_clearance_m: float = 0.0,
     ) -> Cs68PinocchioCollisionChecker:
         pin = _require_pinocchio()
         resolved = resources or Cs68ModelResources.packaged()
@@ -216,7 +261,14 @@ class Cs68PinocchioCollisionChecker:
             pin.COLLISION,
             package_dirs=[str(resolved.root)],
         )
+        robot_geometry_count = int(geometry_model.ngeoms)
         _add_holorobot_collision_pairs(geometry_model)
+        _add_environment_boxes(
+            geometry_model,
+            environment_obstacles,
+            minimum_clearance_m=minimum_clearance_m,
+            robot_geometry_count=robot_geometry_count,
+        )
         geometry_data = pin.GeometryData(geometry_model)
         pair_links: list[tuple[str, str]] = []
         pair_geometries: list[tuple[str, str]] = []
@@ -241,6 +293,9 @@ class Cs68PinocchioCollisionChecker:
             pair_links=tuple(pair_links),
             pair_geometries=tuple(pair_geometries),
             include_d435i_mount=bool(include_d435i_mount),
+            environment_obstacle_names=tuple(
+                obstacle.name for obstacle in environment_obstacles
+            ),
             _temporary_directory=temporary_directory,
         )
 
@@ -346,10 +401,29 @@ class Cs68PinocchioCollisionChecker:
     def _finding(self, pair_index: int) -> CollisionPairFinding:
         links = self.pair_links[pair_index]
         geometries = self.pair_geometries[pair_index]
+        environment_geometry = next(
+            (name for name in geometries if name.startswith("environment::")),
+            None,
+        )
+        if environment_geometry is None:
+            pair_id = f"self_collision:{geometries[0]}:{geometries[1]}"
+            link_a, link_b = links
+        else:
+            robot_geometry = next(name for name in geometries if name != environment_geometry)
+            obstacle_name = environment_geometry.removeprefix("environment::")
+            pair_id = f"workcell_collision:{robot_geometry}:{obstacle_name}"
+            link_a, link_b = (
+                next(
+                    link
+                    for link, name in zip(links, geometries, strict=True)
+                    if name == robot_geometry
+                ),
+                obstacle_name,
+            )
         return CollisionPairFinding(
-            pair_id=f"self_collision:{geometries[0]}:{geometries[1]}",
-            link_a=links[0],
-            link_b=links[1],
+            pair_id=pair_id,
+            link_a=link_a,
+            link_b=link_b,
             geometry_a=geometries[0],
             geometry_b=geometries[1],
         )
@@ -361,6 +435,7 @@ class Cs68PinocchioCollisionChecker:
             "include_d435i_mount": self.include_d435i_mount,
             "geometry_count": int(self.geometry_model.ngeoms),
             "collision_pair_count": len(self.pair_links),
+            "environment_obstacles": list(self.environment_obstacle_names),
             "motion_authorized": False,
             "provenance": robot_stack_provenance(),
         }

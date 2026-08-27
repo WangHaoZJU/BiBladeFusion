@@ -197,11 +197,12 @@ def test_path_validation_refuses_different_kinematics_artifact(tmp_path: Path) -
 
 
 def test_holorobot_motion_preflight_round_trip_is_rederived(tmp_path: Path) -> None:
-    initialization, plan, _, _, view_id = _sources(tmp_path)
+    initialization, plan, _, collision, view_id = _sources(tmp_path)
     output = write_motion_preflight(
         tmp_path / "motion_preflight",
         (view_id,),
         MotionPreflightConfig(maximum_joint_step_rad=0.02),
+        collision,
         source_plan=plan,
         source_initialization=initialization,
     )
@@ -222,3 +223,17 @@ def test_holorobot_motion_preflight_round_trip_is_rederived(tmp_path: Path) -> N
     metadata_path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="does not match"):
         read_motion_preflight(output)
+
+
+def test_motion_preflight_requires_workcell_obstacles(tmp_path: Path) -> None:
+    initialization, plan, _, _, view_id = _sources(tmp_path)
+
+    with pytest.raises(ValueError, match="workcell obstacle"):
+        write_motion_preflight(
+            tmp_path / "motion_preflight",
+            (view_id,),
+            MotionPreflightConfig(),
+            CollisionConfig(require_obstacles=True),
+            source_plan=plan,
+            source_initialization=initialization,
+        )
