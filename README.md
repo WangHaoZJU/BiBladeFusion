@@ -4,7 +4,8 @@
 system for thin-walled blades.
 
 The current development stage provides a Python 3.12 application, validated
-configuration, safe read-only integration with an Elite CS68 robot, synchronized raw
+configuration, read-only Elite CS68 commands plus a default-off guarded control backend,
+synchronized raw
 stereo acquisition from an Intel RealSense D435i, reproducible session storage, a
 calibrated FoundationStereo inference path, paired native/stereo depth evaluation, a
 conservative single-view blade proxy, bilateral surface partitioning, and offline Elite
@@ -105,6 +106,9 @@ Hand-eye input is quality-gated and must explicitly describe `tcp_T_left_ir`. Se
 [calibration and frame conventions](docs/calibration.md) before processing real data.
 Current implementation status and the prioritized remaining work are tracked in the
 [development log](docs/development-log.md).
+The copied/adapted HoloRobot control lifecycle, pose convention, collision preflight,
+and approval boundary are documented in the
+[Elite CS68 control safety contract](docs/elite-cs68-control.md).
 
 Stored calibration sessions can be converted to an auditable ChArUco sample set and
 solved entirely offline:

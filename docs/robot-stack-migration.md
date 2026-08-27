@@ -65,14 +65,17 @@ license and attribution.
 
 ## Migration increments
 
-1. Import the required HoloRobot code/resources and add fail-closed provenance checks.
-2. Replace BiBladeFusion robot state conversion with the HoloRobot read-only arm path.
-3. Resolve CS68 URDF/STL/limits through HoloRobot and cross-check FK on fixed fixtures.
-4. Replace capsule collision validation with HoloRobot Pinocchio/FCL or its configured
-   primitive/hybrid collision backend.
-5. Convert planned camera poses into HoloRobot motion goals and persist motion preflight
+1. **Complete:** import the required HoloRobot code/resources and add fail-closed
+   provenance checks.
+2. **Complete:** align robot state and command conversion with the HoloRobot Elite path.
+3. **Complete:** resolve copied CS68 URDF/STL/limits and cross-check FK fixtures.
+4. **Partially complete:** HoloRobot Pinocchio/FCL self-collision is implemented;
+   workcell environment collision still uses the legacy conservative capsule prefilter.
+5. Convert planned camera poses into the copied motion contracts and persist preflight
    evidence and cost beside the BiBladeFusion view plan.
-6. Add guarded execution behind separate configuration and explicit operator approval.
+6. **Library layer complete:** guarded execution is behind default-off configuration,
+   exact hash confirmation, expiring one-shot permits, and live revalidation. No motion
+   CLI is exposed before step 5 and supervised hardware acceptance are complete.
 7. Remove superseded MDH/capsule code only after artifact compatibility and regression
    tests cover existing offline workflows.
 

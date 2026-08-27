@@ -8,8 +8,9 @@ authoritative fine-grained record; this page records the experiment-facing state
 ## Non-negotiable constraints
 
 - Python 3.12 with `uv`; Elite SDK is installed from the local CPython 3.12 wheel.
-- Elite CS68 access remains read-only. No implemented command loads a robot task,
-  releases brakes, or sends a motion command.
+- All currently exposed CLI commands remain read-only. A library-level Elite control
+  backend now exists but is blocked by default configuration, offline preflight, exact
+  operator confirmation, an expiring one-shot permit, and live revalidation.
 - Every exported view plan has `motion_authorized: false`.
 - Raw synchronized observations are immutable; derived products use separate outputs.
 - Thermal capture remains an explicit disabled placeholder until hardware is selected.
@@ -65,14 +66,22 @@ authoritative fine-grained record; this page records the experiment-facing state
 - View-plan schema 2 cryptographically binds endpoint-feasible IK solutions to their
   controller-specific MDH artifact; safety validation rejects legacy or mismatched
   kinematics provenance while retaining schema-1 geometry-only read compatibility.
-- Current verification: 131 tests, Ruff, package build, and Elite SDK import pass.
-  Through commit `1231f66`, all implementation commits were pushed to GitHub `main`.
+- Copied HoloRobot CS68 YAML/URDF/STL resources, D435i wrist collision mesh, matched
+  YAML/Pinocchio forward kinematics, and Pinocchio/FCL self-collision/path sampling.
+- HoloRobot-aligned Elite Dashboard/RTSI/EliteDriver lifecycle, RPY TCP convention,
+  point trajectories, SpeedJ, ServoJ prewarm/hold/streaming, stop, and safety faults.
+- Conservative linear-joint motion preflight using copied velocity limits, plus exact
+  preflight-hash confirmation, expiring one-shot execution permits, live-start checks,
+  and immediate collision revalidation. No motion command is exposed through the CLI.
+- Current verification: 171 tests, Ruff, wheel build, packaged robot-resource audit,
+  and Elite SDK import pass. Local implementation is through commit `304d303`; commits
+  after `1231f66` have not yet been pushed in this development session.
 
 ## In progress
 
-- Robot-stack migration to the pinned HoloRobot implementation is active. HoloRobot is
-  now the designated source of truth for CS68 URDF/STL, kinematics, collision checking,
-  motion planning, trajectory generation, guarded execution, and Elite pose conventions.
+- Robot-stack migration to the pinned HoloRobot implementation is active. Model,
+  self-collision, control, ServoJ trajectory, and guarded-execution library layers are
+  copied/adapted. View-plan artifact integration and workcell collision migration remain.
 - The migration sequence and safety boundary are recorded in
   `docs/robot-stack-migration.md`. Existing MDH/capsule code remains temporarily for
   artifact compatibility and will not receive new motion functionality.
@@ -83,6 +92,7 @@ authoritative fine-grained record; this page records the experiment-facing state
    CUDA device is currently available in this workspace.
 2. Collect paired blade observations and compare FoundationStereo with native RealSense
    depth using the offline evaluator and aggregate report.
-3. Complete the HoloRobot robot-stack migration, replacing the capsule validator with
-   its URDF-backed collision and motion-preflight path before enabling execution.
+3. Persist HoloRobot-backed motion preflight beside ordered view plans, then migrate
+   workcell collision from the capsule prefilter to primitive/hybrid or occupancy
+   geometry before exposing an interactive execution command.
 4. Implement the thermal-camera adapter after its model and radiometric SDK are known.
