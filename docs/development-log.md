@@ -23,7 +23,66 @@ authoritative fine-grained record; this page records the experiment-facing state
   camera/bracket assembly, records units and transforms explicitly, materializes the
   calibrated ES68 chain into a Pinocchio/FCL URDF, and fails closed until the operator
   supplies every mesh, validates the flange attachment, and marks the manifest ready.
+- A schema-bound fine-plan inspection command now verifies every persisted candidate's
+  transform, camera-to-target distance, optical alignment, incidence, projection,
+  coarse-cloud visibility, adaptive bounds, duplicate-pose status, and bilateral region
+  presence. It atomically exports JSON/CSV plus region-coloured PLY, OBJ camera frusta,
+  and a three-projection SVG. The optional PySide6 orbit viewer provides side/region
+  filters, view/normal toggles, selection highlighting, and rejection details. Inspection
+  explicitly reports robot feasibility as unverified and never changes
+  `motion_authorized: false`.
+- Fine-scan planning now uses a baseline-plus-region-adaptive distance policy. The base
+  footprint is derived from the user-calibrated left-IR intrinsics, baseline distance,
+  image margin, and utilization factor; no fixed 80x60 mm production fallback remains.
+  Each true-surface or fin patch searches an explicit validated distance interval,
+  records its selected distance and nominal footprint, and must pass whole-patch image/
+  depth projection plus coarse z-buffer visibility gates. High-curvature, boundary,
+  fin-root, and fin-rim regions prefer the closest feasible distance; flat main/fin faces
+  prefer the baseline. Infeasible patches are visibility-split to a bounded depth and
+  then fail closed. Schema-4 coarse-model artifacts persist the per-candidate evidence.
+- Paper-derived coarse-model reconstruction now consumes multiple existing
+  pose-registered D435i views, assigns immutable front/back membership from achieved
+  camera centres, voxel-fuses each side, and applies robust point-to-plane residual
+  refinement with robot-pose regularization, hard correction bounds, and no cross-side
+  correspondences.
+- True curved-surface planning now implements improved Angle Criterion boundary evidence,
+  supported outer-contour ordering, four topological junctions, robust endpoint-consistent
+  3D B-splines for root/trailing/tip/leading boundaries, equal-arc sampling, and an
+  invertible Coons-grid irregular surface domain with boundary snapping. Fit/fold gates
+  have explicit recorded fallback or fail-closed behaviour. Front/back use a shared
+  conservative base grid; each populated
+  patch then receives a PCA OBB centre, spherical-histogram main normal, and optional
+  curvature-adaptive split. Fine views use measured main normals and remain non-executable.
+- The photographed specimen's fixed topology is now explicit: robust per-side main-height
+  fitting and height/normal-seeded 3D region growth require one thin fin on the front and
+  one on the back. Fin points are removed before the paper boundary fit. Each retained
+  component has independently persisted face, attachment-root, and free-rim regions;
+  face-normal, root-bisector, and rim views; independent coverage gates; and measured-fin
+  thickness protection in TSDF. Missing fins, multiple significant protrusions, non-thin
+  components, and sub-voxel protected bands fail closed.
+- Bilateral sparse projective TSDF uses a measured-thickness-protected truncation band,
+  integrates front/back independently, and extracts a triangle mesh with a pure NumPy
+  marching-tetrahedra fallback. Calibrated pixel/intrinsic/pose metadata enables the
+  optional locked Open3D scalable backend when installed.
+- Real-surface coverage replaces proxy-plane bins at the coarse-model stage: each patch
+  records sample coverage, residual RMSE, local-normal consistency, curvature, and
+  explicit quality-gate reasons; four edge-region completion ratios and TSDF mesh
+  boundary/watertight evidence are reported separately.
+- `bbf reconstruct coarse-model` validates common hand-eye provenance, runs the full
+  fusion/partition/view/TSDF/quality chain, and atomically writes source-bound,
+  SHA-256-verified arrays and metadata with `motion_authorized: false`.
 
+- HoloRobot-aligned ES68/D435i eye-in-hand workflow: the exact 709-pose calibrated ES68
+  FK and flange-to-RTSI-TCP validation offset are separately packaged under `es68`;
+  synchronized PySide6 capture uses only raw D435i `infrared/1` and user-calibrated
+  intrinsics, records complete ChArUco/robot/timing evidence, gates FK/TCP agreement,
+  solves `flange_T_left_ir` with Daniilidis plus joint SE(3) LM/BA, and exports a
+  flange-primary schema-2 artifact with input hashes and before/after quality metrics.
+- PySide6 raw D435i IR stereo-calibration workflow using the stored 14x9 ChArUco target:
+  synchronized Y8 capture without factory IR calibration access, independent Zhang
+  initialization, joint stereo bundle adjustment, epipolar metrics, source-image
+  retention, selectable radial2/Brown5/Rational8 distortion models, held-out automatic
+  model comparison, and user-calibration YAML export/load with resolution checks.
 - Read-only Elite RTSI state acquisition and controller MDH export.
 - D435i synchronized infrared/native-depth capture with calibration snapshots.
 - Atomic schema-v2 session writer and validated reader.
@@ -36,7 +95,7 @@ authoritative fine-grained record; this page records the experiment-facing state
   inference scale is converted back to full-resolution disparity pixel units.
 - Rectified left/right valid-region filtering and disparity-to-metric-depth conversion.
 - Atomic, checksummed stereo inference artifacts and `bbf stereo infer-session`.
-- Offline Park-Martin/Tsai/Horaud/Andreff/Daniilidis eye-in-hand solving, motion
+- Offline Park-Martin/Tsai/Horaud/Andreff/Daniilidis initial solving, motion
   observability gates, fixed-target closure RMSE, atomic artifacts, and CLI integration.
 - Identified ChArUco detection from raw stored left-IR frames, positive-depth IPPE pose
   selection, planar-ambiguity/reprojection gates, automatic sample extraction, and
@@ -85,9 +144,9 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Mesh motion preflight now persists calibrated `base_T_tcp` goals and sequence cost;
   configured workcell AABBs are clearance-expanded hpp-fcl geometry checked against
   all copied CS68/D435i meshes. Required missing obstacle geometry is blocking.
-- Current verification: 176 tests, Ruff, wheel build, packaged robot-resource audit,
-  and Elite/Pinocchio/hpp-fcl/trimesh imports pass. All implementation commits in this
-  checkpoint are pushed to GitHub `main`.
+- Current local verification: 206 tests, Ruff, offline wheel build, packaged robot-resource
+  audit, and Elite/Pinocchio/hpp-fcl/trimesh imports pass. Curved reconstruction is
+  software-verified on deterministic data and remains pending physical hardware validation.
 
 ## In progress
 
@@ -98,14 +157,20 @@ authoritative fine-grained record; this page records the experiment-facing state
 - The migration sequence and safety boundary are recorded in
   `docs/robot-stack-migration.md`. Existing MDH/capsule code remains temporarily for
   artifact compatibility and will not receive new motion functionality.
+- Real D435i/ES68 coarse scans are not yet available, so the new curved reconstruction
+  is verified on deterministic synthetic bilateral blade data. Hardware threshold
+  tuning, edge occlusion acceptance, and Open3D-versus-NumPy mesh comparison remain.
 
 ## Pending, in priority order
 
-1. Run a real FoundationStereo checkpoint/CUDA smoke test; no compatible checkpoint or
+1. Record overlapping front/back coarse blade views, run `bbf reconstruct coarse-model`,
+   and tune footprint, Angle Criterion, curvature, ICP, TSDF, and quality gates against
+   physical dimensional references.
+2. Run a real FoundationStereo checkpoint/CUDA smoke test; no compatible checkpoint or
    CUDA device is currently available in this workspace.
-2. Collect paired blade observations and compare FoundationStereo with native RealSense
+3. Collect paired blade observations and compare FoundationStereo with native RealSense
    depth using the offline evaluator and aggregate report.
-3. Optimize front/back traversal order using the persisted motion cost, then perform a
+4. Optimize front/back traversal order using the persisted motion cost, then perform a
    separately approved known-safe-pose hardware acceptance before considering an
    interactive execution command. Add occupancy collision for unmodeled objects later.
-4. Implement the thermal-camera adapter after its model and radiometric SDK are known.
+5. Implement the thermal-camera adapter after its model and radiometric SDK are known.

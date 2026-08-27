@@ -1,5 +1,10 @@
 """Reproducible acquisition-session storage."""
 
+from biblade_fusion.storage.coarse_model import (
+    StoredCoarseModelSummary,
+    read_coarse_model_summary,
+    write_coarse_model,
+)
 from biblade_fusion.storage.coverage import (
     StoredCoverageLedger,
     read_coverage_ledger,
@@ -63,6 +68,7 @@ __all__ = [
     "SessionReader",
     "SessionWriter",
     "StoredCoverageLedger",
+    "StoredCoarseModelSummary",
     "StoredCoverageDrivenPlan",
     "StoredDepthComparison",
     "StoredDepthAggregate",
@@ -74,6 +80,7 @@ __all__ = [
     "StoredViewPlan",
     "StoredViewDescriptor",
     "read_initialization",
+    "read_coarse_model_summary",
     "read_motion_preflight",
     "read_path_validation",
     "read_coverage_driven_plan",
@@ -84,6 +91,7 @@ __all__ = [
     "read_stereo_inference",
     "read_view_plan",
     "write_initialization",
+    "write_coarse_model",
     "write_motion_preflight",
     "write_path_validation",
     "write_coverage_driven_plan",

@@ -11,7 +11,7 @@ import yaml
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import HandEyeConfig
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class HandEyeCalibrationError(ValueError):
@@ -20,6 +20,8 @@ class HandEyeCalibrationError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class HandEyeCalibration:
+    # Runtime compatibility transform derived from the flange-primary result and the
+    # independently calibrated HoloRobot flange_T_tcp offset.
     tcp_t_left_ir: PoseSE3
     method: str
     sample_count: int | None
@@ -29,12 +31,18 @@ class HandEyeCalibration:
     rotation_span_deg: float | None = None
     translation_span_m: float | None = None
     rotation_axis_diversity: float | None = None
+    flange_t_left_ir: PoseSE3 | None = None
 
     def __post_init__(self) -> None:
         if self.tcp_t_left_ir.parent_frame != "tcp":
             raise ValueError("Hand-eye parent frame must be tcp")
         if self.tcp_t_left_ir.child_frame != "left_ir":
             raise ValueError("Hand-eye child frame must be left_ir")
+        if self.flange_t_left_ir is not None and (
+            self.flange_t_left_ir.parent_frame,
+            self.flange_t_left_ir.child_frame,
+        ) != ("flange", "left_ir"):
+            raise ValueError("Flange-primary hand-eye transform must be flange_T_left_ir")
         if not self.method:
             raise ValueError("Hand-eye calibration method must be non-empty")
         if self.sample_count is not None and self.sample_count < 3:
@@ -55,7 +63,7 @@ class HandEyeCalibration:
 
 
 def load_hand_eye_calibration(config: HandEyeConfig) -> HandEyeCalibration:
-    """Load and quality-gate a ``tcp_T_left_ir`` calibration artifact."""
+    """Load and quality-gate a flange-primary ES68 hand-eye artifact."""
 
     if config.calibration_path is None:
         raise HandEyeCalibrationError("Hand-eye calibration path is not configured")
@@ -97,11 +105,26 @@ def load_hand_eye_calibration(config: HandEyeConfig) -> HandEyeCalibration:
     except (KeyError, TypeError, ValueError) as exc:
         raise HandEyeCalibrationError(f"Hand-eye calibration fields are invalid: {exc}") from exc
 
-    if schema_version != SCHEMA_VERSION:
+    if schema_version not in (1, SCHEMA_VERSION):
         raise HandEyeCalibrationError(f"Unsupported hand-eye schema {schema_version}")
     try:
+        if schema_version == 1:
+            tcp_t_left_ir = PoseSE3(parent_frame, child_frame, matrix)
+            flange_t_left_ir = None
+        else:
+            if (parent_frame, child_frame) != ("flange", "left_ir"):
+                raise ValueError("Schema-2 hand-eye frames must be flange and left_ir")
+            flange_t_left_ir = PoseSE3("flange", "left_ir", matrix)
+            derived = payload.get("derived_runtime", {})
+            tcp_matrix = derived.get("tcp_T_left_ir")
+            if tcp_matrix is None:
+                from biblade_fusion.robotics import load_es68_flange_t_tcp
+
+                tcp_t_left_ir = load_es68_flange_t_tcp().inverse().compose(flange_t_left_ir)
+            else:
+                tcp_t_left_ir = PoseSE3("tcp", "left_ir", tcp_matrix)
         calibration = HandEyeCalibration(
-            tcp_t_left_ir=PoseSE3(parent_frame, child_frame, matrix),
+            tcp_t_left_ir=tcp_t_left_ir,
             method=method,
             sample_count=sample_count,
             translation_rmse_m=translation_rmse_m,
@@ -110,6 +133,7 @@ def load_hand_eye_calibration(config: HandEyeConfig) -> HandEyeCalibration:
             rotation_span_deg=rotation_span_deg,
             translation_span_m=translation_span_m,
             rotation_axis_diversity=rotation_axis_diversity,
+            flange_t_left_ir=flange_t_left_ir,
         )
     except ValueError as exc:
         raise HandEyeCalibrationError(str(exc)) from exc

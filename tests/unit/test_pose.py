@@ -43,4 +43,3 @@ def test_pose_rejects_non_rigid_matrix() -> None:
 
     with pytest.raises(ValueError, match="orthonormal"):
         PoseSE3("base", "camera", invalid)
-

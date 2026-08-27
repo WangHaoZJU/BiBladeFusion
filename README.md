@@ -4,12 +4,13 @@
 system for thin-walled blades.
 
 The current development stage provides a Python 3.12 application, validated
-configuration, read-only Elite CS68 commands plus a default-off guarded control backend,
+configuration, read-only Elite ES68 commands plus a default-off guarded control backend,
 synchronized raw
 stereo acquisition from an Intel RealSense D435i, reproducible session storage, a
 calibrated FoundationStereo inference path, paired native/stereo depth evaluation, a
-conservative single-view blade proxy, bilateral surface partitioning, and offline Elite
-KDL endpoint IK. Robot motion is disabled by default.
+conservative single-view blade proxy, paper-derived true curved-surface partitioning,
+thin-wall-aware multi-view TSDF/mesh reconstruction, real-surface quality feedback, and
+offline Elite KDL endpoint IK. Robot motion is disabled by default.
 
 ## Bootstrap
 
@@ -89,6 +90,14 @@ The synchronized snapshot brackets the D435i capture with two RTSI robot states 
 rejects it when timing or stationary-state tolerances are exceeded. It does not issue
 robot motion commands.
 
+## User-calibrated D435i infrared stereo
+
+The raw left/right IR calibration path does not use D435i factory IR intrinsics or
+factory stereo extrinsics. A PySide6 application captures synchronized ChArUco views,
+runs independent Zhang initialization, jointly optimizes both cameras and their fixed
+stereo transform, and writes the configuration consumed by later rectification. See
+[D435i infrared stereo calibration](docs/stereo-calibration.md).
+
 ## Bilateral initialization
 
 The initial visible-face point cloud is reduced to a density-balanced voxel cloud and
@@ -102,7 +111,8 @@ the proxy uses the larger of the observed dimensions and these conservative prio
 dimensions. The resulting proxy center is a planning-volume center, not a claim about
 the blade's physical center of mass.
 
-Hand-eye input is quality-gated and must explicitly describe `tcp_T_left_ir`. See
+Hand-eye input is quality-gated and is solved as `flange_T_left_ir` from the raw D435i
+left-IR stream and calibrated ES68 FK. See
 [calibration and frame conventions](docs/calibration.md) before processing real data.
 Current implementation status and the prioritized remaining work are tracked in the
 [development log](docs/development-log.md).
@@ -120,8 +130,17 @@ uv run bbf calibration extract-hand-eye \
   --output data/calibrations/hand_eye_samples.yaml
 uv run bbf calibration solve-hand-eye \
   --samples data/calibrations/hand_eye_samples.yaml \
+  --stereo-calibration data/calibrations/d435i_ir_stereo_calibration.yaml \
   --config configs/local.yaml \
   --output data/calibrations/hand_eye.yaml
+```
+
+For direct synchronized manual-pose collection, use the PySide6 workflow:
+
+```bash
+uv run bbf calibration hand-eye-gui \
+  --config configs/local.yaml \
+  --output data/calibrations/es68_left_ir_hand_eye_run_01
 ```
 
 ## Offline planning workflow
@@ -130,6 +149,10 @@ For the native-depth path, create a Boolean `.npy` blade mask in the native dept
 coordinate system. Then set
 `hand_eye.calibration_path`, `kinematics.model_path`, `proxy_model.estimated_thickness_m`,
 `view_planning.standoff_distance_m`, and measured workcell bounds in the local config.
+For curved fine planning, also set the validated
+`minimum_standoff_distance_m`/`maximum_standoff_distance_m` pair; the baseline partition
+footprint is derived from the stored user-calibrated left-IR intrinsics rather than a
+fixed physical rectangle.
 
 ```bash
 uv run bbf initialize native-depth \
@@ -162,6 +185,22 @@ executes a planned pose.
 The coverage ledger uses pose-registered base-frame blade points to fill independent
 front/back per-patch occupancy grids. See [coverage and replanning](docs/coverage.md) for
 its evidence rules and current limitations.
+
+After proxy views have produced overlapping coarse observations on both physical sides,
+use the [paper-derived curved reconstruction](docs/curved-reconstruction.md) workflow.
+It replaces proxy planes with measured curved patches, independently partitions the
+leading edge, trailing edge, root, and tip, robustly fits the irregular four-boundary
+outline, uses curve-driven equal-arc coordinates with a shared bilateral base grid,
+separates the specimen's one front and one back protruding fin, plans their two faces,
+attachment roots, and free rims with dedicated normals, protects both blade and measured
+fin thickness during TSDF integration, and reports component-level surface/mesh quality. Install
+`uv sync --extra tsdf-open3d` to enable the optional calibrated Open3D backend; the
+locked NumPy fallback remains available without it.
+
+Before attempting robot feasibility, run `bbf reconstruct inspect-fine-plan` on the
+schema-4 coarse model. It exports portable inspection geometry/reports and can open a
+read-only PySide6 orbit viewer; a geometric pass still records robot feasibility as
+unverified and cannot authorize motion.
 
 Explicit ordered view sequences can be checked offline with the fail-closed
 [CS68 collision and path validator](docs/collision-validation.md). It uses configured

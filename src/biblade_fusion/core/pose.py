@@ -113,4 +113,3 @@ class PoseSE3:
         if point_array.shape == () or point_array.shape[-1] != 3:
             raise ValueError("Points must have shape (3,) or (..., 3)")
         return point_array @ self.matrix[:3, :3].T + self.matrix[:3, 3]
-

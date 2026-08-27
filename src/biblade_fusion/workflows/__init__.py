@@ -1,5 +1,10 @@
 """Auditable end-to-end project workflows."""
 
+from biblade_fusion.workflows.coarse_model import (
+    CoarseModelResult,
+    build_coarse_blade_model,
+    registered_cloud_view,
+)
 from biblade_fusion.workflows.depth_aggregation import (
     DepthAggregateGroup,
     DepthAggregateMetrics,
@@ -55,6 +60,7 @@ from biblade_fusion.workflows.view_planning import (
 
 __all__ = [
     "DepthComparisonError",
+    "CoarseModelResult",
     "DepthComparisonMetrics",
     "DepthViewGeometry",
     "PairedDepthComparison",
@@ -88,4 +94,6 @@ __all__ = [
     "validate_view_sequence_collision",
     "reconstruct_foundation_stereo_view",
     "reconstruct_native_depth_view",
+    "build_coarse_blade_model",
+    "registered_cloud_view",
 ]

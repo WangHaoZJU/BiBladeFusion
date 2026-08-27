@@ -22,6 +22,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+calibration-gui = [
+  "pyside6>=6.8,<7",
+]
+tsdf-open3d = [
+  "open3d>=0.18,<1",
+]
 foundation-stereo = [
   "einops>=0.8,<1",
   "huggingface-hub>=0.24,<2",

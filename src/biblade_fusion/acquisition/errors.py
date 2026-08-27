@@ -7,4 +7,3 @@ class AcquisitionError(RuntimeError):
 
 class AcquisitionRejectedError(AcquisitionError):
     """The captured bundle violated timing or stationary-state constraints."""
-

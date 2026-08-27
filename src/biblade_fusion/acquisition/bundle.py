@@ -36,4 +36,3 @@ class SynchronizedFrameBundle:
             raise ValueError("View ID must be non-empty")
         if self.sequence_index < 0:
             raise ValueError("Sequence index must be non-negative")
-

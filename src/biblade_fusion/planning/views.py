@@ -65,6 +65,9 @@ class CandidateView:
     base_t_left_ir: PoseSE3
     standoff_distance_m: float
     footprint_m: tuple[float, float]
+    projection_fraction: float = 1.0
+    visibility_fraction: float = 1.0
+    distance_policy: str = "fixed_baseline"
 
     def __post_init__(self) -> None:
         if self.base_t_left_ir.parent_frame != "base":
@@ -73,6 +76,12 @@ class CandidateView:
             raise ValueError("Candidate standoff must be positive")
         if self.footprint_m[0] <= 0.0 or self.footprint_m[1] <= 0.0:
             raise ValueError("Candidate footprint must be positive")
+        if not 0.0 <= self.projection_fraction <= 1.0:
+            raise ValueError("Candidate projection fraction must lie in [0, 1]")
+        if not 0.0 <= self.visibility_fraction <= 1.0:
+            raise ValueError("Candidate visibility fraction must lie in [0, 1]")
+        if not self.distance_policy:
+            raise ValueError("Candidate distance policy must be non-empty")
 
     @property
     def optical_axis(self) -> NDArray[np.float64]:

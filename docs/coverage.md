@@ -1,5 +1,12 @@
 # Bilateral coverage and replanning
 
+This page describes the conservative **proxy-stage** ledger retained for initial
+planning compatibility. The later coarse-model workflow evaluates samples on the actual
+curved front/back surfaces and TSDF mesh; see
+[paper-derived curved reconstruction](curved-reconstruction.md). The two ledgers are
+deliberately distinct so proxy evidence cannot be mistaken for final reconstruction
+quality.
+
 Coverage is tracked against the fixed conservative proxy and the exact patch IDs in an
 offline view plan. Front and back evidence are never merged. The observed side is
 selected from the calibrated camera center in the proxy frame; a camera too close to the
@@ -27,11 +34,11 @@ plan, source initialization, configuration, observation IDs, front/back completi
 
 ## Registration assumption
 
-Current clouds are registered in `base` through synchronized `base_T_tcp`, the
-quality-gated `tcp_T_left_ir`, and the calibrated camera-stream transform. This preserves
-metric provenance and avoids unconstrained ICP on a thin, locally smooth blade, where
-sliding or front/back convergence is a serious failure mode. Pairwise geometric
-refinement will only be added with explicit correspondence/uncertainty checks.
+Proxy-ledger clouds are registered in `base` through synchronized `base_T_tcp`, the
+quality-gated `tcp_T_left_ir`, and the calibrated camera-stream transform; this legacy
+stage does not alter their poses. The later coarse-model workflow adds only bounded,
+pose-regularized, same-side point-to-plane refinement with correspondence-count and
+residual checks. It never runs unconstrained front/back ICP on the thin blade.
 
 For every later captured view, first create a pose-registered artifact. Choose the depth
 source used by that experiment:

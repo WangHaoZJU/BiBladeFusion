@@ -4,4 +4,3 @@ from biblade_fusion.acquisition.bundle import CaptureMetrics, SynchronizedFrameB
 from biblade_fusion.acquisition.coordinator import SynchronizedAcquirer
 
 __all__ = ["CaptureMetrics", "SynchronizedAcquirer", "SynchronizedFrameBundle"]
-

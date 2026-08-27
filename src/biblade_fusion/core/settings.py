@@ -21,7 +21,7 @@ class ProjectConfig(BaseModel):
 class RobotConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model: Literal["cs68"] = "cs68"
+    model: Literal["es68", "cs68"] = "es68"
     robot_ip: str | None = None
     local_ip: str | None = None
     sdk_import_path: str = "elite_cs_sdk"
@@ -83,6 +83,8 @@ class RealSenseConfig(BaseModel):
     enable_native_depth: bool = True
     warmup_frames: int = Field(default=15, ge=0, le=300)
     timeout_ms: int = Field(default=5000, gt=0, le=60000)
+    infrared_emitter_enabled: bool = False
+    stereo_calibration_path: Path | None = None
 
 
 class ThermalConfig(BaseModel):
@@ -182,6 +184,7 @@ class CharucoTargetConfig(BaseModel):
     minimum_corners: int = Field(default=12, ge=4)
     maximum_reprojection_rmse_px: float = Field(default=0.8, gt=0.0)
     minimum_pose_ambiguity_ratio: float = Field(default=1.5, gt=1.0)
+    detector_params: dict[str, int | float | bool] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_lengths(self) -> Self:
@@ -209,19 +212,50 @@ class HandEyeConfig(BaseModel):
     minimum_rotation_span_deg: float = Field(default=20.0, gt=0.0, le=180.0)
     minimum_translation_span_m: float = Field(default=0.03, gt=0.0)
     minimum_rotation_axis_diversity: float = Field(default=0.1, gt=0.0, le=1.0)
+    maximum_fk_tcp_translation_error_m: float = Field(default=0.002, gt=0.0)
+    maximum_fk_tcp_rotation_error_deg: float = Field(default=0.3, gt=0.0)
     require_quality_metrics: bool = True
     require_observability_metrics: bool = True
+    initial_method: Literal["daniilidis", "park", "tsai", "horaud", "andreff"] = "daniilidis"
+    enable_bundle_adjustment: bool = True
     target: CharucoTargetConfig = Field(default_factory=CharucoTargetConfig)
 
 
 class ViewPlanningConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # ``standoff_distance_m`` is the baseline optical-centre-to-patch-centre
+    # distance.  Fine planning may move an individual candidate within the
+    # explicitly bounded interval below; proxy planning continues to use the
+    # baseline exactly.
     standoff_distance_m: float | None = Field(default=None, gt=0.0)
+    adaptive_standoff_enabled: bool = True
+    minimum_standoff_distance_m: float | None = Field(default=None, gt=0.0)
+    maximum_standoff_distance_m: float | None = Field(default=None, gt=0.0)
+    distance_search_step_m: float = Field(default=0.01, gt=0.0)
     overlap_fraction: float = Field(default=0.3, ge=0.0, lt=0.9)
     footprint_utilization: float = Field(default=0.8, gt=0.0, le=1.0)
+    image_edge_margin_px: int = Field(default=40, ge=0)
+    minimum_patch_projection_fraction: float = Field(default=1.0, gt=0.0, le=1.0)
+    minimum_patch_visibility_fraction: float = Field(default=0.90, gt=0.0, le=1.0)
+    occlusion_depth_tolerance_m: float = Field(default=0.003, ge=0.0)
+    maximum_visibility_split_depth: int = Field(default=2, ge=0, le=5)
     edge_margin_m: float = Field(default=0.005, ge=0.0)
     maximum_candidates: int = Field(default=200, ge=2, le=10000)
+
+    @model_validator(mode="after")
+    def validate_adaptive_standoff(self) -> Self:
+        bounds = (self.minimum_standoff_distance_m, self.maximum_standoff_distance_m)
+        if (bounds[0] is None) != (bounds[1] is None):
+            raise ValueError("Adaptive standoff minimum and maximum must be configured together")
+        if bounds[0] is not None and bounds[1] is not None:
+            if bounds[0] > bounds[1]:
+                raise ValueError("Minimum standoff distance must not exceed maximum")
+            if self.standoff_distance_m is not None and not (
+                bounds[0] <= self.standoff_distance_m <= bounds[1]
+            ):
+                raise ValueError("Baseline standoff distance must lie inside adaptive bounds")
+        return self
 
 
 class AxisAlignedBoxConfig(BaseModel):
@@ -266,6 +300,121 @@ class CoverageConfig(BaseModel):
     minimum_surface_points_per_view: int = Field(default=50, ge=1)
 
 
+class MultiViewFusionConfig(BaseModel):
+    """Bounded pose-prior refinement and thin-wall-aware fusion settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    voxel_size_m: float = Field(default=0.0015, gt=0.0)
+    maximum_icp_points: int = Field(default=2500, ge=100, le=20000)
+    icp_iterations: int = Field(default=12, ge=0, le=100)
+    maximum_correspondence_distance_m: float = Field(default=0.012, gt=0.0)
+    minimum_correspondences: int = Field(default=80, ge=6)
+    pose_prior_weight: float = Field(default=0.25, ge=0.0)
+    maximum_translation_correction_m: float = Field(default=0.008, gt=0.0)
+    maximum_rotation_correction_deg: float = Field(default=1.5, gt=0.0, le=15.0)
+    normal_neighbors: int = Field(default=16, ge=6, le=64)
+
+
+class SurfacePartitionConfig(BaseModel):
+    """Coarse-model partition parameters derived from the blade-view paper."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    voxel_size_m: float = Field(default=0.0015, gt=0.0)
+    maximum_points_per_side: int = Field(default=6000, ge=200, le=50000)
+    minimum_points_per_side: int = Field(default=150, ge=30)
+    normal_neighbors: int = Field(default=16, ge=6, le=64)
+    angle_criterion_threshold_deg: float = Field(default=90.0, gt=0.0, lt=180.0)
+    boundary_curve_enabled: bool = True
+    boundary_allow_fallback: bool = True
+    boundary_angular_bins: int = Field(default=180, ge=24, le=720)
+    boundary_min_points_per_curve: int = Field(default=10, ge=6, le=1000)
+    boundary_control_points: int = Field(default=10, ge=4, le=64)
+    boundary_robust_iterations: int = Field(default=6, ge=1, le=30)
+    boundary_smoothing_lambda: float = Field(default=0.1, ge=0.0)
+    boundary_huber_delta_m: float = Field(default=0.003, gt=0.0)
+    boundary_max_fit_rmse_m: float = Field(default=0.006, gt=0.0)
+    boundary_min_inlier_fraction: float = Field(default=0.70, gt=0.0, le=1.0)
+    boundary_band_fraction: float = Field(default=0.08, gt=0.0, lt=0.25)
+    overlap_fraction: float = Field(default=0.30, ge=0.0, lt=0.9)
+    # Production coarse-model workflows derive this from calibrated left-IR
+    # intrinsics and the baseline standoff.  An explicit value remains available
+    # only for synthetic/offline fixtures and controlled footprint experiments.
+    derive_footprint_from_intrinsics: bool = True
+    usable_footprint_m: tuple[float, float] | None = None
+    minimum_patch_points: int = Field(default=24, ge=6)
+    curvature_split_threshold_deg: float = Field(default=8.0, gt=0.0, le=90.0)
+    maximum_adaptive_depth: int = Field(default=2, ge=0, le=5)
+    normal_azimuth_bins: int = Field(default=24, ge=4, le=72)
+    normal_elevation_bins: int = Field(default=12, ge=3, le=36)
+    fin_mode: Literal["disabled", "optional", "required_single_per_side"] = (
+        "required_single_per_side"
+    )
+    fin_height_fit_iterations: int = Field(default=6, ge=1, le=30)
+    fin_height_huber_delta_m: float = Field(default=0.003, gt=0.0)
+    fin_main_normal_min_cosine: float = Field(default=0.70, ge=0.0, le=1.0)
+    fin_seed_max_normal_cosine: float = Field(default=0.55, ge=0.0, le=1.0)
+    fin_seed_min_height_m: float = Field(default=0.008, gt=0.0)
+    fin_grow_min_height_m: float = Field(default=0.0025, gt=0.0)
+    fin_connectivity_radius_m: float = Field(default=0.006, gt=0.0)
+    fin_minimum_points: int = Field(default=36, ge=12)
+    fin_minimum_span_m: float = Field(default=0.012, gt=0.0)
+    fin_maximum_thickness_ratio: float = Field(default=0.35, gt=0.0, lt=1.0)
+    fin_maximum_secondary_fraction: float = Field(default=0.35, ge=0.0, lt=1.0)
+    fin_root_band_m: float = Field(default=0.006, gt=0.0)
+    fin_free_edge_band_m: float = Field(default=0.006, gt=0.0)
+    fin_face_min_separation_m: float = Field(default=0.0015, gt=0.0)
+    fin_root_view_main_weight: float = Field(default=0.75, gt=0.0, le=2.0)
+
+    @field_validator("usable_footprint_m")
+    @classmethod
+    def validate_usable_footprint(
+        cls, value: tuple[float, float] | None
+    ) -> tuple[float, float] | None:
+        if value is None:
+            return None
+        if not np.isfinite(value).all() or any(item <= 0.0 for item in value):
+            raise ValueError("Usable surface footprint must be finite and positive")
+        return value
+
+    @model_validator(mode="after")
+    def validate_fin_partition(self) -> Self:
+        if self.fin_grow_min_height_m >= self.fin_seed_min_height_m:
+            raise ValueError("Fin grow height must be below the seed height")
+        if self.fin_seed_max_normal_cosine >= self.fin_main_normal_min_cosine:
+            raise ValueError("Fin seed normal cosine must be below the main-surface cosine")
+        if self.fin_connectivity_radius_m < self.voxel_size_m:
+            raise ValueError("Fin connectivity radius must be at least one voxel")
+        return self
+
+
+class TSDFConfig(BaseModel):
+    """Sparse projective TSDF settings with a protected thin-wall truncation band."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    voxel_size_m: float = Field(default=0.0015, gt=0.0)
+    truncation_distance_m: float = Field(default=0.006, gt=0.0)
+    minimum_weight: float = Field(default=1.0, gt=0.0)
+    maximum_voxels: int = Field(default=2_000_000, ge=1000)
+    use_open3d_if_available: bool = True
+    thin_wall_band_fraction: float = Field(default=0.40, gt=0.0, lt=0.5)
+
+
+class SurfaceQualityConfig(BaseModel):
+    """Reference-surface coverage and reconstruction-quality gates."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    maximum_surface_distance_m: float = Field(default=0.004, gt=0.0)
+    minimum_incidence_cosine: float = Field(default=0.35, ge=0.0, le=1.0)
+    completed_fraction: float = Field(default=0.85, gt=0.0, le=1.0)
+    maximum_rmse_m: float = Field(default=0.003, gt=0.0)
+    minimum_normal_consistency: float = Field(default=0.75, ge=0.0, le=1.0)
+    minimum_observed_points: int = Field(default=30, ge=3)
+
+
 class DepthComparisonConfig(BaseModel):
     """Reproducible native-versus-stereo comparison settings."""
 
@@ -278,9 +427,7 @@ class DepthComparisonConfig(BaseModel):
 
     @field_validator("agreement_thresholds_m")
     @classmethod
-    def validate_agreement_thresholds(
-        cls, value: tuple[float, ...]
-    ) -> tuple[float, ...]:
+    def validate_agreement_thresholds(cls, value: tuple[float, ...]) -> tuple[float, ...]:
         if not value or not np.isfinite(value).all() or any(item <= 0.0 for item in value):
             raise ValueError("Depth agreement thresholds must be finite and positive")
         if tuple(sorted(set(value))) != value:
@@ -295,10 +442,7 @@ class DepthComparisonConfig(BaseModel):
             or value[0] != 0.0
             or value[-1] != 90.0
             or not np.isfinite(value).all()
-            or any(
-                first >= second
-                for first, second in zip(value, value[1:], strict=False)
-            )
+            or any(first >= second for first, second in zip(value, value[1:], strict=False))
         ):
             raise ValueError("Incidence bin edges must increase from 0 to 90 degrees")
         return value
@@ -311,6 +455,14 @@ class KinematicsConfig(BaseModel):
     plugin_path: Path | None = None
     primary_timeout_ms: int = Field(default=1000, gt=0, le=30000)
     ik_timeout_s: float = Field(default=0.05, gt=0.0, le=5.0)
+    joint_zero_offsets_rad: tuple[float, float, float, float, float, float] = (
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    )
 
 
 class CollisionObstacleConfig(AxisAlignedBoxConfig):
@@ -355,9 +507,7 @@ class CollisionConfig(BaseModel):
             and limits[1] is not None
             and (
                 not np.isfinite((*limits[0], *limits[1])).all()
-                or any(
-                lower >= upper for lower, upper in zip(*limits, strict=True)
-                )
+                or any(lower >= upper for lower, upper in zip(*limits, strict=True))
             )
         ):
             raise ValueError("Collision joint limits must be finite and ordered")
@@ -395,6 +545,10 @@ class AppSettings(BaseModel):
     view_planning: ViewPlanningConfig = Field(default_factory=ViewPlanningConfig)
     view_filter: ViewFilterConfig = Field(default_factory=ViewFilterConfig)
     coverage: CoverageConfig = Field(default_factory=CoverageConfig)
+    multi_view_fusion: MultiViewFusionConfig = Field(default_factory=MultiViewFusionConfig)
+    surface_partition: SurfacePartitionConfig = Field(default_factory=SurfacePartitionConfig)
+    tsdf: TSDFConfig = Field(default_factory=TSDFConfig)
+    surface_quality: SurfaceQualityConfig = Field(default_factory=SurfaceQualityConfig)
     depth_comparison: DepthComparisonConfig = Field(default_factory=DepthComparisonConfig)
     kinematics: KinematicsConfig = Field(default_factory=KinematicsConfig)
     collision: CollisionConfig = Field(default_factory=CollisionConfig)

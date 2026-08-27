@@ -111,4 +111,3 @@ class SynchronizedAcquirer:
             thermal=thermal,
             metrics=metrics,
         )
-

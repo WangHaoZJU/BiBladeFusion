@@ -105,7 +105,16 @@ class CharucoTargetDetector:
                 dictionary,
             )
             self.board.setLegacyPattern(config.legacy_pattern)
-            self._detector = self._cv2.aruco.CharucoDetector(self.board)
+            parameters = self._cv2.aruco.DetectorParameters()
+            for name, value in config.detector_params.items():
+                if not hasattr(parameters, name):
+                    raise CharucoDetectionError(f"unknown ArUco detector parameter: {name}")
+                setattr(parameters, name, value)
+            self._detector = self._cv2.aruco.CharucoDetector(
+                self.board,
+                self._cv2.aruco.CharucoParameters(),
+                parameters,
+            )
         except (AttributeError, TypeError, self._cv2.error) as exc:
             raise CharucoDetectionError(f"OpenCV ChArUco initialization failed: {exc}") from exc
         self._camera_matrix = _camera_matrix(intrinsics)

@@ -121,6 +121,11 @@ class RealSenseD435i:
 
             try:
                 pipeline_profile = pipeline.start(stream_config)
+                _configure_emitter(
+                    pipeline_profile,
+                    rs,
+                    enabled=self._config.infrared_emitter_enabled,
+                )
                 calibration = self._read_calibration(pipeline_profile, rs)
                 for _ in range(self._config.warmup_frames):
                     pipeline.wait_for_frames(self._config.timeout_ms)
@@ -176,19 +181,32 @@ class RealSenseD435i:
     def _read_calibration(self, pipeline_profile: Any, rs: Any) -> StereoCalibrationSnapshot:
         left_profile = pipeline_profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile()
         right_profile = pipeline_profile.get_stream(rs.stream.infrared, 2).as_video_stream_profile()
-        left_intrinsics = _intrinsics_from_profile(left_profile)
-        right_intrinsics = _intrinsics_from_profile(right_profile)
+        if self._config.stereo_calibration_path is not None:
+            from biblade_fusion.calibration.stereo_charuco import load_stereo_calibration
 
-        left_to_right = left_profile.get_extrinsics_to(right_profile)
-        # librealsense exposes rs2_extrinsics.rotation as a column-major array.
-        rotation = np.asarray(left_to_right.rotation, dtype=np.float64).reshape((3, 3), order="F")
-        translation = np.asarray(left_to_right.translation, dtype=np.float64)
-        right_t_left = PoseSE3.from_rotation_translation(
-            "right_ir",
-            "left_ir",
-            rotation,
-            translation,
-        )
+            user_calibration = load_stereo_calibration(self._config.stereo_calibration_path)
+            left_intrinsics = user_calibration.left
+            right_intrinsics = user_calibration.right
+            right_t_left = user_calibration.right_t_left
+            actual_size = (left_profile.width(), left_profile.height())
+            if actual_size != (left_intrinsics.width, left_intrinsics.height):
+                raise DepthCameraConnectionError(
+                    "configured IR calibration is "
+                    f"{left_intrinsics.width}x{left_intrinsics.height}, "
+                    f"but the stream is {actual_size[0]}x{actual_size[1]}"
+                )
+        else:
+            left_intrinsics = _intrinsics_from_profile(left_profile)
+            right_intrinsics = _intrinsics_from_profile(right_profile)
+            left_to_right = left_profile.get_extrinsics_to(right_profile)
+            # librealsense exposes rs2_extrinsics.rotation as a column-major array.
+            rotation = np.asarray(left_to_right.rotation, dtype=np.float64).reshape(
+                (3, 3), order="F"
+            )
+            translation = np.asarray(left_to_right.translation, dtype=np.float64)
+            right_t_left = PoseSE3.from_rotation_translation(
+                "right_ir", "left_ir", rotation, translation
+            )
 
         depth_scale = None
         depth_intrinsics = None
@@ -230,3 +248,15 @@ def _intrinsics_from_profile(profile: Any) -> CameraIntrinsics:
         distortion_model=str(intrinsics.model),
         distortion_coefficients=tuple(float(value) for value in intrinsics.coeffs),
     )
+
+
+def _configure_emitter(profile: Any, rs: Any, *, enabled: bool) -> None:
+    """Set the D435i projector explicitly when the SDK exposes the option."""
+
+    option_namespace = getattr(rs, "option", None)
+    emitter_option = getattr(option_namespace, "emitter_enabled", None)
+    if emitter_option is None:
+        return
+    sensor = profile.get_device().first_depth_sensor()
+    if sensor.supports(emitter_option):
+        sensor.set_option(emitter_option, 1.0 if enabled else 0.0)

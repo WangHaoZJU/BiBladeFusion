@@ -33,4 +33,3 @@ class NullThermalCamera:
         """Return no observation rather than a fake zero-valued temperature image."""
 
         return None
-

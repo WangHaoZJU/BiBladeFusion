@@ -15,6 +15,7 @@ from biblade_fusion.calibration import (
     fetch_cs68_kinematics,
     load_cs68_kinematics,
     load_hand_eye_calibration,
+    load_stereo_calibration,
     read_hand_eye_samples,
     solve_hand_eye,
     write_cs68_kinematics,
@@ -37,9 +38,11 @@ from biblade_fusion.planning import (
     select_uncovered_candidates,
     update_coverage,
 )
+from biblade_fusion.robotics import Es68KinematicModel
 from biblade_fusion.storage import (
     SessionReader,
     SessionWriter,
+    read_coarse_model_summary,
     read_coverage_driven_plan,
     read_coverage_ledger,
     read_depth_aggregate,
@@ -50,6 +53,7 @@ from biblade_fusion.storage import (
     read_reconstructed_view,
     read_stereo_inference,
     read_view_plan,
+    write_coarse_model,
     write_coverage_driven_plan,
     write_coverage_ledger,
     write_depth_aggregate,
@@ -63,6 +67,7 @@ from biblade_fusion.storage import (
     write_view_plan,
 )
 from biblade_fusion.workflows import (
+    build_coarse_blade_model,
     compare_paired_depth,
     extract_hand_eye_samples,
     infer_rectified_stereo,
@@ -71,6 +76,7 @@ from biblade_fusion.workflows import (
     plan_initial_observation,
     reconstruct_foundation_stereo_view,
     reconstruct_native_depth_view,
+    registered_cloud_view,
 )
 
 app = typer.Typer(
@@ -78,7 +84,7 @@ app = typer.Typer(
     help="BiBladeFusion development and acquisition tools.",
     no_args_is_help=True,
 )
-robot_app = typer.Typer(help="Safe Elite CS68 state tools.", no_args_is_help=True)
+robot_app = typer.Typer(help="Safe Elite ES68 state tools.", no_args_is_help=True)
 camera_app = typer.Typer(help="Intel RealSense D435i tools.", no_args_is_help=True)
 acquire_app = typer.Typer(help="Synchronized read-only acquisition.", no_args_is_help=True)
 calibration_app = typer.Typer(help="Offline calibration tools.", no_args_is_help=True)
@@ -187,7 +193,7 @@ def robot_status(
         typer.Option("--json", help="Emit machine-readable JSON."),
     ] = False,
 ) -> None:
-    """Read one CS68 RTSI state snapshot; this command cannot move the robot."""
+    """Read one ES68 RTSI state snapshot; this command cannot move the robot."""
 
     settings = load_settings(config)
     if robot_ip is not None:
@@ -212,7 +218,7 @@ def robot_status(
         return
 
     console = Console()
-    console.print("[bold]Elite CS68 read-only RTSI status[/bold]")
+    console.print("[bold]Elite ES68 read-only RTSI status[/bold]")
     for key, value in result.items():
         console.print(f"{key}: {value}")
 
@@ -235,7 +241,7 @@ def robot_export_kinematics(
         typer.Option("--ip", help="Temporary robot IP override."),
     ] = None,
 ) -> None:
-    """Read and store CS68 MDH parameters; this command cannot move the robot."""
+    """Read and store ES68 MDH parameters; this command cannot move the robot."""
 
     try:
         settings = load_settings(config)
@@ -250,7 +256,7 @@ def robot_export_kinematics(
     except Exception as exc:
         typer.echo(f"Kinematics export failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-    typer.echo(f"Saved read-only CS68 kinematics artifact: {destination}")
+    typer.echo(f"Saved read-only ES68 kinematics artifact: {destination}")
 
 
 @camera_app.command("list")
@@ -372,7 +378,7 @@ def acquire_snapshot(
         typer.Option("--ip", help="Temporary robot IP override."),
     ] = None,
 ) -> None:
-    """Capture one D435i frame bracketed by read-only CS68 states."""
+    """Capture one D435i frame bracketed by read-only ES68 states."""
 
     settings = load_settings(config)
     if robot_ip is not None:
@@ -480,17 +486,13 @@ def stereo_infer_session(
     typer.echo(f"Valid depth pixels: {valid_count}/{observation.result.valid_mask.size}")
 
 
-@calibration_app.command("solve-hand-eye")
-def calibration_solve_hand_eye(
-    samples: Annotated[
-        Path,
-        typer.Option("--samples", exists=True, dir_okay=False, readable=True),
-    ],
+@calibration_app.command("stereo-gui")
+def calibration_stereo_gui(
     output: Annotated[Path, typer.Option("--output", "-o")],
-    method: Annotated[
-        str,
-        typer.Option(help="OpenCV method: park, tsai, horaud, andreff, or daniilidis."),
-    ] = "park",
+    target: Annotated[
+        Path,
+        typer.Option("--target", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/charuco_dict5x5_14x9_20mm_15mm.yaml"),
     config: Annotated[
         Path,
         typer.Option(
@@ -502,13 +504,88 @@ def calibration_solve_hand_eye(
         ),
     ] = Path("configs/default.yaml"),
 ) -> None:
-    """Solve and quality-gate eye-in-hand calibration from an offline sample set."""
+    """Open the D435i raw-IR PySide6 stereo-calibration application."""
+
+    try:
+        from biblade_fusion.calibration.stereo_gui import launch_stereo_calibration_gui
+
+        settings = load_settings(config)
+        raise_code = launch_stereo_calibration_gui(target, output, settings.realsense)
+    except ModuleNotFoundError as exc:
+        if exc.name == "PySide6":
+            typer.echo("PySide6 is not installed; run `uv sync --extra calibration-gui`.", err=True)
+        else:
+            typer.echo(f"Stereo calibration GUI failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        typer.echo(f"Stereo calibration GUI failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if raise_code:
+        raise typer.Exit(code=raise_code)
+
+
+@calibration_app.command("solve-hand-eye")
+def calibration_solve_hand_eye(
+    samples: Annotated[
+        Path,
+        typer.Option("--samples", exists=True, dir_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    method: Annotated[
+        str,
+        typer.Option(help="OpenCV method: park, tsai, horaud, andreff, or daniilidis."),
+    ] = "daniilidis",
+    stereo_calibration: Annotated[
+        Path | None,
+        typer.Option(
+            "--stereo-calibration",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="User-calibrated D435i IR stereo YAML; defaults to realsense config.",
+        ),
+    ] = None,
+    bundle_adjustment: Annotated[
+        bool,
+        typer.Option("--ba/--no-ba", help="Run HoloRobot-aligned LM reprojection refinement."),
+    ] = True,
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Solve ES68 flange-to-left-IR hand-eye calibration from stored samples."""
 
     try:
         settings = load_settings(config)
         sample_set = read_hand_eye_samples(samples)
-        solution = solve_hand_eye(sample_set, settings.hand_eye, method=method)
-        destination = write_hand_eye_calibration(output, solution)
+        calibration_path = stereo_calibration or settings.realsense.stereo_calibration_path
+        if bundle_adjustment and calibration_path is None:
+            raise ValueError(
+                "--stereo-calibration or realsense.stereo_calibration_path is required for BA"
+            )
+        intrinsics = (
+            load_stereo_calibration(calibration_path).left if calibration_path is not None else None
+        )
+        solution = solve_hand_eye(
+            sample_set,
+            settings.hand_eye,
+            method=method,
+            intrinsics=intrinsics,
+            refine=bundle_adjustment,
+        )
+        destination = write_hand_eye_calibration(
+            output,
+            solution,
+            intrinsics=intrinsics,
+            stereo_calibration_path=calibration_path,
+        )
     except Exception as exc:
         typer.echo(f"Hand-eye calibration failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -519,6 +596,63 @@ def calibration_solve_hand_eye(
         f"rotation RMSE={solution.rotation_rmse_deg:.3f} deg, "
         f"samples={solution.sample_count}"
     )
+    if solution.bundle_adjustment.enabled:
+        typer.echo(
+            "BA: "
+            f"{solution.bundle_adjustment.initial_rmse_px:.4f} -> "
+            f"{solution.bundle_adjustment.final_rmse_px:.4f} px"
+        )
+
+
+@calibration_app.command("hand-eye-gui")
+def calibration_hand_eye_gui(
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    target: Annotated[
+        Path,
+        typer.Option("--target", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/charuco_dict5x5_14x9_20mm_15mm.yaml"),
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Open synchronized ES68 + D435i raw-left-IR hand-eye calibration."""
+
+    try:
+        from biblade_fusion.calibration.hand_eye_gui import (
+            launch_hand_eye_calibration_gui,
+        )
+
+        settings = load_settings(config)
+        raise_code = launch_hand_eye_calibration_gui(
+            target,
+            output,
+            settings.robot,
+            settings.realsense,
+            settings.acquisition,
+            settings.hand_eye,
+            settings.kinematics,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "PySide6":
+            typer.echo(
+                "PySide6 is not installed; run `uv sync --extra calibration-gui`.",
+                err=True,
+            )
+        else:
+            typer.echo(f"Hand-eye calibration GUI failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        typer.echo(f"Hand-eye calibration GUI failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if raise_code:
+        raise typer.Exit(code=raise_code)
 
 
 @calibration_app.command("extract-hand-eye")
@@ -556,7 +690,13 @@ def calibration_extract_hand_eye(
                 (session, reader.load_bundle(descriptor.sequence_index))
                 for descriptor in reader.views
             )
-        result = extract_hand_eye_samples(observations, settings.hand_eye.target)
+        result = extract_hand_eye_samples(
+            observations,
+            settings.hand_eye.target,
+            Es68KinematicModel.from_resources(
+                joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad
+            ),
+        )
         destination = write_hand_eye_samples(output, result.samples, result.rejected)
     except Exception as exc:
         typer.echo(f"Hand-eye sample extraction failed: {exc}", err=True)
@@ -809,6 +949,147 @@ def reconstruct_from_stereo_depth(
     typer.echo(f"Saved pose-registered stereo blade view: {destination}")
 
 
+@reconstruct_app.command("coarse-model")
+def reconstruct_coarse_model(
+    views: Annotated[
+        list[Path],
+        typer.Option(
+            "--view",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Repeat for each front/back pose-registered coarse-scan artifact.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Fuse coarse scans, partition true surfaces, integrate TSDF, and plan fine views."""
+
+    import numpy as np
+
+    try:
+        if len(views) < 2:
+            raise ValueError("At least two reconstructed views are required")
+        settings = load_settings(config)
+        stored = tuple(read_reconstructed_view(path) for path in views)
+        reference_hand_eye = np.asarray(stored[0].metadata["hand_eye"]["tcp_T_left_ir"])
+        if any(
+            not np.allclose(
+                item.metadata["hand_eye"]["tcp_T_left_ir"], reference_hand_eye, atol=1e-9
+            )
+            for item in stored[1:]
+        ):
+            raise ValueError("Coarse views use different hand-eye calibration matrices")
+        planning_intrinsics = stored[0].view.planning_intrinsics
+        if any(item.view.planning_intrinsics != planning_intrinsics for item in stored[1:]):
+            raise ValueError("Coarse views use different left-IR planning intrinsics")
+        result = build_coarse_blade_model(
+            tuple(registered_cloud_view(item.view) for item in stored),
+            planning_intrinsics,
+            settings.multi_view_fusion,
+            settings.surface_partition,
+            settings.view_planning,
+            settings.tsdf,
+            settings.surface_quality,
+        )
+        destination = write_coarse_model(
+            output,
+            result,
+            settings,
+            source_views=tuple(views),
+        )
+        verified = read_coarse_model_summary(destination).metadata
+    except Exception as exc:
+        typer.echo(f"Coarse-model reconstruction failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    quality = verified["quality"]
+    typer.echo(f"Saved paper-derived coarse model: {destination}")
+    typer.echo(
+        f"Patches: {len(verified['surface']['patches'])}; "
+        f"fine views: {len(verified['view_plan']['candidate_ids'])}; "
+        f"mesh triangles: {quality['mesh_triangle_count']}; "
+        f"coarse coverage: {quality['completion_fraction']:.3f}"
+    )
+    typer.echo("Motion authorized: no")
+
+
+@reconstruct_app.command("inspect-fine-plan")
+def reconstruct_inspect_fine_plan(
+    coarse_model: Annotated[
+        Path,
+        typer.Option(
+            "--coarse-model",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Schema-4 paper-derived coarse-model artifact.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    gui: Annotated[
+        bool,
+        typer.Option("--gui/--no-gui", help="Open the read-only PySide6 orbit viewer."),
+    ] = True,
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Audit fine-view geometry and export portable inspection evidence."""
+
+    try:
+        from biblade_fusion.storage.fine_plan_inspection import (
+            read_fine_plan_inspection,
+            write_fine_plan_inspection,
+        )
+        from biblade_fusion.workflows.fine_plan_inspection import inspect_fine_plan
+
+        settings = load_settings(config)
+        summary = read_coarse_model_summary(coarse_model)
+        inspection = inspect_fine_plan(summary, settings.view_filter)
+        destination = write_fine_plan_inspection(output, inspection)
+        verified = read_fine_plan_inspection(destination).metadata
+    except Exception as exc:
+        typer.echo(f"Fine-plan inspection failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    accepted = sum(bool(item["accepted"]) for item in verified["views"])
+    typer.echo(f"Saved fine-plan inspection: {destination}")
+    typer.echo(
+        f"Geometry passed: {'yes' if verified['geometry_passed'] else 'no'}; "
+        f"accepted views: {accepted}/{len(verified['views'])}"
+    )
+    typer.echo("Robot feasibility: unverified; motion authorized: no")
+    if gui:
+        try:
+            from biblade_fusion.planning.fine_plan_gui import (
+                launch_fine_plan_inspection_gui,
+            )
+
+            raise_code = launch_fine_plan_inspection_gui(destination)
+        except ModuleNotFoundError as exc:
+            if exc.name == "PySide6":
+                typer.echo(
+                    "PySide6 is not installed; run `uv sync --extra calibration-gui` "
+                    "or use --no-gui.",
+                    err=True,
+                )
+            else:
+                typer.echo(f"Fine-plan viewer failed: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        except Exception as exc:
+            typer.echo(f"Fine-plan viewer failed: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        if raise_code:
+            raise typer.Exit(code=raise_code)
+    if not verified["geometry_passed"]:
+        raise typer.Exit(code=2)
+
+
 @plan_app.command("views")
 def plan_views(
     initialization: Annotated[
@@ -895,9 +1176,7 @@ def coverage_seed(
         settings = load_settings(config)
         stored_plan = read_view_plan(plan)
         stored_initialization = read_initialization(initialization)
-        expected_initialization = Path(
-            str(stored_plan.metadata["source_initialization"])
-        ).resolve()
+        expected_initialization = Path(str(stored_plan.metadata["source_initialization"])).resolve()
         if expected_initialization != initialization.resolve():
             raise ValueError("View plan was not generated from the supplied initialization")
         observation = stored_initialization.observation
@@ -1270,9 +1549,7 @@ def safety_preflight_path(
     except Exception as exc:
         typer.echo(f"Motion preflight failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-    blocking_count = sum(
-        len(leg.preflight.blocking_reasons) for leg in stored.report.legs
-    )
+    blocking_count = sum(len(leg.preflight.blocking_reasons) for leg in stored.report.legs)
     typer.echo(f"Saved non-executable motion preflight: {destination}")
     typer.echo(
         f"Legs: {len(stored.report.legs)}; blocking reasons: {blocking_count}; "

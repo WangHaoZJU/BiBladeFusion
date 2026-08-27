@@ -1,4 +1,4 @@
-"""Read-only RTSI adapter for the Elite CS68.
+"""Read-only RTSI adapter for the configured Elite arm (ES68 in this project).
 
 This module intentionally does not construct ``EliteDriver`` and exposes no motion,
 power-on, brake-release, I/O-write, or script-send operation.
@@ -33,7 +33,7 @@ def _enum_label(value: Any) -> str:
 
 
 class EliteReadOnlyRobot:
-    """Read CS68 state through RTSI without enabling robot motion."""
+    """Read Elite state through RTSI without enabling robot motion."""
 
     def __init__(self, config: RobotConfig, sdk_module: ModuleType | Any | None = None) -> None:
         self._config = config
@@ -117,4 +117,3 @@ class EliteReadOnlyRobot:
         if self._rtsi is None:
             raise RobotNotConnectedError("Elite RTSI is not connected")
         return self._rtsi
-
