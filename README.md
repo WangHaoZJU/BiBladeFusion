@@ -114,6 +114,10 @@ pairs, rectified epipolar overlays, per-pair metrics, aggregate pass/fail gates,
 SHA-256-bound provenance; see the independent-validation section in
 [D435i infrared stereo calibration](docs/stereo-calibration.md).
 
+Static robot/hand-eye/native-depth coordinate-chain acceptance is documented in
+[static native-depth overlap validation](docs/native-overlap-validation.md). Its primary
+metrics never apply ICP; optional ICP output is diagnostic only.
+
 ## Bilateral initialization
 
 The initial visible-face point cloud is reduced to a density-balanced voxel cloud and

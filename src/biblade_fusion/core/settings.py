@@ -454,6 +454,61 @@ class DepthComparisonConfig(BaseModel):
         return value
 
 
+class NativeOverlapValidationConfig(BaseModel):
+    """Static-scene native-depth registration validation without corrective ICP."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_views: int = Field(default=3, ge=2, le=50)
+    minimum_depth_m: float = Field(default=0.25, gt=0.0)
+    maximum_depth_m: float = Field(default=0.75, gt=0.0)
+    pixel_stride: int = Field(default=2, ge=1, le=16)
+    edge_window_radius_px: int = Field(default=1, ge=0, le=5)
+    maximum_local_depth_range_m: float = Field(default=0.010, gt=0.0)
+    maximum_surface_residual_m: float = Field(default=0.020, gt=0.0)
+    minimum_projected_points: int = Field(default=1000, ge=3)
+    minimum_surface_inlier_fraction: float = Field(default=0.95, gt=0.0, le=1.0)
+    agreement_thresholds_m: tuple[float, ...] = (0.002, 0.005)
+    maximum_median_absolute_error_m: float = Field(default=0.002, gt=0.0)
+    maximum_root_mean_square_error_m: float = Field(default=0.003, gt=0.0)
+    maximum_p95_absolute_error_m: float = Field(default=0.006, gt=0.0)
+    minimum_five_mm_agreement_fraction: float = Field(default=0.90, gt=0.0, le=1.0)
+    minimum_translation_span_m: float = Field(default=0.03, gt=0.0)
+    minimum_rotation_span_deg: float = Field(default=5.0, gt=0.0, le=180.0)
+    diagnostic_icp_enabled: bool = True
+    diagnostic_icp_voxel_size_m: float = Field(default=0.005, gt=0.0)
+    diagnostic_icp_maximum_points: int = Field(default=1200, ge=100, le=5000)
+    diagnostic_icp_iterations: int = Field(default=8, ge=1, le=50)
+    diagnostic_icp_maximum_correspondence_m: float = Field(default=0.020, gt=0.0)
+    diagnostic_icp_minimum_correspondences: int = Field(default=100, ge=20)
+    diagnostic_icp_normal_neighbors: int = Field(default=12, ge=4, le=64)
+    diagnostic_icp_pose_prior_weight: float = Field(default=0.05, ge=0.0)
+    overlay_voxel_size_m: float = Field(default=0.004, gt=0.0)
+    maximum_overlay_points_per_view: int = Field(default=30000, ge=100, le=200000)
+
+    @model_validator(mode="after")
+    def validate_native_overlap(self) -> Self:
+        if self.maximum_depth_m <= self.minimum_depth_m:
+            raise ValueError("native-overlap maximum depth must exceed minimum depth")
+        if self.maximum_local_depth_range_m >= self.maximum_surface_residual_m:
+            raise ValueError(
+                "native-overlap local depth range must be below the surface residual gate"
+            )
+        thresholds = self.agreement_thresholds_m
+        if (
+            not thresholds
+            or not np.isfinite(thresholds).all()
+            or any(value <= 0.0 for value in thresholds)
+            or tuple(sorted(set(thresholds))) != thresholds
+        ):
+            raise ValueError("native-overlap agreement thresholds must be increasing")
+        if not any(np.isclose(value, 0.005, atol=1e-12) for value in thresholds):
+            raise ValueError("native-overlap agreement thresholds must include 0.005 m")
+        if self.diagnostic_icp_normal_neighbors >= self.diagnostic_icp_maximum_points:
+            raise ValueError("diagnostic ICP needs more points than normal neighbors")
+        return self
+
+
 class KinematicsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -556,6 +611,9 @@ class AppSettings(BaseModel):
     tsdf: TSDFConfig = Field(default_factory=TSDFConfig)
     surface_quality: SurfaceQualityConfig = Field(default_factory=SurfaceQualityConfig)
     depth_comparison: DepthComparisonConfig = Field(default_factory=DepthComparisonConfig)
+    native_overlap_validation: NativeOverlapValidationConfig = Field(
+        default_factory=NativeOverlapValidationConfig
+    )
     kinematics: KinematicsConfig = Field(default_factory=KinematicsConfig)
     collision: CollisionConfig = Field(default_factory=CollisionConfig)
     motion_preflight: MotionPreflightConfig = Field(default_factory=MotionPreflightConfig)

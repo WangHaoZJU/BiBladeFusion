@@ -9,6 +9,7 @@ from biblade_fusion.perception.pointcloud.projection import (
 )
 from biblade_fusion.perception.pointcloud.realsense_projection import (
     realsense_depth_image_to_point_cloud,
+    realsense_project_points_to_pixels,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "native_depth_to_meters",
     "point_cloud_to_depth_image",
     "realsense_depth_image_to_point_cloud",
+    "realsense_project_points_to_pixels",
 ]

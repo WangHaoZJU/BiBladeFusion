@@ -36,6 +36,11 @@ from biblade_fusion.storage.motion_preflight import (
     read_motion_preflight,
     write_motion_preflight,
 )
+from biblade_fusion.storage.native_overlap import (
+    StoredNativeOverlapReport,
+    read_native_overlap_report,
+    write_native_overlap_report,
+)
 from biblade_fusion.storage.path_validation import (
     StoredPathValidation,
     read_path_validation,
@@ -74,6 +79,7 @@ __all__ = [
     "StoredDepthAggregate",
     "StoredInitialization",
     "StoredMotionPreflight",
+    "StoredNativeOverlapReport",
     "StoredPathValidation",
     "StoredReconstructedBladeView",
     "StoredStereoInference",
@@ -82,6 +88,7 @@ __all__ = [
     "read_initialization",
     "read_coarse_model_summary",
     "read_motion_preflight",
+    "read_native_overlap_report",
     "read_path_validation",
     "read_coverage_driven_plan",
     "read_depth_comparison",
@@ -93,6 +100,7 @@ __all__ = [
     "write_initialization",
     "write_coarse_model",
     "write_motion_preflight",
+    "write_native_overlap_report",
     "write_path_validation",
     "write_coverage_driven_plan",
     "write_depth_comparison",

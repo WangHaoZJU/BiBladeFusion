@@ -54,6 +54,7 @@ from biblade_fusion.storage import (
     read_depth_comparison,
     read_initialization,
     read_motion_preflight,
+    read_native_overlap_report,
     read_path_validation,
     read_reconstructed_view,
     read_stereo_inference,
@@ -66,6 +67,7 @@ from biblade_fusion.storage import (
     write_depth_comparison,
     write_initialization,
     write_motion_preflight,
+    write_native_overlap_report,
     write_path_validation,
     write_reconstructed_view,
     write_stereo_inference,
@@ -74,6 +76,7 @@ from biblade_fusion.storage import (
 from biblade_fusion.workflows import (
     build_coarse_blade_model,
     compare_paired_depth,
+    evaluate_native_overlap,
     extract_hand_eye_samples,
     infer_rectified_stereo,
     initialize_foundation_stereo_depth,
@@ -97,6 +100,7 @@ def _with_emitter_override(settings, emitter_enabled: bool | None):
             )
         }
     )
+
 
 app = typer.Typer(
     name="bbf",
@@ -1669,6 +1673,114 @@ def evaluate_depth_pair(
         f"P95: {metrics.p95_absolute_error_m * 1000.0:.3f} mm"
     )
     typer.echo("Native RealSense depth is a comparison reference, not ground truth")
+
+
+@evaluate_app.command("native-overlap")
+def evaluate_native_overlap_command(
+    reference: Annotated[
+        Path,
+        typer.Option("--reference", exists=True, file_okay=False, readable=True),
+    ],
+    sessions: Annotated[
+        list[Path],
+        typer.Option(
+            "--session",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Comparison session; repeat once per static-scene view.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Validate static native-depth overlap without applying ICP pose corrections."""
+
+    try:
+        settings = load_settings(config)
+        hand_eye = load_hand_eye_calibration(settings.hand_eye)
+        source_sessions = (reference, *sessions)
+        if len({path.resolve() for path in source_sessions}) != len(source_sessions):
+            raise ValueError("Native-overlap session paths must be unique")
+        readers = tuple(SessionReader(path) for path in source_sessions)
+        if any(len(reader.views) != 1 for reader in readers):
+            raise ValueError("Native-overlap currently requires one immutable view per session")
+        bundles = tuple(reader.load_bundle(reader.views[0].view_id) for reader in readers)
+        report = evaluate_native_overlap(
+            bundles,
+            hand_eye,
+            settings.point_cloud,
+            settings.native_overlap_validation,
+        )
+        destination = write_native_overlap_report(
+            output,
+            report,
+            source_sessions,
+            hand_eye,
+            settings.hand_eye,
+            settings.point_cloud,
+            settings.native_overlap_validation,
+        )
+        verified = read_native_overlap_report(destination).report
+    except Exception as exc:
+        typer.echo(f"Native-overlap validation failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    table = Table(title="Static native-depth overlap (primary metrics: no ICP)")
+    table.add_column("Comparison")
+    table.add_column("Inliers")
+    table.add_column("Median mm")
+    table.add_column("RMSE mm")
+    table.add_column("P95 mm")
+    table.add_column("≤5 mm")
+    table.add_column("ICP diagnostic")
+    table.add_column("Result")
+    for pair in verified.pairs:
+        metrics = pair.metrics
+        agreement = dict(metrics.agreement_fractions)[0.005]
+        diagnostic = pair.icp_diagnostic
+        diagnostic_text = "disabled"
+        if diagnostic is not None:
+            diagnostic_text = (
+                f"{diagnostic.translation_correction_m * 1000:.2f} mm/"
+                f"{diagnostic.rotation_correction_deg:.3f}°"
+                if diagnostic.converged
+                and diagnostic.translation_correction_m is not None
+                and diagnostic.rotation_correction_deg is not None
+                else diagnostic.reason
+            )
+        table.add_row(
+            pair.comparison_view_id,
+            f"{metrics.surface_inlier_fraction * 100:.2f}%",
+            f"{metrics.median_absolute_error_m * 1000:.3f}",
+            f"{metrics.root_mean_square_error_m * 1000:.3f}",
+            f"{metrics.p95_absolute_error_m * 1000:.3f}",
+            f"{agreement * 100:.2f}%",
+            diagnostic_text,
+            "PASS" if metrics.passed else "FAIL",
+        )
+    Console().print(table)
+    typer.echo(
+        f"Pose span: {verified.translation_span_m * 1000:.2f} mm, "
+        f"{verified.rotation_span_deg:.3f} deg"
+    )
+    typer.echo(f"Saved immutable native-overlap report: {destination}")
+    typer.echo("ICP changed primary metrics: no")
+    if not verified.passed:
+        typer.echo("Validation result: FAIL", err=True)
+        for reason in verified.failure_reasons:
+            typer.echo(f"- {reason}", err=True)
+        raise typer.Exit(code=2)
+    typer.echo("Validation result: PASS")
 
 
 @evaluate_app.command("aggregate-depth")

@@ -1,5 +1,23 @@
 # Development log
 
+## 2026-08-27 — static native-depth coordinate-chain validation
+
+- Added `evaluate native-overlap`, a static-scene validator for synchronized D435i native
+  depth transformed by the unchanged `base_T_tcp · tcp_T_left_ir · left_ir_T_depth`
+  chain. Symmetric projective residuals reject depth edges, invalid pixels, occlusions,
+  and field-of-view loss without applying registration corrections.
+- Added explicit thresholds for projected support, same-surface inliers, median/RMSE/P95,
+  5 mm agreement, and camera-pose observability. A deliberately wrong rotating hand-eye
+  offset is covered by regression tests and must fail.
+- Added bounded point-to-plane ICP as diagnostic evidence only. The correction cannot
+  affect primary metrics, pass/fail, overlay points, or active calibration files.
+- Added append-only, fully recomputable assets with source/config/hand-eye hashes,
+  per-pair residual arrays, CSV metrics, a coloured base-frame PLY, and three-view PNG.
+- The first five-view ES68/D435i run passed without ICP: median errors 1.220–1.424 mm,
+  RMSE 2.070–2.470 mm, P95 4.205–4.993 mm, 5 mm agreement 95.02–97.36%, over a
+  188.01 mm/23.683 degree pose span. Evidence is retained under
+  `data/validations/native_overlap_20260827_static_v1`.
+
 ## 2026-08-27 — native-depth validation acquisition override
 
 - Added `--emitter/--no-emitter` to synchronized `acquire snapshot` and standalone

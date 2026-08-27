@@ -31,6 +31,9 @@ def test_default_settings_load_safely() -> None:
     )
     assert settings.hand_eye.initial_method == "park"
     assert settings.hand_eye.validation_minimum_samples == 5
+    assert settings.native_overlap_validation.minimum_views == 3
+    assert settings.native_overlap_validation.maximum_p95_absolute_error_m == 0.006
+    assert settings.native_overlap_validation.diagnostic_icp_enabled is True
     assert settings.view_planning.standoff_distance_m is None
     assert settings.view_planning.adaptive_standoff_enabled is True
     assert settings.view_planning.minimum_standoff_distance_m is None

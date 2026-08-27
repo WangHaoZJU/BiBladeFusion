@@ -7,7 +7,7 @@ from types import ModuleType
 from typing import Any
 
 import numpy as np
-from numpy.typing import ArrayLike
+from numpy.typing import ArrayLike, NDArray
 
 from biblade_fusion.core.settings import PointCloudConfig
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
@@ -84,3 +84,42 @@ def realsense_depth_image_to_point_cloud(
         raise DepthProjectionError(f"librealsense deprojection failed: {exc}") from exc
     pixels = np.column_stack((u, v)).astype(np.int32)
     return PointCloud(frame, points, pixels, (intrinsics.height, intrinsics.width))
+
+
+def realsense_project_points_to_pixels(
+    points_m: ArrayLike,
+    intrinsics: CameraIntrinsics,
+    *,
+    rs_module: ModuleType | Any | None = None,
+) -> NDArray[np.float64]:
+    """Project camera-frame points with the matching librealsense distortion model."""
+
+    points = np.asarray(points_m, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+        raise DepthProjectionError("Projected points must be a finite (N, 3) array")
+    if _is_rectified(intrinsics):
+        pixels = np.full((len(points), 2), np.nan, dtype=np.float64)
+        positive = points[:, 2] > 0.0
+        pixels[positive, 0] = (
+            intrinsics.fx * points[positive, 0] / points[positive, 2] + intrinsics.cx
+        )
+        pixels[positive, 1] = (
+            intrinsics.fy * points[positive, 1] / points[positive, 2] + intrinsics.cy
+        )
+        return pixels
+
+    rs = rs_module or import_module("pyrealsense2")
+    native_intrinsics = _librealsense_intrinsics(intrinsics, rs)
+    try:
+        pixels = np.asarray(
+            [
+                rs.rs2_project_point_to_pixel(native_intrinsics, point.tolist())
+                if point[2] > 0.0
+                else [np.nan, np.nan]
+                for point in points
+            ],
+            dtype=np.float64,
+        )
+    except Exception as exc:
+        raise DepthProjectionError(f"librealsense projection failed: {exc}") from exc
+    return pixels

@@ -37,6 +37,14 @@ from biblade_fusion.workflows.motion_preflight import (
     ViewSequenceMotionPreflight,
     preflight_view_sequence_motion,
 )
+from biblade_fusion.workflows.native_overlap import (
+    IcpCorrectionDiagnostic,
+    NativeOverlapPairMetrics,
+    NativeOverlapPairResult,
+    NativeOverlapReport,
+    NativeOverlapValidationError,
+    evaluate_native_overlap,
+)
 from biblade_fusion.workflows.path_validation import (
     PathSequenceError,
     ValidatedPathLeg,
@@ -77,6 +85,11 @@ __all__ = [
     "InitializationError",
     "OfflineViewPlanningResult",
     "MotionSequenceCost",
+    "IcpCorrectionDiagnostic",
+    "NativeOverlapPairMetrics",
+    "NativeOverlapPairResult",
+    "NativeOverlapReport",
+    "NativeOverlapValidationError",
     "PathSequenceError",
     "PreflightedMotionLeg",
     "ReconstructedBladeView",
@@ -89,6 +102,7 @@ __all__ = [
     "initialize_foundation_stereo_depth",
     "extract_hand_eye_samples",
     "infer_rectified_stereo",
+    "evaluate_native_overlap",
     "plan_initial_observation",
     "preflight_view_sequence_motion",
     "validate_view_sequence_collision",

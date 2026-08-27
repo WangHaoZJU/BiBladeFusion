@@ -253,6 +253,36 @@ depth_comparison:
   minimum_camera_side_offset_m: 0.02
   incidence_bin_edges_deg: [0, 15, 30, 45, 60, 75, 90]
 
+# Static-scene validation of base_T_tcp · tcp_T_left_ir · left_ir_T_depth.
+# Primary metrics are symmetric projective depth residuals and never use ICP.
+native_overlap_validation:
+  minimum_views: 3
+  minimum_depth_m: 0.25
+  maximum_depth_m: 0.75
+  pixel_stride: 2
+  edge_window_radius_px: 1
+  maximum_local_depth_range_m: 0.010
+  maximum_surface_residual_m: 0.020
+  minimum_projected_points: 1000
+  minimum_surface_inlier_fraction: 0.95
+  agreement_thresholds_m: [0.002, 0.005]
+  maximum_median_absolute_error_m: 0.002
+  maximum_root_mean_square_error_m: 0.003
+  maximum_p95_absolute_error_m: 0.006
+  minimum_five_mm_agreement_fraction: 0.90
+  minimum_translation_span_m: 0.03
+  minimum_rotation_span_deg: 5.0
+  diagnostic_icp_enabled: true
+  diagnostic_icp_voxel_size_m: 0.005
+  diagnostic_icp_maximum_points: 1200
+  diagnostic_icp_iterations: 8
+  diagnostic_icp_maximum_correspondence_m: 0.020
+  diagnostic_icp_minimum_correspondences: 100
+  diagnostic_icp_normal_neighbors: 12
+  diagnostic_icp_pose_prior_weight: 0.05
+  overlay_voxel_size_m: 0.004
+  maximum_overlay_points_per_view: 30000
+
 kinematics:
   model_path: null
   plugin_path: null
