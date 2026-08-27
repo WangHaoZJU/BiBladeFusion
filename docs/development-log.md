@@ -18,6 +18,12 @@ authoritative fine-grained record; this page records the experiment-facing state
 
 ## Completed and verified
 
+- Added a HoloRobot-style, manifest-driven ES68+D435i articulated collision template.
+  It reserves independent STL slots for all seven collision links and the flange-mounted
+  camera/bracket assembly, records units and transforms explicitly, materializes the
+  calibrated ES68 chain into a Pinocchio/FCL URDF, and fails closed until the operator
+  supplies every mesh, validates the flange attachment, and marks the manifest ready.
+
 - Read-only Elite RTSI state acquisition and controller MDH export.
 - D435i synchronized infrared/native-depth capture with calibration snapshots.
 - Atomic schema-v2 session writer and validated reader.

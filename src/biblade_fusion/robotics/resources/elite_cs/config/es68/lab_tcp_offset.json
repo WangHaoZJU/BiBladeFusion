@@ -1,0 +1,21 @@
+{
+  "purpose": "Lab ES68 flange to RTSI TCP offset copied from HoloRobot.",
+  "source_log": "tmp/motion_cell_fk_stability_log.json",
+  "samples": 709,
+  "fitted_at": "2026-05-25",
+  "residual_pos_mm": {"max": 1.035, "mean": 0.027},
+  "residual_rot_deg": {"max": 0.139, "mean": 0.006},
+  "tcp_offset": {
+    "frame": "flange",
+    "translation_m": [
+      -3.80525548907586e-06,
+      2.0730886154709452e-06,
+      0.0025845477600085483
+    ],
+    "rotation_rpy_rad": [
+      -5.717488596450999e-06,
+      -1.201357641268711e-05,
+      -9.54431230656744e-06
+    ]
+  }
+}

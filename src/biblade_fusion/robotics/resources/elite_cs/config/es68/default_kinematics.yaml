@@ -1,0 +1,45 @@
+# Calibrated HoloRobot ES68 kinematics (709 poses).
+# Source: HoloRobot examples/robot_models/elite_cs/config/es68/default_kinematics.yaml
+kinematics:
+  shoulder:
+    x: 0
+    y: 0
+    z: 0.161444008581
+    roll: 0
+    pitch: 0
+    yaw: 0
+  upperarm:
+    x: 0
+    y: 0
+    z: 0
+    roll: 1.570796326589793
+    pitch: 0
+    yaw: 0
+  forearm:
+    x: -0.351741999669
+    y: 0
+    z: 0
+    roll: 0
+    pitch: 0
+    yaw: 0
+  wrist_1:
+    x: -0.371899990173
+    y: 0
+    z: 0.134379998682
+    roll: 0
+    pitch: 0
+    yaw: 0
+  wrist_2:
+    x: 0
+    y: -0.096787601938
+    z: 0
+    roll: 1.570796326589793
+    pitch: 0
+    yaw: 0
+  wrist_3:
+    x: 0
+    y: 0.094677203749
+    z: 0
+    roll: -1.570796326589793
+    pitch: 0
+    yaw: 0

@@ -1,0 +1,53 @@
+# Copy this file to manifest.yaml only after all meshes and transforms are verified.
+schema: biblade_fusion.es68_d435i_collision.v1
+model_id: es68_d435i_collision
+ready: false
+
+# STL carries no unit metadata. Select exactly one unit for every mesh in this model.
+mesh_units: m
+
+# Each moving link requires its own STL in that link's URDF coordinate frame.
+links:
+  base_link_inertia:
+    mesh: meshes/es68_d435i/collision/base.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+  shoulder_link:
+    mesh: meshes/es68_d435i/collision/shoulder.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+  upperarm_link:
+    mesh: meshes/es68_d435i/collision/upperarm.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+  forearm_link:
+    mesh: meshes/es68_d435i/collision/forearm.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+  wrist_1_link:
+    mesh: meshes/es68_d435i/collision/wrist1.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+  wrist_2_link:
+    mesh: meshes/es68_d435i/collision/wrist2.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+  wrist_3_link:
+    mesh: meshes/es68_d435i/collision/wrist3.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+
+# This STL should conservatively cover the D435i body, bracket, screws and adapters.
+# joint_origin is flange_T_d435i_collision_link, not the hand-eye optical transform.
+attachment:
+  link_name: d435i_collision_link
+  joint_name: flange-d435i_collision
+  parent_link: flange
+  mesh: meshes/es68_d435i/collision/d435i_assembly.stl
+  joint_origin:
+    xyz_m: [0, 0, 0]       # TODO: replace with measured/CAD flange transform
+    rpy_rad: [0, 0, 0]     # TODO: replace with measured/CAD flange transform
+  origin:
+    xyz_m: [0, 0, 0]
+    rpy_rad: [0, 0, 0]
+
+pair_filter:
+  # Ignore only directly adjacent kinematic bodies, matching HoloRobot's default.
+  max_parent_joint_hop: 1
+
+safety:
+  # Distance threshold is consumed by planning policy; do not encode it by scaling STL.
+  minimum_clearance_m: 0.010
