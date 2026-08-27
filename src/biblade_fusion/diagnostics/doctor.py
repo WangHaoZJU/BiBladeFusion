@@ -196,6 +196,39 @@ def _check_kinematics(settings: AppSettings) -> CheckResult:
     )
 
 
+def _check_collision_configuration(settings: AppSettings) -> CheckResult:
+    config = settings.collision
+    missing = []
+    if config.link_radii_m is None:
+        missing.append("link_radii_m")
+    if config.camera_tool_radius_m is None:
+        missing.append("camera_tool_radius_m")
+    if config.minimum_joint_positions_rad is None:
+        missing.append("minimum_joint_positions_rad")
+    if config.maximum_joint_positions_rad is None:
+        missing.append("maximum_joint_positions_rad")
+    if config.require_obstacles and not config.obstacles:
+        missing.append("obstacles")
+    if missing:
+        return CheckResult(
+            "collision_geometry",
+            CheckLevel.WARN,
+            "offline path validation is unavailable; collision geometry is incomplete",
+            {"missing": missing},
+        )
+    return CheckResult(
+        "collision_geometry",
+        CheckLevel.PASS,
+        "collision geometry and joint limits are configured",
+        {
+            "obstacle_count": len(config.obstacles),
+            "minimum_clearance_m": config.minimum_clearance_m,
+            "maximum_joint_step_rad": config.maximum_joint_step_rad,
+            "motion_authorized": False,
+        },
+    )
+
+
 def run_doctor(settings: AppSettings) -> list[CheckResult]:
     """Run non-moving local checks. This function never connects to the robot."""
 
@@ -208,4 +241,5 @@ def run_doctor(settings: AppSettings) -> list[CheckResult]:
         _check_thermal(settings),
         _check_hand_eye(settings),
         _check_kinematics(settings),
+        _check_collision_configuration(settings),
     ]

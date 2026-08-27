@@ -28,6 +28,8 @@ Copy `configs/default.yaml` to the Git-ignored local configuration and provide:
 `ignored_capsule_indices` may be assigned per obstacle only when an intentional overlap
 is physically unavoidable—for example, a pedestal box containing the fixed base
 capsule. Capsule indices are `0..5` for robot links and `6` for the camera/tool.
+Run `uv run bbf doctor --config configs/local.yaml` to see the exact missing collision
+fields before attempting path validation.
 
 ## Validate an explicit sequence
 

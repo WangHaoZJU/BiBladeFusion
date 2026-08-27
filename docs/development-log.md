@@ -60,7 +60,9 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Exact vendor-convention MDH link origins, fail-closed capsule/workcell geometry,
   joint-limit checks, continuous joint-space sampling, explicit ordered view-sequence
   validation, and immutable reports that always forbid motion.
-- Current verification: 127 tests and Ruff pass. Through commit `3ea4e83`, all prior
+- `bbf doctor` collision-readiness diagnostics enumerate missing radii, tool geometry,
+  joint limits, and required workcell obstacles before path validation is attempted.
+- Current verification: 129 tests and Ruff pass. Through commit `60973bf`, all prior
   commits, package build, and Elite SDK import were verified and pushed.
 
 ## In progress
