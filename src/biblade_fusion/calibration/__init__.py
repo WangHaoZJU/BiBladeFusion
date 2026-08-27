@@ -17,6 +17,7 @@ from biblade_fusion.calibration.hand_eye_assets import (
     HandEyeValidationResult,
     LatestHandEyeBundleMailbox,
     evaluate_hand_eye_validation,
+    load_fixed_hand_eye_solution,
     publish_runtime_hand_eye_calibration,
 )
 from biblade_fusion.calibration.hand_eye_solver import (
@@ -116,6 +117,7 @@ __all__ = [
     "hand_eye_observability",
     "load_cs68_kinematics",
     "load_hand_eye_calibration",
+    "load_fixed_hand_eye_solution",
     "load_stereo_calibration",
     "publish_runtime_hand_eye_calibration",
     "read_hand_eye_samples",

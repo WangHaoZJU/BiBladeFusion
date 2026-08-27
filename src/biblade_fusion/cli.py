@@ -841,6 +841,68 @@ def calibration_hand_eye_gui(
         raise typer.Exit(code=raise_code)
 
 
+@calibration_app.command("hand-eye-validate-gui")
+def calibration_hand_eye_validate_gui(
+    calibration: Annotated[
+        Path,
+        typer.Option(
+            "--calibration",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Frozen schema-2 hand-eye YAML; parameters are never refit.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    target: Annotated[
+        Path,
+        typer.Option("--target", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/charuco_dict5x5_14x9_20mm_15mm.yaml"),
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Collect new held-out poses against one frozen hand-eye result."""
+
+    try:
+        from biblade_fusion.calibration.hand_eye_gui import (
+            launch_hand_eye_calibration_gui,
+        )
+
+        settings = load_settings(config)
+        raise_code = launch_hand_eye_calibration_gui(
+            target,
+            output,
+            settings.robot,
+            settings.realsense,
+            settings.acquisition,
+            settings.hand_eye,
+            settings.kinematics,
+            validation_calibration_path=calibration,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "PySide6":
+            typer.echo(
+                "PySide6 is not installed; run `uv sync --extra calibration-gui`.",
+                err=True,
+            )
+        else:
+            typer.echo(f"Hand-eye validation GUI failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        typer.echo(f"Hand-eye validation GUI failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if raise_code:
+        raise typer.Exit(code=raise_code)
+
+
 @calibration_app.command("extract-hand-eye")
 def calibration_extract_hand_eye(
     sessions: Annotated[

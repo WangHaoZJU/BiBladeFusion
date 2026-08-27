@@ -20,12 +20,15 @@ from numpy.typing import NDArray
 from biblade_fusion.acquisition import SynchronizedFrameBundle
 from biblade_fusion.calibration.hand_eye import load_hand_eye_calibration
 from biblade_fusion.calibration.hand_eye_solver import (
+    HandEyeBundleAdjustment,
+    HandEyeObservability,
     HandEyeSample,
     HandEyeSolution,
     write_hand_eye_calibration,
     write_hand_eye_samples,
 )
 from biblade_fusion.calibration.stereo_charuco import load_stereo_calibration
+from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     HandEyeConfig,
     KinematicsConfig,
@@ -86,6 +89,70 @@ class LatestHandEyeBundleMailbox:
     def snapshot(self) -> SynchronizedFrameBundle | None:
         with self._lock:
             return self._latest
+
+
+def load_fixed_hand_eye_solution(
+    path: str | Path,
+    config: HandEyeConfig,
+) -> HandEyeSolution:
+    """Load a quality-gated schema-2 result for fixed-parameter validation only."""
+
+    source = Path(path).resolve()
+    load_hand_eye_calibration(config.model_copy(update={"calibration_path": source}))
+    try:
+        payload = yaml.safe_load(source.read_text(encoding="utf-8"))
+        if int(payload["schema_version"]) != 2:
+            raise ValueError("supplemental validation requires schema-2 flange calibration")
+        quality = payload["quality"]
+        adjustment = payload["bundle_adjustment"]
+        solution = HandEyeSolution(
+            flange_t_left_ir=PoseSE3("flange", "left_ir", payload["flange_T_left_ir"]),
+            base_t_target=PoseSE3(
+                "base", "target", payload["fixed_target"]["base_T_target"]
+            ),
+            method=str(payload["method"]),
+            sample_count=int(quality["sample_count"]),
+            translation_rmse_m=float(quality["translation_rmse_m"]),
+            rotation_rmse_deg=float(quality["rotation_rmse_deg"]),
+            rotation_max_deg=float(quality["rotation_max_deg"]),
+            observability=HandEyeObservability(
+                rotation_span_deg=float(quality["rotation_span_deg"]),
+                translation_span_m=float(quality["translation_span_m"]),
+                rotation_axis_diversity=float(quality["rotation_axis_diversity"]),
+            ),
+            bundle_adjustment=HandEyeBundleAdjustment(
+                enabled=bool(adjustment["enabled"]),
+                success=bool(adjustment["success"]),
+                initial_rmse_px=(
+                    float(adjustment["initial_rmse_px"])
+                    if adjustment.get("initial_rmse_px") is not None
+                    else None
+                ),
+                final_rmse_px=(
+                    float(adjustment["final_rmse_px"])
+                    if adjustment.get("final_rmse_px") is not None
+                    else None
+                ),
+                mean_error_px=(
+                    float(adjustment["mean_error_px"])
+                    if adjustment.get("mean_error_px") is not None
+                    else None
+                ),
+                maximum_error_px=(
+                    float(adjustment["maximum_error_px"])
+                    if adjustment.get("maximum_error_px") is not None
+                    else None
+                ),
+                message=str(adjustment["message"]),
+            ),
+            initial_translation_rmse_m=float(quality["initial_translation_rmse_m"]),
+            initial_rotation_rmse_deg=float(quality["initial_rotation_rmse_deg"]),
+        )
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+        raise HandEyeAssetError(f"invalid fixed hand-eye solution {source}: {exc}") from exc
+    if not solution.bundle_adjustment.enabled or not solution.bundle_adjustment.success:
+        raise HandEyeAssetError("fixed hand-eye solution has no successful BA result")
+    return solution
 
 
 def _utc_text() -> str:
@@ -265,6 +332,9 @@ class HandEyeAssetSession:
         realsense_config: RealSenseConfig,
         hand_eye_config: HandEyeConfig,
         kinematics_config: KinematicsConfig,
+        session_mode: Literal[
+            "training_and_validation", "supplemental_validation"
+        ] = "training_and_validation",
     ) -> HandEyeAssetSession:
         target_source = Path(target_path).resolve()
         stereo_source = Path(stereo_calibration_path).resolve()
@@ -310,6 +380,7 @@ class HandEyeAssetSession:
             "schema_version": cls.SCHEMA_VERSION,
             "asset_type": "es68_d435i_left_ir_hand_eye_session",
             "session_id": session_id,
+            "session_mode": session_mode,
             "status": "connecting",
             "created_at_utc": created.isoformat(),
             "camera_stream": "infrared/1",
@@ -355,7 +426,11 @@ class HandEyeAssetSession:
     def record_connection_info(self, information: dict[str, object]) -> None:
         with self._lock:
             self._manifest["connection"] = information
-            self._manifest["status"] = "capturing_training"
+            self._manifest["status"] = (
+                "capturing_validation"
+                if self._manifest.get("session_mode") == "supplemental_validation"
+                else "capturing_training"
+            )
             self._manifest["connected_at_utc"] = _utc_text()
             self._write_manifest()
 
@@ -466,6 +541,61 @@ class HandEyeAssetSession:
                 "calibration": _file_record(candidate_path, self.root),
                 "training_samples": _file_record(samples_path, self.root),
                 "method": solution.method,
+                "quality": {
+                    "sample_count": solution.sample_count,
+                    "translation_rmse_m": solution.translation_rmse_m,
+                    "rotation_rmse_deg": solution.rotation_rmse_deg,
+                    "rotation_max_deg": solution.rotation_max_deg,
+                    "rotation_span_deg": solution.observability.rotation_span_deg,
+                    "translation_span_m": solution.observability.translation_span_m,
+                    "rotation_axis_diversity": (
+                        solution.observability.rotation_axis_diversity
+                    ),
+                    "bundle_adjustment": asdict(solution.bundle_adjustment),
+                },
+            }
+            self._manifest["status"] = "capturing_validation"
+            self._write_manifest()
+            return candidate_path
+
+    def bind_fixed_candidate(
+        self,
+        source: str | Path,
+        solution: HandEyeSolution,
+    ) -> Path:
+        """Bind an existing result without changing it or importing validation as train."""
+
+        source_path = Path(source).resolve()
+        with self._lock:
+            if self._manifest.get("session_mode") != "supplemental_validation":
+                raise HandEyeAssetError("fixed candidates require supplemental validation mode")
+            if self._manifest["candidate"] is not None:
+                raise HandEyeAssetError("this session already contains a hand-eye candidate")
+            payload = yaml.safe_load(source_path.read_text(encoding="utf-8"))
+            provenance = payload.get("input_provenance", {})
+            expected_stereo = self._manifest["configuration"]["stereo_calibration"][
+                "sha256"
+            ]
+            expected_target = self._manifest["configuration"]["target"]["sha256"]
+            actual_stereo = (provenance.get("stereo_calibration") or {}).get("sha256")
+            actual_target = (provenance.get("charuco_target") or {}).get("sha256")
+            if actual_stereo != expected_stereo:
+                raise HandEyeAssetError(
+                    "fixed hand-eye and configured stereo calibration hashes differ"
+                )
+            if actual_target != expected_target:
+                raise HandEyeAssetError(
+                    "fixed hand-eye and configured ChArUco target hashes differ"
+                )
+            candidate_path = self.root / "result" / "hand_eye_candidate.yaml"
+            candidate_record = _copy_bound(
+                source_path, candidate_path, self.root
+            )
+            self._manifest["candidate"] = {
+                "calibration": candidate_record,
+                "training_samples": None,
+                "method": solution.method,
+                "source_role": "fixed_existing_result_not_refit",
                 "quality": {
                     "sample_count": solution.sample_count,
                     "translation_rmse_m": solution.translation_rmse_m,

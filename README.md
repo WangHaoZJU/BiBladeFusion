@@ -163,6 +163,15 @@ The GUI starts idle, saves manually with `C`, solves with Park-Martin + LM/BA, t
 requires new held-out poses before atomically publishing the active runtime YAML. Each
 run is stored as a unique, hash-bound digital-asset session below `--output`.
 
+After a completed run, collect additional frozen-parameter evidence without retraining:
+
+```bash
+uv run bbf calibration hand-eye-validate-gui \
+  --calibration data/calibrations/es68_left_ir_hand_eye_active.yaml \
+  --config configs/default.yaml \
+  --output data/calibrations/es68_left_ir_hand_eye_validation
+```
+
 ## Offline planning workflow
 
 For the native-depth path, create a Boolean `.npy` blade mask in the native depth-image

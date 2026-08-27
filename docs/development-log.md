@@ -21,6 +21,10 @@
   candidate with board-closure and corner-reprojection metrics without refitting; only
   a passing report is atomically published to
   `data/calibrations/es68_left_ir_hand_eye_active.yaml`.
+- Added `calibration hand-eye-validate-gui` for later supplemental evidence against an
+  already completed schema-2 result. The new session hash-binds the unchanged candidate,
+  stereo calibration and target, exposes no training/solve controls, never invokes Park
+  or BA, and fails before hardware connection if provenance differs.
 - Added unique, append-only hand-eye digital-asset sessions that copy and hash-bind the
   ChArUco target, D435i stereo calibration, packaged HoloRobot ES68 kinematics and
   flange/TCP offset, settings, raw/audit images, samples, candidate, validation attempts,

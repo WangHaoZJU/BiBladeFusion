@@ -5,9 +5,11 @@ from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import pytest
 import yaml
 
 from biblade_fusion.calibration import (
+    HandEyeAssetError,
     HandEyeAssetSession,
     HandEyeBundleAdjustment,
     HandEyeObservability,
@@ -15,6 +17,8 @@ from biblade_fusion.calibration import (
     HandEyeSolution,
     LatestHandEyeBundleMailbox,
     evaluate_hand_eye_validation,
+    load_fixed_hand_eye_solution,
+    write_hand_eye_calibration,
 )
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import HandEyeConfig, load_settings
@@ -263,3 +267,81 @@ def test_asset_session_preserves_undo_and_publishes_only_validated_result(
     assert manifest["motion_commanded"] is False
     assert "joint_positions_rad" in manifest["robot_pose_source"]
     assert manifest["controller_tcp_role"] == "validation_only_not_solver_input"
+
+
+def test_supplemental_session_binds_frozen_candidate_without_training(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings("configs/default.yaml")
+    stereo_path = _write_stereo_calibration(tmp_path / "stereo.yaml")
+    solution, _, intrinsics = _validation_case()
+    source = write_hand_eye_calibration(
+        tmp_path / "fixed_hand_eye.yaml",
+        solution,
+        intrinsics=intrinsics,
+        stereo_calibration_path=stereo_path,
+        target_path=TARGET,
+    )
+    loaded = load_fixed_hand_eye_solution(source, settings.hand_eye)
+    session = HandEyeAssetSession.create(
+        tmp_path / "supplemental",
+        target_path=TARGET,
+        stereo_calibration_path=stereo_path,
+        robot_config=settings.robot,
+        realsense_config=settings.realsense.model_copy(
+            update={"stereo_calibration_path": stereo_path}
+        ),
+        hand_eye_config=settings.hand_eye,
+        kinematics_config=settings.kinematics,
+        session_mode="supplemental_validation",
+    )
+
+    candidate = session.bind_fixed_candidate(source, loaded)
+    session.record_connection_info({"robot_ip": "192.168.6.60"})
+
+    manifest = json.loads(session.manifest_path.read_text(encoding="utf-8"))
+    assert candidate.read_bytes() == source.read_bytes()
+    assert manifest["session_mode"] == "supplemental_validation"
+    assert manifest["status"] == "capturing_validation"
+    assert manifest["training_samples"] == []
+    assert manifest["candidate"]["training_samples"] is None
+    assert manifest["candidate"]["source_role"] == "fixed_existing_result_not_refit"
+    np.testing.assert_allclose(
+        loaded.flange_t_left_ir.matrix, solution.flange_t_left_ir.matrix
+    )
+
+
+def test_supplemental_session_rejects_mismatched_stereo_provenance(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings("configs/default.yaml")
+    source_stereo = _write_stereo_calibration(tmp_path / "source_stereo.yaml")
+    configured_stereo = _write_stereo_calibration(tmp_path / "configured_stereo.yaml")
+    configured_stereo.write_text(
+        configured_stereo.read_text(encoding="utf-8") + "# different asset\n",
+        encoding="utf-8",
+    )
+    solution, _, intrinsics = _validation_case()
+    source = write_hand_eye_calibration(
+        tmp_path / "fixed_hand_eye.yaml",
+        solution,
+        intrinsics=intrinsics,
+        stereo_calibration_path=source_stereo,
+        target_path=TARGET,
+    )
+    loaded = load_fixed_hand_eye_solution(source, settings.hand_eye)
+    session = HandEyeAssetSession.create(
+        tmp_path / "supplemental",
+        target_path=TARGET,
+        stereo_calibration_path=configured_stereo,
+        robot_config=settings.robot,
+        realsense_config=settings.realsense.model_copy(
+            update={"stereo_calibration_path": configured_stereo}
+        ),
+        hand_eye_config=settings.hand_eye,
+        kinematics_config=settings.kinematics,
+        session_mode="supplemental_validation",
+    )
+
+    with pytest.raises(HandEyeAssetError, match="stereo calibration hashes differ"):
+        session.bind_fixed_candidate(source, loaded)

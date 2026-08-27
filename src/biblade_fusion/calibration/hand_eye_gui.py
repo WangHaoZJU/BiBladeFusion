@@ -22,6 +22,7 @@ from biblade_fusion.calibration.hand_eye_assets import (
     HandEyeValidationResult,
     LatestHandEyeBundleMailbox,
     evaluate_hand_eye_validation,
+    load_fixed_hand_eye_solution,
 )
 from biblade_fusion.calibration.hand_eye_solver import (
     HandEyeSample,
@@ -145,6 +146,7 @@ def launch_hand_eye_calibration_gui(
     acquisition_config: AcquisitionConfig,
     hand_eye_config: HandEyeConfig,
     kinematics_config: KinematicsConfig,
+    validation_calibration_path: str | Path | None = None,
 ) -> int:
     """Launch idle-first manual capture, Park+BA solve, and held-out validation."""
 
@@ -180,6 +182,11 @@ def launch_hand_eye_calibration_gui(
     camera_config = realsense_config.model_copy(update={"enable_native_depth": False})
     runtime_path = hand_eye_config.calibration_path or Path(
         "data/calibrations/es68_left_ir_hand_eye_active.yaml"
+    )
+    supplemental_solution = (
+        load_fixed_hand_eye_solution(validation_calibration_path, hand_eye_config)
+        if validation_calibration_path is not None
+        else None
     )
 
     class CaptureWorker(QObject):
@@ -374,8 +381,12 @@ def launch_hand_eye_calibration_gui(
             self.current_reason = "尚未连接"
 
             instruction = QLabel(
-                "固定ChArUco板；用示教器改变ES68姿态并完全停稳。"
-                "按 C 保存，Backspace 撤销最后一组。程序只读机器人状态，不会控制运动。"
+                (
+                    "补充独立验证：参数已冻结，不会重新拟合。"
+                    if supplemental_solution is not None
+                    else "固定ChArUco板；用示教器改变ES68姿态并完全停稳。"
+                )
+                + "按 C 保存，Backspace 撤销最后一组。程序只读机器人状态，不会控制运动。"
             )
             instruction.setStyleSheet("font-size:15px;padding:5px")
             self.raw_image = QLabel("点击“1. 开始并连接”后显示左红外原图")
@@ -393,7 +404,11 @@ def launch_hand_eye_calibration_gui(
             images.addWidget(self.detection_image, stretch=1)
             images.addWidget(self.details)
 
-            self.start_button = QPushButton("1. 开始并连接 ES68 + D435i")
+            self.start_button = QPushButton(
+                "1. 开始补充独立验证"
+                if supplemental_solution is not None
+                else "1. 开始并连接 ES68 + D435i"
+            )
             self.start_button.clicked.connect(self.start_capture)
             self.capture_button = QPushButton("2. 保存当前同步样本（C）")
             self.capture_button.setEnabled(False)
@@ -404,17 +419,27 @@ def launch_hand_eye_calibration_gui(
             self.minimum = QSpinBox()
             self.minimum.setRange(10, 100)
             self.minimum.setValue(max(20, hand_eye_config.minimum_samples))
+            self.minimum.setEnabled(supplemental_solution is None)
+            self.minimum_label = QLabel("训练最少样本")
             self.solve_button = QPushButton("3. 训练完成：Park 初值 + LM/BA")
             self.solve_button.setEnabled(False)
             self.solve_button.clicked.connect(self.start_solve)
-            self.validate_button = QPushButton("4. 完成独立验证并发布")
+            self.validate_button = QPushButton(
+                "3. 完成补充独立验证并更新证据"
+                if supplemental_solution is not None
+                else "4. 完成独立验证并发布"
+            )
             self.validate_button.setEnabled(False)
             self.validate_button.clicked.connect(self.start_validation)
+            if supplemental_solution is not None:
+                self.minimum_label.setVisible(False)
+                self.minimum.setVisible(False)
+                self.solve_button.setVisible(False)
             controls = QHBoxLayout()
             controls.addWidget(self.start_button)
             controls.addWidget(self.capture_button)
             controls.addWidget(self.undo_button)
-            controls.addWidget(QLabel("训练最少样本"))
+            controls.addWidget(self.minimum_label)
             controls.addWidget(self.minimum)
             controls.addWidget(self.solve_button)
             controls.addWidget(self.validate_button)
@@ -456,6 +481,7 @@ def launch_hand_eye_calibration_gui(
         def start_capture(self) -> None:
             if self.capture_thread is not None or self.analysis_thread is not None:
                 return
+            session: HandEyeAssetSession | None = None
             try:
                 session = HandEyeAssetSession.create(
                     output_dir,
@@ -465,8 +491,20 @@ def launch_hand_eye_calibration_gui(
                     realsense_config=realsense_config,
                     hand_eye_config=hand_eye_config,
                     kinematics_config=kinematics_config,
+                    session_mode=(
+                        "supplemental_validation"
+                        if supplemental_solution is not None
+                        else "training_and_validation"
+                    ),
                 )
+                if supplemental_solution is not None:
+                    session.bind_fixed_candidate(
+                        validation_calibration_path,  # type: ignore[arg-type]
+                        supplemental_solution,
+                    )
             except Exception as exc:
+                if session is not None:
+                    session.mark_failed(str(exc))
                 QMessageBox.critical(self, "无法创建手眼标定会话", str(exc))
                 return
             mailbox = LatestHandEyeBundleMailbox()
@@ -485,9 +523,13 @@ def launch_hand_eye_calibration_gui(
             self.mailbox = mailbox
             self.capture_worker = worker
             self.capture_thread = thread
-            self.mode = "training"
+            if supplemental_solution is None:
+                self.mode = "training"
+            else:
+                self.mode = "validation"
+                self.solution = supplemental_solution
             self.start_button.setEnabled(False)
-            self.minimum.setEnabled(True)
+            self.minimum.setEnabled(supplemental_solution is None)
             self.statusBar().showMessage(f"正在连接设备；资产会话：{session.root}")
             thread.start()
 
@@ -607,10 +649,15 @@ def launch_hand_eye_calibration_gui(
                 else f"{nearest_translation * 1000:.1f} mm / {nearest_rotation:.1f} deg"
             )
             phase = "训练" if self.mode in {"training", "solving"} else "独立验证"
+            training_text = (
+                f"固定候选训练样本：{self.solution.sample_count}\n"
+                if supplemental_solution is not None and self.solution is not None
+                else f"训练样本：{len(self.training_samples)} / {self.minimum.value()}\n"
+            )
             self.details.setText(
                 f"阶段：{phase}\n"
                 f"当前状态：{self.current_reason}\n\n"
-                f"训练样本：{len(self.training_samples)} / {self.minimum.value()}\n"
+                f"{training_text}"
                 f"验证样本：{len(self.validation_samples)} / "
                 f"{hand_eye_config.validation_minimum_samples}\n"
                 f"当前帧：{bundle.stereo.frame_number}\n"

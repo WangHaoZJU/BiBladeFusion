@@ -120,6 +120,27 @@ HoloRobot ES68 kinematics, flange/TCP offset, runtime settings, all raw/audit im
 accepted and excluded samples, candidate, validation reports, and final result. Treat
 this directory as the immutable digital asset, not just the final YAML.
 
+### Supplemental validation of an existing result
+
+To collect more held-out poses after the original session has already been completed,
+use the validation-only GUI. It copies and hash-binds the frozen schema-2 result and
+creates a new supplemental-validation asset session; it does not import validation
+poses into training and never runs Park or BA:
+
+```bash
+uv run bbf calibration hand-eye-validate-gui \
+  --calibration data/calibrations/es68_left_ir_hand_eye_active.yaml \
+  --config configs/default.yaml \
+  --target configs/charuco_dict5x5_14x9_20mm_15mm.yaml \
+  --output data/calibrations/es68_left_ir_hand_eye_validation
+```
+
+Press Start, collect preferably 10 new diverse poses with `C`, then click the fixed-
+parameter validation button. A passing run updates only the validation evidence around
+the unchanged transform and republishes that byte-derived result atomically. Stereo and
+target hashes must exactly match the frozen candidate or the run is rejected before
+hardware connection.
+
 ### Offline extraction and solving
 
 The schema-2 sample set has explicit flange coordinates and BA observations:
