@@ -70,8 +70,12 @@ authoritative fine-grained record; this page records the experiment-facing state
 
 ## In progress
 
-- No partial implementation remains at this checkpoint. The next safety increment is
-  CAD/controller-trajectory validation beyond the conservative capsule prefilter.
+- Robot-stack migration to the pinned HoloRobot implementation is active. HoloRobot is
+  now the designated source of truth for CS68 URDF/STL, kinematics, collision checking,
+  motion planning, trajectory generation, guarded execution, and Elite pose conventions.
+- The migration sequence and safety boundary are recorded in
+  `docs/robot-stack-migration.md`. Existing MDH/capsule code remains temporarily for
+  artifact compatibility and will not receive new motion functionality.
 
 ## Pending, in priority order
 
@@ -79,7 +83,6 @@ authoritative fine-grained record; this page records the experiment-facing state
    CUDA device is currently available in this workspace.
 2. Collect paired blade observations and compare FoundationStereo with native RealSense
    depth using the offline evaluator and aggregate report.
-3. Validate configured capsule geometry against CS68/workcell CAD, then add exact-mesh,
-   controller-timed trajectory, singularity, dynamics, and stopping-distance checks
-   before any future motion-execution feature is considered.
+3. Complete the HoloRobot robot-stack migration, replacing the capsule validator with
+   its URDF-backed collision and motion-preflight path before enabling execution.
 4. Implement the thermal-camera adapter after its model and radiometric SDK are known.
