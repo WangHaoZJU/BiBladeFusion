@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from importlib import import_module
+from math import ceil
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -39,8 +40,15 @@ from biblade_fusion.devices.robot.errors import (
     RobotNotEnabledError,
     RobotReleasedError,
 )
+from biblade_fusion.devices.robot.streaming import (
+    ServoJStream,
+    ServoJStreamConfig,
+    StreamServoJResult,
+)
 
 _TRAJECTORY_RESULT_SUCCESS = 0
+_SERVOJ_STREAM_TIMEOUT_MS = 500
+_SERVOJ_HOLD_TIMEOUT_MS = 3000
 _UNSAFE_SAFETY_MODES = {3, 5, 6, 7, 8, 9, 10, 11}
 _SAFETY_MODE_RECOVERY = 4
 
@@ -55,6 +63,42 @@ _OUTPUT_RECIPE = [
     "timestamp",
 ]
 _INPUT_RECIPE = ["speed_slider_fraction"]
+
+
+def _average(values: Sequence[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _p95(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    index = min(len(ordered) - 1, int(ceil(0.95 * len(ordered))) - 1)
+    return ordered[max(index, 0)]
+
+
+def _timing_summary(
+    *,
+    dt_s: float,
+    tick_periods: Sequence[float],
+    write_durations: Sequence[float],
+    loop_durations: Sequence[float],
+) -> dict[str, float | int]:
+    overruns = [max(0.0, value - dt_s) for value in loop_durations]
+    return {
+        "planned_dt_s": dt_s,
+        "tick_period_count": len(tick_periods),
+        "avg_tick_period_s": _average(tick_periods),
+        "max_tick_period_s": max(tick_periods, default=0.0),
+        "p95_tick_period_s": _p95(tick_periods),
+        "avg_write_s": _average(write_durations),
+        "max_write_s": max(write_durations, default=0.0),
+        "p95_write_s": _p95(write_durations),
+        "avg_loop_body_s": _average(loop_durations),
+        "max_loop_body_s": max(loop_durations, default=0.0),
+        "avg_loop_body_overrun_s": _average(overruns),
+        "max_loop_body_overrun_s": max(overruns, default=0.0),
+    }
 
 
 def _package_install_dir(sdk_module: Any) -> Path | None:
@@ -93,11 +137,13 @@ class EliteArm:
         sdk_module: ModuleType | Any | None = None,
         time_fn: Callable[[], float] = time.time,
         sleep_fn: Callable[[float], None] = time.sleep,
+        stream_time_fn: Callable[[], float] = time.perf_counter,
     ) -> None:
         self._config = config
         self._sdk_module = sdk_module
         self._time = time_fn
         self._sleep = sleep_fn
+        self._stream_time = stream_time_fn
         self._sdk: Any | None = None
         self._dashboard: Any | None = None
         self._rtsi: Any | None = None
@@ -293,6 +339,290 @@ class EliteArm:
         if accepted is False:
             raise RobotCommandError("writeIdle rejected stop command")
         self._stopped = True
+
+    def write_joint_velocity(
+        self,
+        joint_velocity_rad_s: Sequence[float],
+        *,
+        timeout_ms: int,
+    ) -> None:
+        """Write one HoloRobot-style SpeedJ command; scheduling stays above this layer."""
+
+        values = self._validated_joint_vector(joint_velocity_rad_s)
+        with self._motion_lock:
+            self._ensure_ready_for_motion()
+            try:
+                self._write_speedj(values, timeout_ms=timeout_ms)
+            except Exception:
+                self._stopped = True
+                raise
+        self._stopped = False
+
+    def prepare_joint_velocity_stream(self, *, timeout_ms: int) -> None:
+        """Acquire reverse control and validate it with a zero SpeedJ handshake."""
+
+        if timeout_ms <= 0:
+            raise ValueError("SpeedJ timeout_ms must be positive")
+        self.enable()
+        with self._motion_lock:
+            try:
+                self._ensure_ready_for_motion()
+                self._ensure_driver_reverse_connected()
+                self._write_speedj([0.0] * 6, timeout_ms=timeout_ms)
+            except Exception:
+                self._stopped = True
+                raise
+        self._stopped = False
+
+    def stop_joint_velocity(self, *, timeout_ms: int) -> None:
+        """Stop SpeedJ with a zero-velocity write, matching HoloRobot semantics."""
+
+        self._ensure_connected()
+        with self._motion_lock:
+            try:
+                self._write_speedj([0.0] * 6, timeout_ms=timeout_ms)
+            finally:
+                self._stopped = True
+
+    def prepare_servoj_stream(
+        self,
+        *,
+        dt_s: float,
+        warmup_duration_s: float = 0.0,
+    ) -> None:
+        """Prime the reverse socket with the current joint position before ServoJ."""
+
+        if dt_s <= 0.0 or warmup_duration_s < 0.0:
+            raise ValueError("ServoJ timing values are invalid")
+        self._ensure_ready_for_motion()
+        self._ensure_driver_reverse_connected()
+        positions = self._validated_joint_vector(
+            self._rtsi.getActualJointPositions()
+        )
+        with self._motion_lock:
+            if warmup_duration_s == 0.0:
+                self._write_servoj_joint(
+                    positions,
+                    timeout_ms=_SERVOJ_HOLD_TIMEOUT_MS,
+                )
+                return
+            deadline = self._stream_time() + warmup_duration_s
+            while self._stream_time() < deadline:
+                tick = self._stream_time()
+                self._write_servoj_joint(
+                    positions,
+                    timeout_ms=_SERVOJ_HOLD_TIMEOUT_MS,
+                )
+                remaining = min(
+                    max(0.0, dt_s - (self._stream_time() - tick)),
+                    max(0.0, deadline - self._stream_time()),
+                )
+                if remaining:
+                    self._sleep(remaining)
+
+    def write_servoj_hold(
+        self,
+        joint_positions_rad: Sequence[float],
+        *,
+        timeout_ms: int = _SERVOJ_HOLD_TIMEOUT_MS,
+    ) -> None:
+        """Send one long-timeout ServoJ hold for acquisition gaps."""
+
+        values = self._validated_joint_vector(joint_positions_rad)
+        with self._motion_lock:
+            self._ensure_ready_for_motion()
+            self._ensure_driver_reverse_connected()
+            self._write_servoj_joint(values, timeout_ms=timeout_ms)
+
+    def stream_servoj(
+        self,
+        stream: ServoJStream,
+        *,
+        config: ServoJStreamConfig,
+        tracking_samples: list[dict[str, Any]] | None = None,
+    ) -> StreamServoJResult:
+        """Send a fixed-rate ServoJ stream with HoloRobot timing/tracking aborts."""
+
+        self._ensure_ready_for_motion()
+        stream.validate()
+        config.validate()
+        if not np.isclose(stream.dt_s, config.dt_s):
+            raise ValueError("ServoJ stream and runtime dt_s must match")
+        if self._driver is None:
+            return StreamServoJResult(ok=False, abort_reason="driver_unavailable")
+        self._ensure_driver_reverse_connected()
+        with self._motion_lock:
+            return self._stream_servoj_locked(
+                stream,
+                config=config,
+                tracking_samples=tracking_samples,
+            )
+
+    def _stream_servoj_locked(
+        self,
+        stream: ServoJStream,
+        *,
+        config: ServoJStreamConfig,
+        tracking_samples: list[dict[str, Any]] | None,
+    ) -> StreamServoJResult:
+        now = self._stream_time
+        start = now()
+        commands_sent = 0
+        last_index: int | None = None
+        maximum_tracking_error = 0.0
+        consecutive_tracking = 0
+        consecutive_timing = 0
+        previous_tick: float | None = None
+        tick_periods: list[float] = []
+        write_durations: list[float] = []
+        loop_durations: list[float] = []
+
+        def result(ok: bool, reason: str | None) -> StreamServoJResult:
+            return StreamServoJResult(
+                ok=ok,
+                commands_sent=commands_sent,
+                duration_s=now() - start,
+                max_tracking_error_rad=maximum_tracking_error,
+                abort_reason=reason,
+                last_command_index=last_index,
+                timing_summary=_timing_summary(
+                    dt_s=stream.dt_s,
+                    tick_periods=tick_periods,
+                    write_durations=write_durations,
+                    loop_durations=loop_durations,
+                ),
+            )
+
+        for index, command in enumerate(stream.commands):
+            tick = now()
+            if previous_tick is not None:
+                tick_periods.append(tick - previous_tick)
+            previous_tick = tick
+            if self._stopped:
+                return result(False, "operator_stop")
+            write_start = now()
+            try:
+                self._write_servoj_joint(
+                    list(command),
+                    timeout_ms=_SERVOJ_STREAM_TIMEOUT_MS,
+                )
+            except RobotCommandError:
+                self._stopped = True
+                return result(False, "driver_write_failed")
+            write_end = now()
+            write_durations.append(write_end - write_start)
+            commands_sent = index + 1
+            last_index = index
+
+            tracking_check = (
+                index > 0
+                and index % config.tracking_check_every_n_commands == 0
+            )
+            actual: list[float] | None = None
+            if tracking_check or tracking_samples is not None:
+                try:
+                    actual = self._validated_joint_vector(
+                        self._rtsi.getActualJointPositions()
+                    )
+                except Exception:
+                    self._stopped = True
+                    return result(False, "feedback_stale")
+            loop_end = now()
+            loop_duration = loop_end - tick
+            loop_durations.append(loop_duration)
+
+            if actual is not None:
+                error = max(
+                    abs(target - measured)
+                    for target, measured in zip(command, actual, strict=True)
+                )
+                maximum_tracking_error = max(maximum_tracking_error, error)
+                if tracking_samples is not None:
+                    tracking_samples.append(
+                        {
+                            "index": index,
+                            "planned_t_s": round(index * stream.dt_s, 6),
+                            "send_t_s": round(write_start - start, 6),
+                            "write_duration_ms": round(
+                                (write_end - write_start) * 1000.0, 3
+                            ),
+                            "q_cmd": list(command),
+                            "q_actual": actual,
+                            "max_error_rad": error,
+                            "tracking_check": tracking_check,
+                        }
+                    )
+                if tracking_check:
+                    consecutive_tracking = (
+                        consecutive_tracking + 1
+                        if error > config.tracking_error_rad
+                        else 0
+                    )
+                    if (
+                        consecutive_tracking
+                        >= config.max_consecutive_tracking_violations
+                    ):
+                        self._stopped = True
+                        return result(False, "tracking_error_exceeded")
+
+            if (
+                index > 0
+                and loop_duration > config.timing_violation_factor * stream.dt_s
+            ):
+                consecutive_timing += 1
+            else:
+                consecutive_timing = 0
+            if consecutive_timing >= config.max_consecutive_timing_violations:
+                self._stopped = True
+                return result(False, "timing_violation")
+
+            if index < len(stream.commands) - 1:
+                deadline = tick + stream.dt_s
+                while now() < deadline:
+                    if self._stopped:
+                        return result(False, "operator_stop")
+                    self._sleep(min(0.01, deadline - now()))
+        return result(True, None)
+
+    def _write_speedj(self, values: Sequence[float], *, timeout_ms: int) -> None:
+        if self._driver is None:
+            raise RobotNotEnabledError("EliteDriver is unavailable")
+        command = self._validated_joint_vector(values)
+        writer = getattr(self._driver, "writeSpeedj", None)
+        if writer is None:
+            raise RobotCommandError("EliteDriver does not expose writeSpeedj")
+        if writer(command, max(1, int(timeout_ms))) is False:
+            raise RobotCommandError("writeSpeedj rejected command")
+
+    def _write_servoj_joint(self, positions: list[float], *, timeout_ms: int) -> None:
+        if self._driver is None:
+            raise RobotNotEnabledError("EliteDriver is unavailable")
+        command = self._validated_joint_vector(positions)
+        writer = getattr(self._driver, "writeServoj", None)
+        timeout = max(1, int(timeout_ms))
+        if writer is not None:
+            try:
+                accepted = writer(command, timeout, False, False)
+            except TypeError:
+                try:
+                    accepted = writer(command, timeout, False)
+                except TypeError:
+                    accepted = writer(command, timeout)
+        else:
+            writer = getattr(self._driver, "writeServoJ", None)
+            if writer is None:
+                raise RobotCommandError("EliteDriver does not expose writeServoj")
+            try:
+                accepted = writer(
+                    command,
+                    self._config.servoj_time_s,
+                    self._config.servoj_lookahead_time_s,
+                    self._config.servoj_gain,
+                )
+            except TypeError:
+                accepted = writer(command, self._config.servoj_time_s)
+        if accepted is False:
+            raise RobotCommandError("writeServoj rejected command")
 
     def _execute_trajectory_point(
         self,

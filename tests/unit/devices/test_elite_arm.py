@@ -9,7 +9,7 @@ import pytest
 
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import RobotConfig
-from biblade_fusion.devices.robot import EliteArm
+from biblade_fusion.devices.robot import EliteArm, ServoJStream, ServoJStreamConfig
 from biblade_fusion.devices.robot.conversions import rpy_xyz_to_matrix
 from biblade_fusion.devices.robot.errors import (
     RobotCommandError,
@@ -100,6 +100,8 @@ class FakeDriver:
         self.calls: list[tuple[str, object]] = []
         self.callback = None
         self.idle_result = True
+        self.speedj_result = True
+        self.servoj_result = True
 
     def isRobotConnected(self) -> bool:
         return self.connected
@@ -136,6 +138,14 @@ class FakeDriver:
     def writeIdle(self, mode: int) -> bool:
         self.calls.append(("writeIdle", mode))
         return self.idle_result
+
+    def writeSpeedj(self, command: list[float], timeout_ms: int) -> bool:
+        self.calls.append(("writeSpeedj", (command, timeout_ms)))
+        return self.speedj_result
+
+    def writeServoj(self, command: list[float], timeout_ms: int, *flags: bool) -> bool:
+        self.calls.append(("writeServoj", (command, timeout_ms, flags)))
+        return self.servoj_result
 
     def stopControl(self) -> None:
         self.calls.append(("stopControl", None))
@@ -285,3 +295,103 @@ def test_stop_rejects_false_write_idle_result() -> None:
 
     with pytest.raises(RobotCommandError, match="rejected"):
         arm.stop()
+
+
+def test_write_joint_velocity_uses_holorobot_speedj_boundary() -> None:
+    arm, sdk = enabled_arm()
+    command = [0.1, 0.2, 0.0, -0.1, 0.0, 0.05]
+
+    arm.write_joint_velocity(command, timeout_ms=240)
+
+    assert ("writeSpeedj", (command, 240)) in sdk.driver.calls
+
+
+def test_rejected_speedj_marks_arm_stopped() -> None:
+    arm, sdk = enabled_arm()
+    sdk.driver.speedj_result = False
+
+    with pytest.raises(RobotCommandError, match="writeSpeedj rejected"):
+        arm.write_joint_velocity([0.0] * 6, timeout_ms=240)
+
+    with pytest.raises(RobotCommandError, match="stopped"):
+        arm.write_joint_velocity([0.0] * 6, timeout_ms=240)
+
+
+def test_stop_joint_velocity_sends_zero_without_write_idle() -> None:
+    arm, sdk = enabled_arm()
+
+    arm.stop_joint_velocity(timeout_ms=250)
+
+    assert ("writeSpeedj", ([0.0] * 6, 250)) in sdk.driver.calls
+    assert not any(name == "writeIdle" for name, _ in sdk.driver.calls)
+
+
+def test_prepare_servoj_stream_primes_with_long_hold_timeout() -> None:
+    arm, sdk = enabled_arm()
+
+    arm.prepare_servoj_stream(dt_s=0.004)
+
+    write = next(value for name, value in sdk.driver.calls if name == "writeServoj")
+    assert write[1] == 3000
+
+
+def test_stream_servoj_writes_every_command_with_short_timeout() -> None:
+    arm, sdk = enabled_arm()
+    stream = ServoJStream(
+        commands=(
+            (0.0, 0.1, 0.2, 0.3, 0.4, 0.5),
+            (0.01, 0.1, 0.2, 0.3, 0.4, 0.5),
+            (0.02, 0.1, 0.2, 0.3, 0.4, 0.5),
+        ),
+        dt_s=0.004,
+    )
+
+    result = arm.stream_servoj(
+        stream,
+        config=ServoJStreamConfig(
+            dt_s=0.004,
+            tracking_check_every_n_commands=99,
+        ),
+    )
+
+    writes = [value for name, value in sdk.driver.calls if name == "writeServoj"]
+    assert result.ok is True
+    assert result.commands_sent == 3
+    assert [value[1] for value in writes] == [500, 500, 500]
+    assert result.timing_summary["planned_dt_s"] == 0.004
+
+
+def test_stream_servoj_aborts_on_tracking_error() -> None:
+    arm, _ = enabled_arm()
+    stream = ServoJStream(
+        commands=(
+            (0.0, 0.1, 0.2, 0.3, 0.4, 0.5),
+            (0.2, 0.1, 0.2, 0.3, 0.4, 0.5),
+        ),
+        dt_s=0.004,
+    )
+
+    result = arm.stream_servoj(
+        stream,
+        config=ServoJStreamConfig(
+            dt_s=0.004,
+            tracking_error_rad=0.01,
+            tracking_check_every_n_commands=1,
+            max_consecutive_tracking_violations=1,
+        ),
+    )
+
+    assert result.ok is False
+    assert result.abort_reason == "tracking_error_exceeded"
+
+
+def test_stream_servoj_rejected_write_fails_closed() -> None:
+    arm, sdk = enabled_arm()
+    sdk.driver.servoj_result = False
+    stream = ServoJStream(commands=((0.0, 0.1, 0.2, 0.3, 0.4, 0.5),), dt_s=0.004)
+
+    result = arm.stream_servoj(stream, config=ServoJStreamConfig(dt_s=0.004))
+
+    assert result.ok is False
+    assert result.abort_reason == "driver_write_failed"
+    assert result.commands_sent == 0
