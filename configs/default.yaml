@@ -87,7 +87,8 @@ point_cloud:
   minimum_valid_points: 100
 
 hand_eye:
-  calibration_path: null
+  # The GUI publishes here automatically only after held-out validation passes.
+  calibration_path: data/calibrations/es68_left_ir_hand_eye_active.yaml
   minimum_samples: 15
   maximum_translation_rmse_m: 0.002
   maximum_rotation_rmse_deg: 0.5
@@ -97,9 +98,15 @@ hand_eye:
   # RTSI TCP is validation-only: calibrated FK·flange_T_tcp must agree before capture.
   maximum_fk_tcp_translation_error_m: 0.002
   maximum_fk_tcp_rotation_error_deg: 0.3
+  minimum_novel_translation_m: 0.01
+  minimum_novel_rotation_deg: 5.0
+  validation_minimum_samples: 5
+  validation_maximum_translation_rmse_m: 0.003
+  validation_maximum_rotation_rmse_deg: 0.5
+  validation_maximum_reprojection_rmse_px: 0.8
   require_quality_metrics: true
   require_observability_metrics: true
-  initial_method: daniilidis
+  initial_method: park
   enable_bundle_adjustment: true
   target:
     squares_x: 14

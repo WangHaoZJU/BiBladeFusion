@@ -228,6 +228,12 @@ def _pairwise_observability(samples: Sequence[HandEyeSample], cv2: Any) -> HandE
     return HandEyeObservability(max(rotations), max(translations), diversity)
 
 
+def hand_eye_observability(samples: Sequence[HandEyeSample]) -> HandEyeObservability:
+    """Report current motion diversity without solving or changing any sample."""
+
+    return _pairwise_observability(tuple(samples), import_module("cv2"))
+
+
 def _mean_pose(poses: Sequence[PoseSE3]) -> PoseSE3:
     translation = np.mean([pose.translation_m for pose in poses], axis=0)
     rotation_sum = np.sum([pose.rotation for pose in poses], axis=0)

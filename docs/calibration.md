@@ -81,20 +81,36 @@ Start the read-only capture application:
 uv run bbf calibration hand-eye-gui \
   --config configs/local.yaml \
   --target configs/charuco_dict5x5_14x9_20mm_15mm.yaml \
-  --output data/calibrations/es68_left_ir_hand_eye_run_01
+  --output data/calibrations/es68_left_ir_hand_eye
 ```
 
-The application never commands motion. Manually move the robot, stop at each pose, and
-save only after ChArUco PnP, stationarity, timestamp bracketing, and FK/TCP consistency
-are all green. Use at least 20 poses with translation, image-region, distance, and
-rotation diversity about multiple axes. Keep the final joint approach direction
-consistent and avoid changing J6 during this first calibration.
+The window starts idle and does not connect until **1. Start** is clicked. The
+application never commands motion. Manually move the robot, stop at each pose, and
+press **C** (or the save button) only after ChArUco PnP, stationarity, timestamp
+bracketing, FK/TCP consistency, and pose-novelty gates are green. **Backspace** marks
+the latest sample excluded without deleting its raw files. Use at least 20 training
+poses with translation, image-region, distance, and rotation diversity about multiple
+axes. Keep the final joint approach direction consistent and avoid changing J6 during
+this first calibration.
 
 Every accepted pose stores raw left/right audit images, joint readings,
 `base_T_flange`, observed `base_T_tcp`, all ChArUco IDs and 2D/3D correspondences, PnP
-quality, D435i frame number, synchronization window, and FK/TCP discrepancy. Solving
-uses the HoloRobot-aligned Daniilidis initialization followed by joint LM refinement of
-`flange_T_left_ir` and the fixed `base_T_target` over every observed corner.
+quality, D435i frame number, synchronization window, and FK/TCP discrepancy. The GUI
+uses the HoloRobot-aligned Park-Martin initialization followed by joint LM/BA refinement
+of `flange_T_left_ir` and the fixed `base_T_target` over every observed corner.
+
+After solving, the GUI changes to an independent-validation phase. Collect at least
+five **new** poses; these observations evaluate the fixed candidate and never refit it.
+Only a candidate that passes fixed-board translation/rotation closure and corner
+reprojection thresholds is atomically published to
+`data/calibrations/es68_left_ir_hand_eye_active.yaml`. A failed validation remains a
+candidate and cannot silently replace the active runtime calibration.
+
+`--output` is a collection directory. Every click of Start creates a unique UTC session
+below it. The session binds copies and SHA-256 hashes of the target, stereo calibration,
+HoloRobot ES68 kinematics, flange/TCP offset, runtime settings, all raw/audit images,
+accepted and excluded samples, candidate, validation reports, and final result. Treat
+this directory as the immutable digital asset, not just the final YAML.
 
 ### Offline extraction and solving
 
@@ -145,11 +161,12 @@ uv run bbf calibration solve-hand-eye \
   --output data/calibrations/hand_eye.yaml
 ```
 
-The default is Daniilidis + LM/BA. Park-Martin, Tsai-Lenz, Horaud, and Andreff remain
+The default is Park-Martin + LM/BA. Daniilidis, Tsai-Lenz, Horaud, and Andreff remain
 available for diagnostic comparison. Acceptance requires sample-count, motion
 observability, FK/TCP consistency, fixed-target translation/rotation closure, and BA
 reprojection thresholds. A real calibration still requires independent held-out poses
-before any motion planning result is trusted.
+before any motion planning result is trusted; the offline solver writes a candidate and
+does not auto-publish it.
 
 ## Controller-specific CS68 kinematics
 

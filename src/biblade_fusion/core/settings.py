@@ -214,9 +214,15 @@ class HandEyeConfig(BaseModel):
     minimum_rotation_axis_diversity: float = Field(default=0.1, gt=0.0, le=1.0)
     maximum_fk_tcp_translation_error_m: float = Field(default=0.002, gt=0.0)
     maximum_fk_tcp_rotation_error_deg: float = Field(default=0.3, gt=0.0)
+    minimum_novel_translation_m: float = Field(default=0.01, gt=0.0)
+    minimum_novel_rotation_deg: float = Field(default=5.0, gt=0.0, le=180.0)
+    validation_minimum_samples: int = Field(default=5, ge=3, le=50)
+    validation_maximum_translation_rmse_m: float = Field(default=0.003, gt=0.0)
+    validation_maximum_rotation_rmse_deg: float = Field(default=0.5, gt=0.0)
+    validation_maximum_reprojection_rmse_px: float = Field(default=0.8, gt=0.0)
     require_quality_metrics: bool = True
     require_observability_metrics: bool = True
-    initial_method: Literal["daniilidis", "park", "tsai", "horaud", "andreff"] = "daniilidis"
+    initial_method: Literal["daniilidis", "park", "tsai", "horaud", "andreff"] = "park"
     enable_bundle_adjustment: bool = True
     target: CharucoTargetConfig = Field(default_factory=CharucoTargetConfig)
 

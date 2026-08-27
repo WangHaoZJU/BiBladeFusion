@@ -156,8 +156,12 @@ For direct synchronized manual-pose collection, use the PySide6 workflow:
 ```bash
 uv run bbf calibration hand-eye-gui \
   --config configs/local.yaml \
-  --output data/calibrations/es68_left_ir_hand_eye_run_01
+  --output data/calibrations/es68_left_ir_hand_eye
 ```
+
+The GUI starts idle, saves manually with `C`, solves with Park-Martin + LM/BA, then
+requires new held-out poses before atomically publishing the active runtime YAML. Each
+run is stored as a unique, hash-bound digital-asset session below `--output`.
 
 ## Offline planning workflow
 

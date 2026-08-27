@@ -24,7 +24,11 @@ def test_default_settings_load_safely() -> None:
     assert settings.proxy_model.tangential_margin_m == 0.01
     assert settings.point_cloud.minimum_depth_m == 0.15
     assert settings.point_cloud.maximum_depth_m == 1.5
-    assert settings.hand_eye.calibration_path is None
+    assert settings.hand_eye.calibration_path == Path(
+        "data/calibrations/es68_left_ir_hand_eye_active.yaml"
+    )
+    assert settings.hand_eye.initial_method == "park"
+    assert settings.hand_eye.validation_minimum_samples == 5
     assert settings.view_planning.standoff_distance_m is None
     assert settings.view_planning.adaptive_standoff_enabled is True
     assert settings.view_planning.minimum_standoff_distance_m is None

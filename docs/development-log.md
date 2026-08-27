@@ -1,5 +1,30 @@
 # Development log
 
+## 2026-08-27 — Park+BA ES68/D435i hand-eye calibration closure
+
+- Rebuilt the PySide6 hand-eye application as an idle-first, operator-controlled
+  workflow: devices connect only after **Start**, `C` accepts one synchronized pose,
+  Backspace recoverably excludes the last pose, and raw left IR plus detected ChArUco
+  corners remain visible side by side.
+- Isolated acquisition from preview analysis with a latest-frame mailbox and a reused
+  detector. Slow corner processing can drop preview frames but cannot build an event
+  backlog or change which full-resolution frame is atomically saved.
+- Made Park-Martin the default initializer and retained the HoloRobot-aligned joint
+  LM/BA refinement of `flange_T_left_ir` and fixed `base_T_target`, with live
+  motion-observability, pose-novelty, synchronization, PnP, and ES68 FK/TCP gates.
+- Added a strict held-out stage using at least five new poses. It evaluates the fixed
+  candidate with board-closure and corner-reprojection metrics without refitting; only
+  a passing report is atomically published to
+  `data/calibrations/es68_left_ir_hand_eye_active.yaml`.
+- Added unique, append-only hand-eye digital-asset sessions that copy and hash-bind the
+  ChArUco target, D435i stereo calibration, packaged HoloRobot ES68 kinematics and
+  flange/TCP offset, settings, raw/audit images, samples, candidate, validation attempts,
+  and final result. A disconnected nonempty run is sealed instead of being mixed into a
+  new session.
+- Added regression coverage for bounded preview delivery and both pass/fail fixed-
+  parameter validation geometry. The offline solver now also defaults to Park+BA but
+  deliberately writes only a candidate; GUI-held-out validation controls publication.
+
 ## 2026-08-27 — independent D435i IR stereo validation
 
 - Added the `calibration stereo-validate-gui` workflow with an idle startup window and
@@ -112,8 +137,9 @@ authoritative fine-grained record; this page records the experiment-facing state
   FK and flange-to-RTSI-TCP validation offset are separately packaged under `es68`;
   synchronized PySide6 capture uses only raw D435i `infrared/1` and user-calibrated
   intrinsics, records complete ChArUco/robot/timing evidence, gates FK/TCP agreement,
-  solves `flange_T_left_ir` with Daniilidis plus joint SE(3) LM/BA, and exports a
-  flange-primary schema-2 artifact with input hashes and before/after quality metrics.
+  solves `flange_T_left_ir` with Park-Martin plus joint SE(3) LM/BA, validates the fixed
+  candidate on new poses, and publishes a flange-primary schema-2 artifact only after
+  the held-out gates pass.
 - PySide6 raw D435i IR stereo-calibration workflow using the stored 14x9 ChArUco target:
   synchronized Y8 capture without factory IR calibration access, offline independent
   Zhang initialization, joint stereo bundle adjustment, epipolar metrics, selectable

@@ -720,7 +720,7 @@ def calibration_solve_hand_eye(
     method: Annotated[
         str,
         typer.Option(help="OpenCV method: park, tsai, horaud, andreff, or daniilidis."),
-    ] = "daniilidis",
+    ] = "park",
     stereo_calibration: Annotated[
         Path | None,
         typer.Option(
