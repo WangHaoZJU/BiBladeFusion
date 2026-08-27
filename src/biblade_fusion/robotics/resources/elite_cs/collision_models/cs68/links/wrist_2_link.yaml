@@ -1,0 +1,65 @@
+link_name: wrist_2_link
+default_margin_m: 0.001
+source:
+  geometry_kind: collision
+  mesh: meshes/cs68/collision/wrist2.stl
+  mesh_units: m
+  origin:
+    xyz_m:
+    - 0
+    - 0
+    - 0
+    rpy_rad:
+    - 0
+    - 0
+    - 0
+  scale:
+  - 1
+  - 1
+  - 1
+  sha256: acd237bec4d9eafbf0c007250d5e867b4fc68e8b4ba04e2fc43fc8c9aae0b365
+fit:
+  principal_axis_hint:
+  - 0
+  - 0
+  - -1
+  regions:
+  - name: wrist2_1
+    type: cylinder
+    range:
+    - 0
+    - 0.9
+  - name: wrist2_2
+    type: cylinder
+    range:
+    - 0.9
+    - 1
+primitives:
+- primitive_id: wrist2_1
+  kind: cylinder
+  origin:
+    xyz_m:
+    - 0.0006623076325640483
+    - -0.00918806344270706
+    - 0.00041047732035319104
+    rpy_rad:
+    - 1.5707963267948966
+    - -0.0
+    - 3.141592653589793
+  margin_m: 0.001
+  radius_m: 0.04056532844997074
+  length_m: 0.116376133772995
+- primitive_id: wrist2_2
+  kind: cylinder
+  origin:
+    xyz_m:
+    - 8.274721127084548e-05
+    - -8.484747672198932e-20
+    - -0.03145181232306486
+    rpy_rad:
+    - 3.141592653589793
+    - -0.0
+    - 3.141592653589793
+  margin_m: 0.001
+  radius_m: 0.039323814789563406
+  length_m: 0.032096376161777386

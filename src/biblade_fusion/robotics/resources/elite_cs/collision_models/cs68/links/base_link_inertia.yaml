@@ -1,0 +1,84 @@
+link_name: base_link_inertia
+default_margin_m: 0.001
+source:
+  geometry_kind: collision
+  mesh: meshes/cs68/collision/base.stl
+  mesh_units: m
+  origin:
+    xyz_m:
+    - 0
+    - 0
+    - 0
+    rpy_rad:
+    - 0
+    - 0
+    - 0
+  scale:
+  - 1
+  - 1
+  - 1
+  sha256: f247802a04add2bd3a1206cbf28dc6a406b12186cadef841fd2f30201925387f
+fit:
+  principal_axis_hint:
+  - 0
+  - 0
+  - 1
+  regions:
+  - name: base_1
+    type: cylinder
+    range:
+    - 0
+    - 0.26
+  - name: base_2
+    type: cylinder
+    range:
+    - 0.255
+    - 0.56
+  - name: base_3
+    type: cylinder
+    range:
+    - 0.555
+    - 1
+primitives:
+- primitive_id: base_1
+  kind: cylinder
+  origin:
+    xyz_m:
+    - 0.0
+    - -9.086383164050572e-05
+    - 0.011117780221418575
+    rpy_rad:
+    - 0.0
+    - -0.0
+    - 0.0
+  margin_m: 0.001
+  radius_m: 0.0750828044949581
+  length_m: 0.02223557022201534
+- primitive_id: base_2
+  kind: cylinder
+  origin:
+    xyz_m:
+    - -0.0014936828698436215
+    - 9.971150213875662e-05
+    - 0.03662040700826322
+    rpy_rad:
+    - 0.0
+    - -0.0
+    - 0.0
+  margin_m: 0.001
+  radius_m: 0.07581296780115887
+  length_m: 0.026369174603887637
+- primitive_id: base_3
+  kind: cylinder
+  origin:
+    xyz_m:
+    - -0.0009121957047969199
+    - 0.0002659224244356512
+    - 0.07145298124176207
+    rpy_rad:
+    - 0.0
+    - -0.0
+    - 0.0
+  margin_m: 0.001
+  radius_m: 0.06416326575838827
+  length_m: 0.04089403648855991

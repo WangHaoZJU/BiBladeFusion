@@ -1,0 +1,92 @@
+link_name: forearm_link
+default_margin_m: 0.001
+source:
+  geometry_kind: collision
+  mesh: meshes/cs68/collision/forearm.stl
+  mesh_units: m
+  origin:
+    xyz_m: [0, 0, 0]
+    rpy_rad: [0, 0, 0]
+  scale: [1, 1, 1]
+  sha256: 0e46fcb73674b794c41e07cd798dc9375a9337e82a07cdfe8eeb52d4d9082b2c
+fit:
+  principal_axis_hint: [-1, 0, 0]
+  regions:
+  - name: forearm_proximal_joint
+    type: cylinder
+    range: [0, 0.245]
+  - name: forearm_proximal_body
+    type: cylinder
+    range: [0.245, 0.35]
+  - name: forearm_transition
+    type: cylinder
+    range: [0.35, 0.4]
+  - name: forearm_shaft_proximal
+    type: cylinder
+    range: [0.4, 0.52]
+  - name: forearm_shaft_middle
+    type: cylinder
+    range: [0.51, 0.78]
+  - name: forearm_shaft_distal_connector
+    type: cylinder
+    range: [0.77, 0.9]
+  - name: forearm_distal_joint
+    type: cylinder
+    range: [0.84, 1]
+primitives:
+- primitive_id: forearm_proximal_joint
+  kind: cylinder
+  origin:
+    xyz_m: [8.033197666771804e-21, 0, 0.00806559603693379]
+    rpy_rad: [3.141592653589793, 0, -1.5707963267948966]
+  margin_m: 0.001
+  radius_m: 0.06303924207212201
+  length_m: 0.1250688308354418
+- primitive_id: forearm_proximal_body
+  kind: cylinder
+  origin:
+    xyz_m: [-0.06509794635663735, 0.0007130845218001591, 0]
+    rpy_rad: [1.5707963267948966, 0, -1.5707963267948966]
+  margin_m: 0.001
+  radius_m: 0.06244823211249281
+  length_m: 0.07933186890127861
+- primitive_id: forearm_transition
+  kind: cylinder
+  origin:
+    xyz_m: [-0.11210049106422676, 0.0003634538583489834, 0.00018579869006052214]
+    rpy_rad: [1.5707963267948966, 0, -1.5707963267948966]
+  margin_m: 0.001
+  radius_m: 0.047630556638161486
+  length_m: 0.012270772158368914
+- primitive_id: forearm_shaft_proximal
+  kind: cylinder
+  origin:
+    xyz_m: [-0.1445, 0.0006006418337284117, 0.00020752135244093625]
+    rpy_rad: [1.5707963267948966, 0, -1.5707963267948966]
+  margin_m: 0.000001
+  radius_m: 0.039062528646024525
+  length_m: 0.052
+- primitive_id: forearm_shaft_middle
+  kind: cylinder
+  origin:
+    xyz_m: [-0.23, 0.001218908453125743, 0.0001999237961963895]
+    rpy_rad: [1.5707963267948966, 0, -1.5707963267948966]
+  margin_m: 0.000001
+  radius_m: 0.038321
+  length_m: 0.121
+- primitive_id: forearm_shaft_distal_connector
+  kind: cylinder
+  origin:
+    xyz_m: [-0.318, 0.0017636747409900018, 0.000200001522898674]
+    rpy_rad: [1.5707963267948966, 0, -1.5707963267948966]
+  margin_m: 0.000001
+  radius_m: 0.038501722785030355
+  length_m: 0.057
+- primitive_id: forearm_distal_joint
+  kind: cylinder
+  origin:
+    xyz_m: [-0.3680983615133796, 0.001968473196029663, -0.00898805633187294]
+    rpy_rad: [0, 0, 0]
+  margin_m: 0.000001
+  radius_m: 0.0436
+  length_m: 0.1163761243224144

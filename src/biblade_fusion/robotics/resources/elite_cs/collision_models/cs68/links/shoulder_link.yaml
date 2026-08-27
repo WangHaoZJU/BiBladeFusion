@@ -1,0 +1,65 @@
+link_name: shoulder_link
+default_margin_m: 0.001
+source:
+  geometry_kind: collision
+  mesh: meshes/cs68/collision/shoulder.stl
+  mesh_units: m
+  origin:
+    xyz_m:
+    - 0
+    - 0
+    - 0
+    rpy_rad:
+    - 0
+    - 0
+    - 0
+  scale:
+  - 1
+  - 1
+  - 1
+  sha256: c6de3f0a2c5c1c98200abdbf39c135411228b36cfeccb4b48d48af3af831896a
+fit:
+  principal_axis_hint:
+  - 0
+  - 1
+  - 0
+  regions:
+  - name: shoulder_1
+    type: cylinder
+    range:
+    - 0
+    - 0.05
+  - name: shoulder_2
+    type: cylinder
+    range:
+    - 0.05
+    - 1
+primitives:
+- primitive_id: shoulder_1
+  kind: cylinder
+  origin:
+    xyz_m:
+    - -4.91972299165511e-19
+    - -0.0460172586864069
+    - -2.459861495827555e-19
+    rpy_rad:
+    - 1.5707963267948966
+    - -0.0
+    - 3.141592653589793
+  margin_m: 0.001
+  radius_m: 0.05986280200769386
+  length_m: 0.04876548386424676
+- primitive_id: shoulder_2
+  kind: cylinder
+  origin:
+    xyz_m:
+    - 0.00042138825293783823
+    - -0.0016015606968601134
+    - 0.0032987073063850385
+    rpy_rad:
+    - 3.141592653589793
+    - -0.0
+    - 3.141592653589793
+  margin_m: 0.001
+  radius_m: 0.0615
+  length_m: 0.14779742262091827

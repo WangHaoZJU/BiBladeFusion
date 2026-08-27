@@ -1,0 +1,122 @@
+link_name: upperarm_link
+default_margin_m: 0.002
+source:
+  geometry_kind: collision
+  mesh: meshes/cs68/collision/upperarm.stl
+  mesh_units: m
+  origin:
+    xyz_m:
+    - 0
+    - 0
+    - 0
+    rpy_rad:
+    - 0
+    - 0
+    - 0
+  scale:
+  - 1
+  - 1
+  - 1
+  sha256: 3ef69436eb43ed2614c6bb8487ecd9720050f5d1611e88a510ac28260f4f7526
+fit:
+  principal_axis_hint:
+  - -1
+  - 0
+  - 0
+  regions:
+  - name: upperarm_1
+    type: cylinder
+    range:
+    - 0
+    - 0.27
+  - name: upperarm_2
+    type: cylinder
+    range:
+    - 0.26
+    - 0.36
+  - name: upperarm_3
+    type: cylinder
+    range:
+    - 0.35
+    - 0.62
+  - name: upperarm_4
+    type: cylinder
+    range:
+    - 0.61
+    - 0.73
+  - name: upperarm_5
+    type: cylinder
+    range:
+    - 0.72
+    - 1
+primitives:
+- primitive_id: upperarm_1
+  kind: cylinder
+  origin:
+    xyz_m:
+    - -0.003226791316856576
+    - -0.0005510394370358293
+    - 0.1442987099289894
+    rpy_rad:
+    - 3.141592653589793
+    - 0.0
+    - -1.5707963267948966
+  margin_m: 0.002
+  radius_m: 0.07150945575929715
+  length_m: 0.14779742262091827
+- primitive_id: upperarm_2
+  kind: cylinder
+  origin:
+    xyz_m:
+    - -0.07483753112030622
+    - 0.00015831010984467084
+    - 0.14102059843012366
+    rpy_rad:
+    - 1.5707963267948966
+    - -0.0
+    - -1.5707963267948966
+  margin_m: 0.002
+  radius_m: 0.059310973300116365
+  length_m: 0.0560724888788838
+- primitive_id: upperarm_3
+  kind: cylinder
+  origin:
+    xyz_m:
+    - -0.1669734258197681
+    - 5.190673285249116e-05
+    - 0.1405907332839431
+    rpy_rad:
+    - 1.5707963267948966
+    - -0.0
+    - -1.5707963267948966
+  margin_m: 0.002
+  radius_m: 0.05124696792113775
+  length_m: 0.12379867230693602
+- primitive_id: upperarm_4
+  kind: cylinder
+  origin:
+    xyz_m:
+    - -0.26684753415162665
+    - 0.00014253425902721273
+    - 0.1408696466642417
+    rpy_rad:
+    - 1.5707963267948966
+    - -0.0
+    - -1.5707963267948966
+  margin_m: 0.002
+  radius_m: 0.05927845342534256
+  length_m: 0.0707725760817031
+- primitive_id: upperarm_5
+  kind: cylinder
+  origin:
+    xyz_m:
+    - -0.3463855216873948
+    - -0.0003805764405195931
+    - 0.1442987099289894
+    rpy_rad:
+    - 3.141592653589793
+    - -0.0
+    - -1.5707963267948966
+  margin_m: 0.002
+  radius_m: 0.07150945575929715
+  length_m: 0.14779742262091827

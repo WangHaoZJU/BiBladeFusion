@@ -1,0 +1,11 @@
+schema: holorobot.elite_cs_primitive_collision.v1
+model_id: cs68_body_primitives
+default_margin_m: 0.003
+links:
+  base_link_inertia: links/base_link_inertia.yaml
+  shoulder_link: links/shoulder_link.yaml
+  upperarm_link: links/upperarm_link.yaml
+  forearm_link: links/forearm_link.yaml
+  wrist_1_link: links/wrist_1_link.yaml
+  wrist_2_link: links/wrist_2_link.yaml
+  wrist_3_link: links/wrist_3_link.yaml
