@@ -87,3 +87,4 @@ def test_safety_path_validation_is_exposed() -> None:
 
     assert result.exit_code == 0
     assert "validate-path" in result.stdout
+    assert "preflight-path" in result.stdout

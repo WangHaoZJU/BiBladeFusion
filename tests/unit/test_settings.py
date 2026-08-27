@@ -32,6 +32,8 @@ def test_default_settings_load_safely() -> None:
     assert settings.view_filter.minimum_incidence_cosine == 0.95
     assert settings.kinematics.model_path is None
     assert settings.kinematics.ik_timeout_s == 0.05
+    assert settings.motion_preflight.servoj_dt_s == 0.004
+    assert settings.motion_preflight.speed_scaling == 0.08
 
 
 def test_unknown_configuration_key_is_rejected() -> None:

@@ -45,6 +45,7 @@ from biblade_fusion.storage import (
     read_depth_aggregate,
     read_depth_comparison,
     read_initialization,
+    read_motion_preflight,
     read_path_validation,
     read_reconstructed_view,
     read_stereo_inference,
@@ -55,6 +56,7 @@ from biblade_fusion.storage import (
     write_depth_aggregate_manifest,
     write_depth_comparison,
     write_initialization,
+    write_motion_preflight,
     write_path_validation,
     write_reconstructed_view,
     write_stereo_inference,
@@ -1225,6 +1227,56 @@ def safety_validate_path(
     typer.echo(
         f"Legs: {len(stored.report.legs)}; findings: {finding_count}; "
         f"collision free: {'yes' if stored.report.collision_free else 'no'}"
+    )
+    typer.echo("Motion authorized: no")
+
+
+@safety_app.command("preflight-path")
+def safety_preflight_path(
+    plan: Annotated[
+        Path,
+        typer.Option("--plan", exists=True, file_okay=False, readable=True),
+    ],
+    initialization: Annotated[
+        Path,
+        typer.Option("--initialization", exists=True, file_okay=False, readable=True),
+    ],
+    view_ids: Annotated[
+        list[str],
+        typer.Option(
+            "--view-id",
+            help="Repeat in the exact traversal order to preflight.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Persist HoloRobot mesh/ServoJ preflight without connecting to the robot."""
+
+    try:
+        settings = load_settings(config)
+        destination = write_motion_preflight(
+            output,
+            tuple(view_ids),
+            settings.motion_preflight,
+            source_plan=plan,
+            source_initialization=initialization,
+        )
+        stored = read_motion_preflight(destination)
+    except Exception as exc:
+        typer.echo(f"Motion preflight failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    blocking_count = sum(
+        len(leg.preflight.blocking_reasons) for leg in stored.report.legs
+    )
+    typer.echo(f"Saved non-executable motion preflight: {destination}")
+    typer.echo(
+        f"Legs: {len(stored.report.legs)}; blocking reasons: {blocking_count}; "
+        "ready for approval: "
+        f"{'yes' if stored.report.ready_for_approval else 'no'}"
     )
     typer.echo("Motion authorized: no")
 

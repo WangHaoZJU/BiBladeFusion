@@ -26,6 +26,11 @@ from biblade_fusion.storage.initialization import (
     read_initialization,
     write_initialization,
 )
+from biblade_fusion.storage.motion_preflight import (
+    StoredMotionPreflight,
+    read_motion_preflight,
+    write_motion_preflight,
+)
 from biblade_fusion.storage.path_validation import (
     StoredPathValidation,
     read_path_validation,
@@ -62,12 +67,14 @@ __all__ = [
     "StoredDepthComparison",
     "StoredDepthAggregate",
     "StoredInitialization",
+    "StoredMotionPreflight",
     "StoredPathValidation",
     "StoredReconstructedBladeView",
     "StoredStereoInference",
     "StoredViewPlan",
     "StoredViewDescriptor",
     "read_initialization",
+    "read_motion_preflight",
     "read_path_validation",
     "read_coverage_driven_plan",
     "read_depth_comparison",
@@ -77,6 +84,7 @@ __all__ = [
     "read_stereo_inference",
     "read_view_plan",
     "write_initialization",
+    "write_motion_preflight",
     "write_path_validation",
     "write_coverage_driven_plan",
     "write_depth_comparison",

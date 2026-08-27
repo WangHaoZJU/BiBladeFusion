@@ -13,6 +13,7 @@ from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     CollisionConfig,
     CollisionObstacleConfig,
+    MotionPreflightConfig,
     PointCloudConfig,
     ProxyModelConfig,
     ViewFilterConfig,
@@ -29,8 +30,10 @@ from biblade_fusion.planning import (
     generate_bilateral_view_plan,
 )
 from biblade_fusion.storage import (
+    read_motion_preflight,
     read_path_validation,
     write_initialization,
+    write_motion_preflight,
     write_path_validation,
     write_view_plan,
 )
@@ -191,3 +194,28 @@ def test_path_validation_refuses_different_kinematics_artifact(tmp_path: Path) -
             source_initialization=initialization,
             source_kinematics=other_kinematics,
         )
+
+
+def test_holorobot_motion_preflight_round_trip_is_rederived(tmp_path: Path) -> None:
+    initialization, plan, _, _, view_id = _sources(tmp_path)
+    output = write_motion_preflight(
+        tmp_path / "motion_preflight",
+        (view_id,),
+        MotionPreflightConfig(maximum_joint_step_rad=0.02),
+        source_plan=plan,
+        source_initialization=initialization,
+    )
+
+    stored = read_motion_preflight(output)
+
+    assert stored.report.ready_for_approval is True
+    assert stored.report.motion_authorized is False
+    assert stored.metadata["motion_authorized"] is False
+    assert stored.report.legs[0].preflight.servoj_stream is not None
+
+    metadata_path = output / "motion_preflight.json"
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    payload["report"]["legs"] = []
+    metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match"):
+        read_motion_preflight(output)

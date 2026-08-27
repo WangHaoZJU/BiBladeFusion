@@ -364,6 +364,17 @@ class CollisionConfig(BaseModel):
         return self
 
 
+class MotionPreflightConfig(BaseModel):
+    """HoloRobot-derived conservative planning and ServoJ generation settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    maximum_joint_step_rad: float = Field(default=0.02, gt=0.0, le=0.2)
+    servoj_dt_s: float = Field(default=0.004, gt=0.0, le=0.1)
+    speed_scaling: float = Field(default=0.08, gt=0.0, le=1.0)
+    velocity_margin: float = Field(default=0.8, gt=0.0, le=1.0)
+
+
 class AppSettings(BaseModel):
     """Top-level BiBladeFusion settings."""
 
@@ -387,6 +398,7 @@ class AppSettings(BaseModel):
     depth_comparison: DepthComparisonConfig = Field(default_factory=DepthComparisonConfig)
     kinematics: KinematicsConfig = Field(default_factory=KinematicsConfig)
     collision: CollisionConfig = Field(default_factory=CollisionConfig)
+    motion_preflight: MotionPreflightConfig = Field(default_factory=MotionPreflightConfig)
 
 
 def load_settings(path: str | Path) -> AppSettings:

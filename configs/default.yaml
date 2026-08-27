@@ -156,3 +156,11 @@ collision:
   require_obstacles: true
   minimum_clearance_m: 0.01
   maximum_joint_step_rad: 0.02
+
+# HoloRobot-derived self-collision preflight and velocity-limited ServoJ generation.
+# A clear report remains non-executable until the separate live approval gate runs.
+motion_preflight:
+  maximum_joint_step_rad: 0.02
+  servoj_dt_s: 0.004
+  speed_scaling: 0.08
+  velocity_margin: 0.8
