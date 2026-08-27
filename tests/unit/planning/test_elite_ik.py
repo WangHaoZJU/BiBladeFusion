@@ -62,6 +62,22 @@ def test_elite_ik_converts_camera_target_to_tcp_and_returns_joints() -> None:
     np.testing.assert_allclose(solver.target[:3], [0.4, 0, 0])
 
 
+def test_elite_ik_accepts_unique_generated_view_camera_frame() -> None:
+    solver = FakeSolver()
+    ik = checker(solver)
+    camera_pose = PoseSE3.from_rotation_translation(
+        "base",
+        "front_r00_c00_left_ir",
+        np.eye(3),
+        [0.5, 0, 0],
+    )
+
+    result = ik.check(camera_pose)
+
+    assert result.state is ReachabilityState.REACHABLE
+    np.testing.assert_allclose(solver.target[:3], [0.4, 0, 0])
+
+
 def test_elite_ik_reports_no_solution_as_unreachable() -> None:
     result = checker(FakeSolver(succeeds=False)).check(PoseSE3.identity("base", "left_ir"))
 

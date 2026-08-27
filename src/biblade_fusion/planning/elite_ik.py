@@ -73,12 +73,21 @@ class EliteCs68IkChecker:
         self._solver = solver
 
     def check(self, base_t_left_ir: PoseSE3) -> ReachabilityResult:
-        if base_t_left_ir.parent_frame != "base" or base_t_left_ir.child_frame != "left_ir":
+        if base_t_left_ir.parent_frame != "base" or not base_t_left_ir.child_frame.endswith(
+            "left_ir"
+        ):
             return ReachabilityResult(
                 ReachabilityState.UNKNOWN,
                 "Elite IK requires a base_T_left_ir candidate pose",
             )
-        base_t_tcp = base_t_left_ir.compose(self._hand_eye.tcp_t_left_ir.inverse())
+        canonical_camera_pose = PoseSE3(
+            "base",
+            "left_ir",
+            base_t_left_ir.matrix,
+        )
+        base_t_tcp = canonical_camera_pose.compose(
+            self._hand_eye.tcp_t_left_ir.inverse()
+        )
         target = se3_to_elite_kdl_pose(base_t_tcp)
         try:
             ok, solution, result = self._solver.getPositionIK(target, self._near)
