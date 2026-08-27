@@ -212,6 +212,9 @@ def test_holorobot_motion_preflight_round_trip_is_rederived(tmp_path: Path) -> N
     assert stored.report.motion_authorized is False
     assert stored.metadata["motion_authorized"] is False
     assert stored.report.legs[0].preflight.servoj_stream is not None
+    assert stored.report.cost.estimated_servoj_duration_s > 0.0
+    assert stored.report.cost.total_joint_travel_l1_rad == pytest.approx(0.06)
+    assert np.asarray(stored.report.legs[0].goal_base_t_tcp_matrix).shape == (4, 4)
 
     metadata_path = output / "motion_preflight.json"
     payload = json.loads(metadata_path.read_text(encoding="utf-8"))

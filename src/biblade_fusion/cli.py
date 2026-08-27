@@ -1278,6 +1278,12 @@ def safety_preflight_path(
         "ready for approval: "
         f"{'yes' if stored.report.ready_for_approval else 'no'}"
     )
+    typer.echo(
+        "Estimated ServoJ duration: "
+        f"{stored.report.cost.estimated_servoj_duration_s:.3f} s; "
+        "joint travel L1: "
+        f"{stored.report.cost.total_joint_travel_l1_rad:.3f} rad"
+    )
     typer.echo("Motion authorized: no")
 
 

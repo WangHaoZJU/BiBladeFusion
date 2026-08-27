@@ -79,6 +79,7 @@ def _derive(
         ordered_view_ids,
         stored_initialization.observation.seed_joint_positions_rad,
         config,
+        hand_eye=stored_initialization.hand_eye,
         collision_checker=checker,
     )
 

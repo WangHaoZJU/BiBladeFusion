@@ -27,6 +27,7 @@ from biblade_fusion.workflows.initialization import (
     initialize_native_depth,
 )
 from biblade_fusion.workflows.motion_preflight import (
+    MotionSequenceCost,
     PreflightedMotionLeg,
     ViewSequenceMotionPreflight,
     preflight_view_sequence_motion,
@@ -69,6 +70,7 @@ __all__ = [
     "HandEyeExtractionResult",
     "InitializationError",
     "OfflineViewPlanningResult",
+    "MotionSequenceCost",
     "PathSequenceError",
     "PreflightedMotionLeg",
     "ReconstructedBladeView",
