@@ -1,6 +1,6 @@
 # Development log
 
-Last updated: 2026-08-26
+Last updated: 2026-08-27
 
 This log distinguishes verified implementation from pending work. Commit history is the
 authoritative fine-grained record; this page records the experiment-facing state.
@@ -55,13 +55,15 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Achieved-pose experiment labeling composes robot, hand-eye, and rectification
   transforms to derive proxy side and incidence; ambiguous mid-plane/away-facing views
   are rejected, and generated manifests bind the fixed initialization metadata.
-- Current verification: 117 tests, Ruff, package build, and Elite SDK import pass.
-  Through commit `a41ec12`, all implementation commits were pushed to GitHub `main`.
+- Correct Elite KDL IK orientation encoding: the vendor plugin consumes roll/pitch/yaw,
+  which is intentionally distinct from the controller TCP rotation-vector encoding.
+- Current verification: 119 tests and Ruff pass. Through commit `a654bd0`, all prior
+  commits, package build, and Elite SDK import were verified and pushed.
 
 ## In progress
 
-- No partial implementation is left at this checkpoint. The next software target is a
-  non-executable robot-body/workcell collision contract and continuous path validator.
+- Implementing a non-executable robot-body/workcell collision contract and continuous
+  path validator using the exact MDH chain convention in the vendor KDL source.
 
 ## Pending, in priority order
 

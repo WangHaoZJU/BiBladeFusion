@@ -99,3 +99,20 @@ def se3_to_elite_tcp_pose(pose: PoseSE3) -> NDArray[np.float64]:
     result = np.concatenate((pose.translation_m, matrix_to_rotation_vector(pose.rotation)))
     result.setflags(write=False)
     return result
+
+
+def se3_to_elite_kdl_pose(pose: PoseSE3) -> NDArray[np.float64]:
+    """Convert SE(3) to the Elite KDL plugin's ``xyz + roll/pitch/yaw`` input."""
+
+    rotation = pose.rotation
+    horizontal = float(np.hypot(rotation[0, 0], rotation[1, 0]))
+    pitch = float(np.arctan2(-rotation[2, 0], horizontal))
+    if horizontal > 1e-9:
+        roll = float(np.arctan2(rotation[2, 1], rotation[2, 2]))
+        yaw = float(np.arctan2(rotation[1, 0], rotation[0, 0]))
+    else:
+        roll = float(np.arctan2(-rotation[1, 2], rotation[1, 1]))
+        yaw = 0.0
+    result = np.array([*pose.translation_m, roll, pitch, yaw], dtype=np.float64)
+    result.setflags(write=False)
+    return result

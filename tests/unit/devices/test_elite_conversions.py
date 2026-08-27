@@ -1,9 +1,11 @@
 import numpy as np
 
+from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.devices.robot.conversions import (
     elite_tcp_pose_to_se3,
     matrix_to_rotation_vector,
     rotation_vector_to_matrix,
+    se3_to_elite_kdl_pose,
     se3_to_elite_tcp_pose,
 )
 
@@ -53,3 +55,23 @@ def test_se3_to_elite_pose_round_trip() -> None:
 
     np.testing.assert_allclose(decoded.matrix, original.matrix, atol=1e-10)
     assert encoded.flags.writeable is False
+
+
+def test_kdl_pose_conversion_uses_rpy_not_rotation_vector() -> None:
+    roll, pitch, yaw = 0.3, -0.4, 0.5
+    cx, sx = np.cos(roll), np.sin(roll)
+    cy, sy = np.cos(pitch), np.sin(pitch)
+    cz, sz = np.cos(yaw), np.sin(yaw)
+    rotation = np.array(
+        [
+            [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+            [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+            [-sy, cy * sx, cy * cx],
+        ]
+    )
+    pose = PoseSE3.from_rotation_translation("base", "tcp", rotation, [0.1, 0.2, 0.3])
+
+    kdl_pose = se3_to_elite_kdl_pose(pose)
+
+    np.testing.assert_allclose(kdl_pose, [0.1, 0.2, 0.3, roll, pitch, yaw])
+    assert not np.allclose(kdl_pose[3:], se3_to_elite_tcp_pose(pose)[3:])

@@ -67,3 +67,19 @@ def test_elite_ik_reports_no_solution_as_unreachable() -> None:
 
     assert result.state is ReachabilityState.UNREACHABLE
     assert "no endpoint IK solution" in result.message
+
+
+def test_elite_ik_passes_rpy_orientation_expected_by_vendor_plugin() -> None:
+    solver = FakeSolver()
+    ik = checker(solver)
+    rotation = np.array(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    camera_pose = PoseSE3.from_rotation_translation(
+        "base", "left_ir", rotation, [0.5, 0, 0]
+    )
+
+    result = ik.check(camera_pose)
+
+    assert result.state is ReachabilityState.REACHABLE
+    np.testing.assert_allclose(solver.target[3:], [0.0, 0.0, np.pi / 2.0])

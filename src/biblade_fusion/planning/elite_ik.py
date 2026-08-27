@@ -13,7 +13,7 @@ from numpy.typing import ArrayLike, NDArray
 from biblade_fusion.calibration import Cs68KinematicsModel, HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import KinematicsConfig
-from biblade_fusion.devices.robot.conversions import se3_to_elite_tcp_pose
+from biblade_fusion.devices.robot.conversions import se3_to_elite_kdl_pose
 from biblade_fusion.planning.filtering import ReachabilityResult, ReachabilityState
 
 
@@ -79,7 +79,7 @@ class EliteCs68IkChecker:
                 "Elite IK requires a base_T_left_ir candidate pose",
             )
         base_t_tcp = base_t_left_ir.compose(self._hand_eye.tcp_t_left_ir.inverse())
-        target = se3_to_elite_tcp_pose(base_t_tcp)
+        target = se3_to_elite_kdl_pose(base_t_tcp)
         try:
             ok, solution, result = self._solver.getPositionIK(target, self._near)
         except Exception as exc:
