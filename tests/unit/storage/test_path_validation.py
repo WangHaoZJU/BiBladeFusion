@@ -288,8 +288,9 @@ def test_motion_preflight_without_occupancy_is_rederived_as_blocked(tmp_path: Pa
     )
     assert stored.report.legs[0].preflight.servoj_stream is None
     assert stored.report.legs[0].preflight.blocking_reasons == (
-        "es68_d435i_collision_model_unavailable:FileNotFoundError",
-        "endpoint_pose_consistency_es68_model_unavailable",
+        "continuous_swept_mesh_unavailable",
+        "endpoint_fk_tcp_translation_error_exceeded",
+        "endpoint_fk_tcp_rotation_error_exceeded",
     )
     assert stored.report.cost.estimated_servoj_duration_s == 0.0
     assert stored.report.cost.total_joint_travel_l1_rad == pytest.approx(0.06)

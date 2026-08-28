@@ -320,6 +320,19 @@ when installing those meshes. A native real-time coordinator that atomically com
 stopped robot state, FoundationStereo inference, map publication, planning invalidation,
 and execution freshness has not yet been implemented or hardware-verified.
 
+The current HoloRobot-derived ES68 and D435i-only collision assembly can be checked in a
+fully offline Qt3D viewer. The command exposes no robot IP and never opens a robot or
+camera driver:
+
+```bash
+uv sync --extra robot-model-gui
+uv run bbf robot inspect-model --config configs/default.yaml
+```
+
+Use the six joint controls and per-STL visibility switches to check the wrist/flange
+mount orientation and link motion. This visual audit does not replace FCL path validation
+or final dimensional acceptance on the physical installation.
+
 Create and open a self-contained, read-only supervisory replay snapshot with:
 
 ```bash

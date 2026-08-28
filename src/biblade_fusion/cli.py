@@ -602,6 +602,58 @@ def robot_export_kinematics(
     typer.echo(f"Saved read-only ES68 kinematics artifact: {destination}")
 
 
+@robot_app.command("inspect-model")
+def robot_inspect_model(
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Validated YAML configuration file.",
+        ),
+    ] = Path("configs/default.yaml"),
+    joints_deg: Annotated[
+        str,
+        typer.Option(
+            "--joints-deg",
+            help="Six comma- or space-separated controller joint angles in degrees.",
+        ),
+    ] = "0,0,0,0,0,0",
+) -> None:
+    """Open the completely offline ES68+D435i articulated STL inspector."""
+
+    try:
+        settings = load_settings(config)
+        from biblade_fusion.robotics.model_gui import (
+            launch_es68_d435i_model_gui,
+            parse_joint_degrees,
+        )
+
+        initial_joints_rad = parse_joint_degrees(joints_deg)
+        exit_code = launch_es68_d435i_model_gui(
+            joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
+            initial_joint_positions_rad=initial_joints_rad,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "PySide6" or (exc.name or "").startswith("PySide6."):
+            typer.echo(
+                "PySide6/Qt3D is not installed; run "
+                "`uv sync --extra robot-model-gui`.",
+                err=True,
+            )
+        else:
+            typer.echo(f"Offline robot-model viewer failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        typer.echo(f"Offline robot-model viewer failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if exit_code:
+        raise typer.Exit(code=exit_code)
+
+
 @camera_app.command("list")
 def camera_list(output_json: Annotated[bool, typer.Option("--json")] = False) -> None:
     """List connected RealSense devices without starting image streams."""

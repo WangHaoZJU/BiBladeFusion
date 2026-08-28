@@ -1,7 +1,10 @@
+import pytest
 from typer.testing import CliRunner
 
+import biblade_fusion.cli as cli_module
 from biblade_fusion.cli import _with_emitter_override, app
 from biblade_fusion.core.settings import load_settings
+from biblade_fusion.robotics import model_gui
 
 runner = CliRunner()
 
@@ -102,6 +105,48 @@ def test_robot_kinematics_export_is_exposed() -> None:
 
     assert result.exit_code == 0
     assert "export-kinematics" in result.stdout
+    assert "inspect-model" in result.stdout
+
+    inspect_help = runner.invoke(app, ["robot", "inspect-model", "--help"])
+    assert inspect_help.exit_code == 0
+    assert "--joints-deg" in inspect_help.stdout
+    assert "--config" in inspect_help.stdout
+    assert "--ip" not in inspect_help.stdout
+
+
+def test_robot_model_inspector_execution_does_not_construct_hardware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_hardware(*_args, **_kwargs):
+        raise AssertionError("offline model inspector attempted to construct hardware")
+
+    launches: list[dict[str, object]] = []
+
+    def fake_launch(**kwargs) -> int:
+        launches.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli_module, "EliteReadOnlyRobot", forbidden_hardware)
+    monkeypatch.setattr(cli_module, "RealSenseD435i", forbidden_hardware)
+    monkeypatch.setattr(model_gui, "launch_es68_d435i_model_gui", fake_launch)
+
+    result = runner.invoke(
+        app,
+        [
+            "robot",
+            "inspect-model",
+            "--config",
+            "configs/default.yaml",
+            "--joints-deg",
+            "0,-60,90,-60,-90,0",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(launches) == 1
+    assert launches[0]["initial_joint_positions_rad"] == pytest.approx(
+        (0.0, -1.0471975512, 1.5707963268, -1.0471975512, -1.5707963268, 0.0)
+    )
 
 
 def test_safety_path_validation_is_exposed() -> None:

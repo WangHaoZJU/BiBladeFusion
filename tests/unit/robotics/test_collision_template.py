@@ -30,6 +30,37 @@ def test_packaged_collision_template_is_explicitly_inactive() -> None:
         template.validate_assets()
 
 
+def test_packaged_active_collision_model_uses_holorobot_d435i_mount_relation() -> None:
+    resources = Es68D435iCollisionResources.packaged_template()
+
+    template = resources.load_active()
+    root = ElementTree.fromstring(build_es68_d435i_collision_urdf(template))
+
+    assert template.model_id == "es68_d435i_depth_camera_mount_v1"
+    assert template.mesh_units == "m"
+    assert template.mesh_scale == 1.0
+    assert all(spec.origin_xyz_m == (0.0, 0.0, 0.0) for spec in template.links)
+    assert template.attachment.mesh_path.name == "depth_camera_mount.stl"
+    assert template.attachment.joint_xyz_m == (0.0, 0.0, 0.0)
+    assert template.attachment.joint_rpy_rad == (0.0, 0.0, 0.0)
+    assert template.attachment.origin_xyz_m == (-0.0505, -0.031815, 0.0)
+
+    joint = root.find(".//joint[@name='flange-d435i_collision']")
+    collision = root.find(".//link[@name='d435i_collision_link']/collision")
+    assert joint is not None
+    assert collision is not None
+    assert joint.find("parent").attrib == {"link": "flange"}
+    assert joint.find("origin").attrib == {"xyz": "0 0 0", "rpy": "0 0 0"}
+    assert collision.find("origin").attrib == {
+        "xyz": "-0.0505 -0.031815 0",
+        "rpy": "0 0 0",
+    }
+    assert collision.find("geometry/mesh").attrib == {
+        "filename": "meshes/es68_d435i/collision/depth_camera_mount.stl",
+        "scale": "1 1 1",
+    }
+
+
 def _ready_template(tmp_path: Path, *, units: str = "m") -> Es68D435iCollisionTemplate:
     packaged = Es68D435iCollisionResources.packaged_template()
     payload = yaml.safe_load(packaged.manifest_template_path.read_text(encoding="utf-8"))

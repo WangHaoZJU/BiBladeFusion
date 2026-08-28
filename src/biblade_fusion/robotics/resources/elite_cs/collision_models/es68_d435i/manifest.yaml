@@ -1,0 +1,61 @@
+# Active collision asset for the current laboratory ES68 + D435i installation.
+#
+# Provenance:
+# - arm meshes and link-local origins follow HoloRobot's
+#   es68_elite_a_sensor_combo model;
+# - the current D435i-only attachment follows HoloRobot cs_macro.xacro's
+#   wrist_3-depth_camera_mount relationship;
+# - wrist_3_link_T_flange is identity in the same model, so the attachment can
+#   be parented to flange without changing the transform.
+schema: biblade_fusion.es68_d435i_collision.v1
+model_id: es68_d435i_depth_camera_mount_v1
+ready: true
+
+# HoloRobot's STL vertices are expressed in metres.
+mesh_units: m
+
+# Every arm mesh is already expressed in its corresponding URDF link frame.
+links:
+  base_link_inertia:
+    mesh: meshes/es68_d435i/collision/base.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+  shoulder_link:
+    mesh: meshes/es68_d435i/collision/shoulder.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+  upperarm_link:
+    mesh: meshes/es68_d435i/collision/upperarm.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+  forearm_link:
+    mesh: meshes/es68_d435i/collision/forearm.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+  wrist_1_link:
+    mesh: meshes/es68_d435i/collision/wrist1.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+  wrist_2_link:
+    mesh: meshes/es68_d435i/collision/wrist2.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+  wrist_3_link:
+    mesh: meshes/es68_d435i/collision/wrist3.stl
+    origin: {xyz_m: [0, 0, 0], rpy_rad: [0, 0, 0]}
+
+attachment:
+  link_name: d435i_collision_link
+  joint_name: flange-d435i_collision
+  parent_link: flange
+  mesh: meshes/es68_d435i/collision/depth_camera_mount.stl
+  # HoloRobot: wrist_3-depth_camera_mount fixed joint is identity.
+  joint_origin:
+    xyz_m: [0, 0, 0]
+    rpy_rad: [0, 0, 0]
+  # HoloRobot cs_macro.xacro collision origin for depth_camera_mount.stl.
+  origin:
+    xyz_m: [-0.0505, -0.031815, 0]
+    rpy_rad: [0, 0, 0]
+
+pair_filter:
+  # Ignore only directly adjacent kinematic bodies, matching HoloRobot.
+  max_parent_joint_hop: 1
+
+safety:
+  # Policy clearance is separate from the physical collision-mesh dimensions.
+  minimum_clearance_m: 0.010

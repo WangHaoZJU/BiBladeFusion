@@ -1,5 +1,31 @@
 # Development log
 
+## 2026-08-28 — active ES68+D435i collision assembly and offline inspector
+
+- Activated the current D435i-only ES68 collision manifest from the matching HoloRobot
+  model. The seven arm meshes remain in their URDF link frames; the payload uses the
+  documented identity flange joint and the `depth_camera_mount.stl` collision origin
+  `[-0.0505, -0.031815, 0] m` with zero rotation. The eight copied STL files are byte-for-
+  byte identical to their HoloRobot sources and retain metre units.
+- Added a completely offline PySide6/Qt3D assembly inspector. It renders the exact eight
+  collision meshes, drives them from the same packaged ES68 forward kinematics and joint-
+  zero offsets used by safety code, provides six joint controls, selectable STL layers,
+  orbit/zoom controls, link positions and mesh-loader status. The command has no robot-IP
+  option, opens no device backend and contains no motion or authorization path.
+- Exercised the production Pinocchio/FCL chain with the active manifest: all eight
+  geometries loaded, 20 filtered collision pairs were constructed, and zero plus three
+  nonzero diagnostic poses were clear under the configured 10 mm policy. These discrete
+  checks establish software loading and assembly consistency; they are not a continuous
+  swept-path proof or hardware dimensional acceptance.
+- Audited mesh quality separately. The source set is intentionally detailed (about
+  674,000 triangles); several meshes are not watertight and five degenerate faces remain,
+  although hpp-fcl 2.4.4 loads the complete set. Keep this provenance set for acceptance
+  and introduce simplified collision meshes later only under a new model identity with
+  conservative-envelope regression checks.
+- Completed a real desktop-display launch and operator visual check, then closed the
+  change with the complete regression suite (`414 passed`), repository-wide Ruff,
+  bytecode compilation and lockfile consistency checks.
+
 ## 2026-08-28 — FK-authority native-depth re-evaluation
 
 - Reprocessed the five preserved real ES68/D435i sessions with the current schema-2

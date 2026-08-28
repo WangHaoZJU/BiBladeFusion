@@ -88,6 +88,9 @@ calibration-gui = [
 supervision-gui = [
     { name = "pyside6" },
 ]
+robot-model-gui = [
+    { name = "pyside6" },
+]
 foundation-stereo = [
     { name = "einops" },
     { name = "huggingface-hub" },
@@ -121,6 +124,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.5,<3" },
     { name = "pyrealsense2", specifier = ">=2.54,<3" },
     { name = "pyside6", marker = "extra == 'calibration-gui'", specifier = ">=6.8,<7" },
+    { name = "pyside6", marker = "extra == 'robot-model-gui'", specifier = ">=6.8,<7" },
     { name = "pyside6", marker = "extra == 'supervision-gui'", specifier = ">=6.8,<7" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "rich", specifier = ">=13.9,<15" },
@@ -131,7 +135,7 @@ requires-dist = [
     { name = "trimesh", specifier = ">=4,<5" },
     { name = "typer", specifier = ">=0.12,<1" },
 ]
-provides-extras = ["calibration-gui", "supervision-gui", "tsdf-open3d", "foundation-stereo"]
+provides-extras = ["calibration-gui", "supervision-gui", "robot-model-gui", "tsdf-open3d", "foundation-stereo"]
 
 [package.metadata.requires-dev]
 dev = [
