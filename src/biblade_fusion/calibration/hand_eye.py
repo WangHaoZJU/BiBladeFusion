@@ -43,6 +43,18 @@ class HandEyeCalibration:
             self.flange_t_left_ir.child_frame,
         ) != ("flange", "left_ir"):
             raise ValueError("Flange-primary hand-eye transform must be flange_T_left_ir")
+        if self.flange_t_left_ir is not None:
+            expected = _derived_tcp_t_left_ir(self.flange_t_left_ir)
+            if not np.allclose(
+                self.tcp_t_left_ir.matrix,
+                expected.matrix,
+                rtol=0.0,
+                atol=1e-9,
+            ):
+                raise ValueError(
+                    "Derived tcp_T_left_ir does not match "
+                    "inverse(flange_T_tcp) * flange_T_left_ir"
+                )
         if not self.method:
             raise ValueError("Hand-eye calibration method must be non-empty")
         if self.sample_count is not None and self.sample_count < 3:
@@ -60,6 +72,21 @@ class HandEyeCalibration:
             and not 0.0 <= self.rotation_axis_diversity <= 1.0
         ):
             raise ValueError("Hand-eye rotation-axis diversity must be in [0, 1]")
+
+    def require_flange_primary(self) -> PoseSE3:
+        """Return the authoritative flange transform or reject a legacy artifact."""
+
+        if self.flange_t_left_ir is None:
+            raise HandEyeCalibrationError(
+                "This operation requires schema-2 flange-primary hand-eye calibration"
+            )
+        return self.flange_t_left_ir
+
+
+def _derived_tcp_t_left_ir(flange_t_left_ir: PoseSE3) -> PoseSE3:
+    from biblade_fusion.robotics.es68_model import load_es68_flange_t_tcp
+
+    return load_es68_flange_t_tcp().inverse().compose(flange_t_left_ir)
 
 
 def load_hand_eye_calibration(config: HandEyeConfig) -> HandEyeCalibration:
@@ -116,11 +143,11 @@ def load_hand_eye_calibration(config: HandEyeConfig) -> HandEyeCalibration:
                 raise ValueError("Schema-2 hand-eye frames must be flange and left_ir")
             flange_t_left_ir = PoseSE3("flange", "left_ir", matrix)
             derived = payload.get("derived_runtime", {})
+            if not isinstance(derived, dict):
+                raise TypeError("derived_runtime must be a mapping")
             tcp_matrix = derived.get("tcp_T_left_ir")
             if tcp_matrix is None:
-                from biblade_fusion.robotics import load_es68_flange_t_tcp
-
-                tcp_t_left_ir = load_es68_flange_t_tcp().inverse().compose(flange_t_left_ir)
+                tcp_t_left_ir = _derived_tcp_t_left_ir(flange_t_left_ir)
             else:
                 tcp_t_left_ir = PoseSE3("tcp", "left_ir", tcp_matrix)
         calibration = HandEyeCalibration(

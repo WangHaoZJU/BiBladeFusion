@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -18,7 +19,15 @@ from biblade_fusion.core.settings import AppSettings
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.devices.robot.base import RobotState
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _atomic_json(path: Path, payload: Any) -> None:
@@ -147,11 +156,17 @@ class SessionWriter:
             shutil.rmtree(temporary_dir, ignore_errors=True)
             raise
 
+        file_hashes = {
+            path.name: _sha256(path)
+            for path in sorted(final_dir.iterdir())
+            if path.is_file()
+        }
         self._manifest["views"].append(
             {
                 "sequence_index": bundle.sequence_index,
                 "view_id": bundle.view_id,
                 "path": f"views/{view_name}",
+                "files": file_hashes,
             }
         )
         _atomic_json(self._manifest_path, self._manifest)

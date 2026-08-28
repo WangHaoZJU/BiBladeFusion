@@ -32,6 +32,7 @@ from biblade_fusion.workflows.initialization import (
     initialize_native_depth,
 )
 from biblade_fusion.workflows.motion_preflight import (
+    EndpointPoseConsistency,
     MotionSequenceCost,
     PreflightedMotionLeg,
     ViewSequenceMotionPreflight,
@@ -45,6 +46,13 @@ from biblade_fusion.workflows.native_overlap import (
     NativeOverlapValidationError,
     evaluate_native_overlap,
 )
+from biblade_fusion.workflows.occupancy_mapping import (
+    OccupancyFrameEvidence,
+    OccupancyFrameUpdate,
+    OccupancyMappingError,
+    integrate_foundation_stereo_occupancy,
+    mark_snapshot_stale_if_expired,
+)
 from biblade_fusion.workflows.path_validation import (
     PathSequenceError,
     ValidatedPathLeg,
@@ -52,10 +60,12 @@ from biblade_fusion.workflows.path_validation import (
     validate_view_sequence_collision,
 )
 from biblade_fusion.workflows.reconstruction import (
+    AuthoritativeRobotPose,
     ReconstructedBladeView,
     ReconstructionError,
     reconstruct_foundation_stereo_view,
     reconstruct_native_depth_view,
+    resolve_authoritative_robot_pose,
 )
 from biblade_fusion.workflows.stereo_inference import (
     StereoInferenceObservation,
@@ -85,13 +95,18 @@ __all__ = [
     "InitializationError",
     "OfflineViewPlanningResult",
     "MotionSequenceCost",
+    "EndpointPoseConsistency",
     "IcpCorrectionDiagnostic",
     "NativeOverlapPairMetrics",
     "NativeOverlapPairResult",
     "NativeOverlapReport",
     "NativeOverlapValidationError",
+    "OccupancyFrameEvidence",
+    "OccupancyFrameUpdate",
+    "OccupancyMappingError",
     "PathSequenceError",
     "PreflightedMotionLeg",
+    "AuthoritativeRobotPose",
     "ReconstructedBladeView",
     "ReconstructionError",
     "ValidatedPathLeg",
@@ -103,11 +118,14 @@ __all__ = [
     "extract_hand_eye_samples",
     "infer_rectified_stereo",
     "evaluate_native_overlap",
+    "integrate_foundation_stereo_occupancy",
+    "mark_snapshot_stale_if_expired",
     "plan_initial_observation",
     "preflight_view_sequence_motion",
     "validate_view_sequence_collision",
     "reconstruct_foundation_stereo_view",
     "reconstruct_native_depth_view",
+    "resolve_authoritative_robot_pose",
     "build_coarse_blade_model",
     "registered_cloud_view",
 ]

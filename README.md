@@ -1,16 +1,23 @@
 # BiBladeFusion
 
-**BiBladeFusion** is a robot-guided bilateral 3D geometry and thermal reconstruction
-system for thin-walled blades.
+**BiBladeFusion** is a robot-guided bilateral 3D-geometry reconstruction system for
+thin-walled blades, with a planned thermal-reconstruction extension.
 
-The current development stage provides a Python 3.12 application, validated
-configuration, read-only Elite ES68 commands plus a default-off guarded control backend,
-synchronized raw
-stereo acquisition from an Intel RealSense D435i, reproducible session storage, a
-calibrated FoundationStereo inference path, paired native/stereo depth evaluation, a
-conservative single-view blade proxy, paper-derived true curved-surface partitioning,
-thin-wall-aware multi-view TSDF/mesh reconstruction, real-surface quality feedback, and
-offline Elite KDL endpoint IK. Robot motion is disabled by default.
+The current development stage provides a Python 3.12 application, read-only Elite ES68
+diagnostics plus a fail-closed guarded-control library, synchronized raw stereo acquisition
+from an Intel RealSense D435i, reproducible session storage, a calibrated
+FoundationStereo inference path, paired native/stereo depth evaluation, a conservative
+single-view blade proxy, paper-derived true curved-surface partitioning, thin-wall-aware
+multi-view TSDF/mesh reconstruction, real-surface quality feedback, and offline Elite KDL
+endpoint IK. It also contains a fail-closed, FoundationStereo-derived three-state safety
+occupancy layer and a read-only supervisory replay console. The curved reconstruction
+chain is currently regression-verified on deterministic synthetic bilateral-blade data;
+real-blade accuracy and hardware thresholds still require recorded experiments. Thermal
+capture/fusion is not implemented beyond a disabled interface placeholder. Every public
+Elite-arm motion method and every public CLI motion path is sealed; the guarded executor
+can reach the private driver capability only after its complete evidence contract passes.
+The two required continuous swept-volume backends are not implemented, so that contract
+currently blocks before driver preparation.
 
 ## Bootstrap
 
@@ -20,6 +27,11 @@ offline Elite KDL endpoint IK. Robot motion is disabled by default.
 
 The bootstrap script creates the project virtual environment with `uv`, synchronizes
 the locked dependencies, and installs the local Elite CS SDK wheel.
+
+The committed default configuration currently retains the present laboratory bring-up IP
+addresses and absolute SDK-wheel path. Keep them unchanged for this rig; before public
+release or deployment to another workstation, move machine-specific addresses and paths
+to a Git-ignored `configs/local.yaml` and remove them from the distributable defaults.
 
 Initialize the pinned official stereo source and install its optional runtime only on a
 FoundationStereo inference machine:
@@ -83,7 +95,7 @@ uv run bbf camera list
 uv run bbf acquire snapshot --config configs/local.yaml --view-id seed
 uv run bbf robot export-kinematics \
   --config configs/local.yaml \
-  --output data/calibrations/cs68_mdh.yaml
+  --output data/calibrations/es68_mdh.yaml
 ```
 
 The synchronized snapshot brackets the D435i capture with two RTSI robot states and
@@ -97,13 +109,15 @@ factory stereo extrinsics. A PySide6 application first stores latest-frame synch
 Y8 pairs as unique, checksummed digital-asset sessions, then performs ChArUco detection,
 independent Zhang initialization and joint stereo optimization offline. Raw pairs,
 accept/reject evidence and every calibration result remain traceable and non-overwriting.
-The verified result is automatically published to the fixed runtime path consumed by
-later workflows; missing user calibration fails closed without factory IR fallback. See
+The solver-accepted result is automatically published to the fixed runtime path consumed
+by later workflows; publication activates a result but is not independent hold-out
+validation. Missing user calibration fails closed without factory IR fallback. See
 [D435i infrared stereo calibration](docs/stereo-calibration.md).
 
 Validate the published parameters on new images that were not used by the solver:
 
 ```bash
+uv sync --extra calibration-gui
 ./.venv/bin/bbf calibration stereo-validate-gui \
   --config configs/default.yaml \
   --output data/calibrations/d435i_ir_validation
@@ -134,11 +148,16 @@ the blade's physical center of mass.
 Hand-eye input is quality-gated and is solved as `flange_T_left_ir` from the raw D435i
 left-IR stream and calibrated ES68 FK. See
 [calibration and frame conventions](docs/calibration.md) before processing real data.
+Native and FoundationStereo reconstruction use synchronized joints plus the configured
+joint-zero offsets to reproduce `base_T_flange`; the controller-reported `base_T_tcp`
+is accepted only as a validation residual within 2 mm and 0.3 degrees by default.
+Legacy TCP-primary hand-eye artifacts remain readable for inspection but are rejected by
+reconstruction, planning, collision, and motion-preflight paths.
 Current implementation status and the prioritized remaining work are tracked in the
 [development log](docs/development-log.md).
 The copied/adapted HoloRobot control lifecycle, pose convention, collision preflight,
 and approval boundary are documented in the
-[Elite CS68 control safety contract](docs/elite-cs68-control.md).
+[Elite ES68 control safety contract](docs/elite-cs68-control.md).
 
 Stored calibration sessions can be converted to an auditable ChArUco sample set and
 solved entirely offline:
@@ -158,6 +177,7 @@ uv run bbf calibration solve-hand-eye \
 For direct synchronized manual-pose collection, use the PySide6 workflow:
 
 ```bash
+uv sync --extra calibration-gui
 uv run bbf calibration hand-eye-gui \
   --config configs/local.yaml \
   --output data/calibrations/es68_left_ir_hand_eye
@@ -209,7 +229,7 @@ uv run bbf coverage seed \
 
 The planner creates both front and back partitions from the conservative proxy. Each
 view is checked for optical alignment, incidence, coverage, standoff, camera clearance,
-workspace bounds, forbidden volumes, duplicate poses, and—when configured—offline CS68
+workspace bounds, forbidden volumes, duplicate poses, and—when configured—offline ES68
 IK. A `geometry_only` view has not passed IK/workspace validation. An
 `endpoint_feasible` view still has **not** passed robot-body collision or trajectory
 validation. Every exported plan contains `motion_authorized: false`; no current command
@@ -226,7 +246,10 @@ leading edge, trailing edge, root, and tip, robustly fits the irregular four-bou
 outline, uses curve-driven equal-arc coordinates with a shared bilateral base grid,
 separates the specimen's one front and one back protruding fin, plans their two faces,
 attachment roots, and free rims with dedicated normals, protects both blade and measured
-fin thickness during TSDF integration, and reports component-level surface/mesh quality. Install
+fin thickness during TSDF integration, and reports component-level surface/mesh quality.
+These functions are software-verified on deterministic synthetic data; real D435i/ES68
+coarse scans and dimensional references are still required for physical validation.
+Install
 `uv sync --extra tsdf-open3d` to enable the optional calibrated Open3D backend; the
 locked NumPy fallback remains available without it.
 
@@ -235,23 +258,128 @@ schema-4 coarse model. It exports portable inspection geometry/reports and can o
 read-only PySide6 orbit viewer; a geometric pass still records robot feasibility as
 unverified and cannot authorize motion.
 
+```bash
+uv sync --extra supervision-gui
+```
+
 Explicit ordered view sequences can be checked offline with the fail-closed
-[CS68 collision and path validator](docs/collision-validation.md). It uses configured
+[ES68 collision and path validator](docs/collision-validation.md). It uses configured
 capsule/workcell geometry and controller-specific MDH data, but remains a conservative
 prefilter and never authorizes motion.
 
-After an ordered sequence has endpoint-feasible IK solutions, generate the copied
-HoloRobot mesh-collision and velocity-limited ServoJ preflight artifact:
+## Unknown-blade occupancy and supervision
+
+For an unknown blade, environment collision evidence is derived from settled,
+pose-registered FoundationStereo observations rather than a prior blade STL. Each
+accepted observation must carry the configured left-right consistency evidence and
+its derived score array. The stored score is
+`exp(-|d_L-d_R| / configured_LR_threshold)`; it is a deterministic,
+non-probabilistic consistency score, not a calibrated probability. Calibrated ES68 FK
+from the synchronized joint vector is the
+authoritative pose source: `base_T_flange · flange_T_left_ir` places the camera and depth
+in `base`. The synchronized RTSI TCP is validation-only; before any ray enters the map,
+`base_T_flange · flange_T_tcp` must agree with it within 2 mm and 0.3 degrees by default.
+Both source poses and residuals are stored in the immutable evidence chain and re-derived
+on read. The final ES68+D435i collision meshes are rendered into the left-IR camera and
+depth-consistently masked before ray integration. Masked pixels do not clear the robot or
+the space hidden behind it.
+
+The sparse voxel map has exactly three semantic states:
+
+- `FREE`: traversed by enough geometrically independent accepted depth rays before their
+  measured surfaces;
+- `OCCUPIED`: supported by accepted surface evidence;
+- `UNKNOWN`: neither proven free nor occupied, including out-of-grid space and pixels
+  removed by the robot self-mask.
+
+`UNKNOWN` blocks motion. A voxel needs three independent FREE votes by default, with at
+most one vote per view. A new supporting view must differ from every prior supporting
+view by at least 20 mm of camera-centre translation or 5 degrees of optical-axis angle;
+changing only a view identifier is rejected before ray integration. Mapping is
+stop-and-capture, and map age starts at the first frame of the complete rebuild cycle—it
+is not continuous dynamic obstacle avoidance. The following command reconstructs
+immutable mapping evidence from at least three previously stored FoundationStereo
+artifacts:
+
+```bash
+uv run bbf occupancy build-replay \
+  --stereo outputs/stereo_view_000 \
+  --stereo outputs/stereo_view_001 \
+  --stereo outputs/stereo_view_002 \
+  --config configs/local.yaml \
+  --output outputs/occupancy_replay
+uv run bbf occupancy inspect --artifact outputs/occupancy_replay
+```
+
+`occupancy build-replay` **always** seals the result as `STALE`; it is useful for
+algorithm verification and audit only, and can never become live motion evidence. The
+production renderer also fails closed when the ready, final ES68+D435i STL manifest is
+absent or mismatched. Follow the [final ES68+D435i collision-model activation
+checklist](src/biblade_fusion/robotics/resources/elite_cs/collision_models/es68_d435i/README.md)
+when installing those meshes. A native real-time coordinator that atomically combines
+stopped robot state, FoundationStereo inference, map publication, planning invalidation,
+and execution freshness has not yet been implemented or hardware-verified.
+
+Create and open a self-contained, read-only supervisory replay snapshot with:
+
+```bash
+uv sync --extra supervision-gui
+uv run bbf supervise build-replay \
+  --occupancy outputs/occupancy_replay \
+  --current-view outputs/reconstructed_view_002 \
+  --coarse-model outputs/coarse_model \
+  --output outputs/supervision/snapshot_0002
+uv run bbf supervise replay \
+  --snapshot outputs/supervision/snapshot_0002
+```
+
+The GUI visualizes only evidence it can bind: occupancy and implicit unknown workspace,
+the historical robot chain and camera pose, current/fused blade point clouds, sensor
+quality, copied source manifests and blocking events. Exact ES68+D435i meshes appear only
+when the active final collision model reproduces the mapping geometry hash; planned TCP
+endpoints appear only from a canonically re-derived preflight. A continuous actual TCP
+trace is not yet persisted. The GUI is strictly an observer: replay snapshots remain
+`REPLAY/BLOCKED`, and it contains no approval or robot-command path. `--follow` only
+polls atomically published replay snapshots; it does not provide online avoidance or a
+deterministic control loop.
+
+After an ordered sequence has endpoint-feasible IK solutions, the production preflight
+interface is the following read-only command. It requires a fresh `MAP_READY` occupancy
+asset, but no current CLI publishes one; the path below denotes future native-coordinator
+output and cannot be replaced by `build-replay`. Consequently this is presently a
+contract-level interface, not a complete CLI-only workflow.
 
 ```bash
 uv run bbf safety preflight-path \
   --plan outputs/view_plan \
   --initialization outputs/initialization \
+  --occupancy outputs/fresh_map_ready_occupancy \
   --view-id front_r00_c00 \
   --view-id back_r00_c00 \
   --config configs/local.yaml \
   --output outputs/motion_preflight
 ```
 
-The artifact binds and verifies its source hashes, re-derives every leg when read, and
-always stores `motion_authorized: false`. This command does not connect to the robot.
+When supplied with a separately produced valid fresh asset, the artifact binds and
+verifies its source hashes, ES68+D435i motion-model contract,
+FoundationStereo occupancy sequence/hash/freshness horizon, and configured ServoJ runtime
+contract. The full reader re-verifies the raw session arrays, user stereo calibration,
+rectification, official FoundationStereo source/checkpoint/configuration, hand-eye/FK
+chain and active robot-depth rendering before issuing a process-local semantic
+attestation. That attestation is bound through collision evidence, preflight, permit and
+guarded execution; replay-only assets never receive one. The artifact re-derives every
+leg when read and always stores
+`motion_authorized: false`. The production path currently stops at
+`continuous_swept_mesh_unavailable` before creating a ServoJ stream, so a zero reported
+duration is a blocked diagnostic, not an executable trajectory. Even after that backend
+exists, the independent continuous robot-versus-voxel proof must also pass. This command
+does not connect to the robot. Passing an offline `build-replay` occupancy asset is
+intentionally blocked because that asset is `STALE`.
+
+The current implementation must not be interpreted as physical motion clearance. Robot
+pixels removed by self-masking remain `UNKNOWN`, so the robot's own volume can block its
+occupancy query. Both continuous swept-mesh/FCL collision evidence and continuous
+robot-versus-voxel occupancy evidence are independently unimplemented; bounded-step
+discrete samples and transformed mesh-AABB bounding spheres are diagnostic only. These
+limitations, the absent live coordinator, and final-model hardware acceptance must be
+resolved before exposing a motion CLI.

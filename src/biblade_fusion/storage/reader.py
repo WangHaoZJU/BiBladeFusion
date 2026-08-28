@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,18 @@ class StoredViewDescriptor:
     sequence_index: int
     view_id: str
     relative_path: str
+    file_sha256: tuple[tuple[str, str], ...] = ()
+
+
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -82,7 +96,7 @@ class SessionReader:
             raw_views = self.manifest["views"]
         except (KeyError, TypeError, ValueError) as exc:
             raise SessionFormatError("Session manifest is missing required fields") from exc
-        if self.schema_version not in {1, 2}:
+        if self.schema_version not in {1, 2, 3}:
             raise SessionFormatError(f"Unsupported session schema {self.schema_version}")
         if not isinstance(raw_views, list):
             raise SessionFormatError("Session manifest views must be a list")
@@ -94,6 +108,7 @@ class SessionReader:
                     sequence_index=int(item["sequence_index"]),
                     view_id=str(item["view_id"]),
                     relative_path=str(item["path"]),
+                    file_sha256=self._view_file_hashes(item),
                 )
                 self._contained_path(descriptor.relative_path)
                 descriptors.append(descriptor)
@@ -104,6 +119,32 @@ class SessionReader:
         if len({item.sequence_index for item in descriptors}) != len(descriptors):
             raise SessionFormatError("Session contains duplicate sequence indices")
         self.views = tuple(sorted(descriptors, key=lambda item: item.sequence_index))
+
+    def _view_file_hashes(
+        self,
+        item: dict[str, Any],
+    ) -> tuple[tuple[str, str], ...]:
+        if self.schema_version < 3:
+            return ()
+        raw = item.get("files")
+        if not isinstance(raw, dict) or not raw:
+            raise SessionFormatError("Schema-3 session view lacks file checksums")
+        records: list[tuple[str, str]] = []
+        for filename, digest in raw.items():
+            relative = str(filename)
+            if (
+                Path(relative).is_absolute()
+                or len(Path(relative).parts) != 1
+                or not isinstance(digest, str)
+                or _SHA256_PATTERN.fullmatch(digest) is None
+            ):
+                raise SessionFormatError("Schema-3 session file checksum is invalid")
+            records.append((relative, digest))
+        if "metadata.json" not in raw or not {"left_ir.npy", "right_ir.npy"}.issubset(
+            raw
+        ):
+            raise SessionFormatError("Schema-3 session view lacks required raw files")
+        return tuple(sorted(records))
 
     def _contained_path(self, relative_path: str, *, root: Path | None = None) -> Path:
         if Path(relative_path).is_absolute():
@@ -128,6 +169,12 @@ class SessionReader:
     def load_bundle(self, selector: int | str) -> SynchronizedFrameBundle:
         descriptor = self.descriptor(selector)
         view_path = self._contained_path(descriptor.relative_path)
+        for filename, digest in descriptor.file_sha256:
+            source = self._contained_path(filename, root=view_path)
+            if not source.is_file() or _sha256(source) != digest:
+                raise SessionFormatError(
+                    f"Stored session file checksum mismatch: {source}"
+                )
         metadata = _read_json(view_path / "metadata.json")
         try:
             bundle = self._parse_bundle(view_path, metadata)

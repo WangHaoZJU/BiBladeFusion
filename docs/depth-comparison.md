@@ -70,9 +70,12 @@ uv run bbf evaluate make-depth-manifest \
   --output experiments/depth_comparison.yaml
 ```
 
-The generator composes synchronized `base_T_tcp`, quality-gated `tcp_T_left_ir`, and the
-rectification rotation. It classifies the camera center against the fixed proxy mid-plane
-and computes incidence from the achieved rectified optical axis and selected face normal.
+The generator reproduces `base_T_flange` from synchronized joints, the initialization's
+explicit joint-zero offsets, and packaged ES68 FK, then composes the flange-primary
+`flange_T_left_ir` and rectification rotation. Synchronized `base_T_tcp` is used only for
+the stored 2 mm/0.3 degree validation gate. It classifies the camera center against the
+fixed proxy mid-plane and computes incidence from the achieved rectified optical axis and
+selected face normal.
 Ambiguous mid-plane views and cameras pointing away from the selected face are rejected.
 The generated manifest resembles:
 

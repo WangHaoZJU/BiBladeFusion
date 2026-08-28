@@ -116,9 +116,20 @@ def test_endpoint_plan_requires_and_verifies_kinematics_provenance(
             filtering,
             source_initialization=tmp_path / "initialization",
         )
+    assert not tuple(tmp_path.glob(".*.partial"))
 
     kinematics = tmp_path / "kinematics.yaml"
     kinematics.write_text("controller-specific-mdh\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="joint-zero offsets"):
+        write_view_plan(
+            tmp_path / "missing-offsets",
+            endpoint,
+            planning,
+            filtering,
+            source_initialization=tmp_path / "initialization",
+            source_kinematics=kinematics,
+        )
+    assert not tuple(tmp_path.glob(".*.partial"))
     output = write_view_plan(
         tmp_path / "plan",
         endpoint,
@@ -126,8 +137,11 @@ def test_endpoint_plan_requires_and_verifies_kinematics_provenance(
         filtering,
         source_initialization=tmp_path / "initialization",
         source_kinematics=kinematics,
+        joint_zero_offsets_rad=(0.0,) * 6,
     )
-    assert read_view_plan(output).metadata["source_kinematics"]["sha256"]
+    stored = read_view_plan(output)
+    assert stored.metadata["source_kinematics"]["sha256"]
+    assert stored.metadata["source_kinematics"]["joint_zero_offsets_rad"] == [0.0] * 6
 
     kinematics.write_text("changed-mdh\n", encoding="utf-8")
     with pytest.raises(ValueError, match="kinematics checksum mismatch"):

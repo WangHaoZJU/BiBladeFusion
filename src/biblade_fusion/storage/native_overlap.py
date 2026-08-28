@@ -19,13 +19,15 @@ import numpy as np
 from biblade_fusion.calibration import HandEyeCalibration, load_hand_eye_calibration
 from biblade_fusion.core.settings import (
     HandEyeConfig,
+    KinematicsConfig,
     NativeOverlapValidationConfig,
     PointCloudConfig,
 )
+from biblade_fusion.robotics import Es68ModelResources, load_es68_flange_t_tcp
 from biblade_fusion.storage.reader import SessionReader
 from biblade_fusion.workflows import NativeOverlapReport, evaluate_native_overlap
 
-NATIVE_OVERLAP_SCHEMA_VERSION = 1
+NATIVE_OVERLAP_SCHEMA_VERSION = 2
 
 _PALETTE_RGB = np.asarray(
     [
@@ -46,6 +48,18 @@ _PALETTE_RGB = np.asarray(
 class StoredNativeOverlapReport:
     report: NativeOverlapReport
     metadata: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyNativeOverlapReplay:
+    """Integrity-verified schema-1 result with no FK-authority eligibility."""
+
+    metadata: dict[str, Any]
+    overlay_points_m: np.ndarray
+    overlay_view_indices: np.ndarray
+    pair_residuals_m: tuple[np.ndarray, ...]
+    verification_status: str = "legacy_tcp_primary_integrity_only"
+    current_fk_authority_eligible: bool = False
 
 
 def _sha256(path: Path) -> str:
@@ -297,6 +311,7 @@ def write_native_overlap_report(
     source_sessions: tuple[str | Path, ...],
     hand_eye: HandEyeCalibration,
     hand_eye_config: HandEyeConfig,
+    kinematics_config: KinematicsConfig,
     point_cloud_config: PointCloudConfig,
     validation_config: NativeOverlapValidationConfig,
 ) -> Path:
@@ -317,7 +332,10 @@ def write_native_overlap_report(
         raise ValueError("Native-overlap source frames must be physically distinct")
     if len({source["emitter_enabled"] for source in sources}) != 1:
         raise ValueError("Native-overlap sessions use mixed projector states")
+    flange_t_left_ir = hand_eye.require_flange_primary()
+    flange_t_tcp = load_es68_flange_t_tcp()
     hand_eye_path = hand_eye.source_path.resolve()
+    resources = Es68ModelResources.packaged()
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.{uuid4().hex}.partial")
     temporary.mkdir()
@@ -358,8 +376,15 @@ def write_native_overlap_report(
                 "sessions": list(sources),
                 "hand_eye": {
                     **_source_file(hand_eye_path),
+                    "flange_T_left_ir": flange_t_left_ir.matrix.tolist(),
                     "tcp_T_left_ir": hand_eye.tcp_t_left_ir.matrix.tolist(),
+                    "flange_T_tcp": flange_t_tcp.matrix.tolist(),
                     "method": hand_eye.method,
+                },
+                "kinematics_assets": {
+                    "model": _source_file(resources.kinematics_yaml),
+                    "joint_limits": _source_file(resources.joint_limits_yaml),
+                    "flange_tcp": _source_file(resources.tcp_offset_json),
                 },
             },
             "files": {
@@ -372,13 +397,16 @@ def write_native_overlap_report(
             },
             "processing": {
                 "hand_eye": hand_eye_config.model_dump(mode="json"),
+                "kinematics": kinematics_config.model_dump(mode="json"),
                 "point_cloud": point_cloud_config.model_dump(mode="json"),
                 "native_overlap_validation": validation_config.model_dump(mode="json"),
             },
             "interpretation": {
                 "primary": (
                     "symmetric projective native-depth residuals use the unmodified "
-                    "base_T_tcp · tcp_T_left_ir · left_ir_T_depth chain"
+                    "joints -> packaged ES68 FK -> base_T_flange · "
+                    "flange_T_left_ir · left_ir_T_depth chain; controller TCP is "
+                    "validation-only"
                 ),
                 "icp": (
                     "ICP corrections are diagnostic only and were not applied to primary "
@@ -444,6 +472,8 @@ def read_native_overlap_report(path: str | Path) -> StoredNativeOverlapReport:
             ):
                 _verify_source(source[field])
         _verify_source(sources["hand_eye"])
+        for record in sources["kinematics_assets"].values():
+            _verify_source(record)
         files = payload["files"]
         overlay_points = _load_array(root, files["overlay_points_m"])
         overlay_labels = _load_array(root, files["overlay_view_indices"])
@@ -461,12 +491,28 @@ def read_native_overlap_report(path: str | Path) -> StoredNativeOverlapReport:
             update={"calibration_path": Path(sources["hand_eye"]["path"])}
         )
         hand_eye = load_hand_eye_calibration(hand_eye_config)
+        if hand_eye.flange_t_left_ir is None:
+            raise ValueError("native-overlap requires flange-primary hand-eye")
+        if not np.allclose(
+            hand_eye.flange_t_left_ir.matrix,
+            sources["hand_eye"]["flange_T_left_ir"],
+            atol=1e-12,
+            rtol=0.0,
+        ):
+            raise ValueError("native-overlap flange-primary hand-eye matrix changed")
         if not np.allclose(
             hand_eye.tcp_t_left_ir.matrix,
             sources["hand_eye"]["tcp_T_left_ir"],
             atol=1e-12,
         ):
             raise ValueError("native-overlap hand-eye matrix changed")
+        if not np.allclose(
+            load_es68_flange_t_tcp().matrix,
+            sources["hand_eye"]["flange_T_tcp"],
+            atol=1e-12,
+            rtol=0.0,
+        ):
+            raise ValueError("native-overlap flange_T_tcp changed")
         bundles = tuple(
             SessionReader(source["root"]).load_bundle(str(source["view_id"]))
             for source in session_sources
@@ -476,6 +522,8 @@ def read_native_overlap_report(path: str | Path) -> StoredNativeOverlapReport:
             hand_eye,
             PointCloudConfig.model_validate(processing["point_cloud"]),
             NativeOverlapValidationConfig.model_validate(processing["native_overlap_validation"]),
+            kinematics_config=KinematicsConfig.model_validate(processing["kinematics"]),
+            hand_eye_config=hand_eye_config,
         )
         if _report_payload(expected) != payload["evaluation"]:
             raise ValueError("native-overlap metrics do not match recomputed sources")
@@ -491,3 +539,77 @@ def read_native_overlap_report(path: str | Path) -> StoredNativeOverlapReport:
         return StoredNativeOverlapReport(expected, payload)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid native-overlap artifact {root}: {exc}") from exc
+
+
+def read_legacy_native_overlap_for_replay(
+    path: str | Path,
+) -> LegacyNativeOverlapReplay:
+    """Read schema-1 TCP-primary assets without reinterpreting them as schema 2.
+
+    This API verifies every still-addressable source and every derived file.  It
+    deliberately does not return :class:`StoredNativeOverlapReport`, because the
+    legacy coordinate chain cannot satisfy the current FK-authority experiment.
+    """
+
+    root = Path(path)
+    try:
+        payload = json.loads(
+            (root / "native_overlap_report.json").read_text(encoding="utf-8")
+        )
+        if int(payload["schema_version"]) != 1:
+            raise ValueError(
+                f"legacy replay requires schema 1, got {payload['schema_version']}"
+            )
+        primary = str(payload["interpretation"]["primary"])
+        if "base_T_tcp" not in primary or "tcp_T_left_ir" not in primary:
+            raise ValueError("legacy report does not declare its TCP-primary chain")
+        sources = payload["sources"]
+        for source in sources["sessions"]:
+            for field in (
+                "manifest",
+                "config_snapshot",
+                "view_metadata",
+                "native_depth",
+            ):
+                _verify_source(source[field])
+        _verify_source(sources["hand_eye"])
+        files = payload["files"]
+        overlay_points = _load_array(root, files["overlay_points_m"])
+        overlay_labels = _load_array(root, files["overlay_view_indices"])
+        residuals = tuple(
+            _load_array(root, record) for record in files["pair_residuals"]
+        )
+        if (
+            overlay_points.ndim != 2
+            or overlay_points.shape[1] != 3
+            or overlay_labels.shape != (len(overlay_points),)
+        ):
+            raise ValueError("legacy native-overlap overlay arrays are invalid")
+        pairs = payload["evaluation"]["pairs"]
+        if len(residuals) != len(pairs):
+            raise ValueError("legacy native-overlap residual count differs from metrics")
+        for residual in residuals:
+            if residual.ndim != 1 or not np.isfinite(residual).all():
+                raise ValueError("legacy native-overlap residual array is invalid")
+        for field in ("overlay_ply", "overview_png", "metrics_csv"):
+            record = files[field]
+            derived = _contained(root, str(record["path"]))
+            if (
+                _sha256(derived) != str(record["sha256"])
+                or derived.stat().st_size != int(record["size_bytes"])
+            ):
+                raise ValueError(
+                    f"legacy native-overlap derived file mismatch: {record['path']}"
+                )
+        for array in (overlay_points, overlay_labels, *residuals):
+            array.setflags(write=False)
+        return LegacyNativeOverlapReplay(
+            payload,
+            overlay_points,
+            overlay_labels,
+            residuals,
+        )
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Invalid legacy native-overlap artifact {root}: {exc}"
+        ) from exc

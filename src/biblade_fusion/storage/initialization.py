@@ -14,15 +14,25 @@ from uuid import uuid4
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from biblade_fusion.calibration import HandEyeCalibration
+from biblade_fusion.calibration import HandEyeCalibration, load_hand_eye_calibration
 from biblade_fusion.core.pose import PoseSE3
-from biblade_fusion.core.settings import PointCloudConfig, ProxyModelConfig
+from biblade_fusion.core.settings import (
+    HandEyeConfig,
+    KinematicsConfig,
+    PointCloudConfig,
+    ProxyModelConfig,
+)
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import BilateralBladeProxy
-from biblade_fusion.workflows import InitialObservation
+from biblade_fusion.robotics import (
+    Es68KinematicModel,
+    Es68ModelResources,
+    load_es68_flange_t_tcp,
+)
+from biblade_fusion.workflows import AuthoritativeRobotPose, InitialObservation
 
-INITIALIZATION_SCHEMA_VERSION = 6
+INITIALIZATION_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +77,64 @@ def _array_record(path: Path) -> dict[str, Any]:
         }
     finally:
         del array
+
+
+def _source_record(path: Path) -> dict[str, Any]:
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise ValueError(f"Initialization source asset is missing: {resolved}")
+    return {
+        "path": str(resolved),
+        "sha256": _sha256(resolved),
+        "size_bytes": resolved.stat().st_size,
+    }
+
+
+def _pose_authority_payload(authority: AuthoritativeRobotPose) -> dict[str, Any]:
+    return {
+        "method": "joints_to_packaged_es68_fk_v1",
+        "controller_tcp_role": "validation_only",
+        "joint_zero_offsets_rad": list(authority.joint_zero_offsets_rad),
+        "base_T_flange": authority.base_t_flange.matrix.tolist(),
+        "predicted_base_T_tcp": authority.predicted_base_t_tcp.matrix.tolist(),
+        "observed_base_T_tcp": authority.observed_base_t_tcp.matrix.tolist(),
+        "fk_tcp_translation_error_m": authority.fk_tcp_translation_error_m,
+        "fk_tcp_rotation_error_deg": authority.fk_tcp_rotation_error_deg,
+        "maximum_fk_tcp_translation_error_m": (
+            authority.maximum_fk_tcp_translation_error_m
+        ),
+        "maximum_fk_tcp_rotation_error_deg": (
+            authority.maximum_fk_tcp_rotation_error_deg
+        ),
+    }
+
+
+def _verified_source_hand_eye(
+    hand_eye: HandEyeCalibration,
+    config: HandEyeConfig,
+) -> HandEyeCalibration:
+    loaded = load_hand_eye_calibration(
+        config.model_copy(update={"calibration_path": hand_eye.source_path})
+    )
+    if (
+        loaded.method != hand_eye.method
+        or loaded.flange_t_left_ir is None
+        or hand_eye.flange_t_left_ir is None
+        or not np.allclose(
+            loaded.flange_t_left_ir.matrix,
+            hand_eye.flange_t_left_ir.matrix,
+            rtol=0.0,
+            atol=1e-12,
+        )
+        or not np.allclose(
+            loaded.tcp_t_left_ir.matrix,
+            hand_eye.tcp_t_left_ir.matrix,
+            rtol=0.0,
+            atol=1e-12,
+        )
+    ):
+        raise ValueError("Initialization in-memory hand-eye does not match its source")
+    return loaded
 
 
 def _load_contained_array(root: Path, record: Any) -> np.ndarray:
@@ -124,6 +192,8 @@ def write_initialization(
     hand_eye: HandEyeCalibration,
     point_cloud_config: PointCloudConfig,
     proxy_config: ProxyModelConfig,
+    kinematics_config: KinematicsConfig,
+    hand_eye_config: HandEyeConfig,
     *,
     source_session: str | Path,
     source_stereo_inference: str | Path | None = None,
@@ -140,6 +210,45 @@ def write_initialization(
     if mask.shape != observation.base_cloud.source_image_shape:
         shutil.rmtree(temporary, ignore_errors=True)
         raise ValueError("Blade mask does not match source image shape")
+
+    hand_eye = _verified_source_hand_eye(hand_eye, hand_eye_config)
+    flange_t_left_ir = hand_eye.require_flange_primary()
+    authority = observation.pose_authority
+    if authority is None:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise ValueError("Initialization requires authoritative ES68 FK pose evidence")
+    if tuple(kinematics_config.joint_zero_offsets_rad) != authority.joint_zero_offsets_rad:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise ValueError("Initialization kinematics offsets do not match pose evidence")
+    if (
+        authority.maximum_fk_tcp_translation_error_m
+        != hand_eye_config.maximum_fk_tcp_translation_error_m
+        or authority.maximum_fk_tcp_rotation_error_deg
+        != hand_eye_config.maximum_fk_tcp_rotation_error_deg
+    ):
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise ValueError("Initialization hand-eye gate does not match pose evidence")
+    if not np.allclose(
+        authority.base_t_flange.compose(flange_t_left_ir).matrix,
+        observation.base_t_left_ir.matrix,
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise ValueError("Initialization camera pose is not derived from flange-primary hand-eye")
+    flange_t_tcp = load_es68_flange_t_tcp()
+    if not np.allclose(
+        authority.base_t_flange.compose(flange_t_tcp).matrix,
+        authority.predicted_base_t_tcp.matrix,
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise ValueError("Initialization predicted TCP is not derived from ES68 flange FK")
+    resources = Es68ModelResources.packaged()
+    left_ir_t_projection_camera = observation.base_t_left_ir.inverse().compose(
+        observation.base_t_projection_camera
+    )
 
     proxy = observation.proxy
     metadata: dict[str, Any] = {
@@ -165,6 +274,7 @@ def write_initialization(
             "base_T_left_ir": observation.base_t_left_ir.matrix.tolist(),
             "base_T_projection_camera": observation.base_t_projection_camera.matrix.tolist(),
             "projection_camera_frame": observation.base_t_projection_camera.child_frame,
+            "left_ir_T_projection_camera": left_ir_t_projection_camera.matrix.tolist(),
         },
         "proxy": {
             "base_T_proxy": proxy.frame_T_proxy.matrix.tolist(),
@@ -177,9 +287,11 @@ def write_initialization(
             "camera_normal_cosine": proxy.camera_normal_cosine,
         },
         "hand_eye": {
-            "source_path": str(hand_eye.source_path.resolve()),
+            "source": _source_record(hand_eye.source_path),
             "method": hand_eye.method,
+            "flange_T_left_ir": flange_t_left_ir.matrix.tolist(),
             "tcp_T_left_ir": hand_eye.tcp_t_left_ir.matrix.tolist(),
+            "flange_T_tcp": flange_t_tcp.matrix.tolist(),
             "sample_count": hand_eye.sample_count,
             "translation_rmse_m": hand_eye.translation_rmse_m,
             "rotation_rmse_deg": hand_eye.rotation_rmse_deg,
@@ -187,9 +299,17 @@ def write_initialization(
             "translation_span_m": hand_eye.translation_span_m,
             "rotation_axis_diversity": hand_eye.rotation_axis_diversity,
         },
+        "pose_authority": _pose_authority_payload(authority),
+        "kinematics_assets": {
+            "model": _source_record(resources.kinematics_yaml),
+            "joint_limits": _source_record(resources.joint_limits_yaml),
+            "flange_tcp": _source_record(resources.tcp_offset_json),
+        },
         "processing": {
             "point_cloud": point_cloud_config.model_dump(mode="json"),
             "proxy_model": proxy_config.model_dump(mode="json"),
+            "kinematics": kinematics_config.model_dump(mode="json"),
+            "hand_eye_gate": hand_eye_config.model_dump(mode="json"),
         },
     }
     try:
@@ -225,7 +345,7 @@ def read_initialization(path: str | Path) -> StoredInitialization:
         if not isinstance(metadata, dict):
             raise TypeError("metadata root must be an object")
         schema_version = int(metadata["schema_version"])
-        if schema_version not in {4, 5, INITIALIZATION_SCHEMA_VERSION}:
+        if schema_version not in {4, 5, 6, INITIALIZATION_SCHEMA_VERSION}:
             raise ValueError(f"unsupported schema {schema_version}")
         files = metadata["files"]
         points = _load_contained_array(root, files["base_points_m"])
@@ -290,7 +410,13 @@ def read_initialization(path: str | Path) -> StoredInitialization:
                 if hand_eye_data.get("rotation_rmse_deg") is not None
                 else None
             ),
-            source_path=Path(str(hand_eye_data["source_path"])),
+            source_path=Path(
+                str(
+                    hand_eye_data["source"]["path"]
+                    if schema_version == INITIALIZATION_SCHEMA_VERSION
+                    else hand_eye_data["source_path"]
+                )
+            ),
             rotation_span_deg=(
                 float(hand_eye_data["rotation_span_deg"])
                 if hand_eye_data.get("rotation_span_deg") is not None
@@ -306,7 +432,117 @@ def read_initialization(path: str | Path) -> StoredInitialization:
                 if hand_eye_data.get("rotation_axis_diversity") is not None
                 else None
             ),
+            flange_t_left_ir=(
+                PoseSE3("flange", "left_ir", hand_eye_data["flange_T_left_ir"])
+                if schema_version == INITIALIZATION_SCHEMA_VERSION
+                else None
+            ),
         )
+        pose_authority = None
+        if schema_version == INITIALIZATION_SCHEMA_VERSION:
+            for record in metadata["kinematics_assets"].values():
+                asset_path = Path(str(record["path"])).resolve()
+                if (
+                    _sha256(asset_path) != str(record["sha256"])
+                    or asset_path.stat().st_size != int(record["size_bytes"])
+                ):
+                    raise ValueError(f"initialization kinematics asset changed: {asset_path}")
+            source_record = hand_eye_data["source"]
+            source_path = Path(str(source_record["path"])).resolve()
+            if (
+                _sha256(source_path) != str(source_record["sha256"])
+                or source_path.stat().st_size != int(source_record["size_bytes"])
+            ):
+                raise ValueError("initialization hand-eye source changed")
+            processing = metadata["processing"]
+            kinematics_config = KinematicsConfig.model_validate(processing["kinematics"])
+            hand_eye_config = HandEyeConfig.model_validate(processing["hand_eye_gate"])
+            loaded_hand_eye = _verified_source_hand_eye(hand_eye, hand_eye_config)
+            hand_eye = loaded_hand_eye
+            authority_data = metadata["pose_authority"]
+            if authority_data["method"] != "joints_to_packaged_es68_fk_v1":
+                raise ValueError("initialization pose authority method is unsupported")
+            if authority_data["controller_tcp_role"] != "validation_only":
+                raise ValueError("initialization controller TCP role is invalid")
+            recorded_offsets = tuple(
+                float(value) for value in authority_data["joint_zero_offsets_rad"]
+            )
+            if recorded_offsets != tuple(kinematics_config.joint_zero_offsets_rad):
+                raise ValueError("initialization joint offsets changed")
+            expected_base_t_flange = Es68KinematicModel.from_resources(
+                joint_zero_offsets_rad=kinematics_config.joint_zero_offsets_rad
+            ).base_t_flange(observation.seed_joint_positions_rad)
+            flange_t_tcp = load_es68_flange_t_tcp()
+            if not np.allclose(
+                hand_eye_data["flange_T_tcp"],
+                flange_t_tcp.matrix,
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                raise ValueError("initialization flange_T_tcp changed")
+            pose_authority = AuthoritativeRobotPose(
+                PoseSE3("base", "flange", authority_data["base_T_flange"]),
+                PoseSE3("base", "tcp", authority_data["predicted_base_T_tcp"]),
+                PoseSE3("base", "tcp", authority_data["observed_base_T_tcp"]),
+                float(authority_data["fk_tcp_translation_error_m"]),
+                float(authority_data["fk_tcp_rotation_error_deg"]),
+                float(authority_data["maximum_fk_tcp_translation_error_m"]),
+                float(authority_data["maximum_fk_tcp_rotation_error_deg"]),
+                recorded_offsets,
+            )
+            if not np.allclose(
+                pose_authority.base_t_flange.matrix,
+                expected_base_t_flange.matrix,
+                rtol=0.0,
+                atol=1e-9,
+            ):
+                raise ValueError("initialization base_T_flange does not match ES68 FK")
+            if not np.allclose(
+                pose_authority.predicted_base_t_tcp.matrix,
+                expected_base_t_flange.compose(flange_t_tcp).matrix,
+                rtol=0.0,
+                atol=1e-9,
+            ):
+                raise ValueError("initialization predicted base_T_tcp does not match ES68 FK")
+            if (
+                pose_authority.maximum_fk_tcp_translation_error_m
+                != hand_eye_config.maximum_fk_tcp_translation_error_m
+                or pose_authority.maximum_fk_tcp_rotation_error_deg
+                != hand_eye_config.maximum_fk_tcp_rotation_error_deg
+            ):
+                raise ValueError("initialization FK/TCP gate changed")
+            if not np.allclose(
+                observation.base_t_left_ir.matrix,
+                expected_base_t_flange.compose(hand_eye.require_flange_primary()).matrix,
+                rtol=0.0,
+                atol=1e-9,
+            ):
+                raise ValueError("initialization base_T_left_ir is not authoritative")
+            left_ir_t_projection = PoseSE3(
+                "left_ir",
+                observation.base_t_projection_camera.child_frame,
+                transforms["left_ir_T_projection_camera"],
+            )
+            if not np.allclose(
+                observation.base_t_projection_camera.matrix,
+                observation.base_t_left_ir.compose(left_ir_t_projection).matrix,
+                rtol=0.0,
+                atol=1e-9,
+            ):
+                raise ValueError("initialization projection-camera transform is inconsistent")
+            observation = InitialObservation(
+                source_view_id=observation.source_view_id,
+                planning_intrinsics=observation.planning_intrinsics,
+                seed_joint_positions_rad=observation.seed_joint_positions_rad,
+                base_t_left_ir=observation.base_t_left_ir,
+                base_t_projection_camera=observation.base_t_projection_camera,
+                base_cloud=observation.base_cloud,
+                proxy=observation.proxy,
+                depth_source=observation.depth_source,
+                source_sequence_index=observation.source_sequence_index,
+                source_frame_number=observation.source_frame_number,
+                pose_authority=pose_authority,
+            )
         return StoredInitialization(observation, hand_eye, mask, metadata)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid initialization artifact {root}: {exc}") from exc

@@ -7,6 +7,7 @@ from biblade_fusion.calibration import Cs68KinematicsModel, HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import KinematicsConfig
 from biblade_fusion.planning import EliteCs68IkChecker, ReachabilityState
+from biblade_fusion.robotics import load_es68_flange_t_tcp
 
 
 class FakeSolver:
@@ -33,13 +34,17 @@ def checker(solver: FakeSolver) -> EliteCs68IkChecker:
         np.arange(6) * 0.02,
         "unit-test",
     )
+    tcp_t_left_ir = PoseSE3.from_rotation_translation(
+        "tcp", "left_ir", np.eye(3), [0.1, 0, 0]
+    )
     hand_eye = HandEyeCalibration(
-        PoseSE3.from_rotation_translation("tcp", "left_ir", np.eye(3), [0.1, 0, 0]),
+        tcp_t_left_ir,
         "test",
         20,
         0.001,
         0.2,
         Path("hand_eye.yaml"),
+        flange_t_left_ir=load_es68_flange_t_tcp().compose(tcp_t_left_ir),
     )
     return EliteCs68IkChecker(
         model,
@@ -98,4 +103,8 @@ def test_elite_ik_passes_rpy_orientation_expected_by_vendor_plugin() -> None:
     result = ik.check(camera_pose)
 
     assert result.state is ReachabilityState.REACHABLE
-    np.testing.assert_allclose(solver.target[3:], [0.0, 0.0, np.pi / 2.0])
+    np.testing.assert_allclose(
+        solver.target[3:],
+        [0.0, 0.0, np.pi / 2.0],
+        atol=1e-12,
+    )

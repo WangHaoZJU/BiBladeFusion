@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,18 +21,26 @@ class ServoJStreamConfig:
     timing_violation_factor: float = 1.5
 
     def validate(self) -> None:
-        if self.dt_s <= 0.0:
-            raise ValueError("ServoJ dt_s must be positive")
-        if self.tracking_error_rad <= 0.0:
-            raise ValueError("ServoJ tracking_error_rad must be positive")
+        if not math.isfinite(self.dt_s) or self.dt_s <= 0.0:
+            raise ValueError("ServoJ dt_s must be finite and positive")
+        if (
+            not math.isfinite(self.tracking_error_rad)
+            or self.tracking_error_rad <= 0.0
+        ):
+            raise ValueError("ServoJ tracking_error_rad must be finite and positive")
         if self.max_consecutive_tracking_violations < 1:
             raise ValueError("ServoJ tracking violation count must be positive")
         if self.tracking_check_every_n_commands < 1:
             raise ValueError("ServoJ tracking check interval must be positive")
         if self.max_consecutive_timing_violations < 1:
             raise ValueError("ServoJ timing violation count must be positive")
-        if self.timing_violation_factor <= 1.0:
-            raise ValueError("ServoJ timing_violation_factor must exceed one")
+        if (
+            not math.isfinite(self.timing_violation_factor)
+            or self.timing_violation_factor <= 1.0
+        ):
+            raise ValueError(
+                "ServoJ timing_violation_factor must be finite and exceed one"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,8 +51,8 @@ class ServoJStream:
     dt_s: float
 
     def validate(self) -> None:
-        if self.dt_s <= 0.0:
-            raise ValueError("ServoJStream.dt_s must be positive")
+        if not math.isfinite(self.dt_s) or self.dt_s <= 0.0:
+            raise ValueError("ServoJStream.dt_s must be finite and positive")
         if not self.commands:
             raise ValueError("ServoJStream.commands must be non-empty")
         for index, command in enumerate(self.commands):

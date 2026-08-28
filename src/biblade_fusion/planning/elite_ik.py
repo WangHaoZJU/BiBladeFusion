@@ -15,6 +15,7 @@ from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import KinematicsConfig
 from biblade_fusion.devices.robot.conversions import se3_to_elite_kdl_pose
 from biblade_fusion.planning.filtering import ReachabilityResult, ReachabilityState
+from biblade_fusion.robotics import load_es68_flange_t_tcp
 
 
 class EliteIkError(RuntimeError):
@@ -52,7 +53,13 @@ class EliteCs68IkChecker:
         native_module: ModuleType | Any | None = None,
         solver: Any | None = None,
     ) -> None:
-        self._hand_eye = hand_eye
+        try:
+            self._flange_t_left_ir = hand_eye.require_flange_primary()
+            self._flange_t_tcp = load_es68_flange_t_tcp()
+        except (OSError, ValueError) as exc:
+            raise EliteIkError(
+                f"Elite IK requires authoritative flange-primary hand-eye: {exc}"
+            ) from exc
         self._near = _joint_seed(near_joint_positions_rad)
         self._loader: Any | None = None
         if solver is None:
@@ -85,9 +92,10 @@ class EliteCs68IkChecker:
             "left_ir",
             base_t_left_ir.matrix,
         )
-        base_t_tcp = canonical_camera_pose.compose(
-            self._hand_eye.tcp_t_left_ir.inverse()
+        base_t_flange = canonical_camera_pose.compose(
+            self._flange_t_left_ir.inverse()
         )
+        base_t_tcp = base_t_flange.compose(self._flange_t_tcp)
         target = se3_to_elite_kdl_pose(base_t_tcp)
         try:
             ok, solution, result = self._solver.getPositionIK(target, self._near)

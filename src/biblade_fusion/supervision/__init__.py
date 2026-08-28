@@ -1,0 +1,28 @@
+"""Read-only supervision contracts and user interfaces.
+
+This package deliberately has no dependency on robot command or execution ports.
+"""
+
+from biblade_fusion.supervision.snapshot import (
+    ArrayReference,
+    StoredSupervisorySnapshot,
+    SupervisorySnapshot,
+    SupervisoryTimeline,
+    discover_supervisory_snapshots,
+    load_snapshot_array,
+    read_supervisory_snapshot,
+    snapshot_array_references,
+)
+from biblade_fusion.supervision.storage import AtomicSupervisorySnapshotWriter
+
+__all__ = [
+    "ArrayReference",
+    "AtomicSupervisorySnapshotWriter",
+    "StoredSupervisorySnapshot",
+    "SupervisorySnapshot",
+    "SupervisoryTimeline",
+    "discover_supervisory_snapshots",
+    "load_snapshot_array",
+    "read_supervisory_snapshot",
+    "snapshot_array_references",
+]

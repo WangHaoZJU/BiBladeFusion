@@ -37,9 +37,18 @@ from biblade_fusion.storage.motion_preflight import (
     write_motion_preflight,
 )
 from biblade_fusion.storage.native_overlap import (
+    LegacyNativeOverlapReplay,
     StoredNativeOverlapReport,
+    read_legacy_native_overlap_for_replay,
     read_native_overlap_report,
     write_native_overlap_report,
+)
+from biblade_fusion.storage.occupancy_mapping import (
+    ReplayOccupancyMapping,
+    StoredOccupancyMapping,
+    read_occupancy_mapping,
+    read_occupancy_mapping_for_replay,
+    write_occupancy_mapping,
 )
 from biblade_fusion.storage.path_validation import (
     StoredPathValidation,
@@ -60,6 +69,7 @@ from biblade_fusion.storage.session import SessionWriter
 from biblade_fusion.storage.stereo_inference import (
     StoredStereoInference,
     read_stereo_inference,
+    verify_stereo_inference_source,
     write_stereo_inference,
 )
 from biblade_fusion.storage.view_plan import (
@@ -80,6 +90,9 @@ __all__ = [
     "StoredInitialization",
     "StoredMotionPreflight",
     "StoredNativeOverlapReport",
+    "LegacyNativeOverlapReplay",
+    "StoredOccupancyMapping",
+    "ReplayOccupancyMapping",
     "StoredPathValidation",
     "StoredReconstructedBladeView",
     "StoredStereoInference",
@@ -89,6 +102,9 @@ __all__ = [
     "read_coarse_model_summary",
     "read_motion_preflight",
     "read_native_overlap_report",
+    "read_legacy_native_overlap_for_replay",
+    "read_occupancy_mapping",
+    "read_occupancy_mapping_for_replay",
     "read_path_validation",
     "read_coverage_driven_plan",
     "read_depth_comparison",
@@ -96,11 +112,13 @@ __all__ = [
     "read_reconstructed_view",
     "read_coverage_ledger",
     "read_stereo_inference",
+    "verify_stereo_inference_source",
     "read_view_plan",
     "write_initialization",
     "write_coarse_model",
     "write_motion_preflight",
     "write_native_overlap_report",
+    "write_occupancy_mapping",
     "write_path_validation",
     "write_coverage_driven_plan",
     "write_depth_comparison",

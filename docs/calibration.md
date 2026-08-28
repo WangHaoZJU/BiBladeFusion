@@ -34,7 +34,7 @@ robot_model: es68
 camera_stream: infrared/1
 parent_frame: flange
 child_frame: left_ir
-method: OpenCV Daniilidis + LM bundle adjustment
+method: OpenCV Park-Martin + LM bundle adjustment
 matrix:
   - [r00, r01, r02, tx]
   - [r10, r11, r12, ty]
@@ -61,9 +61,11 @@ produced by the new workflow.
 ### Live capture
 
 First generate the raw IR stereo YAML with `bbf calibration stereo-gui`. A successful
-solve automatically publishes the verified result to
+solve automatically publishes the solver-accepted result to
 `data/calibrations/d435i_ir_active.yaml`, which the default configuration already uses.
-Only machine-specific robot addresses need to be set in a Git-ignored local config:
+The committed defaults retain the current laboratory bring-up addresses and SDK path.
+For another workstation or before public release, move all machine-specific robot/local
+addresses, SDK paths, and camera serials to a Git-ignored local config:
 
 ```yaml
 robot:
@@ -78,6 +80,7 @@ realsense:
 Start the read-only capture application:
 
 ```bash
+uv sync --extra calibration-gui
 uv run bbf calibration hand-eye-gui \
   --config configs/local.yaml \
   --target configs/charuco_dict5x5_14x9_20mm_15mm.yaml \
@@ -197,7 +200,7 @@ reprojection thresholds. A real calibration still requires independent held-out 
 before any motion planning result is trusted; the offline solver writes a candidate and
 does not auto-publish it.
 
-## Controller-specific CS68 kinematics
+## Controller-specific ES68 kinematics
 
 The vendor KDL solver needs the modified DH parameters reported by the actual
 controller. Acquire them through the read-only Primary interface:
@@ -205,13 +208,14 @@ controller. Acquire them through the read-only Primary interface:
 ```bash
 uv run bbf robot export-kinematics \
   --config configs/local.yaml \
-  --output data/calibrations/cs68_mdh.yaml
+  --output data/calibrations/es68_mdh.yaml
 ```
 
 This command calls `PrimaryClientInterface.getPackage(KinematicsInfo)` and does not load
 tasks, send scripts, release brakes, or command motion. Configure the resulting file as
-`kinematics.model_path`. Offline IK converts each planned `base_T_left_ir` through the
-stored hand-eye transform into `base_T_tcp`, then calls the packaged
+`kinematics.model_path`. Offline IK first derives the requested `base_T_flange` from the
+planned `base_T_left_ir` and flange-primary hand-eye, then composes the independently
+calibrated `flange_T_tcp` target before calling the packaged
 `libelite_kdl_kinematics` solver near the joint state captured with the seed view.
 
 An IK solution validates only an endpoint pose. It does not validate self-collision,

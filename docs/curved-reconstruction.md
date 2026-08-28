@@ -1,8 +1,11 @@
 # Paper-derived curved-blade reconstruction
 
-This workflow implements the coarse-model-to-fine-view method from
+This workflow is a software adaptation of the coarse-model-to-fine-view method from
 `航空叶片形貌高精度结构光扫描视点规划.pdf` for a D435i/ES68 bilateral thin-blade
-experiment. It is an offline geometry workflow and cannot command the robot.
+experiment. It is an offline geometry workflow and cannot command the robot. The complete
+chain is currently regression-verified on deterministic synthetic bilateral single-fin
+data; no real-blade accuracy claim is made without the hardware experiments described
+below.
 
 ## Pipeline and paper mapping
 
@@ -114,6 +117,7 @@ coverage evidence, pose refinements, configurations, source hashes, and quality 
 Create immutable inspection evidence and open the read-only PySide6 orbit viewer:
 
 ```bash
+uv sync --extra supervision-gui
 uv run bbf reconstruct inspect-fine-plan \
   --coarse-model outputs/blade_coarse_model \
   --config configs/local.yaml \
@@ -171,7 +175,7 @@ OBB/main-normal construction, adaptive splitting, true-normal viewpoints, protec
 TSDF, non-empty mesh extraction, real-surface quality feedback, artifact checksums, and
 the non-motion invariant. The fin tests additionally verify main-surface decontamination,
 two-face separation, root/free-rim regions, opposing and bisector views, fin-thickness
-TSDF protection, coverage categories, schema-3 persistence, and missing-fin failure.
+TSDF protection, coverage categories, schema-4 persistence, and missing-fin failure.
 Hardware accuracy, final thresholds, reflective-metal depth completeness, final
 line-of-sight acceptance, and real Open3D output still require recorded D435i/ES68 coarse
 scans and calibrated transforms.

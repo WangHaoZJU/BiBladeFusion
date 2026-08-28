@@ -25,6 +25,9 @@ dependencies = [
 calibration-gui = [
   "pyside6>=6.8,<7",
 ]
+supervision-gui = [
+  "pyside6>=6.8,<7",
+]
 tsdf-open3d = [
   "open3d>=0.18,<1",
 ]

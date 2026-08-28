@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from math import cos, radians, sin
+import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,7 @@ from biblade_fusion.calibration import HandEyeCalibration, load_hand_eye_calibra
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     HandEyeConfig,
+    KinematicsConfig,
     NativeOverlapValidationConfig,
     PointCloudConfig,
     load_settings,
@@ -22,32 +24,23 @@ from biblade_fusion.devices.depth_camera import (
     StereoFrame,
 )
 from biblade_fusion.devices.robot import RobotState
+from biblade_fusion.robotics import Es68KinematicModel, load_es68_flange_t_tcp
 from biblade_fusion.storage import (
     SessionWriter,
+    read_legacy_native_overlap_for_replay,
     read_native_overlap_report,
     write_native_overlap_report,
 )
 from biblade_fusion.workflows import evaluate_native_overlap
 
-
-def _rotation_y(angle_deg: float) -> np.ndarray:
-    angle = radians(angle_deg)
-    return np.array(
-        [[cos(angle), 0.0, sin(angle)], [0.0, 1.0, 0.0], [-sin(angle), 0.0, cos(angle)]]
-    )
-
-
-def _rotation_x(angle_deg: float) -> np.ndarray:
-    angle = radians(angle_deg)
-    return np.array(
-        [[1.0, 0.0, 0.0], [0.0, cos(angle), -sin(angle)], [0.0, sin(angle), cos(angle)]]
-    )
-
-
 INTRINSICS = CameraIntrinsics(64, 48, 80.0, 80.0, 31.5, 23.5, "none", ())
 
 
-def _plane_depth(base_t_camera: PoseSE3, plane_z_m: float = 0.5) -> np.ndarray:
+def _plane_depth(
+    base_t_camera: PoseSE3,
+    plane_point_m: np.ndarray,
+    plane_normal: np.ndarray,
+) -> np.ndarray:
     u, v = np.meshgrid(np.arange(INTRINSICS.width), np.arange(INTRINSICS.height))
     rays = np.column_stack(
         (
@@ -57,13 +50,23 @@ def _plane_depth(base_t_camera: PoseSE3, plane_z_m: float = 0.5) -> np.ndarray:
         )
     )
     directions = rays @ base_t_camera.rotation.T
-    axial_depth = (plane_z_m - base_t_camera.translation_m[2]) / directions[:, 2]
-    axial_depth[directions[:, 2] <= 0.0] = np.nan
+    numerator = float(plane_normal @ (plane_point_m - base_t_camera.translation_m))
+    denominator = directions @ plane_normal
+    axial_depth = numerator / denominator
+    axial_depth[(denominator <= 0.0) | (axial_depth <= 0.0)] = np.nan
     return axial_depth.reshape((INTRINSICS.height, INTRINSICS.width))
 
 
-def _bundle(view_id: str, index: int, base_t_tcp: PoseSE3) -> SynchronizedFrameBundle:
-    depth_m = _plane_depth(base_t_tcp)
+def _bundle(
+    view_id: str,
+    index: int,
+    joints: np.ndarray,
+    plane_point_m: np.ndarray,
+    plane_normal: np.ndarray,
+) -> SynchronizedFrameBundle:
+    base_t_flange = Es68KinematicModel.from_resources().base_t_flange(joints)
+    base_t_tcp = base_t_flange.compose(load_es68_flange_t_tcp())
+    depth_m = _plane_depth(base_t_tcp, plane_point_m, plane_normal)
     native = np.rint(depth_m * 1000.0).astype(np.uint16)
     calibration = StereoCalibrationSnapshot(
         INTRINSICS,
@@ -87,7 +90,7 @@ def _bundle(view_id: str, index: int, base_t_tcp: PoseSE3) -> SynchronizedFrameB
     state = RobotState(
         1000 + index * 10,
         float(index),
-        np.full(6, index * 0.01),
+        joints,
         base_t_tcp,
         "IDLE",
         "NORMAL",
@@ -106,12 +109,20 @@ def _bundle(view_id: str, index: int, base_t_tcp: PoseSE3) -> SynchronizedFrameB
 
 
 def _bundles() -> tuple[SynchronizedFrameBundle, ...]:
-    poses = (
-        PoseSE3.identity("base", "tcp"),
-        PoseSE3.from_rotation_translation("base", "tcp", _rotation_y(8.0), [-0.03, 0.0, 0.0]),
-        PoseSE3.from_rotation_translation("base", "tcp", _rotation_x(-7.0), [0.0, -0.03, 0.0]),
+    joints = (
+        np.zeros(6),
+        np.array([0.12, -0.08, 0.06, 0.0, 0.0, 0.0]),
+        np.array([-0.10, 0.07, -0.08, 0.04, 0.0, 0.0]),
     )
-    return tuple(_bundle(f"view_{index}", index, pose) for index, pose in enumerate(poses))
+    reference = Es68KinematicModel.from_resources().base_t_flange(joints[0]).compose(
+        load_es68_flange_t_tcp()
+    )
+    normal = reference.rotation[:, 2]
+    point = reference.translation_m + normal * 0.5
+    return tuple(
+        _bundle(f"view_{index}", index, pose, point, normal)
+        for index, pose in enumerate(joints)
+    )
 
 
 def _config() -> NativeOverlapValidationConfig:
@@ -137,13 +148,26 @@ def _config() -> NativeOverlapValidationConfig:
 
 
 def _hand_eye(path: Path, translation=(0.0, 0.0, 0.0)) -> HandEyeCalibration:
+    tcp_t_left_ir = PoseSE3.from_rotation_translation(
+        "tcp", "left_ir", np.eye(3), translation
+    )
+    flange_t_left_ir = load_es68_flange_t_tcp().compose(tcp_t_left_ir)
     return HandEyeCalibration(
-        PoseSE3.from_rotation_translation("tcp", "left_ir", np.eye(3), translation),
+        tcp_t_left_ir,
         "synthetic",
         None,
         None,
         None,
         path,
+        flange_t_left_ir=flange_t_left_ir,
+    )
+
+
+def _hand_eye_gate(path: Path | None = None) -> HandEyeConfig:
+    return HandEyeConfig(
+        calibration_path=path,
+        require_quality_metrics=False,
+        require_observability_metrics=False,
     )
 
 
@@ -153,6 +177,8 @@ def test_native_overlap_passes_consistent_static_plane_without_using_icp() -> No
         _hand_eye(Path("synthetic.yaml")),
         PointCloudConfig(minimum_valid_points=100),
         _config(),
+        kinematics_config=KinematicsConfig(),
+        hand_eye_config=_hand_eye_gate(),
     )
 
     assert report.passed
@@ -169,6 +195,8 @@ def test_native_overlap_detects_wrong_rotating_hand_eye_offset() -> None:
         _hand_eye(Path("wrong.yaml"), (0.05, 0.0, 0.0)),
         PointCloudConfig(minimum_valid_points=100),
         _config(),
+        kinematics_config=KinematicsConfig(),
+        hand_eye_config=_hand_eye_gate(),
     )
 
     assert not report.passed
@@ -176,23 +204,23 @@ def test_native_overlap_detects_wrong_rotating_hand_eye_offset() -> None:
 
 
 def _write_hand_eye(path: Path) -> tuple[HandEyeConfig, HandEyeCalibration]:
+    flange_t_tcp = load_es68_flange_t_tcp()
     path.write_text(
         yaml.safe_dump(
             {
-                "schema_version": 1,
-                "parent_frame": "tcp",
+                "schema_version": 2,
+                "parent_frame": "flange",
                 "child_frame": "left_ir",
                 "method": "synthetic",
-                "matrix": np.eye(4).tolist(),
+                "matrix": flange_t_tcp.matrix.tolist(),
+                "derived_runtime": {
+                    "tcp_T_left_ir": np.eye(4).tolist(),
+                },
             }
         ),
         encoding="utf-8",
     )
-    config = HandEyeConfig(
-        calibration_path=path,
-        require_quality_metrics=False,
-        require_observability_metrics=False,
-    )
+    config = _hand_eye_gate(path)
     return config, load_hand_eye_calibration(config)
 
 
@@ -208,7 +236,14 @@ def test_native_overlap_artifact_recomputes_sources_and_rejects_tampering(
     hand_eye_config, hand_eye = _write_hand_eye(tmp_path / "hand_eye.yaml")
     point_config = PointCloudConfig(minimum_valid_points=100)
     validation_config = _config()
-    report = evaluate_native_overlap(_bundles(), hand_eye, point_config, validation_config)
+    report = evaluate_native_overlap(
+        _bundles(),
+        hand_eye,
+        point_config,
+        validation_config,
+        kinematics_config=settings.kinematics,
+        hand_eye_config=hand_eye_config,
+    )
 
     output = write_native_overlap_report(
         tmp_path / "overlap",
@@ -216,6 +251,7 @@ def test_native_overlap_artifact_recomputes_sources_and_rejects_tampering(
         tuple(sessions),
         hand_eye,
         hand_eye_config,
+        settings.kinematics,
         point_config,
         validation_config,
     )
@@ -225,6 +261,21 @@ def test_native_overlap_artifact_recomputes_sources_and_rejects_tampering(
     assert (output / "overlay_base_frame.ply").is_file()
     assert (output / "overview.png").is_file()
     assert (output / "metrics.csv").is_file()
+    legacy_output = tmp_path / "legacy-overlap"
+    shutil.copytree(output, legacy_output)
+    legacy_metadata_path = legacy_output / "native_overlap_report.json"
+    legacy_metadata = json.loads(legacy_metadata_path.read_text(encoding="utf-8"))
+    legacy_metadata["schema_version"] = 1
+    legacy_metadata["interpretation"]["primary"] = (
+        "base_T_tcp · tcp_T_left_ir · left_ir_T_depth"
+    )
+    legacy_metadata_path.write_text(json.dumps(legacy_metadata), encoding="utf-8")
+    legacy = read_legacy_native_overlap_for_replay(legacy_output)
+    assert legacy.verification_status == "legacy_tcp_primary_integrity_only"
+    assert legacy.current_fk_authority_eligible is False
+    with pytest.raises(ValueError, match="unsupported schema 1"):
+        read_native_overlap_report(legacy_output)
+
     residual = next((output / "arrays").glob("residual_*.npy"))
     np.save(residual, np.zeros(5), allow_pickle=False)
     with pytest.raises(ValueError, match="checksum mismatch"):

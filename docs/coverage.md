@@ -34,9 +34,10 @@ plan, source initialization, configuration, observation IDs, front/back completi
 
 ## Registration assumption
 
-Proxy-ledger clouds are registered in `base` through synchronized `base_T_tcp`, the
-quality-gated `tcp_T_left_ir`, and the calibrated camera-stream transform; this legacy
-stage does not alter their poses. The later coarse-model workflow adds only bounded,
+Proxy-ledger clouds are registered in `base` through synchronized joints, configured
+joint-zero offsets, packaged ES68 FK, flange-primary `flange_T_left_ir`, and the calibrated
+camera-stream transform. Controller `base_T_tcp` is validation-only and must pass the
+configured residual gate. The later coarse-model workflow adds only bounded,
 pose-regularized, same-side point-to-plane refinement with correspondence-count and
 residual checks. It never runs unconstrained front/back ICP on the thin blade.
 
@@ -66,8 +67,8 @@ uv run bbf coverage add \
   --output outputs/coverage_001
 ```
 
-The update validates plan/initialization provenance and requires the same hand-eye
-matrix used by the reference initialization. A stable identity derived from source
+The update validates plan/initialization provenance and requires the same flange-primary
+hand-eye matrix and FK authority used by the reference initialization. A stable identity derived from source
 session, sequence, camera frame number, and view ID prevents counting one physical frame
 twice—even if it was reconstructed once with native depth and once with stereo depth.
 

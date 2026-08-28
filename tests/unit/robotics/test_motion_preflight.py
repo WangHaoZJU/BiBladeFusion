@@ -1,19 +1,42 @@
 from __future__ import annotations
 
+from dataclasses import fields, replace
+from datetime import UTC, datetime
+
 import numpy as np
 import pytest
 
 from biblade_fusion.robotics import (
     Cs68KinematicModel,
     Cs68PinocchioCollisionChecker,
+    Es68PinocchioCollisionChecker,
     MotionPreflightStatus,
+    OccupancyRobotCollisionChecker,
     preflight_linear_joint_motion,
 )
 
 
+class _SyntheticSweptEs68Checker(Es68PinocchioCollisionChecker):
+    def check_path(self, *args, **kwargs):
+        return replace(
+            super().check_path(*args, **kwargs),
+            continuous_swept_volume_verified=True,
+        )
+
+
 @pytest.fixture(scope="module")
 def checker() -> Cs68PinocchioCollisionChecker:
-    return Cs68PinocchioCollisionChecker.from_resources()
+    base = Cs68PinocchioCollisionChecker.from_resources()
+    payload = {field.name: getattr(base, field.name) for field in fields(base)}
+    payload.update(
+        model_name="es68",
+        collision_model_id="test-es68-d435i",
+        collision_model_hash="1" * 64,
+        robot_geometry_hash="2" * 64,
+        motion_model_contract_hash="3" * 64,
+        continuous_swept_volume_supported=True,
+    )
+    return _SyntheticSweptEs68Checker(**payload)
 
 
 def test_preflight_fails_closed_without_collision_checker() -> None:
@@ -29,11 +52,42 @@ def test_preflight_fails_closed_without_collision_checker() -> None:
     assert report.motion_authorized is False
 
 
-def test_clear_preflight_builds_velocity_limited_servoj_stream(checker) -> None:
+def test_preflight_fails_closed_without_required_occupancy(checker) -> None:
+    report = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        (0.02, 0.0, 0.0, 0.0, 0.0, 0.0),
+        collision_checker=checker,
+    )
+
+    assert report.status is MotionPreflightStatus.CHECKER_UNAVAILABLE
+    assert report.blocking_reasons == ("occupancy_checker_unavailable",)
+    assert report.servoj_stream is None
+    assert report.ready_for_approval is False
+
+
+def test_discrete_mesh_checker_is_blocked_without_swept_volume_evidence() -> None:
+    checker = Cs68PinocchioCollisionChecker.from_resources()
+    report = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        (0.02, 0.0, 0.0, 0.0, 0.0, 0.0),
+        collision_checker=checker,
+        require_occupancy=False,
+    )
+
+    assert report.status is MotionPreflightStatus.BLOCKED
+    assert report.blocking_reasons == ("continuous_swept_mesh_unavailable",)
+    assert report.servoj_stream is None
+    assert report.ready_for_approval is False
+
+
+def test_clear_preflight_builds_velocity_limited_servoj_stream(
+    checker, occupancy_checker
+) -> None:
     report = preflight_linear_joint_motion(
         (0.0,) * 6,
         (0.05, -0.04, 0.03, -0.02, 0.01, 0.0),
         collision_checker=checker,
+        occupancy_checker=occupancy_checker,
         maximum_joint_step_rad=0.02,
         servoj_dt_s=0.004,
         speed_scaling=0.08,
@@ -44,6 +98,12 @@ def test_clear_preflight_builds_velocity_limited_servoj_stream(checker) -> None:
     assert report.ready_for_approval is True
     assert report.motion_authorized is False
     assert report.servoj_stream is not None
+    assert report.occupancy is not None
+    assert report.occupancy.continuous_swept_volume_verified is True
+    assert report.continuous_occupancy_sweep_required is True
+    assert report.occupancy.evidence is not None
+    assert report.occupancy.evidence.sequence == 7
+    assert report.occupancy.evidence.semantic_attestation_valid is True
     assert report.servoj_stream.commands[0] == (0.0,) * 6
     np.testing.assert_allclose(
         report.servoj_stream.commands[-1],
@@ -65,6 +125,8 @@ def test_folded_goal_is_blocked_before_trajectory_generation(checker) -> None:
         (0.0,) * 6,
         (0.0, -3.0, 3.0, -3.0, 0.0, 0.0),
         collision_checker=checker,
+        require_occupancy=False,
+        require_swept_mesh=False,
         maximum_joint_step_rad=0.1,
     )
 
@@ -81,3 +143,101 @@ def test_invalid_joint_contract_is_rejected() -> None:
             (0.0,) * 6,
             collision_checker=None,
         )
+
+
+def test_mesh_only_diagnostic_cannot_be_approved(checker) -> None:
+    report = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        (0.02, 0.0, 0.0, 0.0, 0.0, 0.0),
+        collision_checker=checker,
+        require_occupancy=False,
+        require_swept_mesh=False,
+    )
+
+    assert report.status is MotionPreflightStatus.CLEAR
+    assert report.servoj_stream is not None
+    assert report.occupancy_required is False
+    assert report.continuous_occupancy_sweep_required is True
+    assert report.ready_for_approval is False
+    assert "occupancy_disabled_offline_diagnostic_only" in report.warnings
+    assert "continuous_swept_mesh_disabled_offline_diagnostic_only" in report.warnings
+
+
+def test_discrete_occupancy_path_is_blocked_without_continuous_sweep_proof(
+    checker, occupancy_snapshot
+) -> None:
+    occupancy = OccupancyRobotCollisionChecker(
+        checker,
+        lambda: occupancy_snapshot,
+        utc_clock=lambda: datetime(2026, 8, 28, 0, 0, 1, tzinfo=UTC),
+    )
+
+    report = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        (0.02, 0.0, 0.0, 0.0, 0.0, 0.0),
+        collision_checker=checker,
+        occupancy_checker=occupancy,
+    )
+
+    assert report.status is MotionPreflightStatus.BLOCKED
+    assert report.blocking_reasons == ("continuous_swept_occupancy_unavailable",)
+    assert report.servoj_stream is None
+    assert report.occupancy is not None
+    assert report.occupancy.status.value == "clear"
+    assert report.occupancy.continuous_swept_volume_verified is False
+    assert report.ready_for_approval is False
+
+
+def test_disabling_continuous_occupancy_sweep_is_diagnostic_only(
+    checker, occupancy_snapshot
+) -> None:
+    occupancy = OccupancyRobotCollisionChecker(
+        checker,
+        lambda: occupancy_snapshot,
+        utc_clock=lambda: datetime(2026, 8, 28, 0, 0, 1, tzinfo=UTC),
+    )
+
+    report = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        (0.02, 0.0, 0.0, 0.0, 0.0, 0.0),
+        collision_checker=checker,
+        occupancy_checker=occupancy,
+        require_continuous_occupancy_sweep=False,
+    )
+
+    assert report.status is MotionPreflightStatus.CLEAR
+    assert report.servoj_stream is not None
+    assert report.continuous_occupancy_sweep_required is False
+    assert report.ready_for_approval is False
+    assert (
+        "continuous_swept_occupancy_disabled_offline_diagnostic_only"
+        in report.warnings
+    )
+    assert (
+        "occupancy_semantic_attestation_unavailable_diagnostic_only"
+        in report.warnings
+    )
+
+
+def test_preflight_requires_map_freshness_for_full_stream_duration(
+    checker, occupancy_snapshot
+) -> None:
+    occupancy = OccupancyRobotCollisionChecker(
+        checker,
+        lambda: occupancy_snapshot,
+        maximum_map_age_s=5.0,
+        utc_clock=lambda: datetime(2026, 8, 28, 0, 0, 4, 900000, tzinfo=UTC),
+    )
+    assert occupancy.current_evidence().sequence == occupancy_snapshot.sequence
+
+    report = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        (0.1, 0.0, 0.0, 0.0, 0.0, 0.0),
+        collision_checker=checker,
+        occupancy_checker=occupancy,
+    )
+
+    assert report.status is MotionPreflightStatus.BLOCKED
+    assert report.servoj_stream is None
+    assert "occupancy_map_stale_or_unusable" in report.blocking_reasons[0]
+    assert report.diagnostics["planned_servoj_duration_s"] > 0.1

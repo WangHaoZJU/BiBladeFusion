@@ -1,11 +1,85 @@
 # Development log
 
-## 2026-08-27 — static native-depth coordinate-chain validation
+## 2026-08-28 — FK-authority native-depth re-evaluation
 
-- Added `evaluate native-overlap`, a static-scene validator for synchronized D435i native
-  depth transformed by the unchanged `base_T_tcp · tcp_T_left_ir · left_ir_T_depth`
-  chain. Symmetric projective residuals reject depth edges, invalid pixels, occlusions,
-  and field-of-view loss without applying registration corrections.
+- Reprocessed the five preserved real ES68/D435i sessions with the current schema-2
+  `FK(joints + zero offsets) · flange_T_left_ir · left_ir_T_depth` authority chain;
+  controller TCP remained validation-only.
+- The new immutable report
+  `data/validations/native_overlap_20260828_fk_authority_v2` passed strict full
+  recomputation. Across the four comparisons, median error was 1.220–1.423 mm, RMSE
+  2.069–2.469 mm, P95 4.205–4.992 mm, and 5 mm agreement 95.03–97.36%, over a
+  188.01 mm/23.683 degree pose span. ICP remained diagnostic-only.
+- Preserved the schema-1 TCP-primary report unchanged and added a separately named
+  integrity-only legacy replay reader; legacy values are never promoted to current
+  FK-authority evidence.
+
+## 2026-08-28 — unknown-blade occupancy safety and supervisory replay
+
+- Added stop-and-capture occupancy construction from stored FoundationStereo depth in
+  calibrated `base` coordinates. Mapping requires left-right consistency evidence, its
+  explicitly non-probabilistic consistency-score array, a bounded depth range, synchronized
+  ES68 joints, the accepted flange-primary left-IR hand-eye transform, and at least three
+  geometrically independent settled views. Each new view must differ from every prior
+  view by 20 mm of camera-centre translation or 5 degrees of optical-axis angle by
+  default; changing only its identifier fails before ray integration. Calibrated FK is
+  the mapping pose authority; synchronized RTSI
+  TCP is validation-only, with both poses and their residuals retained and independently
+  reproduced during asset readback.
+- Added a final-model ES68+D435i renderer and conservative depth-consistent robot
+  self-mask. Measurements clearly in front of the rendered robot are retained as
+  possible unknown surfaces; matching or farther measurements are removed so a stereo
+  dropout cannot ray-clear through the robot. Removed pixels and their occluded rays
+  remain `UNKNOWN` rather than being cleared as free space.
+- Added immutable sparse occupancy assets with `FREE`, `OCCUPIED`, and implicit
+  `UNKNOWN` voxels, an explicit `UNMAPPED/MAPPING/MAP_READY/STALE` lifecycle, per-frame
+  quality arrays, hash-chained evidence, mapping-context binding, and read-time
+  reproduction of masks, integration and snapshots. Out-of-grid and unknown space are
+  fail-closed. A voxel needs three independent FREE votes by default, while OCCUPIED
+  remains dominant; map freshness starts at the first frame of a complete rebuild cycle.
+  Occupancy asset schema 6, snapshot format 4, and mapping-context schema 4 additionally
+  retain the supporting camera poses, FK flange pose, predicted/observed TCP poses and
+  flange-primary camera chain. The reader re-runs packaged ES68 FK from every stored
+  joint vector before accepting them.
+- Added strict source-to-motion semantic verification. The full occupancy reader
+  reproduces raw-session integrity, user stereo calibration and rectification, official
+  FoundationStereo source/checkpoint/configuration, self masking, integration and active
+  robot geometry before issuing a typed attestation. Replay has no attestation. The
+  occupancy checker, motion-preflight schema 5, one-shot permit and guarded executor bind
+  that exact proof; protocol fakes, mutable snapshots and metadata changes fail closed.
+- Added occupancy-aware motion preflight. The artifact binds the occupancy sequence,
+  content hash and freshness horizon together with the complete ES68+D435i motion-model
+  contract and ServoJ runtime configuration. Offline `occupancy build-replay` output is
+  deliberately sealed `STALE`, so it can exercise storage and visualization but cannot
+  satisfy motion preflight.
+- Added a self-contained supervisory snapshot bridge and PySide6 replay console for the
+  historical robot/camera scene, occupancy, current/fused blade point clouds, sensor
+  evidence, copied provenance manifests and blocking events. Exact collision meshes are
+  shown only after the active final model reproduces the historical geometry hash, and
+  planned TCP targets only after canonical preflight replay; no continuous actual TCP
+  trace is claimed. The GUI is read-only, always labels replay as `REPLAY/BLOCKED`, and
+  exposes no approval or motion command.
+- Preserved the physical-release boundary. A missing or unready final ES68+D435i STL
+  manifest fails closed. Robot-self-masked volume remains unknown and can block the
+  current bounding-sphere occupancy query; robot/environment paths are still evaluated
+  at discrete joint samples rather than by an exact swept mesh. The native real-time
+  coordinator has not yet been implemented or hardware-verified. These are blocking
+  items, not merely performance optimizations.
+- Sealed the public Elite motion methods behind the guarded executor's private capability.
+  Even that path re-derives the exact ServoJ stream and rechecks every command segment;
+  the missing continuous swept-mesh and swept-occupancy proofs still stop it before driver
+  preparation.
+- Verified this increment with the complete repository regression suite (`406 passed`),
+  repository-wide Ruff checks, bytecode compilation, CLI smoke checks, and a locked-
+  dependency consistency check.
+
+## 2026-08-27 — native-depth validation infrastructure and legacy baseline
+
+- Added `evaluate native-overlap`. The current schema-2 implementation validates
+  synchronized D435i native depth transformed by the authoritative
+  `FK(joints + zero offsets) · flange_T_left_ir · left_ir_T_depth` chain. Symmetric
+  projective residuals reject depth edges, invalid pixels, occlusions, and field-of-view
+  loss without applying registration corrections.
 - Added explicit thresholds for projected support, same-surface inliers, median/RMSE/P95,
   5 mm agreement, and camera-pose observability. A deliberately wrong rotating hand-eye
   offset is covered by regression tests and must fail.
@@ -16,7 +90,11 @@
 - The first five-view ES68/D435i run passed without ICP: median errors 1.220–1.424 mm,
   RMSE 2.070–2.470 mm, P95 4.205–4.993 mm, 5 mm agreement 95.02–97.36%, over a
   188.01 mm/23.683 degree pose span. Evidence is retained under
-  `data/validations/native_overlap_20260827_static_v1`.
+  `data/validations/native_overlap_20260827_static_v1`. That retained report is schema 1
+  and explicitly used the legacy TCP-primary
+  `base_T_tcp · tcp_T_left_ir · left_ir_T_depth` chain. Its numbers are a historical
+  baseline, not validation of the current FK-authority path; the raw sessions must be
+  reprocessed to a separate schema-2 output before making that claim.
 
 ## 2026-08-27 — native-depth validation acquisition override
 
@@ -76,7 +154,7 @@
   acquisition, plus unit coverage for fixed-input provenance, successful ideal
   geometry, checksum tamper rejection, and calibration/stream resolution mismatch.
 
-Last updated: 2026-08-27
+Last updated: 2026-08-28
 
 This log distinguishes verified implementation from pending work. Commit history is the
 authoritative fine-grained record; this page records the experiment-facing state.
@@ -84,9 +162,10 @@ authoritative fine-grained record; this page records the experiment-facing state
 ## Non-negotiable constraints
 
 - Python 3.12 with `uv`; Elite SDK is installed from the local CPython 3.12 wheel.
-- All currently exposed CLI commands remain read-only. A library-level Elite control
-  backend now exists but is blocked by default configuration, offline preflight, exact
-  operator confirmation, an expiring one-shot permit, and live revalidation.
+- All currently exposed CLI commands remain non-moving with respect to the robot; commands
+  that acquire or derive data write only their declared digital assets. A library-level
+  Elite control backend exists but is blocked by default configuration, offline preflight,
+  exact operator confirmation, an expiring one-shot permit, and live revalidation.
 - Every exported view plan has `motion_authorized: false`.
 - Raw synchronized observations are immutable; derived products use separate outputs.
 - Thermal capture remains an explicit disabled placeholder until hardware is selected.
@@ -103,7 +182,7 @@ authoritative fine-grained record; this page records the experiment-facing state
   rather than accumulating GUI events, and completed sessions reject further writes.
   The GUI starts idle; only an explicit operator click on **开始** connects the camera,
   creates the session and starts sample statistics at zero.
-- A successful D435i IR solve now atomically publishes the verified result to
+- A successful D435i IR solve now atomically publishes the solver-accepted result to
   `data/calibrations/d435i_ir_active.yaml`, the fixed path used by the default runtime
   configuration. All later calibrated capture paths therefore consume the latest
   completed user result without manual path editing. Missing user calibration fails
@@ -184,7 +263,7 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Atomic schema-v2 session writer and validated reader.
 - Native-depth point-cloud initialization, conservative thin-blade proxy, bilateral
   partitioning, candidate generation/filtering/scoring, and non-executable plan export.
-- Offline CS68 KDL endpoint IK validation with captured seed joints.
+- Offline ES68 KDL endpoint IK validation with captured seed joints.
 - Calibrated D435i stereo rectification with explicit frame-chain transforms.
 - Official FoundationStereo source pinned as a Git submodule.
 - Lazy FoundationStereo adapter with no implicit EdgeNeXt or DINOv2 network download;
@@ -212,44 +291,55 @@ authoritative fine-grained record; this page records the experiment-facing state
   verification, and explicit non-ground-truth interpretation.
 - Manifest-driven depth aggregation with duplicate-frame rejection, view-balanced and
   pixel-pooled metrics, plus retained front/back and incidence-angle strata.
-- Initialization schema 6 adds SHA-256, dtype, and shape manifests for base clouds,
-  pixel provenance, and masks while retaining schema 4/5 read compatibility.
+- Initialization schema 7 adds source-pose authority and TCP-validation evidence on top
+  of the SHA-256, dtype, and shape manifests for base clouds, pixel provenance, and masks;
+  the reader retains schema 4/5/6 compatibility.
 - Achieved-pose experiment labeling composes robot, hand-eye, and rectification
   transforms to derive proxy side and incidence; ambiguous mid-plane/away-facing views
   are rejected, and generated manifests bind the fixed initialization metadata.
 - Correct Elite KDL IK orientation encoding: the vendor plugin consumes roll/pitch/yaw,
   which is intentionally distinct from the controller TCP rotation-vector encoding.
 - Exact vendor-convention MDH link origins, fail-closed capsule/workcell geometry,
-  joint-limit checks, continuous joint-space sampling, explicit ordered view-sequence
+  joint-limit checks, bounded-step discrete joint-space sampling, explicit ordered view-sequence
   validation, and immutable reports that always forbid motion.
 - `bbf doctor` collision-readiness diagnostics enumerate missing radii, tool geometry,
   joint limits, and required workcell obstacles before path validation is attempted.
-- View-plan schema 2 cryptographically binds endpoint-feasible IK solutions to their
-  controller-specific MDH artifact; safety validation rejects legacy or mismatched
-  kinematics provenance while retaining schema-1 geometry-only read compatibility.
-- Copied HoloRobot CS68 YAML/URDF/STL resources, D435i wrist collision mesh, matched
-  YAML/Pinocchio forward kinematics, and Pinocchio/FCL self-collision/path sampling.
+- View-plan schema 3 cryptographically binds endpoint-feasible IK solutions to their
+  controller-specific MDH artifact and six joint-zero offsets; safety validation rejects
+  legacy or mismatched endpoint provenance while retaining older geometry-only plans for
+  read-only compatibility.
+- Adapted the pinned HoloRobot structural resources (whose upstream package paths retain
+  `cs68` identifiers) to the calibrated ES68 chain and D435i wrist geometry. Development
+  fixtures exercise YAML/Pinocchio FK and FCL sampling, while production resolution now
+  requires the separately accepted final ES68+D435i manifest and never falls back to the
+  upstream-labelled meshes.
 - HoloRobot-aligned Elite Dashboard/RTSI/EliteDriver lifecycle, RPY TCP convention,
   point trajectories, SpeedJ, ServoJ prewarm/hold/streaming, stop, and safety faults.
 - Conservative linear-joint motion preflight using copied velocity limits, plus exact
   preflight-hash confirmation, expiring one-shot execution permits, live-start checks,
   and immediate collision revalidation. No motion command is exposed through the CLI.
-- Immutable ordered view-sequence motion-preflight artifacts bind plan/initialization
-  hashes, re-derive Pinocchio/FCL and ServoJ evidence on read, and are generated offline
-  by `bbf safety preflight-path` with `motion_authorized: false`.
-- Mesh motion preflight now persists calibrated `base_T_tcp` goals and sequence cost;
+- Immutable ordered view-sequence motion-preflight schema-4 artifacts bind plan,
+  initialization, occupancy, and motion-model hashes and re-derive the fail-closed report
+  on read. The production path currently stops at missing continuous swept-mesh evidence
+  before ServoJ generation; diagnostic-only library overrides do not create approval
+  evidence. `bbf safety preflight-path` always writes `motion_authorized: false`.
+- Mesh motion preflight persists calibrated `base_T_tcp` goals and bounded-step sequence
+  cost evidence;
   configured workcell AABBs are clearance-expanded hpp-fcl geometry checked against
-  all copied CS68/D435i meshes. Required missing obstacle geometry is blocking.
-- Current local verification: 206 tests, Ruff, offline wheel build, packaged robot-resource
-  audit, and Elite/Pinocchio/hpp-fcl/trimesh imports pass. Curved reconstruction is
-  software-verified on deterministic data and remains pending physical hardware validation.
+  the resolved ES68+D435i model. Missing required production geometry is blocking.
+- The 2026-08-27 software baseline passed 206 tests, Ruff, an offline wheel build, the
+  packaged-resource audit, and Elite/Pinocchio/hpp-fcl/trimesh import checks. Curved
+  reconstruction remains software-verified on deterministic data and pending physical
+  hardware validation; later commits add their own regression evidence.
 
 ## In progress
 
 - Robot-stack migration to the pinned HoloRobot implementation is active. Model,
   self/workcell collision, control, ServoJ trajectory, guarded-execution, and ordered
-  tool-goal preflight artifact layers are copied/adapted. Hardware acceptance and
-  traversal-order optimization remain.
+  tool-goal preflight artifact layers are copied/adapted. FoundationStereo occupancy
+  storage, conservative queries and replay visualization are implemented, but the live
+  stop-and-capture coordinator is not implemented; hardware acceptance and traversal-order
+  optimization also remain.
 - The migration sequence and safety boundary are recorded in
   `docs/robot-stack-migration.md`. Existing MDH/capsule code remains temporarily for
   artifact compatibility and will not receive new motion functionality.
@@ -266,7 +356,16 @@ authoritative fine-grained record; this page records the experiment-facing state
    CUDA device is currently available in this workspace.
 3. Collect paired blade observations and compare FoundationStereo with native RealSense
    depth using the offline evaluator and aggregate report.
-4. Optimize front/back traversal order using the persisted motion cost, then perform a
+4. Install and accept the final ES68+D435i STL manifest, then close the self-masked
+   `UNKNOWN`-volume problem without ray-clearing occluded space. Implement and validate
+   two independent continuous proofs for every segment: swept ES68+D435i mesh/FCL
+   clearance and swept robot-versus-voxel occupancy clearance. Discrete bounding-sphere
+   samples remain diagnostic only.
+5. Implement and hardware-verify the native stop-and-capture coordinator that publishes
+   fresh `MAP_READY` snapshots, invalidates plans on every update, and preserves the
+   required freshness horizon through execution. Offline `build-replay` must remain
+   `STALE/BLOCKED`.
+6. Optimize front/back traversal order using the persisted motion cost, then perform a
    separately approved known-safe-pose hardware acceptance before considering an
-   interactive execution command. Add occupancy collision for unmodeled objects later.
-5. Implement the thermal-camera adapter after its model and radiometric SDK are known.
+   interactive execution command.
+7. Implement the thermal-camera adapter after its model and radiometric SDK are known.

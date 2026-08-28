@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,7 @@ from biblade_fusion.devices.depth_camera import (
 from biblade_fusion.devices.robot.base import RobotState
 from biblade_fusion.perception.stereo import StereoResult
 from biblade_fusion.planning import BladeSide
+from biblade_fusion.robotics import Es68KinematicModel, load_es68_flange_t_tcp
 from biblade_fusion.storage import (
     SessionReader,
     SessionWriter,
@@ -69,11 +71,14 @@ def make_bundle() -> SynchronizedFrameBundle:
         np.full((20, 20), 500, dtype=np.uint16),
         calibration,
     )
+    base_t_tcp = Es68KinematicModel.from_resources().base_t_flange(
+        np.zeros(6)
+    ).compose(load_es68_flange_t_tcp())
     state = RobotState(
         1_000_000_000,
         1.0,
         np.zeros(6),
-        PoseSE3.identity("base", "tcp"),
+        base_t_tcp,
         "IDLE",
         "NORMAL",
         0.2,
@@ -90,20 +95,51 @@ def make_bundle() -> SynchronizedFrameBundle:
     )
 
 
+def make_hand_eye(path: Path) -> HandEyeCalibration:
+    base_t_flange = Es68KinematicModel.from_resources().base_t_flange(np.zeros(6))
+    flange_t_left_ir = base_t_flange.inverse().compose(
+        PoseSE3.identity("base", "left_ir")
+    )
+    tcp_t_left_ir = load_es68_flange_t_tcp().inverse().compose(flange_t_left_ir)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "parent_frame": "flange",
+                "child_frame": "left_ir",
+                "method": "integration-test",
+                "matrix": flange_t_left_ir.matrix.tolist(),
+                "derived_runtime": {
+                    "tcp_T_left_ir": tcp_t_left_ir.matrix.tolist(),
+                },
+                "quality": {
+                    "sample_count": 20,
+                    "translation_rmse_m": 0.001,
+                    "rotation_rmse_deg": 0.2,
+                    "rotation_span_deg": 45.0,
+                    "translation_span_m": 0.1,
+                    "rotation_axis_diversity": 0.5,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return HandEyeCalibration(
+        tcp_t_left_ir,
+        "integration-test",
+        20,
+        0.001,
+        0.2,
+        path,
+        flange_t_left_ir=flange_t_left_ir,
+    )
 def test_raw_session_to_non_executable_bilateral_plan(tmp_path: Path) -> None:
     settings = load_settings("configs/default.yaml")
     with SessionWriter.create(tmp_path, settings, label="integration") as writer:
         writer.write_bundle(make_bundle())
     bundle = SessionReader(writer.path).load_bundle("seed")
 
-    hand_eye = HandEyeCalibration(
-        PoseSE3.identity("tcp", "left_ir"),
-        "integration-test",
-        20,
-        0.001,
-        0.2,
-        tmp_path / "hand_eye.yaml",
-    )
+    hand_eye = make_hand_eye(tmp_path / "hand_eye.yaml")
     point_config = PointCloudConfig(
         minimum_depth_m=0.1,
         maximum_depth_m=1.0,
@@ -121,6 +157,8 @@ def test_raw_session_to_non_executable_bilateral_plan(tmp_path: Path) -> None:
         hand_eye,
         point_config,
         proxy_config,
+        kinematics_config=settings.kinematics,
+        hand_eye_config=settings.hand_eye,
     )
     initialization_path = write_initialization(
         tmp_path / "initialization",
@@ -129,6 +167,8 @@ def test_raw_session_to_non_executable_bilateral_plan(tmp_path: Path) -> None:
         hand_eye,
         point_config,
         proxy_config,
+        settings.kinematics,
+        settings.hand_eye,
         source_session=writer.path,
     )
     stored_initialization = read_initialization(initialization_path)
@@ -182,14 +222,7 @@ def test_raw_session_through_stereo_depth_to_non_executable_plan(tmp_path: Path)
         source_session=writer.path,
     )
     stored_stereo = read_stereo_inference(stereo_path)
-    hand_eye = HandEyeCalibration(
-        PoseSE3.identity("tcp", "left_ir"),
-        "integration-test",
-        20,
-        0.001,
-        0.2,
-        tmp_path / "hand_eye.yaml",
-    )
+    hand_eye = make_hand_eye(tmp_path / "hand_eye.yaml")
     point_config = PointCloudConfig(
         minimum_depth_m=0.1,
         maximum_depth_m=1.0,
@@ -208,6 +241,8 @@ def test_raw_session_through_stereo_depth_to_non_executable_plan(tmp_path: Path)
         hand_eye,
         point_config,
         proxy_config,
+        kinematics_config=settings.kinematics,
+        hand_eye_config=settings.hand_eye,
     )
     initialization_path = write_initialization(
         tmp_path / "stereo-initialization",
@@ -216,6 +251,8 @@ def test_raw_session_through_stereo_depth_to_non_executable_plan(tmp_path: Path)
         hand_eye,
         point_config,
         proxy_config,
+        settings.kinematics,
+        settings.hand_eye,
         source_session=writer.path,
         source_stereo_inference=stereo_path,
     )

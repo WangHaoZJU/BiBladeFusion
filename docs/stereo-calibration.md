@@ -12,6 +12,7 @@ The configured physical target is
 Install the optional desktop dependency and launch the application:
 
 ```bash
+uv sync --extra calibration-gui
 ./.venv/bin/bbf calibration stereo-gui \
   --target configs/charuco_dict5x5_14x9_20mm_15mm.yaml \
   --config configs/default.yaml \
@@ -89,15 +90,17 @@ The GUI provides four distortion choices:
 Automatic comparison requires at least 20 accepted observations. Model selection never
 uses the factory calibration and never relies only on training RMS.
 
-After a successful solve, the program automatically verifies and atomically publishes
-the result to the fixed runtime path used by later workflows:
+After a successful solve, the program checks the solver's configured acceptance gates and
+atomically publishes the solver-accepted result to the fixed runtime path used by later
+workflows:
 
 ```yaml
 realsense:
   stereo_calibration_path: data/calibrations/d435i_ir_active.yaml
 ```
 
-The timestamped session result remains the authoritative digital asset. The fixed
+Publication activates the runtime copy; it does not replace the independent hold-out
+experiment below. The timestamped session result remains the authoritative digital asset. The fixed
 runtime copy removes manual path editing: stereo rectification, FoundationStereo,
 hand-eye capture, reconstruction and calibrated view planning load it through the
 normal application settings. If it is missing or invalid, D435i production capture

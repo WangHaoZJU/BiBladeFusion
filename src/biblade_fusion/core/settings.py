@@ -114,6 +114,11 @@ class FoundationStereoConfig(BaseModel):
     valid_iterations: int = Field(default=32, gt=0, le=128)
     hierarchical: bool = False
     remove_invisible: bool = True
+    left_right_consistency_threshold_px: float | None = Field(
+        default=1.0,
+        gt=0.0,
+        le=10.0,
+    )
 
 
 class StereoRectificationConfig(BaseModel):
@@ -540,7 +545,7 @@ class CollisionObstacleConfig(AxisAlignedBoxConfig):
 
 
 class CollisionConfig(BaseModel):
-    """Fail-closed geometry required for offline CS68 path validation."""
+    """Fail-closed geometry required for offline ES68 path validation."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -549,7 +554,7 @@ class CollisionConfig(BaseModel):
     minimum_joint_positions_rad: tuple[float, float, float, float, float, float] | None = None
     maximum_joint_positions_rad: tuple[float, float, float, float, float, float] | None = None
     obstacles: tuple[CollisionObstacleConfig, ...] = ()
-    require_obstacles: bool = True
+    require_obstacles: bool = False
     minimum_clearance_m: float = Field(default=0.01, ge=0.0)
     maximum_joint_step_rad: float = Field(default=0.02, gt=0.0, le=0.2)
 
@@ -584,6 +589,71 @@ class MotionPreflightConfig(BaseModel):
     servoj_dt_s: float = Field(default=0.004, gt=0.0, le=0.1)
     speed_scaling: float = Field(default=0.08, gt=0.0, le=1.0)
     velocity_margin: float = Field(default=0.8, gt=0.0, le=1.0)
+    maximum_endpoint_translation_error_m: float = Field(default=0.002, gt=0.0)
+    maximum_endpoint_rotation_error_deg: float = Field(default=0.3, gt=0.0, le=180.0)
+
+
+class OccupancyConfig(BaseModel):
+    """Fail-closed online environment mapping for the unknown blade workcell."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    frame_id: Literal["base"] = "base"
+    mapping_mode: Literal["stop_and_capture"] = "stop_and_capture"
+    voxel_size_m: float = Field(default=0.01, gt=0.0, le=0.05)
+    workspace_bounds_min_m: tuple[float, float, float] | None = None
+    workspace_bounds_max_m: tuple[float, float, float] | None = None
+    minimum_depth_m: float = Field(default=0.15, gt=0.0)
+    maximum_depth_m: float = Field(default=1.5, gt=0.0)
+    integration_stride: int = Field(default=2, ge=1, le=16)
+    free_space_margin_m: float = Field(default=0.01, ge=0.0, le=0.10)
+    obstacle_inflation_m: float = Field(default=0.01, ge=0.0, le=0.20)
+    maximum_map_age_s: float = Field(default=5.0, gt=0.0, le=300.0)
+    unknown_policy: Literal["block"] = "block"
+    require_robot_self_mask: bool = True
+    self_mask_front_tolerance_m: float = Field(default=0.01, ge=0.0, le=0.10)
+    self_mask_back_tolerance_m: float = Field(default=0.02, ge=0.0, le=0.20)
+    self_mask_dilation_px: int = Field(default=1, ge=0, le=20)
+    maximum_fk_tcp_translation_error_m: float = Field(default=0.002, gt=0.0)
+    maximum_fk_tcp_rotation_error_deg: float = Field(
+        default=0.3,
+        gt=0.0,
+        le=180.0,
+    )
+    minimum_valid_depth_fraction: float = Field(default=0.05, gt=0.0, le=1.0)
+    minimum_stereo_confidence: float = Field(default=0.5, gt=0.0, le=1.0)
+    maximum_lr_consistency_error_px: float = Field(default=1.0, gt=0.0, le=10.0)
+    minimum_source_views: int = Field(default=3, ge=3, le=10000)
+    minimum_free_observations: int = Field(default=3, ge=2, le=10000)
+    minimum_free_view_translation_m: float = Field(default=0.02, gt=0.0, le=1.0)
+    minimum_free_view_direction_deg: float = Field(default=5.0, gt=0.0, le=180.0)
+    maximum_grid_voxels: int = Field(default=8_000_000, ge=1000)
+
+    @model_validator(mode="after")
+    def validate_occupancy_contract(self) -> Self:
+        bounds = (self.workspace_bounds_min_m, self.workspace_bounds_max_m)
+        if (bounds[0] is None) != (bounds[1] is None):
+            raise ValueError("Occupancy workspace minimum and maximum must be configured together")
+        if self.maximum_depth_m <= self.minimum_depth_m:
+            raise ValueError("Occupancy maximum depth must exceed minimum depth")
+        if self.free_space_margin_m >= self.maximum_depth_m:
+            raise ValueError("Occupancy free-space margin must be below maximum depth")
+        if bounds[0] is not None and bounds[1] is not None:
+            values = (*bounds[0], *bounds[1])
+            if not np.isfinite(values).all() or any(
+                lower >= upper for lower, upper in zip(*bounds, strict=True)
+            ):
+                raise ValueError("Occupancy workspace bounds must be finite and ordered")
+            extents = np.asarray(bounds[1]) - np.asarray(bounds[0])
+            grid_shape = np.ceil(extents / self.voxel_size_m).astype(np.int64)
+            if int(np.prod(grid_shape)) > self.maximum_grid_voxels:
+                raise ValueError("Occupancy workspace exceeds maximum_grid_voxels")
+        if self.enabled and bounds[0] is None:
+            raise ValueError("Enabled occupancy mapping requires measured workspace bounds")
+        if self.enabled and not self.require_robot_self_mask:
+            raise ValueError("Physical occupancy mapping requires robot self masking")
+        return self
 
 
 class AppSettings(BaseModel):
@@ -617,6 +687,7 @@ class AppSettings(BaseModel):
     kinematics: KinematicsConfig = Field(default_factory=KinematicsConfig)
     collision: CollisionConfig = Field(default_factory=CollisionConfig)
     motion_preflight: MotionPreflightConfig = Field(default_factory=MotionPreflightConfig)
+    occupancy: OccupancyConfig = Field(default_factory=OccupancyConfig)
 
 
 def load_settings(path: str | Path) -> AppSettings:

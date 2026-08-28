@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import numpy as np
+
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import ViewFilterConfig, ViewPlanningConfig
 from biblade_fusion.planning import (
@@ -24,7 +26,7 @@ from biblade_fusion.planning import (
 )
 from biblade_fusion.workflows import OfflineViewPlanningResult
 
-VIEW_PLAN_SCHEMA_VERSION = 2
+VIEW_PLAN_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,15 +87,13 @@ def write_view_plan(
     *,
     source_initialization: str | Path,
     source_kinematics: str | Path | None = None,
+    joint_zero_offsets_rad: tuple[float, float, float, float, float, float] | None = None,
 ) -> Path:
     """Write an offline-only plan without overwriting an existing artifact."""
 
     output = Path(output_dir)
     if output.exists():
         raise FileExistsError(f"View-plan output already exists: {output}")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.name}.{uuid4().hex}.partial")
-    temporary.mkdir()
     geometric = result.geometric_plan
     filtered = result.filtered_plan
     has_endpoint_solutions = bool(filtered.endpoint_feasible)
@@ -101,6 +101,16 @@ def write_view_plan(
         raise ValueError(
             "Endpoint-feasible plans must record their controller kinematics artifact"
         )
+    if has_endpoint_solutions and joint_zero_offsets_rad is None:
+        raise ValueError(
+            "Endpoint-feasible plans must record the applied joint-zero offsets"
+        )
+    offsets = None
+    if joint_zero_offsets_rad is not None:
+        offset_array = np.asarray(joint_zero_offsets_rad, dtype=np.float64)
+        if offset_array.shape != (6,) or not np.isfinite(offset_array).all():
+            raise ValueError("joint_zero_offsets_rad must be a finite six-vector")
+        offsets = [float(value) for value in offset_array]
     kinematics_record = None
     if source_kinematics is not None:
         kinematics_path = Path(source_kinematics).resolve()
@@ -109,7 +119,11 @@ def write_view_plan(
         kinematics_record = {
             "path": str(kinematics_path),
             "sha256": _sha256(kinematics_path),
+            "joint_zero_offsets_rad": offsets,
         }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{uuid4().hex}.partial")
+    temporary.mkdir()
     payload: dict[str, Any] = {
         "schema_version": VIEW_PLAN_SCHEMA_VERSION,
         "created_at_utc": datetime.now(UTC).isoformat(),
@@ -181,7 +195,7 @@ def read_view_plan(path: str | Path) -> StoredViewPlan:
         if not isinstance(payload, dict):
             raise TypeError("view plan root must be an object")
         schema_version = int(payload["schema_version"])
-        if schema_version not in {1, VIEW_PLAN_SCHEMA_VERSION}:
+        if schema_version not in {1, 2, VIEW_PLAN_SCHEMA_VERSION}:
             raise ValueError(f"unsupported schema {payload['schema_version']}")
         if payload.get("motion_authorized") is not False:
             raise ValueError("stored view plan must explicitly forbid motion")
@@ -224,12 +238,24 @@ def read_view_plan(path: str | Path) -> StoredViewPlan:
             kinematics_path = Path(str(kinematics_record["path"])).resolve()
             if _sha256(kinematics_path) != str(kinematics_record["sha256"]):
                 raise ValueError("view-plan kinematics checksum mismatch")
+            offsets = kinematics_record.get("joint_zero_offsets_rad")
+            if offsets is not None:
+                offset_array = np.asarray(offsets, dtype=np.float64)
+                if offset_array.shape != (6,) or not np.isfinite(offset_array).all():
+                    raise ValueError("view-plan joint-zero offsets are invalid")
         if (
             filtered.endpoint_feasible
             and kinematics_record is None
             and schema_version == VIEW_PLAN_SCHEMA_VERSION
         ):
             raise ValueError("endpoint-feasible plan lacks kinematics provenance")
+        if (
+            filtered.endpoint_feasible
+            and schema_version == VIEW_PLAN_SCHEMA_VERSION
+            and kinematics_record is not None
+            and kinematics_record.get("joint_zero_offsets_rad") is None
+        ):
+            raise ValueError("endpoint-feasible plan lacks joint-zero-offset provenance")
         return StoredViewPlan(OfflineViewPlanningResult(geometric, filtered), payload)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid view-plan artifact {root}: {exc}") from exc

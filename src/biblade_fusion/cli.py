@@ -1,7 +1,9 @@
 """BiBladeFusion command-line interface."""
 
+import hashlib
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -32,6 +34,7 @@ from biblade_fusion.devices.depth_camera import RealSenseD435i, list_realsense_d
 from biblade_fusion.devices.robot import EliteReadOnlyRobot
 from biblade_fusion.devices.thermal_camera import NullThermalCamera
 from biblade_fusion.diagnostics import CheckLevel, run_doctor
+from biblade_fusion.mapping import Es68D435iRobotDepthRenderer, OccupancyMapState
 from biblade_fusion.perception.stereo import (
     FoundationStereoBackend,
     run_foundation_stereo_doctor,
@@ -55,6 +58,7 @@ from biblade_fusion.storage import (
     read_initialization,
     read_motion_preflight,
     read_native_overlap_report,
+    read_occupancy_mapping,
     read_path_validation,
     read_reconstructed_view,
     read_stereo_inference,
@@ -68,6 +72,7 @@ from biblade_fusion.storage import (
     write_initialization,
     write_motion_preflight,
     write_native_overlap_report,
+    write_occupancy_mapping,
     write_path_validation,
     write_reconstructed_view,
     write_stereo_inference,
@@ -81,11 +86,20 @@ from biblade_fusion.workflows import (
     infer_rectified_stereo,
     initialize_foundation_stereo_depth,
     initialize_native_depth,
+    integrate_foundation_stereo_occupancy,
     plan_initial_observation,
     reconstruct_foundation_stereo_view,
     reconstruct_native_depth_view,
     registered_cloud_view,
 )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _with_emitter_override(settings, emitter_enabled: bool | None):
@@ -118,6 +132,14 @@ coverage_app = typer.Typer(help="Offline bilateral coverage tracking.", no_args_
 reconstruct_app = typer.Typer(help="Pose-register stored blade depth views.", no_args_is_help=True)
 evaluate_app = typer.Typer(help="Offline experiment evaluation.", no_args_is_help=True)
 safety_app = typer.Typer(help="Offline, non-executable safety validation.", no_args_is_help=True)
+occupancy_app = typer.Typer(
+    help="Depth-derived unknown-environment occupancy assets.",
+    no_args_is_help=True,
+)
+supervise_app = typer.Typer(
+    help="Read-only, snapshot-driven supervision and evidence replay.",
+    no_args_is_help=True,
+)
 app.add_typer(robot_app, name="robot")
 app.add_typer(camera_app, name="camera")
 app.add_typer(acquire_app, name="acquire")
@@ -129,11 +151,309 @@ app.add_typer(coverage_app, name="coverage")
 app.add_typer(reconstruct_app, name="reconstruct")
 app.add_typer(evaluate_app, name="evaluate")
 app.add_typer(safety_app, name="safety")
+app.add_typer(occupancy_app, name="occupancy")
+app.add_typer(supervise_app, name="supervise")
 
 
 @app.callback()
 def main() -> None:
     """BiBladeFusion command group."""
+
+
+@occupancy_app.command("build-replay")
+def occupancy_build_replay(
+    stereo_inferences: Annotated[
+        list[Path],
+        typer.Option(
+            "--stereo",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Repeat in settled capture order for each FoundationStereo artifact.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+    workspace_min: Annotated[
+        tuple[float, float, float] | None,
+        typer.Option("--workspace-min", help="Temporary base-frame x y z minimum in metres."),
+    ] = None,
+    workspace_max: Annotated[
+        tuple[float, float, float] | None,
+        typer.Option("--workspace-max", help="Temporary base-frame x y z maximum in metres."),
+    ] = None,
+    voxel_size_m: Annotated[
+        float | None,
+        typer.Option("--voxel-size-m", min=0.001, max=0.05),
+    ] = None,
+) -> None:
+    """Build an immutable offline/replay map; it is never live motion evidence."""
+
+    try:
+        if not stereo_inferences:
+            raise ValueError("At least one --stereo artifact is required")
+        if (workspace_min is None) != (workspace_max is None):
+            raise ValueError("--workspace-min and --workspace-max must be supplied together")
+        settings = load_settings(config)
+        occupancy_update = {
+            "enabled": True,
+            **(
+                {
+                    "workspace_bounds_min_m": workspace_min,
+                    "workspace_bounds_max_m": workspace_max,
+                }
+                if workspace_min is not None and workspace_max is not None
+                else {}
+            ),
+            **({"voxel_size_m": voxel_size_m} if voxel_size_m is not None else {}),
+        }
+        occupancy_config = type(settings.occupancy).model_validate(
+            {**settings.occupancy.model_dump(), **occupancy_update}
+        )
+        hand_eye = load_hand_eye_calibration(settings.hand_eye)
+        renderer = Es68D435iRobotDepthRenderer.from_active_resources(
+            joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
+        )
+        snapshot = None
+        previous_evidence_hash = None
+        updates = []
+        source_sessions = []
+        for stereo_path in stereo_inferences:
+            stored = read_stereo_inference(stereo_path)
+            resolved_stereo = Path(stereo_path).resolve()
+            source_session = Path(str(stored.metadata["source"]["session"])).resolve()
+            reader = SessionReader(source_session)
+            bundle = reader.load_bundle(stored.observation.source_view_id)
+            captured_at = datetime.fromisoformat(str(reader.manifest["created_at_utc"]))
+            descriptor = reader.descriptor(stored.observation.source_view_id)
+            relative_view = Path(descriptor.relative_path)
+            view_metadata = (source_session / relative_view / "metadata.json").resolve()
+            if relative_view.is_absolute() or not view_metadata.is_relative_to(
+                source_session
+            ):
+                raise ValueError("Selected source view metadata escapes its session")
+            update = integrate_foundation_stereo_occupancy(
+                snapshot,
+                bundle,
+                stored.observation,
+                hand_eye,
+                occupancy_config,
+                settings.acquisition,
+                renderer,
+                captured_at_utc=captured_at,
+                source_stereo_metadata_sha256=_file_sha256(
+                    resolved_stereo / "metadata.json"
+                ),
+                source_session_manifest_sha256=_file_sha256(
+                    source_session / "manifest.json"
+                ),
+                source_session_view_metadata_sha256=_file_sha256(view_metadata),
+                previous_evidence_hash=previous_evidence_hash,
+            )
+            snapshot = update.snapshot
+            previous_evidence_hash = update.evidence.quality_evidence_hash
+            updates.append(update)
+            source_sessions.append(source_session)
+        if snapshot is None:
+            raise ValueError("No occupancy snapshot was produced")
+        if snapshot.map_state is OccupancyMapState.MAP_READY:
+            snapshot = snapshot.mark_stale(
+                "offline replay build; acquire a fresh live snapshot before motion"
+            )
+            updates[-1] = replace(updates[-1], snapshot=snapshot)
+        destination = write_occupancy_mapping(
+            output,
+            tuple(updates),
+            occupancy_config,
+            settings.acquisition,
+            source_stereo_inferences=tuple(stereo_inferences),
+            source_sessions=tuple(source_sessions),
+            source_hand_eye=hand_eye.source_path,
+        )
+        stored_output = read_occupancy_mapping(destination)
+    except Exception as exc:
+        typer.echo(f"Occupancy replay build failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved immutable occupancy replay asset: {destination}")
+    typer.echo(
+        f"Map: {stored_output.snapshot.version}; state: "
+        f"{stored_output.snapshot.map_state.value}; views: "
+        f"{len(stored_output.snapshot.source_view_ids)}"
+    )
+    typer.echo("Motion authorized: no (offline/replay occupancy is deliberately stale)")
+
+
+@occupancy_app.command("inspect")
+def occupancy_inspect(
+    artifact: Annotated[
+        Path,
+        typer.Option("--artifact", exists=True, file_okay=False, readable=True),
+    ],
+) -> None:
+    """Verify and summarize a stored occupancy-mapping digital asset."""
+
+    try:
+        stored = read_occupancy_mapping(artifact)
+    except Exception as exc:
+        typer.echo(f"Occupancy inspection failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    snapshot = stored.snapshot
+    typer.echo(f"Version: {snapshot.version}")
+    typer.echo(f"State: {snapshot.map_state.value}")
+    typer.echo(
+        f"Known/free/occupied/unknown voxels: {snapshot.known_voxel_count}/"
+        f"{len(snapshot.free_indices)}/{len(snapshot.occupied_indices)}/"
+        f"{snapshot.unknown_voxel_count}"
+    )
+    typer.echo(f"Source views: {', '.join(snapshot.source_view_ids)}")
+    typer.echo("Usable for motion: no unless a live process independently proves freshness")
+
+
+@supervise_app.command("replay")
+def supervise_replay(
+    snapshot: Annotated[
+        Path,
+        typer.Option(
+            "--snapshot",
+            exists=True,
+            readable=True,
+            help=(
+                "A snapshot JSON/directory, or a directory containing an ordered "
+                "snapshot timeline."
+            ),
+        ),
+    ],
+    interval_ms: Annotated[
+        int,
+        typer.Option(
+            "--interval-ms",
+            min=100,
+            help="Replay interval for multi-snapshot timelines.",
+        ),
+    ] = 800,
+    follow: Annotated[
+        bool,
+        typer.Option(
+            "--follow",
+            help=(
+                "Read-only poll a timeline root for atomically published child snapshots; "
+                "this is not live obstacle avoidance."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Open the immutable read-only console; never connect to command ports."""
+
+    try:
+        from biblade_fusion.supervision.gui import launch_supervisory_console
+
+        return_code = launch_supervisory_console(
+            snapshot,
+            replay_interval_ms=interval_ms,
+            follow=follow,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "PySide6":
+            typer.echo(
+                "PySide6 is not installed; run `uv sync --extra supervision-gui`.",
+                err=True,
+            )
+        else:
+            typer.echo(f"Supervisory replay failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        typer.echo(f"Supervisory replay failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if return_code:
+        raise typer.Exit(code=return_code)
+
+
+@supervise_app.command("build-replay")
+def supervise_build_replay(
+    occupancy: Annotated[
+        Path,
+        typer.Option(
+            "--occupancy",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Required immutable occupancy-mapping artifact.",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="New self-contained replay snapshot directory."),
+    ],
+    stereo: Annotated[
+        Path | None,
+        typer.Option(
+            "--stereo",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Optional explicit latest stereo artifact; otherwise follow occupancy provenance.",
+        ),
+    ] = None,
+    current_view: Annotated[
+        Path | None,
+        typer.Option(
+            "--current-view",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Optional pose-registered view matching the occupancy map's latest frame.",
+        ),
+    ] = None,
+    coarse_model: Annotated[
+        Path | None,
+        typer.Option(
+            "--coarse-model",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Optional verified multi-view coarse-model artifact.",
+        ),
+    ] = None,
+    preflight: Annotated[
+        Path | None,
+        typer.Option(
+            "--preflight",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Optional historical preflight bound to the same occupancy asset.",
+        ),
+    ] = None,
+) -> None:
+    """Build an immutable offline replay snapshot; never authorize motion."""
+
+    try:
+        from biblade_fusion.workflows.supervision_replay import (
+            build_supervisory_replay_snapshot,
+        )
+
+        stored = build_supervisory_replay_snapshot(
+            output,
+            source_occupancy=occupancy,
+            source_stereo_inference=stereo,
+            source_reconstructed_view=current_view,
+            source_coarse_model=coarse_model,
+            source_motion_preflight=preflight,
+        )
+    except Exception as exc:
+        typer.echo(f"Supervisory replay build failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    snapshot = stored.snapshot
+    typer.echo(f"Saved immutable supervisory replay snapshot: {stored.root}")
+    typer.echo(
+        f"Map: {snapshot.occupancy.version}; state: {snapshot.occupancy.state}; "
+        f"occupied/free: {snapshot.occupancy.occupied_centres_m.shape[0]}/"
+        f"{snapshot.occupancy.free_centres_m.shape[0]}"
+    )
+    typer.echo("Viewer mode: REPLAY; system state: BLOCKED; motion authorized: no")
 
 
 @app.command()
@@ -514,6 +834,7 @@ def stereo_infer_session(
             settings.foundation_stereo,
             settings.stereo_rectification,
             source_session=session,
+            source_stereo_calibration=settings.realsense.stereo_calibration_path,
         )
     except Exception as exc:
         typer.echo(f"Stereo inference failed: {exc}", err=True)
@@ -1032,6 +1353,8 @@ def initialize_from_native_depth(
             hand_eye,
             settings.point_cloud,
             settings.proxy_model,
+            kinematics_config=settings.kinematics,
+            hand_eye_config=settings.hand_eye,
         )
         destination = write_initialization(
             output,
@@ -1040,6 +1363,8 @@ def initialize_from_native_depth(
             hand_eye,
             settings.point_cloud,
             settings.proxy_model,
+            settings.kinematics,
+            settings.hand_eye,
             source_session=session,
         )
     except Exception as exc:
@@ -1095,6 +1420,8 @@ def initialize_from_stereo_depth(
             hand_eye,
             settings.point_cloud,
             settings.proxy_model,
+            kinematics_config=settings.kinematics,
+            hand_eye_config=settings.hand_eye,
         )
         destination = write_initialization(
             output,
@@ -1103,6 +1430,8 @@ def initialize_from_stereo_depth(
             hand_eye,
             settings.point_cloud,
             settings.proxy_model,
+            settings.kinematics,
+            settings.hand_eye,
             source_session=session,
             source_stereo_inference=stereo,
         )
@@ -1152,6 +1481,8 @@ def reconstruct_from_native_depth(
             blade_mask,
             hand_eye,
             settings.point_cloud,
+            kinematics_config=settings.kinematics,
+            hand_eye_config=settings.hand_eye,
         )
         destination = write_reconstructed_view(
             output,
@@ -1159,6 +1490,8 @@ def reconstruct_from_native_depth(
             blade_mask,
             hand_eye,
             settings.point_cloud,
+            settings.kinematics,
+            settings.hand_eye,
             source_session=session,
         )
     except Exception as exc:
@@ -1213,6 +1546,8 @@ def reconstruct_from_stereo_depth(
             blade_mask,
             hand_eye,
             settings.point_cloud,
+            kinematics_config=settings.kinematics,
+            hand_eye_config=settings.hand_eye,
         )
         destination = write_reconstructed_view(
             output,
@@ -1220,6 +1555,8 @@ def reconstruct_from_stereo_depth(
             blade_mask,
             hand_eye,
             settings.point_cloud,
+            settings.kinematics,
+            settings.hand_eye,
             source_session=session,
             source_stereo_inference=stereo,
         )
@@ -1415,6 +1752,7 @@ def plan_views(
             settings.view_filter,
             source_initialization=initialization,
             source_kinematics=settings.kinematics.model_path,
+            joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
         )
     except Exception as exc:
         typer.echo(f"View planning failed: {exc}", err=True)
@@ -1532,10 +1870,13 @@ def coverage_add(
             != initialization.resolve()
         ):
             raise ValueError("Coverage ledger does not belong to the supplied initialization")
-        if not np.allclose(
-            stored_view.metadata["hand_eye"]["tcp_T_left_ir"],
-            stored_initialization.hand_eye.tcp_t_left_ir.matrix,
-            atol=1e-9,
+        if (
+            stored_initialization.hand_eye.flange_t_left_ir is None
+            or not np.allclose(
+                stored_view.metadata["hand_eye"]["flange_T_left_ir"],
+                stored_initialization.hand_eye.flange_t_left_ir.matrix,
+                atol=1e-9,
+            )
         ):
             raise ValueError("Reconstructed view uses a different hand-eye calibration")
         source = stored_view.metadata["source"]
@@ -1720,6 +2061,8 @@ def evaluate_native_overlap_command(
             hand_eye,
             settings.point_cloud,
             settings.native_overlap_validation,
+            kinematics_config=settings.kinematics,
+            hand_eye_config=settings.hand_eye,
         )
         destination = write_native_overlap_report(
             output,
@@ -1727,6 +2070,7 @@ def evaluate_native_overlap_command(
             source_sessions,
             hand_eye,
             settings.hand_eye,
+            settings.kinematics,
             settings.point_cloud,
             settings.native_overlap_validation,
         )
@@ -1908,6 +2252,16 @@ def safety_preflight_path(
         Path,
         typer.Option("--initialization", exists=True, file_okay=False, readable=True),
     ],
+    occupancy: Annotated[
+        Path,
+        typer.Option(
+            "--occupancy",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Versioned occupancy-mapping artifact bound to this preflight.",
+        ),
+    ],
     view_ids: Annotated[
         list[str],
         typer.Option(
@@ -1930,8 +2284,11 @@ def safety_preflight_path(
             tuple(view_ids),
             settings.motion_preflight,
             settings.collision,
+            settings.occupancy,
             source_plan=plan,
             source_initialization=initialization,
+            source_occupancy=occupancy,
+            joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
         )
         stored = read_motion_preflight(destination)
     except Exception as exc:

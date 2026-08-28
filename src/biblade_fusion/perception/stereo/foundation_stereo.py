@@ -14,7 +14,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from biblade_fusion.core.settings import FoundationStereoConfig
-from biblade_fusion.diagnostics import CheckLevel, CheckResult
+from biblade_fusion.diagnostics.types import CheckLevel, CheckResult
 from biblade_fusion.perception.stereo.base import StereoResult
 
 _REQUIRED_MODULES = (
@@ -411,37 +411,64 @@ class FoundationStereoBackend:
         right_rgb = np.ascontiguousarray(np.repeat(right[:, :, None], 3, axis=2))
 
         runtime = self._get_runtime()
-        scaled_disparity = np.asarray(
-            runtime.infer(
-                left_rgb,
-                right_rgb,
-                valid_iterations=self._config.valid_iterations,
-                hierarchical=self._config.hierarchical,
-            ),
-            dtype=np.float32,
-        )
-        if scaled_disparity.shape != (scaled_height, scaled_width):
-            raise FoundationStereoError(
-                "runtime disparity shape does not match scaled input: "
-                f"{scaled_disparity.shape} != {(scaled_height, scaled_width)}"
-            )
-
         horizontal_scale = scaled_width / width
-        if scaled_disparity.shape != (height, width):
-            cv2 = import_module("cv2")
-            disparity = cv2.resize(
-                scaled_disparity,
-                (width, height),
-                interpolation=cv2.INTER_LINEAR,
-            ) / horizontal_scale
-        else:
-            disparity = scaled_disparity.copy()
-        disparity = np.asarray(disparity, dtype=np.float32)
+        disparity = self._infer_full_resolution_disparity(
+            runtime,
+            left_rgb,
+            right_rgb,
+            inference_shape=(scaled_height, scaled_width),
+            output_shape=(height, width),
+            horizontal_scale=horizontal_scale,
+        )
 
         valid = np.isfinite(disparity) & (disparity > 0.0)
         if self._config.remove_invisible:
             horizontal_pixels = np.arange(width, dtype=np.float32)[None, :]
             valid &= horizontal_pixels - disparity >= 0.0
+
+        confidence = None
+        threshold = self._config.left_right_consistency_threshold_px
+        if threshold is not None:
+            # Flip-and-swap preserves the positive-disparity convention while
+            # estimating the correspondence field from the physical right view.
+            flipped_right = np.ascontiguousarray(right_rgb[:, ::-1])
+            flipped_left = np.ascontiguousarray(left_rgb[:, ::-1])
+            flipped_right_disparity = self._infer_full_resolution_disparity(
+                runtime,
+                flipped_right,
+                flipped_left,
+                inference_shape=(scaled_height, scaled_width),
+                output_shape=(height, width),
+                horizontal_scale=horizontal_scale,
+            )
+            right_disparity = np.ascontiguousarray(
+                flipped_right_disparity[:, ::-1]
+            )
+            row_indices = np.arange(height, dtype=np.int64)[:, None]
+            horizontal_pixels = np.arange(width, dtype=np.float32)[None, :]
+            finite_left = np.isfinite(disparity)
+            correspondence_x = np.rint(
+                horizontal_pixels - np.where(finite_left, disparity, 0.0)
+            ).astype(np.int64)
+            correspondence_in_bounds = (
+                finite_left
+                & (correspondence_x >= 0)
+                & (correspondence_x < width)
+            )
+            clipped_x = np.clip(correspondence_x, 0, width - 1)
+            corresponding_right = right_disparity[row_indices, clipped_x]
+            error_px = np.abs(disparity - corresponding_right)
+            comparable = (
+                correspondence_in_bounds
+                & np.isfinite(corresponding_right)
+                & (corresponding_right > 0.0)
+            )
+            consistent = comparable & (error_px <= threshold)
+            valid &= consistent
+            confidence = np.zeros(disparity.shape, dtype=np.float32)
+            confidence[comparable] = np.exp(
+                -error_px[comparable] / float(threshold)
+            ).astype(np.float32)
 
         metadata = {
             "backend": "foundation_stereo",
@@ -452,6 +479,51 @@ class FoundationStereoBackend:
             "valid_iterations": self._config.valid_iterations,
             "hierarchical": self._config.hierarchical,
             "remove_invisible": self._config.remove_invisible,
+            "left_right_consistency_applied": threshold is not None,
+            "left_right_consistency_threshold_px": threshold,
+            "confidence_semantic": (
+                "exp_negative_left_right_disparity_error_not_calibrated_probability"
+                if threshold is not None
+                else None
+            ),
             **runtime.metadata,
         }
-        return StereoResult(disparity, valid, metadata=metadata)
+        return StereoResult(disparity, valid, confidence, metadata)
+
+    def _infer_full_resolution_disparity(
+        self,
+        runtime: FoundationStereoRuntime,
+        left_rgb: NDArray[np.uint8],
+        right_rgb: NDArray[np.uint8],
+        *,
+        inference_shape: tuple[int, int],
+        output_shape: tuple[int, int],
+        horizontal_scale: float,
+    ) -> NDArray[np.float32]:
+        scaled_disparity = np.asarray(
+            runtime.infer(
+                left_rgb,
+                right_rgb,
+                valid_iterations=self._config.valid_iterations,
+                hierarchical=self._config.hierarchical,
+            ),
+            dtype=np.float32,
+        )
+        if scaled_disparity.shape != inference_shape:
+            raise FoundationStereoError(
+                "runtime disparity shape does not match scaled input: "
+                f"{scaled_disparity.shape} != {inference_shape}"
+            )
+        if scaled_disparity.shape == output_shape:
+            return np.asarray(scaled_disparity, dtype=np.float32).copy()
+        cv2 = import_module("cv2")
+        width, height = output_shape[1], output_shape[0]
+        return np.asarray(
+            cv2.resize(
+                scaled_disparity,
+                (width, height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            / horizontal_scale,
+            dtype=np.float32,
+        )

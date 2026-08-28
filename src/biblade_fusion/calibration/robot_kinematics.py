@@ -1,4 +1,9 @@
-"""Read-only acquisition and persistence of controller-specific CS68 MDH data."""
+"""Read-only acquisition and persistence of controller-specific ES68 MDH data.
+
+The public Python symbols retain their historical ``cs68`` spelling for artifact and
+downstream API compatibility.  New assets identify the physical robot unambiguously as
+ES68 and legacy schema-1 CS68 assets are not accepted by this project.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +19,7 @@ import numpy as np
 import yaml
 from numpy.typing import ArrayLike, NDArray
 
-KINEMATICS_SCHEMA_VERSION = 1
+KINEMATICS_SCHEMA_VERSION = 2
 
 
 class RobotKinematicsError(ValueError):
@@ -76,7 +81,7 @@ def fetch_cs68_kinematics(
 
 
 def write_cs68_kinematics(path: str | Path, model: Cs68KinematicsModel) -> Path:
-    """Atomically store controller-specific MDH parameters as YAML."""
+    """Atomically store controller-specific ES68 MDH parameters as YAML."""
 
     destination = Path(path)
     if destination.exists():
@@ -84,7 +89,7 @@ def write_cs68_kinematics(path: str | Path, model: Cs68KinematicsModel) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": KINEMATICS_SCHEMA_VERSION,
-        "robot_model": "cs68",
+        "robot_model": "es68",
         "created_at_utc": datetime.now(UTC).isoformat(),
         "source": model.source,
         "modified_dh": {
@@ -105,7 +110,7 @@ def write_cs68_kinematics(path: str | Path, model: Cs68KinematicsModel) -> Path:
 
 
 def load_cs68_kinematics(path: str | Path) -> Cs68KinematicsModel:
-    """Load a controller-specific MDH artifact for offline IK."""
+    """Load a controller-specific ES68 MDH artifact for offline IK."""
 
     source_path = Path(path)
     try:
@@ -114,8 +119,8 @@ def load_cs68_kinematics(path: str | Path) -> Cs68KinematicsModel:
             raise TypeError("kinematics root must be a mapping")
         if int(payload["schema_version"]) != KINEMATICS_SCHEMA_VERSION:
             raise ValueError(f"unsupported schema {payload['schema_version']}")
-        if str(payload["robot_model"]).lower() != "cs68":
-            raise ValueError("kinematics artifact is not for CS68")
+        if str(payload["robot_model"]).lower() != "es68":
+            raise ValueError("kinematics artifact is not for ES68")
         mdh = payload["modified_dh"]
         return Cs68KinematicsModel(
             mdh["alpha_rad"],
@@ -125,5 +130,5 @@ def load_cs68_kinematics(path: str | Path) -> Cs68KinematicsModel:
         )
     except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
         raise RobotKinematicsError(
-            f"Invalid CS68 kinematics artifact {source_path}: {exc}"
+            f"Invalid ES68 kinematics artifact {source_path}: {exc}"
         ) from exc

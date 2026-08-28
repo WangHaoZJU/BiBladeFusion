@@ -10,6 +10,8 @@ from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     DepthComparisonConfig,
     FoundationStereoConfig,
+    HandEyeConfig,
+    KinematicsConfig,
     PointCloudConfig,
     ProxyModelConfig,
     StereoRectificationConfig,
@@ -22,6 +24,7 @@ from biblade_fusion.devices.depth_camera import (
 )
 from biblade_fusion.devices.robot import RobotState
 from biblade_fusion.perception.stereo import StereoRectifier, StereoResult
+from biblade_fusion.robotics import Es68KinematicModel, load_es68_flange_t_tcp
 from biblade_fusion.storage import (
     SessionReader,
     SessionWriter,
@@ -63,11 +66,14 @@ def _bundle() -> SynchronizedFrameBundle:
         np.full((20, 20), 500, dtype=np.uint16),
         calibration,
     )
+    base_t_tcp = Es68KinematicModel.from_resources().base_t_flange(
+        np.zeros(6)
+    ).compose(load_es68_flange_t_tcp())
     state = RobotState(
         100,
         1.0,
         np.zeros(6),
-        PoseSE3.identity("base", "tcp"),
+        base_t_tcp,
         "IDLE",
         "NORMAL",
         0.2,
@@ -201,13 +207,43 @@ def test_depth_manifest_labels_achieved_pose_from_initialization(tmp_path: Path)
         source_blade_mask=mask,
     )
     bundle = SessionReader(session).load_bundle("seed")
+    base_t_flange = Es68KinematicModel.from_resources().base_t_flange(np.zeros(6))
+    flange_t_left_ir = base_t_flange.inverse().compose(
+        PoseSE3.identity("base", "left_ir")
+    )
+    hand_eye_path = tmp_path / "hand_eye.yaml"
+    tcp_t_left_ir = load_es68_flange_t_tcp().inverse().compose(flange_t_left_ir)
+    hand_eye_path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 2,
+                "parent_frame": "flange",
+                "child_frame": "left_ir",
+                "method": "test",
+                "matrix": flange_t_left_ir.matrix.tolist(),
+                "derived_runtime": {
+                    "tcp_T_left_ir": tcp_t_left_ir.matrix.tolist(),
+                },
+                "quality": {
+                    "sample_count": 20,
+                    "translation_rmse_m": 0.001,
+                    "rotation_rmse_deg": 0.2,
+                    "rotation_span_deg": 45.0,
+                    "translation_span_m": 0.1,
+                    "rotation_axis_diversity": 0.5,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     hand_eye = HandEyeCalibration(
-        PoseSE3.identity("tcp", "left_ir"),
+        tcp_t_left_ir,
         "test",
         20,
         0.001,
         0.2,
-        tmp_path / "hand_eye.yaml",
+        hand_eye_path,
+        flange_t_left_ir=flange_t_left_ir,
     )
     proxy_config = ProxyModelConfig(
         voxel_size_m=0.0001,
@@ -220,6 +256,8 @@ def test_depth_manifest_labels_achieved_pose_from_initialization(tmp_path: Path)
         hand_eye,
         point_config,
         proxy_config,
+        kinematics_config=KinematicsConfig(),
+        hand_eye_config=HandEyeConfig(),
     )
     initialization = write_initialization(
         tmp_path / "initialization",
@@ -228,6 +266,8 @@ def test_depth_manifest_labels_achieved_pose_from_initialization(tmp_path: Path)
         hand_eye,
         point_config,
         proxy_config,
+        KinematicsConfig(),
+        HandEyeConfig(),
         source_session=session,
     )
 

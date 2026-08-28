@@ -10,6 +10,9 @@ import pytest
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import RobotConfig
 from biblade_fusion.devices.robot import EliteArm, ServoJStream, ServoJStreamConfig
+from biblade_fusion.devices.robot._motion_capability import (
+    _GUARDED_MOTION_CAPABILITY,
+)
 from biblade_fusion.devices.robot.conversions import rpy_xyz_to_matrix
 from biblade_fusion.devices.robot.errors import (
     RobotCommandError,
@@ -254,7 +257,7 @@ def test_move_joints_executes_holorobot_single_point_trajectory() -> None:
     arm, sdk = enabled_arm()
     target = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6]
 
-    arm.move_joints(target)
+    arm._guarded_move_joints(target, capability=_GUARDED_MOTION_CAPABILITY)
 
     point = next(value for name, value in sdk.driver.calls if name == "writeTrajectoryPoint")
     assert point == (target, 3.0, 0.0, False)
@@ -272,7 +275,7 @@ def test_move_tcp_writes_xyz_rpy_cartesian_point() -> None:
         [0.4, 0.1, 0.5],
     )
 
-    arm.move_tcp(target)
+    arm._guarded_move_tcp(target, capability=_GUARDED_MOTION_CAPABILITY)
 
     point = next(value for name, value in sdk.driver.calls if name == "writeTrajectoryPoint")
     np.testing.assert_allclose(point[0], [0.4, 0.1, 0.5, 0.3, -0.4, 0.5])
@@ -284,9 +287,46 @@ def test_unsafe_controller_state_fails_closed_before_motion() -> None:
     sdk.rtsi.safety_status = 3
 
     with pytest.raises(RobotHardwareFaultError, match="forbids motion"):
-        arm.move_joints([0.0] * 6)
+        arm._guarded_move_joints(
+            [0.0] * 6,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
 
     assert not any(name == "writeTrajectoryPoint" for name, _ in sdk.driver.calls)
+
+
+@pytest.mark.parametrize("safety_status", [0, 4, "not-an-enum", None])
+def test_unknown_or_unparseable_safety_state_fails_closed(safety_status) -> None:
+    arm, sdk = enabled_arm()
+    sdk.rtsi.safety_status = safety_status
+
+    with pytest.raises(RobotHardwareFaultError, match="motion|forbids"):
+        arm._guarded_move_joints(
+            [0.0] * 6,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
+
+    assert not any(name == "writeTrajectoryPoint" for name, _ in sdk.driver.calls)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        ServoJStreamConfig(dt_s=float("nan")),
+        ServoJStreamConfig(tracking_error_rad=float("nan")),
+        ServoJStreamConfig(timing_violation_factor=float("nan")),
+    ],
+)
+def test_servoj_runtime_guards_reject_nonfinite_values(config) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        config.validate()
+
+
+def test_servoj_stream_rejects_nonfinite_period() -> None:
+    stream = ServoJStream(commands=((0.0,) * 6,), dt_s=float("nan"))
+
+    with pytest.raises(ValueError, match="finite"):
+        stream.validate()
 
 
 def test_stop_rejects_false_write_idle_result() -> None:
@@ -297,11 +337,40 @@ def test_stop_rejects_false_write_idle_result() -> None:
         arm.stop()
 
 
+def test_public_motion_methods_are_permanently_guarded() -> None:
+    arm, sdk = enabled_arm()
+
+    with pytest.raises(RobotMotionDisabledError, match="GuardedEliteExecutor"):
+        arm.move_joints([0.0] * 6)
+    with pytest.raises(RobotMotionDisabledError, match="GuardedEliteExecutor"):
+        arm.write_joint_velocity([0.0] * 6, timeout_ms=240)
+    with pytest.raises(RobotMotionDisabledError, match="GuardedEliteExecutor"):
+        arm.prepare_servoj_stream(dt_s=0.004)
+
+    assert not any(
+        name in {"writeTrajectoryPoint", "writeSpeedj", "writeServoj"}
+        for name, _ in sdk.driver.calls
+    )
+
+
+def test_guarded_motion_primitive_rejects_missing_capability() -> None:
+    arm, sdk = enabled_arm()
+
+    with pytest.raises(PermissionError, match="guarded-executor capability"):
+        arm._guarded_prepare_servoj_stream(dt_s=0.004, capability=object())
+
+    assert not any(name == "writeServoj" for name, _ in sdk.driver.calls)
+
+
 def test_write_joint_velocity_uses_holorobot_speedj_boundary() -> None:
     arm, sdk = enabled_arm()
     command = [0.1, 0.2, 0.0, -0.1, 0.0, 0.05]
 
-    arm.write_joint_velocity(command, timeout_ms=240)
+    arm._guarded_write_joint_velocity(
+        command,
+        timeout_ms=240,
+        capability=_GUARDED_MOTION_CAPABILITY,
+    )
 
     assert ("writeSpeedj", (command, 240)) in sdk.driver.calls
 
@@ -311,10 +380,18 @@ def test_rejected_speedj_marks_arm_stopped() -> None:
     sdk.driver.speedj_result = False
 
     with pytest.raises(RobotCommandError, match="writeSpeedj rejected"):
-        arm.write_joint_velocity([0.0] * 6, timeout_ms=240)
+        arm._guarded_write_joint_velocity(
+            [0.0] * 6,
+            timeout_ms=240,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
 
     with pytest.raises(RobotCommandError, match="stopped"):
-        arm.write_joint_velocity([0.0] * 6, timeout_ms=240)
+        arm._guarded_write_joint_velocity(
+            [0.0] * 6,
+            timeout_ms=240,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
 
 
 def test_stop_joint_velocity_sends_zero_without_write_idle() -> None:
@@ -329,7 +406,10 @@ def test_stop_joint_velocity_sends_zero_without_write_idle() -> None:
 def test_prepare_servoj_stream_primes_with_long_hold_timeout() -> None:
     arm, sdk = enabled_arm()
 
-    arm.prepare_servoj_stream(dt_s=0.004)
+    arm._guarded_prepare_servoj_stream(
+        dt_s=0.004,
+        capability=_GUARDED_MOTION_CAPABILITY,
+    )
 
     write = next(value for name, value in sdk.driver.calls if name == "writeServoj")
     assert write[1] == 3000
@@ -346,8 +426,9 @@ def test_stream_servoj_writes_every_command_with_short_timeout() -> None:
         dt_s=0.004,
     )
 
-    result = arm.stream_servoj(
+    result = arm._guarded_stream_servoj(
         stream,
+        capability=_GUARDED_MOTION_CAPABILITY,
         config=ServoJStreamConfig(
             dt_s=0.004,
             tracking_check_every_n_commands=99,
@@ -371,8 +452,9 @@ def test_stream_servoj_aborts_on_tracking_error() -> None:
         dt_s=0.004,
     )
 
-    result = arm.stream_servoj(
+    result = arm._guarded_stream_servoj(
         stream,
+        capability=_GUARDED_MOTION_CAPABILITY,
         config=ServoJStreamConfig(
             dt_s=0.004,
             tracking_error_rad=0.01,
@@ -390,7 +472,11 @@ def test_stream_servoj_rejected_write_fails_closed() -> None:
     sdk.driver.servoj_result = False
     stream = ServoJStream(commands=((0.0, 0.1, 0.2, 0.3, 0.4, 0.5),), dt_s=0.004)
 
-    result = arm.stream_servoj(stream, config=ServoJStreamConfig(dt_s=0.004))
+    result = arm._guarded_stream_servoj(
+        stream,
+        config=ServoJStreamConfig(dt_s=0.004),
+        capability=_GUARDED_MOTION_CAPABILITY,
+    )
 
     assert result.ok is False
     assert result.abort_reason == "driver_write_failed"

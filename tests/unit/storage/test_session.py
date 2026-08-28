@@ -69,7 +69,7 @@ def test_session_writer_preserves_raw_data_and_metadata(tmp_path: Path) -> None:
     assert (view_path / "right_ir.npy").is_file()
     assert (view_path / "native_depth.npy").is_file()
     metadata = json.loads((view_path / "metadata.json").read_text())
-    assert metadata["schema_version"] == 2
+    assert metadata["schema_version"] == 3
     assert metadata["view_id"] == "seed/front"
     assert metadata["stereo"]["calibration"]["native_depth_scale_m"] == 0.001
     assert metadata["stereo"]["calibration"]["depth"]["width"] == 4
@@ -77,7 +77,9 @@ def test_session_writer_preserves_raw_data_and_metadata(tmp_path: Path) -> None:
     assert metadata["thermal"] is None
 
     manifest = json.loads((writer.path / "manifest.json").read_text())
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
+    assert manifest["views"][0]["files"]["left_ir.npy"]
+    assert manifest["views"][0]["files"]["right_ir.npy"]
     assert manifest["status"] == "completed"
     assert manifest["views"][0]["path"] == "views/0000_seed_front"
 
@@ -102,7 +104,7 @@ def test_session_reader_round_trips_a_bundle(tmp_path: Path) -> None:
     reader = SessionReader(writer.path)
     loaded = reader.load_bundle("seed/front")
 
-    assert reader.schema_version == 2
+    assert reader.schema_version == 3
     assert reader.views[0].sequence_index == 0
     np.testing.assert_array_equal(loaded.stereo.native_depth, make_bundle().stereo.native_depth)
     np.testing.assert_allclose(
@@ -110,6 +112,20 @@ def test_session_reader_round_trips_a_bundle(tmp_path: Path) -> None:
         make_bundle().stereo.calibration.left_t_depth.matrix,
     )
     np.testing.assert_allclose(loaded.selected_robot_state.base_t_tcp.matrix, np.eye(4))
+
+
+def test_schema3_session_reader_rejects_raw_array_tampering(tmp_path: Path) -> None:
+    settings = load_settings("configs/default.yaml")
+    with SessionWriter.create(tmp_path, settings, label="tamper") as writer:
+        view_path = writer.write_bundle(make_bundle())
+    np.save(
+        view_path / "left_ir.npy",
+        np.zeros((3, 4), dtype=np.uint8),
+        allow_pickle=False,
+    )
+
+    with pytest.raises(SessionFormatError, match="checksum mismatch"):
+        SessionReader(writer.path).load_bundle("seed/front")
 
 
 def test_session_reader_rejects_manifest_path_escape(tmp_path: Path) -> None:

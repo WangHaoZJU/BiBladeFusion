@@ -9,7 +9,12 @@ from numpy.typing import ArrayLike, NDArray
 
 from biblade_fusion.acquisition import SynchronizedFrameBundle
 from biblade_fusion.calibration import HandEyeCalibration
-from biblade_fusion.core.settings import DepthComparisonConfig, PointCloudConfig
+from biblade_fusion.core.settings import (
+    DepthComparisonConfig,
+    HandEyeConfig,
+    KinematicsConfig,
+    PointCloudConfig,
+)
 from biblade_fusion.perception.pointcloud import (
     native_depth_to_meters,
     point_cloud_to_depth_image,
@@ -17,6 +22,7 @@ from biblade_fusion.perception.pointcloud import (
 )
 from biblade_fusion.perception.proxy import BilateralBladeProxy
 from biblade_fusion.planning import BladeSide
+from biblade_fusion.workflows.reconstruction import resolve_authoritative_robot_pose
 from biblade_fusion.workflows.stereo_inference import StereoInferenceObservation
 
 
@@ -82,6 +88,9 @@ def classify_depth_view_geometry(
     proxy: BilateralBladeProxy,
     hand_eye: HandEyeCalibration,
     minimum_camera_side_offset_m: float,
+    *,
+    kinematics_config: KinematicsConfig,
+    hand_eye_config: HandEyeConfig,
 ) -> DepthViewGeometry:
     """Classify achieved rectified-camera pose against the fixed bilateral proxy."""
 
@@ -93,7 +102,17 @@ def classify_depth_view_geometry(
         raise DepthComparisonError("Stereo inference artifact does not match the stored view")
     if minimum_camera_side_offset_m <= 0.0:
         raise DepthComparisonError("Minimum camera side offset must be positive")
-    base_t_left_ir = bundle.selected_robot_state.base_t_tcp.compose(hand_eye.tcp_t_left_ir)
+    try:
+        base_t_left_ir, _ = resolve_authoritative_robot_pose(
+            bundle,
+            hand_eye,
+            kinematics_config,
+            hand_eye_config,
+        )
+    except ValueError as exc:
+        raise DepthComparisonError(
+            f"Cannot classify view without authoritative ES68 FK: {exc}"
+        ) from exc
     base_t_left_rectified = base_t_left_ir.compose(
         stereo.rectified.calibration.left_rectified_t_left_ir.inverse()
     )

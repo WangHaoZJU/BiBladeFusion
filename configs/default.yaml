@@ -2,6 +2,9 @@ project:
   data_root: data
   log_root: logs
 
+# The following robot addresses and SDK path are the current laboratory bring-up values.
+# Keep them for this rig. Before public release, move machine-specific values to the
+# Git-ignored configs/local.yaml and remove them from distributable defaults.
 robot:
   model: es68
   robot_ip: 192.168.6.60
@@ -43,6 +46,7 @@ realsense:
   stereo_calibration_path: data/calibrations/d435i_ir_active.yaml
 
 thermal:
+  # Interface placeholder only: no radiometric hardware adapter or fusion path exists yet.
   enabled: false
   driver: null
 
@@ -62,6 +66,7 @@ foundation_stereo:
   valid_iterations: 32
   hierarchical: false
   remove_invisible: true
+  left_right_consistency_threshold_px: 1.0
 
 stereo_rectification:
   alpha: 0.0
@@ -253,7 +258,10 @@ depth_comparison:
   minimum_camera_side_offset_m: 0.02
   incidence_bin_edges_deg: [0, 15, 30, 45, 60, 75, 90]
 
-# Static-scene validation of base_T_tcp · tcp_T_left_ir · left_ir_T_depth.
+# Current schema-2 static-scene validation uses authoritative calibrated FK:
+# FK(joints + zero offsets) · flange_T_left_ir · left_ir_T_depth.
+# Synchronized controller TCP is validation-only. The retained 2026-08-27 schema-1 result
+# is a legacy TCP-primary baseline and must not be relabelled as current FK-chain evidence.
 # Primary metrics are symmetric projective depth residuals and never use ICP.
 native_overlap_validation:
   minimum_views: 3
@@ -300,14 +308,58 @@ collision:
   minimum_joint_positions_rad: null
   maximum_joint_positions_rad: null
   obstacles: []
-  require_obstacles: true
+  require_obstacles: false
   minimum_clearance_m: 0.01
   maximum_joint_step_rad: 0.02
 
-# HoloRobot-derived self-collision preflight and velocity-limited ServoJ generation.
-# A clear report remains non-executable until the separate live approval gate runs.
+# HoloRobot-derived motion-preflight contract. Production mode currently fails closed at
+# the missing continuous swept-mesh proof before ServoJ generation, and later also requires
+# an independent continuous robot-versus-voxel proof. Discrete streams are diagnostic only.
 motion_preflight:
   maximum_joint_step_rad: 0.02
   servoj_dt_s: 0.004
   speed_scaling: 0.08
   velocity_margin: 0.8
+  # Every stored IK endpoint must reproduce its requested base_T_tcp under the calibrated
+  # ES68 FK and packaged flange_T_tcp before any future approval-eligible stream exists.
+  maximum_endpoint_translation_error_m: 0.002
+  maximum_endpoint_rotation_error_deg: 0.3
+
+# Unknown-blade safety mapping. Enable only after measuring the workcell bounds and
+# validating the final ES68+D435i robot self-filter. UNKNOWN and stale maps block motion.
+# Numeric defaults below are software/test starting points, not hardware-accepted safety
+# values; physical release requires recorded workcell-specific acceptance experiments.
+occupancy:
+  enabled: false
+  frame_id: base
+  mapping_mode: stop_and_capture
+  voxel_size_m: 0.01
+  workspace_bounds_min_m: null
+  workspace_bounds_max_m: null
+  minimum_depth_m: 0.15
+  maximum_depth_m: 1.5
+  integration_stride: 2
+  free_space_margin_m: 0.01
+  obstacle_inflation_m: 0.01
+  maximum_map_age_s: 5.0
+  unknown_policy: block
+  require_robot_self_mask: true
+  self_mask_front_tolerance_m: 0.01
+  self_mask_back_tolerance_m: 0.02
+  self_mask_dilation_px: 1
+  # Every safety frame must agree with HoloRobot ES68 FK and the fitted
+  # flange-to-controller-TCP transform before its rays enter the base-frame map.
+  maximum_fk_tcp_translation_error_m: 0.002
+  maximum_fk_tcp_rotation_error_deg: 0.3
+  minimum_valid_depth_fraction: 0.05
+  # Deterministic exp(-LR disparity error / LR threshold), not a calibrated probability.
+  minimum_stereo_confidence: 0.5
+  maximum_lr_consistency_error_px: 1.0
+  minimum_source_views: 3
+  # A voxel remains UNKNOWN until this many independent captured views vote FREE.
+  minimum_free_observations: 3
+  # A new FREE-supporting view must differ from every accepted view by at least
+  # one of these base-frame camera-pose thresholds.
+  minimum_free_view_translation_m: 0.02
+  minimum_free_view_direction_deg: 5.0
+  maximum_grid_voxels: 8000000

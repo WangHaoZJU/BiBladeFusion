@@ -7,6 +7,8 @@ attached to ``flange`` through a fixed joint.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -15,14 +17,21 @@ from xml.etree import ElementTree
 
 import yaml
 
+from biblade_fusion.core.settings import CollisionObstacleConfig
 from biblade_fusion.robotics.cs68_model import (
     CS68_COLLISION_LINK_NAMES,
     CS68_JOINT_NAMES,
     Cs68ModelResources,
 )
-from biblade_fusion.robotics.es68_model import Es68KinematicModel
+from biblade_fusion.robotics.es68_model import Es68KinematicModel, Es68ModelResources
 
 ES68_D435I_COLLISION_SCHEMA = "biblade_fusion.es68_d435i_collision.v1"
+ES68_D435I_ROBOT_GEOMETRY_HASH_SCHEMA = (
+    "biblade_fusion.es68_d435i_robot_geometry_hash.v1"
+)
+ES68_D435I_MOTION_CONTRACT_HASH_SCHEMA = (
+    "biblade_fusion.es68_d435i_motion_model_contract_hash.v1"
+)
 
 
 def _vector3(value: object, *, field: str) -> tuple[float, float, float]:
@@ -216,6 +225,119 @@ class Es68D435iCollisionResources:
         )
         template.validate_assets()
         return template
+
+
+def es68_d435i_collision_content_hash(
+    template: Es68D435iCollisionTemplate,
+) -> str:
+    """Bind the exact manifest and every articulated collision mesh."""
+
+    template.validate_assets()
+    digest = hashlib.sha256()
+    digest.update(template.manifest_path.read_bytes())
+    for spec in (*template.links, template.attachment):
+        digest.update(spec.mesh_uri.encode("utf-8"))
+        with spec.mesh_path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_sha256(payload: Mapping[str, object]) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _normalized_joint_zero_offsets(
+    values: Sequence[float],
+) -> tuple[float, float, float, float, float, float]:
+    offsets = tuple(float(value) for value in values)
+    if not offsets:
+        offsets = (0.0,) * 6
+    if len(offsets) != 6 or not all(math.isfinite(value) for value in offsets):
+        raise ValueError("ES68 joint-zero offsets must be a finite six-vector")
+    return offsets  # type: ignore[return-value]
+
+
+def es68_d435i_robot_geometry_hash(
+    template: Es68D435iCollisionTemplate,
+    *,
+    joint_zero_offsets_rad: Sequence[float] = (),
+) -> str:
+    """Bind geometry, the generated ES68 chain, limits and controller offsets.
+
+    Workcell obstacles are deliberately excluded.  This identity is shared by
+    self-mask rendering and collision checking so occupancy evidence can prove
+    that both stages used the same articulated robot.
+    """
+
+    template.validate_assets()
+    offsets = _normalized_joint_zero_offsets(joint_zero_offsets_rad)
+    es68 = Es68ModelResources.packaged()
+    generated_urdf = build_es68_d435i_collision_urdf(template).encode("utf-8")
+    return _canonical_sha256(
+        {
+            "schema": ES68_D435I_ROBOT_GEOMETRY_HASH_SCHEMA,
+            "collision_asset_hash": es68_d435i_collision_content_hash(template),
+            "generated_urdf_sha256": hashlib.sha256(generated_urdf).hexdigest(),
+            "es68_kinematics_sha256": _file_sha256(es68.kinematics_yaml),
+            "es68_joint_limits_sha256": _file_sha256(es68.joint_limits_yaml),
+            "joint_zero_offsets_rad": list(offsets),
+        }
+    )
+
+
+def es68_d435i_motion_model_contract_hash(
+    template: Es68D435iCollisionTemplate,
+    *,
+    joint_zero_offsets_rad: Sequence[float] = (),
+    environment_obstacles: Sequence[CollisionObstacleConfig] = (),
+    minimum_clearance_m: float = 0.0,
+    resolved_collision_pairs: Sequence[tuple[str, str]] = (),
+    collision_backend_versions: Mapping[str, str] | None = None,
+) -> str:
+    """Bind the complete ES68 collision policy used by one motion preflight."""
+
+    clearance = float(minimum_clearance_m)
+    if not math.isfinite(clearance) or clearance < 0.0:
+        raise ValueError("minimum_clearance_m must be finite and non-negative")
+    normalized_pairs = sorted(
+        tuple(sorted((str(first), str(second))))
+        for first, second in resolved_collision_pairs
+    )
+    return _canonical_sha256(
+        {
+            "schema": ES68_D435I_MOTION_CONTRACT_HASH_SCHEMA,
+            "robot_geometry_hash": es68_d435i_robot_geometry_hash(
+                template,
+                joint_zero_offsets_rad=joint_zero_offsets_rad,
+            ),
+            "environment_obstacles": [
+                obstacle.model_dump(mode="json") for obstacle in environment_obstacles
+            ],
+            "minimum_clearance_m": clearance,
+            "pair_filter": {
+                "backend": "holorobot_parent_joint_hop",
+                "max_parent_joint_hop": template.max_parent_joint_hop,
+            },
+            "resolved_collision_pairs": [list(pair) for pair in normalized_pairs],
+            "collision_backend_versions": dict(collision_backend_versions or {}),
+        }
+    )
 
 
 def _parse_mesh_spec(

@@ -14,7 +14,11 @@ from uuid import uuid4
 
 import yaml
 
-from biblade_fusion.core.settings import DepthComparisonConfig
+from biblade_fusion.core.settings import (
+    DepthComparisonConfig,
+    HandEyeConfig,
+    KinematicsConfig,
+)
 from biblade_fusion.planning import BladeSide
 from biblade_fusion.storage.depth_comparison import read_depth_comparison
 from biblade_fusion.storage.initialization import read_initialization
@@ -159,6 +163,12 @@ def write_depth_aggregate_manifest(
             stored_initialization.observation.proxy,
             stored_initialization.hand_eye,
             config.minimum_camera_side_offset_m,
+            kinematics_config=KinematicsConfig.model_validate(
+                stored_initialization.metadata["processing"]["kinematics"]
+            ),
+            hand_eye_config=HandEyeConfig.model_validate(
+                stored_initialization.metadata["processing"]["hand_eye_gate"]
+            ),
         )
         entries.append(
             {

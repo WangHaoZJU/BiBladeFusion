@@ -22,6 +22,7 @@ from biblade_fusion.robotics.cs68_model import (
     Cs68KinematicModel,
     _apply_overrides,
     _parse_joint_limits,
+    _parse_joint_velocity_limits,
     _parse_segments,
 )
 
@@ -99,6 +100,13 @@ class Es68KinematicModel(Cs68KinematicModel):
         """Return the calibrated ``base_T_flange`` for controller joint readings."""
 
         return PoseSE3("base", "flange", self.forward_kinematics(joint_positions_rad))
+
+    def joint_velocity_limits_rad_s(self) -> tuple[float, ...]:
+        """Return the ES68 controller-profile limits without touching CS68 assets."""
+
+        resources = Es68ModelResources.packaged()
+        limits = _parse_joint_velocity_limits(resources.joint_limits_yaml)
+        return tuple(limits[name] for name in ES68_JOINT_NAMES)
 
 
 def load_es68_flange_t_tcp(

@@ -5,7 +5,9 @@ import pytest
 import yaml
 
 from biblade_fusion.calibration import HandEyeCalibrationError, load_hand_eye_calibration
+from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import HandEyeConfig
+from biblade_fusion.robotics import load_es68_flange_t_tcp
 
 
 def write_calibration(path: Path, **quality_overrides: object) -> None:
@@ -79,3 +81,34 @@ def test_hand_eye_requires_observable_motion_metrics(tmp_path: Path) -> None:
 
     with pytest.raises(HandEyeCalibrationError, match="rotation-axis diversity"):
         load_hand_eye_calibration(config(path))
+
+
+def test_schema_two_rejects_tampered_derived_tcp_transform(tmp_path: Path) -> None:
+    path = tmp_path / "hand_eye_v2.yaml"
+    flange_t_left_ir = load_es68_flange_t_tcp().compose(
+        PoseSE3.identity("tcp", "left_ir")
+    )
+    tampered = np.eye(4)
+    tampered[0, 3] = 0.001
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 2,
+                "parent_frame": "flange",
+                "child_frame": "left_ir",
+                "method": "test",
+                "matrix": flange_t_left_ir.matrix.tolist(),
+                "derived_runtime": {"tcp_T_left_ir": tampered.tolist()},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(HandEyeCalibrationError, match="Derived tcp_T_left_ir"):
+        load_hand_eye_calibration(
+            config(
+                path,
+                require_quality_metrics=False,
+                require_observability_metrics=False,
+            )
+        )

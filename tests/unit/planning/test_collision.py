@@ -14,6 +14,7 @@ from biblade_fusion.planning import (
     cs68_mdh_joint_origins,
     validate_joint_path_collision,
 )
+from biblade_fusion.robotics import load_es68_flange_t_tcp
 
 
 def model(*, a: tuple[float, ...] = (0.2,) * 6) -> Cs68KinematicsModel:
@@ -21,13 +22,17 @@ def model(*, a: tuple[float, ...] = (0.2,) * 6) -> Cs68KinematicsModel:
 
 
 def hand_eye() -> HandEyeCalibration:
+    tcp_t_left_ir = PoseSE3.from_rotation_translation(
+        "tcp", "left_ir", np.eye(3), [0.1, 0, 0]
+    )
     return HandEyeCalibration(
-        PoseSE3.from_rotation_translation("tcp", "left_ir", np.eye(3), [0.1, 0, 0]),
+        tcp_t_left_ir,
         "test",
         20,
         0.001,
         0.2,
         Path("hand_eye.yaml"),
+        flange_t_left_ir=load_es68_flange_t_tcp().compose(tcp_t_left_ir),
     )
 
 
@@ -45,14 +50,15 @@ def config(*, obstacles=()) -> CollisionConfig:
 
 
 def test_mdh_origins_follow_vendor_fixed_transform_then_rotz_chain() -> None:
-    origins, base_t_tcp = cs68_mdh_joint_origins(
+    origins, base_t_flange = cs68_mdh_joint_origins(
         model(),
         [np.pi / 2, 0, 0, 0, 0, 0],
     )
 
     np.testing.assert_allclose(origins[1], [0.2, 0.0, 0.0], atol=1e-12)
     np.testing.assert_allclose(origins[2], [0.2, 0.2, 0.0], atol=1e-12)
-    np.testing.assert_allclose(base_t_tcp.translation_m, [0.2, 1.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(base_t_flange.translation_m, [0.2, 1.0, 0.0], atol=1e-12)
+    assert base_t_flange.child_frame == "flange"
 
 
 def test_collision_validation_is_fail_closed_without_geometry() -> None:

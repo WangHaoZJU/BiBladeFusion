@@ -99,7 +99,7 @@ def cs68_mdh_joint_origins(
         transform = transform @ _rot_z(float(joint))
     points = np.asarray(origins, dtype=np.float64)
     points.setflags(write=False)
-    return points, PoseSE3("base", "tcp", transform)
+    return points, PoseSE3("base", "flange", transform)
 
 
 def _capsules(
@@ -112,12 +112,18 @@ def _capsules(
         raise CollisionValidationError(
             "Collision link radii and camera/tool radius must be configured"
         )
-    origins, base_t_tcp = cs68_mdh_joint_origins(model, joints)
+    origins, base_t_flange = cs68_mdh_joint_origins(model, joints)
     links = tuple(
         Capsule(f"link_{index}", origins[index], origins[index + 1], radius)
         for index, radius in enumerate(config.link_radii_m)
     )
-    camera = base_t_tcp.compose(hand_eye.tcp_t_left_ir).translation_m
+    try:
+        flange_t_left_ir = hand_eye.require_flange_primary()
+    except ValueError as exc:
+        raise CollisionValidationError(
+            f"Collision validation requires flange-primary hand-eye: {exc}"
+        ) from exc
+    camera = base_t_flange.compose(flange_t_left_ir).translation_m
     return (*links, Capsule("camera_tool", origins[-1], camera, config.camera_tool_radius_m))
 
 

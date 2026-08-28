@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import platform
+import re
 import sys
-from dataclasses import dataclass, field
-from enum import StrEnum
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any
 
 from biblade_fusion.calibration import (
     HandEyeCalibrationError,
@@ -17,20 +16,16 @@ from biblade_fusion.calibration import (
     load_hand_eye_calibration,
 )
 from biblade_fusion.core.settings import AppSettings
+from biblade_fusion.diagnostics.types import CheckLevel, CheckResult
+from biblade_fusion.mapping.occupancy import OccupancyState
+from biblade_fusion.robotics.collision_template import (
+    Es68D435iCollisionResources,
+    Es68D435iCollisionTemplate,
+    es68_d435i_collision_content_hash,
+    es68_d435i_robot_geometry_hash,
+)
 
-
-class CheckLevel(StrEnum):
-    PASS = "pass"
-    WARN = "warn"
-    FAIL = "fail"
-
-
-@dataclass(frozen=True, slots=True)
-class CheckResult:
-    name: str
-    level: CheckLevel
-    message: str
-    details: dict[str, Any] = field(default_factory=dict)
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 def _package_version(distribution_name: str) -> str:
@@ -180,18 +175,18 @@ def _check_kinematics(settings: AppSettings) -> CheckResult:
     path = settings.kinematics.model_path
     if path is None:
         return CheckResult(
-            "cs68_kinematics",
+            "es68_controller_kinematics",
             CheckLevel.WARN,
             "controller MDH artifact is not configured; offline IK is unavailable",
         )
     try:
         model = load_cs68_kinematics(path)
     except RobotKinematicsError as exc:
-        return CheckResult("cs68_kinematics", CheckLevel.FAIL, str(exc))
+        return CheckResult("es68_controller_kinematics", CheckLevel.FAIL, str(exc))
     return CheckResult(
-        "cs68_kinematics",
+        "es68_controller_kinematics",
         CheckLevel.PASS,
-        "validated controller-specific CS68 MDH artifact",
+        "validated controller-specific ES68 MDH artifact",
         {"path": str(path), "source": model.source},
     )
 
@@ -229,6 +224,225 @@ def _check_collision_configuration(settings: AppSettings) -> CheckResult:
     )
 
 
+def _check_occupancy_configuration(settings: AppSettings) -> CheckResult:
+    """Check the fail-closed three-state map contract without reading a live map."""
+
+    config = settings.occupancy
+    semantic_states = tuple(state.value for state in OccupancyState)
+    bounds_min = config.workspace_bounds_min_m
+    bounds_max = config.workspace_bounds_max_m
+    bounds_configured = bounds_min is not None and bounds_max is not None
+    details: dict[str, object] = {
+        "enabled": config.enabled,
+        "frame_id": config.frame_id,
+        "mapping_mode": config.mapping_mode,
+        "semantic_states": list(semantic_states),
+        "unknown_policy": config.unknown_policy,
+        "unknown_blocks_motion": config.unknown_policy == "block",
+        "workspace_bounds_configured": bounds_configured,
+        "workspace_bounds_min_m": list(bounds_min) if bounds_min is not None else None,
+        "workspace_bounds_max_m": list(bounds_max) if bounds_max is not None else None,
+        "voxel_size_m": config.voxel_size_m,
+        "minimum_free_observations": config.minimum_free_observations,
+        "motion_authorized": False,
+        "hardware_connection_attempted": False,
+    }
+    contract_errors = []
+    if semantic_states != ("free", "occupied", "unknown"):
+        contract_errors.append("semantic_states")
+    if config.frame_id != "base":
+        contract_errors.append("frame_id")
+    if config.mapping_mode != "stop_and_capture":
+        contract_errors.append("mapping_mode")
+    if config.unknown_policy != "block":
+        contract_errors.append("unknown_policy")
+    if not config.require_robot_self_mask:
+        contract_errors.append("require_robot_self_mask")
+    if contract_errors:
+        details["invalid"] = contract_errors
+        return CheckResult(
+            "occupancy_configuration",
+            CheckLevel.FAIL,
+            "occupancy safety contract is not fail-closed",
+            details,
+        )
+    if not bounds_configured:
+        details["missing"] = ["workspace_bounds_min_m", "workspace_bounds_max_m"]
+        return CheckResult(
+            "occupancy_configuration",
+            CheckLevel.WARN,
+            "three-state occupancy is fail-closed, but measured workspace bounds are missing",
+            details,
+        )
+
+    assert bounds_min is not None and bounds_max is not None
+    bounds_are_valid = all(
+        math.isfinite(lower) and math.isfinite(upper) and lower < upper
+        for lower, upper in zip(bounds_min, bounds_max, strict=True)
+    )
+    details["workspace_bounds_valid"] = bounds_are_valid
+    if not bounds_are_valid:
+        return CheckResult(
+            "occupancy_configuration",
+            CheckLevel.FAIL,
+            "occupancy workspace bounds must be finite and strictly ordered",
+            details,
+        )
+    grid_shape = tuple(
+        int(math.ceil((upper - lower) / config.voxel_size_m))
+        for lower, upper in zip(bounds_min, bounds_max, strict=True)
+    )
+    grid_voxels = math.prod(grid_shape)
+    details.update(
+        {
+            "grid_shape": list(grid_shape),
+            "grid_voxels": grid_voxels,
+            "maximum_grid_voxels": config.maximum_grid_voxels,
+        }
+    )
+    if grid_voxels <= 0 or grid_voxels > config.maximum_grid_voxels:
+        return CheckResult(
+            "occupancy_configuration",
+            CheckLevel.FAIL,
+            "occupancy workspace cannot be represented within the configured voxel limit",
+            details,
+        )
+    if not config.enabled:
+        return CheckResult(
+            "occupancy_configuration",
+            CheckLevel.WARN,
+            "three-state occupancy workspace is configured but mapping is disabled",
+            details,
+        )
+    return CheckResult(
+        "occupancy_configuration",
+        CheckLevel.PASS,
+        "three-state stop-and-capture occupancy is configured; UNKNOWN blocks",
+        details,
+    )
+
+
+def _check_final_collision_model(
+    settings: AppSettings,
+    resources: Es68D435iCollisionResources | None = None,
+) -> CheckResult:
+    """Validate and hash the local final ES68+D435i assets without loading FCL."""
+
+    resolved = resources or Es68D435iCollisionResources.packaged_template()
+    manifest_path = resolved.manifest_path
+    details: dict[str, object] = {
+        "manifest_path": str(manifest_path),
+        "manifest_exists": manifest_path.is_file(),
+        "ready": False,
+        "motion_authorized": False,
+        "hardware_connection_attempted": False,
+    }
+    if not manifest_path.is_file():
+        details["manifest_template_path"] = str(resolved.manifest_template_path)
+        return CheckResult(
+            "es68_d435i_final_collision_model",
+            CheckLevel.WARN,
+            "final ES68+D435i manifest is absent; production collision checking is unavailable",
+            details,
+        )
+    try:
+        parsed = Es68D435iCollisionTemplate.load(
+            manifest_path,
+            model_root=resolved.root,
+        )
+    except Exception as exc:
+        details["error"] = str(exc)
+        return CheckResult(
+            "es68_d435i_final_collision_model",
+            CheckLevel.FAIL,
+            "final ES68+D435i manifest is invalid",
+            details,
+        )
+    details.update({"model_id": parsed.model_id, "ready": parsed.ready})
+    if not parsed.ready:
+        return CheckResult(
+            "es68_d435i_final_collision_model",
+            CheckLevel.WARN,
+            "final ES68+D435i manifest exists but is not marked ready",
+            details,
+        )
+    try:
+        template = resolved.load_active()
+        collision_hash_before = es68_d435i_collision_content_hash(template)
+        robot_hash_before = es68_d435i_robot_geometry_hash(
+            template,
+            joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
+        )
+        collision_hash_after = es68_d435i_collision_content_hash(template)
+        robot_hash_after = es68_d435i_robot_geometry_hash(
+            template,
+            joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
+        )
+    except Exception as exc:
+        details["error"] = str(exc)
+        return CheckResult(
+            "es68_d435i_final_collision_model",
+            CheckLevel.FAIL,
+            "final ES68+D435i assets failed validation or hashing",
+            details,
+        )
+    hashes_are_sha256 = all(
+        _SHA256_PATTERN.fullmatch(value) is not None
+        for value in (collision_hash_before, robot_hash_before)
+    )
+    hashes_are_stable = (
+        collision_hash_before == collision_hash_after
+        and robot_hash_before == robot_hash_after
+    )
+    details.update(
+        {
+            "collision_content_sha256": collision_hash_before,
+            "robot_geometry_sha256": robot_hash_before,
+            "hashes_are_sha256": hashes_are_sha256,
+            "hashes_stable_across_recompute": hashes_are_stable,
+            "hash_scope": "two-pass local manifest/mesh/FK recomputation",
+            "joint_zero_offsets_rad": list(settings.kinematics.joint_zero_offsets_rad),
+        }
+    )
+    if not hashes_are_sha256 or not hashes_are_stable:
+        return CheckResult(
+            "es68_d435i_final_collision_model",
+            CheckLevel.FAIL,
+            "final ES68+D435i asset hashes are invalid or changed during diagnosis",
+            details,
+        )
+    return CheckResult(
+        "es68_d435i_final_collision_model",
+        CheckLevel.PASS,
+        "final ES68+D435i manifest is ready and local asset hashes are stable",
+        details,
+    )
+
+
+def _check_motion_readiness(settings: AppSettings) -> CheckResult:
+    """Expose present release blockers without constructing a robot driver."""
+
+    # These values describe the current backends. Bounded-step samples are useful for
+    # diagnostics, but neither backend supplies the independent continuous proof required
+    # by production preflight and guarded execution.
+    level = CheckLevel.FAIL if settings.robot.motion_enabled else CheckLevel.WARN
+    return CheckResult(
+        "motion_readiness",
+        level,
+        "production motion is blocked: continuous swept-mesh and swept-occupancy "
+        "backends are unavailable",
+        {
+            "motion_enabled": settings.robot.motion_enabled,
+            "motion_ready": False,
+            "continuous_swept_mesh_supported": False,
+            "continuous_swept_occupancy_supported": False,
+            "available_path_checks": "bounded-step discrete diagnostics only",
+            "doctor_authorizes_motion": False,
+            "hardware_connection_attempted": False,
+        },
+    )
+
+
 def run_doctor(settings: AppSettings) -> list[CheckResult]:
     """Run non-moving local checks. This function never connects to the robot."""
 
@@ -242,4 +456,7 @@ def run_doctor(settings: AppSettings) -> list[CheckResult]:
         _check_hand_eye(settings),
         _check_kinematics(settings),
         _check_collision_configuration(settings),
+        _check_occupancy_configuration(settings),
+        _check_final_collision_model(settings),
+        _check_motion_readiness(settings),
     ]

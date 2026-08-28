@@ -9,6 +9,8 @@ from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     DepthComparisonConfig,
+    HandEyeConfig,
+    KinematicsConfig,
     PointCloudConfig,
     StereoRectificationConfig,
 )
@@ -20,6 +22,7 @@ from biblade_fusion.devices.depth_camera import (
 from biblade_fusion.devices.robot import RobotState
 from biblade_fusion.perception.proxy import BilateralBladeProxy
 from biblade_fusion.perception.stereo import StereoRectifier, StereoResult
+from biblade_fusion.robotics import Es68KinematicModel, load_es68_flange_t_tcp
 from biblade_fusion.workflows import (
     DepthComparisonError,
     StereoInferenceObservation,
@@ -125,11 +128,13 @@ def test_paired_depth_comparison_rejects_mismatched_source() -> None:
 
 def test_depth_view_geometry_uses_achieved_pose_and_proxy_normal() -> None:
     bundle = make_bundle()
+    base_t_flange = Es68KinematicModel.from_resources().base_t_flange(np.zeros(6))
+    desired_base_t_left_ir = PoseSE3.from_rotation_translation(
+        "base", "left_ir", np.diag([1.0, -1.0, -1.0]), [0.0, 0.0, 0.2]
+    )
     state = replace(
         bundle.selected_robot_state,
-        base_t_tcp=PoseSE3.from_rotation_translation(
-            "base", "tcp", np.diag([1.0, -1.0, -1.0]), [0.0, 0.0, 0.2]
-        ),
+        base_t_tcp=base_t_flange.compose(load_es68_flange_t_tcp()),
     )
     bundle = replace(
         bundle,
@@ -157,17 +162,25 @@ def test_depth_view_geometry_uses_achieved_pose_and_proxy_normal() -> None:
         100,
         1.0,
     )
+    flange_t_left_ir = base_t_flange.inverse().compose(desired_base_t_left_ir)
     hand_eye = HandEyeCalibration(
-        PoseSE3.identity("tcp", "left_ir"),
+        load_es68_flange_t_tcp().inverse().compose(flange_t_left_ir),
         "test",
         20,
         0.001,
         0.2,
         Path("hand_eye.yaml"),
+        flange_t_left_ir=flange_t_left_ir,
     )
 
     geometry = classify_depth_view_geometry(
-        bundle, observation, proxy, hand_eye, 0.02
+        bundle,
+        observation,
+        proxy,
+        hand_eye,
+        0.02,
+        kinematics_config=KinematicsConfig(),
+        hand_eye_config=HandEyeConfig(),
     )
 
     assert geometry.side.value == "front"

@@ -1,4 +1,4 @@
-"""HoloRobot-compatible Pinocchio/FCL kinematics and CS68 self-collision checks.
+"""HoloRobot-compatible Pinocchio/FCL kinematics and ES68 collision checks.
 
 Adapted from HoloRobot's ``pinocchio_robot_model.py`` and
 ``pinocchio_collision.py`` at the pinned provenance commit.
@@ -18,11 +18,19 @@ import numpy as np
 from numpy.typing import NDArray
 
 from biblade_fusion.core.settings import CollisionObstacleConfig
+from biblade_fusion.robotics.collision_template import (
+    Es68D435iCollisionResources,
+    es68_d435i_collision_content_hash,
+    es68_d435i_motion_model_contract_hash,
+    es68_d435i_robot_geometry_hash,
+    write_es68_d435i_collision_urdf,
+)
 from biblade_fusion.robotics.cs68_model import (
     CS68_JOINT_NAMES,
     Cs68KinematicModel,
     Cs68ModelResources,
 )
+from biblade_fusion.robotics.es68_model import Es68KinematicModel
 from biblade_fusion.robotics.provenance import robot_stack_provenance
 from biblade_fusion.robotics.urdf import write_cs68_urdf
 
@@ -40,6 +48,8 @@ class CollisionPairFinding:
     link_b: str
     geometry_a: str
     geometry_b: str
+    minimum_distance_m: float | None = None
+    required_clearance_m: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +76,7 @@ class JointPathMeshCollisionReport:
     blocked_path_fraction: float | None
     result: CollisionCheckResult
     maximum_joint_step_rad: float
+    continuous_swept_volume_verified: bool = False
 
     @property
     def collision_free(self) -> bool:
@@ -92,6 +103,17 @@ def pinocchio_collision_available() -> bool:
     except ImportError:
         return False
     return True
+
+
+def _collision_backend_versions(pin: Any) -> dict[str, str]:
+    try:
+        import hppfcl
+    except ImportError as exc:  # pragma: no cover - geometry load already requires FCL
+        raise ImportError("hpp-fcl is required for ES68 collision checking") from exc
+    return {
+        "pinocchio": str(getattr(pin, "__version__", "unknown")),
+        "hppfcl": str(getattr(hppfcl, "__version__", "unknown")),
+    }
 
 
 @dataclass(slots=True)
@@ -158,15 +180,24 @@ class PinocchioCs68Model:
         ).copy()
 
 
-def _add_holorobot_collision_pairs(geometry_model: Any) -> None:
+def _add_holorobot_collision_pairs(
+    geometry_model: Any,
+    *,
+    max_parent_joint_hop: int = 1,
+) -> None:
     """Apply HoloRobot's adjacent-parent-joint exclusion policy."""
 
+    if max_parent_joint_hop < 0:
+        raise ValueError("max_parent_joint_hop must be non-negative")
     pin = _require_pinocchio()
     for first in range(int(geometry_model.ngeoms)):
         for second in range(first + 1, int(geometry_model.ngeoms)):
             first_geometry = geometry_model.geometryObjects[first]
             second_geometry = geometry_model.geometryObjects[second]
-            if abs(int(first_geometry.parentJoint) - int(second_geometry.parentJoint)) <= 1:
+            if (
+                abs(int(first_geometry.parentJoint) - int(second_geometry.parentJoint))
+                <= max_parent_joint_hop
+            ):
                 continue
             geometry_model.addCollisionPair(pin.CollisionPair(first, second))
 
@@ -216,7 +247,7 @@ def _add_environment_boxes(
 class Cs68PinocchioCollisionChecker:
     """Fail-closed CS68+D435i mesh collision checker copied from HoloRobot semantics."""
 
-    resources: Cs68ModelResources
+    resources: Cs68ModelResources | Es68D435iCollisionResources
     kinematic_model: Cs68KinematicModel
     pinocchio_model: PinocchioCs68Model
     geometry_model: Any
@@ -225,6 +256,14 @@ class Cs68PinocchioCollisionChecker:
     pair_geometries: tuple[tuple[str, str], ...]
     include_d435i_mount: bool
     environment_obstacle_names: tuple[str, ...] = ()
+    model_name: str = "cs68"
+    collision_model_id: str | None = None
+    collision_model_hash: str | None = None
+    robot_geometry_hash: str | None = None
+    motion_model_contract_hash: str | None = None
+    minimum_clearance_m: float = 0.0
+    continuous_swept_volume_supported: bool = False
+    collision_backend_versions: dict[str, str] = field(default_factory=dict)
     _temporary_directory: TemporaryDirectory[str] | None = field(
         default=None, repr=False
     )
@@ -240,6 +279,9 @@ class Cs68PinocchioCollisionChecker:
         minimum_clearance_m: float = 0.0,
     ) -> Cs68PinocchioCollisionChecker:
         pin = _require_pinocchio()
+        clearance_m = float(minimum_clearance_m)
+        if not math.isfinite(clearance_m) or clearance_m < 0.0:
+            raise ValueError("minimum_clearance_m must be finite and non-negative")
         resolved = resources or Cs68ModelResources.packaged()
         resolved.validate()
         temporary_directory: TemporaryDirectory[str] | None = None
@@ -266,7 +308,7 @@ class Cs68PinocchioCollisionChecker:
         _add_environment_boxes(
             geometry_model,
             environment_obstacles,
-            minimum_clearance_m=minimum_clearance_m,
+            minimum_clearance_m=clearance_m,
             robot_geometry_count=robot_geometry_count,
         )
         geometry_data = pin.GeometryData(geometry_model)
@@ -296,7 +338,105 @@ class Cs68PinocchioCollisionChecker:
             environment_obstacle_names=tuple(
                 obstacle.name for obstacle in environment_obstacles
             ),
+            model_name="cs68",
+            minimum_clearance_m=clearance_m,
+            collision_backend_versions=_collision_backend_versions(pin),
             _temporary_directory=temporary_directory,
+        )
+
+    @classmethod
+    def from_es68_resources(
+        cls,
+        resources: Es68D435iCollisionResources | None = None,
+        *,
+        joint_zero_offsets_rad: Sequence[float] = (),
+        environment_obstacles: Sequence[CollisionObstacleConfig] = (),
+        minimum_clearance_m: float = 0.0,
+    ) -> Cs68PinocchioCollisionChecker:
+        """Load only the completed ES68+D435i manifest; never fall back to CS68."""
+
+        pin = _require_pinocchio()
+        resolved = resources or Es68D435iCollisionResources.packaged_template()
+        template = resolved.load_active()
+        requested_clearance_m = float(minimum_clearance_m)
+        if not math.isfinite(requested_clearance_m) or requested_clearance_m < 0.0:
+            raise ValueError("minimum_clearance_m must be finite and non-negative")
+        effective_clearance_m = max(
+            requested_clearance_m,
+            float(template.minimum_clearance_m),
+        )
+        backend_versions = _collision_backend_versions(pin)
+        temporary = TemporaryDirectory(prefix="biblade-es68-urdf-")
+        urdf_path = write_es68_d435i_collision_urdf(
+            Path(temporary.name) / "es68_d435i.urdf",
+            template,
+        )
+        model = PinocchioCs68Model.from_urdf(
+            urdf_path,
+            joint_zero_offsets_rad=joint_zero_offsets_rad,
+        )
+        geometry_model = pin.buildGeomFromUrdf(
+            model.model,
+            str(urdf_path),
+            pin.COLLISION,
+            package_dirs=[str(resolved.root)],
+        )
+        robot_geometry_count = int(geometry_model.ngeoms)
+        _add_holorobot_collision_pairs(
+            geometry_model,
+            max_parent_joint_hop=template.max_parent_joint_hop,
+        )
+        _add_environment_boxes(
+            geometry_model,
+            environment_obstacles,
+            minimum_clearance_m=effective_clearance_m,
+            robot_geometry_count=robot_geometry_count,
+        )
+        geometry_data = pin.GeometryData(geometry_model)
+        pair_links: list[tuple[str, str]] = []
+        pair_geometries: list[tuple[str, str]] = []
+        for pair in geometry_model.collisionPairs:
+            first = geometry_model.geometryObjects[pair.first]
+            second = geometry_model.geometryObjects[pair.second]
+            pair_links.append(
+                (
+                    str(model.model.frames[int(first.parentFrame)].name),
+                    str(model.model.frames[int(second.parentFrame)].name),
+                )
+            )
+            pair_geometries.append((str(first.name), str(second.name)))
+        return cls(
+            resources=resolved,
+            kinematic_model=Es68KinematicModel.from_resources(
+                joint_zero_offsets_rad=joint_zero_offsets_rad
+            ),
+            pinocchio_model=model,
+            geometry_model=geometry_model,
+            geometry_data=geometry_data,
+            pair_links=tuple(pair_links),
+            pair_geometries=tuple(pair_geometries),
+            include_d435i_mount=True,
+            environment_obstacle_names=tuple(
+                obstacle.name for obstacle in environment_obstacles
+            ),
+            model_name="es68",
+            collision_model_id=template.model_id,
+            collision_model_hash=es68_d435i_collision_content_hash(template),
+            robot_geometry_hash=es68_d435i_robot_geometry_hash(
+                template,
+                joint_zero_offsets_rad=joint_zero_offsets_rad,
+            ),
+            motion_model_contract_hash=es68_d435i_motion_model_contract_hash(
+                template,
+                joint_zero_offsets_rad=joint_zero_offsets_rad,
+                environment_obstacles=environment_obstacles,
+                minimum_clearance_m=effective_clearance_m,
+                resolved_collision_pairs=pair_geometries,
+                collision_backend_versions=backend_versions,
+            ),
+            minimum_clearance_m=effective_clearance_m,
+            collision_backend_versions=backend_versions,
+            _temporary_directory=temporary,
         )
 
     def check(self, joint_positions_rad: Sequence[float]) -> CollisionCheckResult:
@@ -332,28 +472,68 @@ class Cs68PinocchioCollisionChecker:
                 self.geometry_data,
             )
             pin.computeCollisions(self.geometry_model, self.geometry_data, False)
-            blocked_indices = tuple(
+            collision_indices = tuple(
                 index
                 for index, result in enumerate(self.geometry_data.collisionResults)
                 if bool(result.isCollision())
             )
-            pairs = tuple(self._finding(index) for index in blocked_indices)
+            clearance_distances: dict[int, float] = {}
+            if self.minimum_clearance_m > 0.0:
+                pin.computeDistances(self.geometry_model, self.geometry_data)
+                for index, (geometries, result) in enumerate(
+                    zip(
+                        self.pair_geometries,
+                        self.geometry_data.distanceResults,
+                        strict=True,
+                    )
+                ):
+                    if index in collision_indices or any(
+                        name.startswith("environment::") for name in geometries
+                    ):
+                        continue
+                    distance = float(result.min_distance)
+                    if not math.isfinite(distance):
+                        raise ValueError(
+                            f"non-finite self-clearance distance for pair {geometries}"
+                        )
+                    if distance < self.minimum_clearance_m:
+                        clearance_distances[index] = distance
+            pairs = tuple(
+                self._finding(index) for index in collision_indices
+            ) + tuple(
+                self._finding(index, clearance_distance_m=distance)
+                for index, distance in clearance_distances.items()
+            )
             return CollisionCheckResult(
                 status=(
                     CollisionCheckStatus.BLOCKED
-                    if blocked_indices
+                    if pairs
                     else CollisionCheckStatus.CLEAR
                 ),
                 blocking_reasons=tuple(pair.pair_id for pair in pairs),
                 pairs=pairs,
                 diagnostics=self._diagnostics(),
             )
+
         except (TypeError, ValueError, RuntimeError) as exc:
             return CollisionCheckResult(
                 status=CollisionCheckStatus.UNKNOWN,
                 blocking_reasons=(f"collision_checker_error:{exc}",),
                 diagnostics=self._diagnostics(),
             )
+
+    @property
+    def model_binding(
+        self,
+    ) -> tuple[str, str | None, str | None, str | None]:
+        """Stable identity that preflight and execution must agree on."""
+
+        return (
+            f"elite_{self.model_name}",
+            self.collision_model_id,
+            self.robot_geometry_hash,
+            self.motion_model_contract_hash,
+        )
 
     def check_path(
         self,
@@ -384,6 +564,7 @@ class Cs68PinocchioCollisionChecker:
                     blocked_path_fraction=float(fraction),
                     result=result,
                     maximum_joint_step_rad=step,
+                    continuous_swept_volume_verified=False,
                 )
         clear = CollisionCheckResult(
             status=CollisionCheckStatus.CLEAR,
@@ -396,9 +577,15 @@ class Cs68PinocchioCollisionChecker:
             blocked_path_fraction=None,
             result=clear,
             maximum_joint_step_rad=step,
+            continuous_swept_volume_verified=False,
         )
 
-    def _finding(self, pair_index: int) -> CollisionPairFinding:
+    def _finding(
+        self,
+        pair_index: int,
+        *,
+        clearance_distance_m: float | None = None,
+    ) -> CollisionPairFinding:
         links = self.pair_links[pair_index]
         geometries = self.pair_geometries[pair_index]
         environment_geometry = next(
@@ -406,7 +593,12 @@ class Cs68PinocchioCollisionChecker:
             None,
         )
         if environment_geometry is None:
-            pair_id = f"self_collision:{geometries[0]}:{geometries[1]}"
+            prefix = (
+                "self_clearance"
+                if clearance_distance_m is not None
+                else "self_collision"
+            )
+            pair_id = f"{prefix}:{geometries[0]}:{geometries[1]}"
             link_a, link_b = links
         else:
             robot_geometry = next(name for name in geometries if name != environment_geometry)
@@ -426,12 +618,25 @@ class Cs68PinocchioCollisionChecker:
             link_b=link_b,
             geometry_a=geometries[0],
             geometry_b=geometries[1],
+            minimum_distance_m=clearance_distance_m,
+            required_clearance_m=(
+                self.minimum_clearance_m
+                if clearance_distance_m is not None
+                else None
+            ),
         )
 
     def _diagnostics(self) -> dict[str, Any]:
         return {
             "backend": "pinocchio_fcl",
-            "model": "elite_cs68",
+            "model": f"elite_{self.model_name}",
+            "collision_model_id": self.collision_model_id,
+            "collision_model_hash": self.collision_model_hash,
+            "robot_geometry_hash": self.robot_geometry_hash,
+            "motion_model_contract_hash": self.motion_model_contract_hash,
+            "minimum_clearance_m": self.minimum_clearance_m,
+            "self_clearance_enforced": True,
+            "collision_backend_versions": dict(self.collision_backend_versions),
             "include_d435i_mount": self.include_d435i_mount,
             "geometry_count": int(self.geometry_model.ngeoms),
             "collision_pair_count": len(self.pair_links),
@@ -439,3 +644,11 @@ class Cs68PinocchioCollisionChecker:
             "motion_authorized": False,
             "provenance": robot_stack_provenance(),
         }
+
+
+class Es68PinocchioCollisionChecker(Cs68PinocchioCollisionChecker):
+    """Production-facing name for the strict ES68+D435i loader.
+
+    The legacy base class remains available only for regression against the copied
+    HoloRobot CS68 fixtures.  Production code must call ``from_es68_resources``.
+    """

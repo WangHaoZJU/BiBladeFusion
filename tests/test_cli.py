@@ -110,3 +110,15 @@ def test_safety_path_validation_is_exposed() -> None:
     assert result.exit_code == 0
     assert "validate-path" in result.stdout
     assert "preflight-path" in result.stdout
+
+
+def test_read_only_supervisory_replay_is_exposed() -> None:
+    result = runner.invoke(app, ["supervise", "--help"])
+
+    assert result.exit_code == 0
+    assert "replay" in result.stdout
+    assert "build-replay" in result.stdout
+
+    replay_help = runner.invoke(app, ["supervise", "replay", "--help"])
+    assert replay_help.exit_code == 0
+    assert "--follow" in replay_help.stdout

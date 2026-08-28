@@ -6,10 +6,13 @@ from xml.etree import ElementTree
 import pytest
 import yaml
 
+from biblade_fusion.core.settings import CollisionObstacleConfig
 from biblade_fusion.robotics.collision_template import (
     Es68D435iCollisionResources,
     Es68D435iCollisionTemplate,
     build_es68_d435i_collision_urdf,
+    es68_d435i_motion_model_contract_hash,
+    es68_d435i_robot_geometry_hash,
 )
 
 
@@ -65,3 +68,41 @@ def test_ready_template_fails_closed_when_a_mesh_is_missing(tmp_path: Path) -> N
 
     with pytest.raises(FileNotFoundError, match="d435i_assembly.stl"):
         build_es68_d435i_collision_urdf(template)
+
+
+def test_robot_and_motion_hashes_bind_offsets_environment_and_policy(
+    tmp_path: Path,
+) -> None:
+    template = _ready_template(tmp_path)
+    zero_geometry = es68_d435i_robot_geometry_hash(template)
+    offset_geometry = es68_d435i_robot_geometry_hash(
+        template,
+        joint_zero_offsets_rad=(0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+    obstacle = CollisionObstacleConfig(
+        name="blade_fixture",
+        minimum_m=(0.2, -0.1, 0.0),
+        maximum_m=(0.4, 0.1, 0.3),
+    )
+    first_motion = es68_d435i_motion_model_contract_hash(
+        template,
+        environment_obstacles=(obstacle,),
+        minimum_clearance_m=0.01,
+    )
+    changed_clearance = es68_d435i_motion_model_contract_hash(
+        template,
+        environment_obstacles=(obstacle,),
+        minimum_clearance_m=0.02,
+    )
+    changed_resolved_pairs = es68_d435i_motion_model_contract_hash(
+        template,
+        environment_obstacles=(obstacle,),
+        minimum_clearance_m=0.01,
+        resolved_collision_pairs=(("base_mesh", "fixture"),),
+        collision_backend_versions={"pinocchio": "2.7.0", "hppfcl": "2.4.4"},
+    )
+
+    assert len(zero_geometry) == 64
+    assert zero_geometry != offset_geometry
+    assert first_motion != changed_clearance
+    assert first_motion != changed_resolved_pairs

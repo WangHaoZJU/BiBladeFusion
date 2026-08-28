@@ -22,6 +22,9 @@ import numpy as np
 
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import RobotConfig
+from biblade_fusion.devices.robot._motion_capability import (
+    require_guarded_motion_capability,
+)
 from biblade_fusion.devices.robot.base import RobotState
 from biblade_fusion.devices.robot.conversions import (
     elite_tcp_pose_to_se3,
@@ -49,8 +52,7 @@ from biblade_fusion.devices.robot.streaming import (
 _TRAJECTORY_RESULT_SUCCESS = 0
 _SERVOJ_STREAM_TIMEOUT_MS = 500
 _SERVOJ_HOLD_TIMEOUT_MS = 3000
-_UNSAFE_SAFETY_MODES = {3, 5, 6, 7, 8, 9, 10, 11}
-_SAFETY_MODE_RECOVERY = 4
+_MOTION_SAFE_SAFETY_MODES = {1, 2}  # NORMAL, REDUCED
 
 _OUTPUT_RECIPE = [
     "actual_joint_positions",
@@ -305,6 +307,19 @@ class EliteArm:
         *,
         timeout_s: float | None = None,
     ) -> None:
+        del joint_positions_rad, timeout_s
+        raise RobotMotionDisabledError(
+            "Direct joint motion is disabled; use GuardedEliteExecutor"
+        )
+
+    def _guarded_move_joints(
+        self,
+        joint_positions_rad: Sequence[float],
+        *,
+        timeout_s: float | None = None,
+        capability: object,
+    ) -> None:
+        require_guarded_motion_capability(capability)
         joints = self._validated_joint_vector(joint_positions_rad)
         with self._motion_lock:
             self._ensure_ready_for_motion()
@@ -315,6 +330,19 @@ class EliteArm:
             )
 
     def move_tcp(self, target: PoseSE3, *, timeout_s: float | None = None) -> None:
+        del target, timeout_s
+        raise RobotMotionDisabledError(
+            "Direct Cartesian motion is disabled; use GuardedEliteExecutor"
+        )
+
+    def _guarded_move_tcp(
+        self,
+        target: PoseSE3,
+        *,
+        timeout_s: float | None = None,
+        capability: object,
+    ) -> None:
+        require_guarded_motion_capability(capability)
         if target.parent_frame not in {"base", "elite_b_base"}:
             raise RobotCommandError(
                 "Elite TCP target must be expressed in base or elite_b_base"
@@ -346,8 +374,21 @@ class EliteArm:
         *,
         timeout_ms: int,
     ) -> None:
+        del joint_velocity_rad_s, timeout_ms
+        raise RobotMotionDisabledError(
+            "Direct SpeedJ motion is disabled; use GuardedEliteExecutor"
+        )
+
+    def _guarded_write_joint_velocity(
+        self,
+        joint_velocity_rad_s: Sequence[float],
+        *,
+        timeout_ms: int,
+        capability: object,
+    ) -> None:
         """Write one HoloRobot-style SpeedJ command; scheduling stays above this layer."""
 
+        require_guarded_motion_capability(capability)
         values = self._validated_joint_vector(joint_velocity_rad_s)
         with self._motion_lock:
             self._ensure_ready_for_motion()
@@ -359,8 +400,20 @@ class EliteArm:
         self._stopped = False
 
     def prepare_joint_velocity_stream(self, *, timeout_ms: int) -> None:
+        del timeout_ms
+        raise RobotMotionDisabledError(
+            "Direct SpeedJ preparation is disabled; use GuardedEliteExecutor"
+        )
+
+    def _guarded_prepare_joint_velocity_stream(
+        self,
+        *,
+        timeout_ms: int,
+        capability: object,
+    ) -> None:
         """Acquire reverse control and validate it with a zero SpeedJ handshake."""
 
+        require_guarded_motion_capability(capability)
         if timeout_ms <= 0:
             raise ValueError("SpeedJ timeout_ms must be positive")
         self.enable()
@@ -390,8 +443,21 @@ class EliteArm:
         dt_s: float,
         warmup_duration_s: float = 0.0,
     ) -> None:
+        del dt_s, warmup_duration_s
+        raise RobotMotionDisabledError(
+            "Direct ServoJ preparation is disabled; use GuardedEliteExecutor"
+        )
+
+    def _guarded_prepare_servoj_stream(
+        self,
+        *,
+        dt_s: float,
+        warmup_duration_s: float = 0.0,
+        capability: object,
+    ) -> None:
         """Prime the reverse socket with the current joint position before ServoJ."""
 
+        require_guarded_motion_capability(capability)
         if dt_s <= 0.0 or warmup_duration_s < 0.0:
             raise ValueError("ServoJ timing values are invalid")
         self._ensure_ready_for_motion()
@@ -426,8 +492,21 @@ class EliteArm:
         *,
         timeout_ms: int = _SERVOJ_HOLD_TIMEOUT_MS,
     ) -> None:
+        del joint_positions_rad, timeout_ms
+        raise RobotMotionDisabledError(
+            "Direct ServoJ hold is disabled; use GuardedEliteExecutor"
+        )
+
+    def _guarded_write_servoj_hold(
+        self,
+        joint_positions_rad: Sequence[float],
+        *,
+        timeout_ms: int = _SERVOJ_HOLD_TIMEOUT_MS,
+        capability: object,
+    ) -> None:
         """Send one long-timeout ServoJ hold for acquisition gaps."""
 
+        require_guarded_motion_capability(capability)
         values = self._validated_joint_vector(joint_positions_rad)
         with self._motion_lock:
             self._ensure_ready_for_motion()
@@ -441,8 +520,22 @@ class EliteArm:
         config: ServoJStreamConfig,
         tracking_samples: list[dict[str, Any]] | None = None,
     ) -> StreamServoJResult:
+        del stream, config, tracking_samples
+        raise RobotMotionDisabledError(
+            "Direct ServoJ streaming is disabled; use GuardedEliteExecutor"
+        )
+
+    def _guarded_stream_servoj(
+        self,
+        stream: ServoJStream,
+        *,
+        config: ServoJStreamConfig,
+        capability: object,
+        tracking_samples: list[dict[str, Any]] | None = None,
+    ) -> StreamServoJResult:
         """Send a fixed-rate ServoJ stream with HoloRobot timing/tracking aborts."""
 
+        require_guarded_motion_capability(capability)
         self._ensure_ready_for_motion()
         stream.validate()
         config.validate()
@@ -688,13 +781,11 @@ class EliteArm:
     def _raise_for_safety(self) -> None:
         try:
             safety = int(self._rtsi.getSafetyStatus())
-        except (TypeError, ValueError):
-            return
         except Exception as exc:
             raise RobotHardwareFaultError(
-                "failed to read robot safety status; motion is blocked"
+                "failed to read or parse robot safety status; motion is blocked"
             ) from exc
-        if safety in _UNSAFE_SAFETY_MODES or safety == _SAFETY_MODE_RECOVERY:
+        if safety not in _MOTION_SAFE_SAFETY_MODES:
             raise RobotHardwareFaultError(
                 f"robot safety mode {safety} forbids motion"
             )

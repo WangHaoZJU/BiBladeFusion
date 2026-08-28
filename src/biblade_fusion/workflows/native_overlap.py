@@ -17,6 +17,8 @@ from biblade_fusion.acquisition import SynchronizedFrameBundle
 from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
+    HandEyeConfig,
+    KinematicsConfig,
     NativeOverlapValidationConfig,
     PointCloudConfig,
 )
@@ -254,6 +256,8 @@ def _prepare(
     hand_eye: HandEyeCalibration,
     point_cloud_config: PointCloudConfig,
     config: NativeOverlapValidationConfig,
+    kinematics_config: KinematicsConfig,
+    hand_eye_config: HandEyeConfig,
 ) -> _PreparedObservation:
     stereo = bundle.stereo
     calibration = stereo.calibration
@@ -263,12 +267,19 @@ def _prepare(
         raise NativeOverlapValidationError(f"{bundle.view_id} has no depth-stream calibration")
     depth_m = native_depth_to_meters(stereo.native_depth, calibration.native_depth_scale_m)
     smooth = _smooth_depth_mask(depth_m, config)
-    reconstructed = reconstruct_native_depth_view(
-        bundle,
-        smooth,
-        hand_eye,
-        point_cloud_config,
-    )
+    try:
+        reconstructed = reconstruct_native_depth_view(
+            bundle,
+            smooth,
+            hand_eye,
+            point_cloud_config,
+            kinematics_config=kinematics_config,
+            hand_eye_config=hand_eye_config,
+        )
+    except ValueError as exc:
+        raise NativeOverlapValidationError(
+            f"{bundle.view_id} failed authoritative FK validation: {exc}"
+        ) from exc
     return _PreparedObservation(
         bundle.view_id,
         calibration.depth,
@@ -575,6 +586,9 @@ def evaluate_native_overlap(
     hand_eye: HandEyeCalibration,
     point_cloud_config: PointCloudConfig,
     config: NativeOverlapValidationConfig,
+    *,
+    kinematics_config: KinematicsConfig,
+    hand_eye_config: HandEyeConfig,
 ) -> NativeOverlapReport:
     """Evaluate one reference plus static-scene comparison views without pose correction."""
 
@@ -586,7 +600,17 @@ def evaluate_native_overlap(
     if len(set(view_ids)) != len(view_ids):
         raise NativeOverlapValidationError("native-overlap view IDs must be unique")
     processing_cloud = _point_cloud_config(point_cloud_config, config)
-    observations = tuple(_prepare(bundle, hand_eye, processing_cloud, config) for bundle in bundles)
+    observations = tuple(
+        _prepare(
+            bundle,
+            hand_eye,
+            processing_cloud,
+            config,
+            kinematics_config,
+            hand_eye_config,
+        )
+        for bundle in bundles
+    )
     reference = observations[0]
     if any(not _same_calibration(reference, item) for item in observations[1:]):
         raise NativeOverlapValidationError(

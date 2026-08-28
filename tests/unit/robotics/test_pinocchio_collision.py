@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+from pathlib import Path
 from xml.etree import ElementTree
 
 import numpy as np
 import pytest
+import yaml
 
 from biblade_fusion.core.settings import CollisionObstacleConfig
+from biblade_fusion.mapping.robot_depth_renderer import Es68D435iRobotDepthRenderer
 from biblade_fusion.robotics import (
     CollisionCheckStatus,
     Cs68KinematicModel,
     Cs68ModelResources,
     Cs68PinocchioCollisionChecker,
+    Es68D435iCollisionResources,
+    Es68PinocchioCollisionChecker,
 )
 from biblade_fusion.robotics.pinocchio_collision import PinocchioCs68Model
 from biblade_fusion.robotics.urdf import (
@@ -75,6 +80,20 @@ def test_pinocchio_collision_clear_at_zero() -> None:
     assert result.status is CollisionCheckStatus.CLEAR
     assert result.motion_authorized is False
     assert result.diagnostics["include_d435i_mount"] is True
+
+
+def test_pinocchio_collision_enforces_self_clearance_before_contact() -> None:
+    result = Cs68PinocchioCollisionChecker.from_resources(
+        minimum_clearance_m=0.02
+    ).check((0.0,) * 6)
+
+    assert result.status is CollisionCheckStatus.BLOCKED
+    finding = next(
+        item for item in result.pairs if item.pair_id.startswith("self_clearance:")
+    )
+    assert finding.minimum_distance_m is not None
+    assert finding.minimum_distance_m < 0.02
+    assert finding.required_clearance_m == 0.02
 
 
 def test_pinocchio_collision_blocks_holorobot_folded_fixture() -> None:
@@ -146,3 +165,55 @@ def test_far_workcell_box_preserves_clear_state() -> None:
     assert result.status is CollisionCheckStatus.CLEAR
     assert checker.geometry_model.ngeoms == 9
     assert len(checker.pair_links) == 28
+
+
+def _write_ready_es68_resources(root: Path) -> Es68D435iCollisionResources:
+    import trimesh
+
+    packaged = Es68D435iCollisionResources.packaged_template()
+    payload = yaml.safe_load(
+        packaged.manifest_template_path.read_text(encoding="utf-8")
+    )
+    payload["ready"] = True
+    manifest = root / "collision_models" / "es68_d435i" / "manifest.yaml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    for index, spec in enumerate((*payload["links"].values(), payload["attachment"])):
+        mesh = root / spec["mesh"]
+        mesh.parent.mkdir(parents=True, exist_ok=True)
+        trimesh.creation.box(
+            extents=(0.01 + index * 0.0001, 0.01, 0.01)
+        ).export(mesh)
+    return Es68D435iCollisionResources(root)
+
+
+def test_strict_es68_checker_binds_active_manifest_and_mesh_hash(tmp_path: Path) -> None:
+    resources = _write_ready_es68_resources(tmp_path)
+
+    checker = Es68PinocchioCollisionChecker.from_es68_resources(resources)
+
+    assert checker.model_binding[0] == "elite_es68"
+    assert checker.collision_model_id == "es68_d435i_collision"
+    assert checker.collision_model_hash is not None
+    assert len(checker.collision_model_hash) == 64
+    assert checker.geometry_model.ngeoms == 8
+
+
+def test_renderer_and_checker_share_nonzero_offset_robot_geometry_hash(
+    tmp_path: Path,
+) -> None:
+    resources = _write_ready_es68_resources(tmp_path)
+    offsets = (0.01, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    checker = Es68PinocchioCollisionChecker.from_es68_resources(
+        resources,
+        joint_zero_offsets_rad=offsets,
+    )
+    renderer = Es68D435iRobotDepthRenderer.from_active_resources(
+        resources,
+        joint_zero_offsets_rad=offsets,
+    )
+    zero_renderer = Es68D435iRobotDepthRenderer.from_active_resources(resources)
+
+    assert renderer.model_content_hash == checker.robot_geometry_hash
+    assert renderer.model_content_hash != zero_renderer.model_content_hash

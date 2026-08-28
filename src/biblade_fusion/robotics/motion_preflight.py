@@ -1,4 +1,4 @@
-"""HoloRobot-style conservative CS68 joint planning and offline preflight."""
+"""HoloRobot-style conservative ES68 joint planning and offline preflight."""
 
 from __future__ import annotations
 
@@ -10,8 +10,11 @@ from typing import Any
 import numpy as np
 from numpy.typing import ArrayLike
 
-from biblade_fusion.devices.robot.streaming import ServoJStream
-from biblade_fusion.robotics.cs68_model import Cs68KinematicModel
+from biblade_fusion.devices.robot.streaming import ServoJStream, ServoJStreamConfig
+from biblade_fusion.robotics.occupancy_collision import (
+    JointPathOccupancyCollisionReport,
+    OccupancyRobotCollisionChecker,
+)
 from biblade_fusion.robotics.pinocchio_collision import (
     CollisionCheckStatus,
     Cs68PinocchioCollisionChecker,
@@ -37,9 +40,14 @@ class JointMotionPreflight:
     planning_waypoints: tuple[tuple[float, ...], ...]
     servoj_stream: ServoJStream | None
     collision: JointPathMeshCollisionReport | None
+    occupancy: JointPathOccupancyCollisionReport | None
     blocking_reasons: tuple[str, ...]
     warnings: tuple[str, ...]
     diagnostics: dict[str, Any]
+    servoj_runtime_config: ServoJStreamConfig | None = None
+    occupancy_required: bool = True
+    swept_mesh_required: bool = True
+    continuous_occupancy_sweep_required: bool = True
     approval_required: bool = True
 
     @property
@@ -49,6 +57,27 @@ class JointMotionPreflight:
             and self.servoj_stream is not None
             and self.collision is not None
             and self.collision.status is CollisionCheckStatus.CLEAR
+            and self.swept_mesh_required
+            and self.collision.continuous_swept_volume_verified
+            and self.collision.result.diagnostics.get("model") == "elite_es68"
+            and bool(self.collision.result.diagnostics.get("robot_geometry_hash"))
+            and bool(
+                self.collision.result.diagnostics.get("motion_model_contract_hash")
+            )
+            and self.occupancy_required
+            and self.occupancy is not None
+            and self.occupancy.status is CollisionCheckStatus.CLEAR
+            and self.occupancy.evidence is not None
+            and self.occupancy.evidence.semantic_attestation_valid
+            and self.continuous_occupancy_sweep_required
+            and self.occupancy.continuous_swept_volume_evidence_valid
+            and bool(
+                self.occupancy.result.diagnostics.get(
+                    "occupancy_policy_contract_hash"
+                )
+            )
+            and self.servoj_runtime_config is not None
+            and self.approval_required
         )
 
     @property
@@ -59,7 +88,7 @@ class JointMotionPreflight:
 def _joint_vector(values: ArrayLike, *, label: str) -> tuple[float, ...]:
     vector = np.asarray(values, dtype=np.float64)
     if vector.shape != (6,) or not np.isfinite(vector).all():
-        raise ValueError(f"{label} must be a finite CS68 six-vector")
+        raise ValueError(f"{label} must be a finite ES68 six-vector")
     return tuple(float(value) for value in vector)
 
 
@@ -90,12 +119,17 @@ def _velocity_limited_stream(
     speed_scaling: float,
     velocity_margin: float,
 ) -> ServoJStream:
-    if dt_s <= 0.0:
-        raise ValueError("ServoJ dt_s must be positive")
-    if not 0.0 < speed_scaling <= 1.0:
-        raise ValueError("ServoJ speed scaling must be in (0, 1]")
-    if not 0.0 < velocity_margin <= 1.0:
-        raise ValueError("ServoJ velocity margin must be in (0, 1]")
+    if not math.isfinite(dt_s) or dt_s <= 0.0:
+        raise ValueError("ServoJ dt_s must be finite and positive")
+    if not math.isfinite(speed_scaling) or not 0.0 < speed_scaling <= 1.0:
+        raise ValueError("ServoJ speed scaling must be finite and in (0, 1]")
+    if not math.isfinite(velocity_margin) or not 0.0 < velocity_margin <= 1.0:
+        raise ValueError("ServoJ velocity margin must be finite and in (0, 1]")
+    velocities = np.asarray(maximum_velocity_rad_s, dtype=np.float64)
+    if velocities.shape != (6,) or not np.isfinite(velocities).all() or np.any(
+        velocities <= 0.0
+    ):
+        raise ValueError("Joint velocity limits must be a finite positive six-vector")
     maximum_steps = tuple(
         velocity * dt_s * speed_scaling * velocity_margin
         for velocity in maximum_velocity_rad_s
@@ -123,15 +157,109 @@ def _velocity_limited_stream(
     return stream
 
 
+def validate_preflight_servoj_contract(
+    preflight: JointMotionPreflight,
+    collision_checker: Cs68PinocchioCollisionChecker,
+) -> ServoJStream:
+    """Reproduce the exact deterministic ServoJ stream from bound planner inputs.
+
+    A stored :class:`JointMotionPreflight` is an evidence object, not an executable
+    command container by construction.  This function independently rebuilds its
+    waypoints and velocity-limited command stream using the active ES68 kinematic
+    model.  Any caller-created or deserialisation-induced command detour therefore
+    fails closed before an execution permit can be issued.
+    """
+
+    if preflight.diagnostics.get("planner") != "holorobot_conservative_linear_joint":
+        raise ValueError("Unsupported motion preflight planner contract")
+    if (
+        preflight.diagnostics.get("trajectory_generator")
+        != "holorobot_velocity_limited_servoj"
+    ):
+        raise ValueError("Unsupported motion trajectory-generator contract")
+
+    def diagnostic_float(name: str) -> float:
+        raw = preflight.diagnostics.get(name)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, np.number)):
+            raise ValueError(f"Motion preflight diagnostic {name} is not numeric")
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError(f"Motion preflight diagnostic {name} is not finite")
+        return value
+
+    maximum_step = diagnostic_float("maximum_joint_step_rad")
+    dt_s = diagnostic_float("servoj_dt_s")
+    speed_scaling = diagnostic_float("speed_scaling")
+    velocity_margin = diagnostic_float("velocity_margin")
+    freshness_margin = diagnostic_float("execution_freshness_margin_s")
+    if freshness_margin < 0.0:
+        raise ValueError("Execution freshness margin must be non-negative")
+
+    start = _joint_vector(
+        preflight.start_joint_positions_rad,
+        label="motion preflight start",
+    )
+    goal = _joint_vector(
+        preflight.goal_joint_positions_rad,
+        label="motion preflight goal",
+    )
+    expected_waypoints = _linear_waypoints(
+        start,
+        goal,
+        maximum_joint_step_rad=maximum_step,
+    )
+    if preflight.planning_waypoints != expected_waypoints:
+        raise ValueError("Motion preflight waypoints do not reproduce")
+    expected_stream = _velocity_limited_stream(
+        expected_waypoints,
+        maximum_velocity_rad_s=(
+            collision_checker.kinematic_model.joint_velocity_limits_rad_s()
+        ),
+        dt_s=dt_s,
+        speed_scaling=speed_scaling,
+        velocity_margin=velocity_margin,
+    )
+    stream = preflight.servoj_stream
+    if stream is None:
+        raise ValueError("Motion preflight lacks a ServoJ stream")
+    stream.validate()
+    if stream != expected_stream:
+        raise ValueError("Motion preflight ServoJ stream does not reproduce")
+    runtime_config = preflight.servoj_runtime_config
+    if runtime_config is None:
+        raise ValueError("Motion preflight lacks a ServoJ runtime config")
+    runtime_config.validate()
+    if runtime_config.dt_s != expected_stream.dt_s:
+        raise ValueError("Motion preflight runtime dt_s differs from its stream")
+
+    expected_duration = max(0, len(expected_stream.commands) - 1) * expected_stream.dt_s
+    expected_horizon = expected_duration + freshness_margin
+    for name, expected in (
+        ("planned_servoj_duration_s", expected_duration),
+        ("required_freshness_horizon_s", expected_horizon),
+    ):
+        recorded = diagnostic_float(name)
+        if not math.isclose(recorded, expected, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"Motion preflight diagnostic {name} does not reproduce")
+    return expected_stream
+
+
 def preflight_linear_joint_motion(
     start_joint_positions_rad: ArrayLike,
     goal_joint_positions_rad: ArrayLike,
     *,
     collision_checker: Cs68PinocchioCollisionChecker | None,
+    checker_unavailable_reason: str = "checker_unavailable",
+    occupancy_checker: OccupancyRobotCollisionChecker | None = None,
+    require_occupancy: bool = True,
+    require_swept_mesh: bool = True,
+    require_continuous_occupancy_sweep: bool = True,
     maximum_joint_step_rad: float = 0.02,
     servoj_dt_s: float = 0.004,
     speed_scaling: float = 0.08,
     velocity_margin: float = 0.8,
+    execution_freshness_margin_s: float = 1.0,
+    servoj_runtime_config: ServoJStreamConfig | None = None,
 ) -> JointMotionPreflight:
     """Plan, collision-check, and time-parameterize one conservative linear joint leg."""
 
@@ -142,6 +270,16 @@ def preflight_linear_joint_motion(
         goal,
         maximum_joint_step_rad=maximum_joint_step_rad,
     )
+    freshness_margin_s = float(execution_freshness_margin_s)
+    if not math.isfinite(freshness_margin_s) or freshness_margin_s < 0.0:
+        raise ValueError("execution_freshness_margin_s must be finite and non-negative")
+    runtime_config = servoj_runtime_config or ServoJStreamConfig(
+        dt_s=servoj_dt_s,
+        tracking_check_every_n_commands=2,
+    )
+    runtime_config.validate()
+    if runtime_config.dt_s != servoj_dt_s:
+        raise ValueError("Preflight ServoJ runtime config dt_s differs from servoj_dt_s")
     diagnostics = {
         "planner": "holorobot_conservative_linear_joint",
         "trajectory_generator": "holorobot_velocity_limited_servoj",
@@ -149,9 +287,18 @@ def preflight_linear_joint_motion(
         "servoj_dt_s": servoj_dt_s,
         "speed_scaling": speed_scaling,
         "velocity_margin": velocity_margin,
+        "execution_freshness_margin_s": freshness_margin_s,
+        "require_occupancy": bool(require_occupancy),
+        "require_swept_mesh": bool(require_swept_mesh),
+        "require_continuous_occupancy_sweep": bool(
+            require_continuous_occupancy_sweep
+        ),
         "provenance": robot_stack_provenance(),
         "motion_authorized": False,
     }
+    unavailable_reason = str(checker_unavailable_reason).strip()
+    if not unavailable_reason:
+        raise ValueError("checker_unavailable_reason must be non-empty")
     if collision_checker is None:
         return JointMotionPreflight(
             status=MotionPreflightStatus.CHECKER_UNAVAILABLE,
@@ -160,9 +307,15 @@ def preflight_linear_joint_motion(
             planning_waypoints=waypoints,
             servoj_stream=None,
             collision=None,
-            blocking_reasons=("checker_unavailable",),
+            occupancy=None,
+            blocking_reasons=(unavailable_reason,),
             warnings=(),
             diagnostics=diagnostics,
+            occupancy_required=bool(require_occupancy),
+            swept_mesh_required=bool(require_swept_mesh),
+            continuous_occupancy_sweep_required=bool(
+                require_continuous_occupancy_sweep
+            ),
         )
     collision = collision_checker.check_path(
         start,
@@ -180,11 +333,35 @@ def preflight_linear_joint_motion(
             planning_waypoints=waypoints,
             servoj_stream=None,
             collision=collision,
+            occupancy=None,
             blocking_reasons=reasons,
             warnings=(),
             diagnostics=diagnostics,
+            occupancy_required=bool(require_occupancy),
+            swept_mesh_required=bool(require_swept_mesh),
+            continuous_occupancy_sweep_required=bool(
+                require_continuous_occupancy_sweep
+            ),
         )
-    velocities = Cs68KinematicModel.from_resources().joint_velocity_limits_rad_s()
+    if require_swept_mesh and not collision.continuous_swept_volume_verified:
+        return JointMotionPreflight(
+            status=MotionPreflightStatus.BLOCKED,
+            start_joint_positions_rad=start,
+            goal_joint_positions_rad=goal,
+            planning_waypoints=waypoints,
+            servoj_stream=None,
+            collision=collision,
+            occupancy=None,
+            blocking_reasons=("continuous_swept_mesh_unavailable",),
+            warnings=("discrete_mesh_samples_are_diagnostic_only",),
+            diagnostics=diagnostics,
+            occupancy_required=bool(require_occupancy),
+            swept_mesh_required=True,
+            continuous_occupancy_sweep_required=bool(
+                require_continuous_occupancy_sweep
+            ),
+        )
+    velocities = collision_checker.kinematic_model.joint_velocity_limits_rad_s()
     stream = _velocity_limited_stream(
         waypoints,
         maximum_velocity_rad_s=velocities,
@@ -192,6 +369,76 @@ def preflight_linear_joint_motion(
         speed_scaling=speed_scaling,
         velocity_margin=velocity_margin,
     )
+    stream_duration_s = max(0, len(stream.commands) - 1) * stream.dt_s
+    required_freshness_horizon_s = stream_duration_s + freshness_margin_s
+    diagnostics["planned_servoj_duration_s"] = stream_duration_s
+    diagnostics["required_freshness_horizon_s"] = required_freshness_horizon_s
+    occupancy: JointPathOccupancyCollisionReport | None = None
+    if occupancy_checker is not None:
+        occupancy = occupancy_checker.check_path(
+            start,
+            goal,
+            maximum_joint_step_rad=maximum_joint_step_rad,
+            required_freshness_horizon_s=required_freshness_horizon_s,
+        )
+        if occupancy.status is not CollisionCheckStatus.CLEAR:
+            reasons = occupancy.result.blocking_reasons or (
+                f"occupancy_status:{occupancy.status.value}",
+            )
+            return JointMotionPreflight(
+                status=MotionPreflightStatus.BLOCKED,
+                start_joint_positions_rad=start,
+                goal_joint_positions_rad=goal,
+                planning_waypoints=waypoints,
+                servoj_stream=None,
+                collision=collision,
+                occupancy=occupancy,
+                blocking_reasons=reasons,
+                warnings=(),
+                diagnostics=diagnostics,
+                occupancy_required=bool(require_occupancy),
+                swept_mesh_required=bool(require_swept_mesh),
+                continuous_occupancy_sweep_required=bool(
+                    require_continuous_occupancy_sweep
+                ),
+            )
+        if (
+            require_continuous_occupancy_sweep
+            and not occupancy.continuous_swept_volume_evidence_valid
+        ):
+            return JointMotionPreflight(
+                status=MotionPreflightStatus.BLOCKED,
+                start_joint_positions_rad=start,
+                goal_joint_positions_rad=goal,
+                planning_waypoints=waypoints,
+                servoj_stream=None,
+                collision=collision,
+                occupancy=occupancy,
+                blocking_reasons=("continuous_swept_occupancy_unavailable",),
+                warnings=("discrete_occupancy_samples_are_diagnostic_only",),
+                diagnostics=diagnostics,
+                occupancy_required=bool(require_occupancy),
+                swept_mesh_required=bool(require_swept_mesh),
+                continuous_occupancy_sweep_required=True,
+            )
+    elif require_occupancy:
+        return JointMotionPreflight(
+            status=MotionPreflightStatus.CHECKER_UNAVAILABLE,
+            start_joint_positions_rad=start,
+            goal_joint_positions_rad=goal,
+            planning_waypoints=waypoints,
+            servoj_stream=None,
+            collision=collision,
+            occupancy=None,
+            blocking_reasons=("occupancy_checker_unavailable",),
+            warnings=(),
+            diagnostics=diagnostics,
+            occupancy_required=True,
+            swept_mesh_required=bool(require_swept_mesh),
+            continuous_occupancy_sweep_required=bool(
+                require_continuous_occupancy_sweep
+            ),
+        )
     return JointMotionPreflight(
         status=MotionPreflightStatus.CLEAR,
         start_joint_positions_rad=start,
@@ -199,7 +446,49 @@ def preflight_linear_joint_motion(
         planning_waypoints=waypoints,
         servoj_stream=stream,
         collision=collision,
+        occupancy=occupancy,
         blocking_reasons=(),
-        warnings=("acceleration_limits_unavailable",),
+        warnings=(
+            "acceleration_limits_unavailable",
+            *(
+                ()
+                if require_occupancy
+                else ("occupancy_disabled_offline_diagnostic_only",)
+            ),
+            *(
+                ()
+                if require_swept_mesh
+                else ("continuous_swept_mesh_disabled_offline_diagnostic_only",)
+            ),
+            *(
+                ()
+                if require_continuous_occupancy_sweep
+                else (
+                    "continuous_swept_occupancy_disabled_offline_diagnostic_only",
+                )
+            ),
+            *(
+                ()
+                if require_occupancy
+                else (
+                    "continuous_swept_occupancy_unavailable_offline_diagnostic_only",
+                )
+            ),
+            *(
+                ()
+                if (
+                    occupancy is not None
+                    and occupancy.evidence is not None
+                    and occupancy.evidence.semantic_attestation_valid
+                )
+                else ("occupancy_semantic_attestation_unavailable_diagnostic_only",)
+            ),
+        ),
         diagnostics=diagnostics,
+        servoj_runtime_config=runtime_config,
+        occupancy_required=bool(require_occupancy),
+        swept_mesh_required=bool(require_swept_mesh),
+        continuous_occupancy_sweep_required=bool(
+            require_continuous_occupancy_sweep
+        ),
     )
