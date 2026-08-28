@@ -51,6 +51,13 @@ from biblade_fusion.robotics.pinocchio_collision import (
     JointPathMeshCollisionReport,
 )
 from biblade_fusion.robotics.provenance import HOLOROBOT_SOURCE_COMMIT
+from biblade_fusion.robotics.stationarity import (
+    StationarityError,
+    StationarityEvidence,
+    StationarityTimeoutError,
+    validate_stationary_trace,
+    wait_until_settled,
+)
 
 __all__ = [
     "CS68_COLLISION_LINK_NAMES",
@@ -82,6 +89,9 @@ __all__ = [
     "OccupancyRobotCollisionChecker",
     "OccupancySemanticAttestation",
     "RobotEnvelopeSphere",
+    "StationarityError",
+    "StationarityEvidence",
+    "StationarityTimeoutError",
     "occupancy_evidence_from_snapshot",
     "preflight_linear_joint_motion",
     "build_es68_d435i_collision_urdf",
@@ -89,5 +99,7 @@ __all__ = [
     "es68_d435i_motion_model_contract_hash",
     "es68_d435i_robot_geometry_hash",
     "load_es68_flange_t_tcp",
+    "validate_stationary_trace",
+    "wait_until_settled",
     "write_es68_d435i_collision_urdf",
 ]

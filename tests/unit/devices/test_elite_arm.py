@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,8 @@ from biblade_fusion.devices.robot.errors import (
     RobotCommandError,
     RobotHardwareFaultError,
     RobotMotionDisabledError,
+    RobotMotionInterruptedError,
+    RobotNotEnabledError,
 )
 
 
@@ -66,6 +69,23 @@ class FakeRtsi:
         self.frequency = frequency
         self.safety_status = 1
         self.disconnected = False
+        self.timestamp_getter_entered: threading.Event | None = None
+        self.timestamp_getter_release: threading.Event | None = None
+        self._getter_counter_lock = threading.Lock()
+        self._active_getters = 0
+        self.maximum_concurrent_getters = 0
+
+    def _enter_getter(self) -> None:
+        with self._getter_counter_lock:
+            self._active_getters += 1
+            self.maximum_concurrent_getters = max(
+                self.maximum_concurrent_getters,
+                self._active_getters,
+            )
+
+    def _leave_getter(self) -> None:
+        with self._getter_counter_lock:
+            self._active_getters -= 1
 
     def connect(self, ip: str) -> bool:
         return ip == "192.0.2.68"
@@ -80,13 +100,28 @@ class FakeRtsi:
         return [0.4, 0.1, 0.5, 0.3, -0.4, 0.5]
 
     def getTimestamp(self) -> float:
-        return 12.5
+        self._enter_getter()
+        try:
+            if self.timestamp_getter_entered is not None:
+                self.timestamp_getter_entered.set()
+            if (
+                self.timestamp_getter_release is not None
+                and not self.timestamp_getter_release.wait(timeout=2.0)
+            ):
+                raise TimeoutError("test timestamp getter was not released")
+            return 12.5
+        finally:
+            self._leave_getter()
 
     def getRobotMode(self) -> int:
         return 5
 
     def getSafetyStatus(self) -> int:
-        return self.safety_status
+        self._enter_getter()
+        try:
+            return self.safety_status
+        finally:
+            self._leave_getter()
 
     def getActualSpeedScaling(self) -> float:
         return 0.3
@@ -105,6 +140,8 @@ class FakeDriver:
         self.idle_result = True
         self.speedj_result = True
         self.servoj_result = True
+        self.servoj_write_entered: threading.Event | None = None
+        self.servoj_write_release: threading.Event | None = None
 
     def isRobotConnected(self) -> bool:
         return self.connected
@@ -148,6 +185,13 @@ class FakeDriver:
 
     def writeServoj(self, command: list[float], timeout_ms: int, *flags: bool) -> bool:
         self.calls.append(("writeServoj", (command, timeout_ms, flags)))
+        if self.servoj_write_entered is not None:
+            self.servoj_write_entered.set()
+        if (
+            self.servoj_write_release is not None
+            and not self.servoj_write_release.wait(timeout=2.0)
+        ):
+            raise TimeoutError("test ServoJ write was not released")
         return self.servoj_result
 
     def stopControl(self) -> None:
@@ -335,6 +379,353 @@ def test_stop_rejects_false_write_idle_result() -> None:
 
     with pytest.raises(RobotCommandError, match="rejected"):
         arm.stop()
+    with pytest.raises(RobotMotionInterruptedError, match="stopped"):
+        arm._guarded_prepare_servoj_stream(
+            dt_s=0.004,
+            expected_stop_generation=arm.stop_generation,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
+
+
+def test_public_enable_cannot_clear_stop_latch() -> None:
+    arm, _ = enabled_arm()
+    arm.stop()
+
+    with pytest.raises(RobotMotionInterruptedError, match="one-shot approval"):
+        arm.enable()
+
+
+def test_guarded_servoj_recovery_requires_private_capability() -> None:
+    arm, sdk = enabled_arm()
+    arm.stop()
+
+    with pytest.raises(PermissionError, match="guarded-executor capability"):
+        arm._guarded_resume_servoj_control(
+            expected_stop_generation=arm.stop_generation,
+            capability=object(),
+        )
+    with pytest.raises(RobotMotionInterruptedError, match="stopped"):
+        arm._guarded_prepare_servoj_stream(
+            dt_s=0.004,
+            expected_stop_generation=arm.stop_generation,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
+
+    assert not any(name == "writeServoj" for name, _ in sdk.driver.calls)
+
+
+def test_guarded_servoj_recovery_clears_stop_without_sending_motion() -> None:
+    arm, sdk = enabled_arm()
+    arm.stop()
+
+    arm._guarded_resume_servoj_control(
+        expected_stop_generation=arm.stop_generation,
+        capability=_GUARDED_MOTION_CAPABILITY,
+    )
+
+    assert [name for name, _ in sdk.driver.calls] == ["writeIdle"]
+    arm._guarded_prepare_servoj_stream(
+        dt_s=0.004,
+        expected_stop_generation=arm.stop_generation,
+        capability=_GUARDED_MOTION_CAPABILITY,
+    )
+    assert [name for name, _ in sdk.driver.calls] == ["writeIdle", "writeServoj"]
+
+
+def test_guarded_servoj_recovery_never_implicitly_enables_arm() -> None:
+    arm, sdk = connected_arm()
+
+    with pytest.raises(RobotNotEnabledError, match="must be enabled"):
+        arm._guarded_resume_servoj_control(
+            expected_stop_generation=arm.stop_generation,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
+
+    assert not any(
+        name in {"powerOn", "brakeRelease"} for name, _ in sdk.dashboard.calls
+    )
+
+
+def test_guarded_servoj_recovery_keeps_stop_latched_on_unsafe_state() -> None:
+    arm, sdk = enabled_arm()
+    arm.stop()
+    sdk.rtsi.safety_status = 3
+
+    with pytest.raises(RobotHardwareFaultError, match="forbids motion"):
+        arm._guarded_resume_servoj_control(
+            expected_stop_generation=arm.stop_generation,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
+
+    sdk.rtsi.safety_status = 1
+    with pytest.raises(RobotMotionInterruptedError, match="stopped"):
+        arm._guarded_prepare_servoj_stream(
+            dt_s=0.004,
+            expected_stop_generation=arm.stop_generation,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
+
+
+def test_concurrent_stop_generation_wins_over_blocked_servoj_recovery() -> None:
+    arm, _ = enabled_arm()
+    arm.stop()
+    approved_generation = arm.stop_generation
+    recovery_entered = threading.Event()
+    release_recovery = threading.Event()
+    recovery_errors: list[BaseException] = []
+    original_reverse_check = arm._ensure_driver_reverse_connected
+
+    def blocked_reverse_check() -> None:
+        recovery_entered.set()
+        if not release_recovery.wait(timeout=2.0):
+            raise TimeoutError("test recovery was not released")
+        original_reverse_check()
+
+    arm._ensure_driver_reverse_connected = blocked_reverse_check  # type: ignore[method-assign]
+
+    def recover() -> None:
+        try:
+            arm._guarded_resume_servoj_control(
+                expected_stop_generation=approved_generation,
+                capability=_GUARDED_MOTION_CAPABILITY,
+            )
+        except BaseException as exc:
+            recovery_errors.append(exc)
+
+    recovery_thread = threading.Thread(target=recover)
+    recovery_thread.start()
+    assert recovery_entered.wait(timeout=1.0)
+
+    # stop() must not wait for the recovery thread's long _motion_lock section.
+    arm.stop()
+    assert arm.stop_generation == approved_generation + 1
+    assert recovery_thread.is_alive()
+
+    release_recovery.set()
+    recovery_thread.join(timeout=2.0)
+    assert not recovery_thread.is_alive()
+    assert len(recovery_errors) == 1
+    assert isinstance(recovery_errors[0], RobotMotionInterruptedError)
+    assert "generation changed" in str(recovery_errors[0])
+    with pytest.raises(RobotMotionInterruptedError, match="stopped"):
+        arm._guarded_prepare_servoj_stream(
+            dt_s=0.004,
+            expected_stop_generation=arm.stop_generation,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
+
+
+def test_rtsi_state_and_motion_safety_getters_are_serialized() -> None:
+    arm, sdk = enabled_arm()
+    timestamp_entered = threading.Event()
+    release_timestamp = threading.Event()
+    sdk.rtsi.timestamp_getter_entered = timestamp_entered
+    sdk.rtsi.timestamp_getter_release = release_timestamp
+    errors: list[BaseException] = []
+
+    def read_full_state() -> None:
+        try:
+            arm.read_state()
+        except BaseException as exc:
+            errors.append(exc)
+
+    def read_motion_safety() -> None:
+        try:
+            arm._raise_for_safety()
+        except BaseException as exc:
+            errors.append(exc)
+
+    state_thread = threading.Thread(target=read_full_state)
+    safety_thread = threading.Thread(target=read_motion_safety)
+    state_thread.start()
+    assert timestamp_entered.wait(timeout=1.0)
+    safety_thread.start()
+
+    # The safety thread is blocked on _state_lock, not inside the vendor getter.
+    assert safety_thread.is_alive()
+    assert sdk.rtsi.maximum_concurrent_getters == 1
+
+    release_timestamp.set()
+    state_thread.join(timeout=2.0)
+    safety_thread.join(timeout=2.0)
+    assert not state_thread.is_alive()
+    assert not safety_thread.is_alive()
+    assert errors == []
+    assert sdk.rtsi.maximum_concurrent_getters == 1
+
+
+def test_long_servoj_write_does_not_hold_rtsi_state_lock() -> None:
+    arm, sdk = enabled_arm()
+    write_entered = threading.Event()
+    release_write = threading.Event()
+    sdk.driver.servoj_write_entered = write_entered
+    sdk.driver.servoj_write_release = release_write
+    stream = ServoJStream(
+        commands=((0.0, 0.1, 0.2, 0.3, 0.4, 0.5),),
+        dt_s=0.004,
+    )
+    stream_errors: list[BaseException] = []
+    state_results: list[object] = []
+
+    def run_stream() -> None:
+        try:
+            arm._guarded_stream_servoj(
+                stream,
+                config=ServoJStreamConfig(dt_s=0.004),
+                expected_stop_generation=arm.stop_generation,
+                capability=_GUARDED_MOTION_CAPABILITY,
+            )
+        except BaseException as exc:
+            stream_errors.append(exc)
+
+    def read_state() -> None:
+        state_results.append(arm.read_state())
+
+    stream_thread = threading.Thread(target=run_stream)
+    stream_thread.start()
+    assert write_entered.wait(timeout=1.0)
+    state_thread = threading.Thread(target=read_state)
+    state_thread.start()
+    state_thread.join(timeout=1.0)
+
+    assert not state_thread.is_alive()
+    assert len(state_results) == 1
+    assert stream_thread.is_alive()
+
+    release_write.set()
+    stream_thread.join(timeout=2.0)
+    assert not stream_thread.is_alive()
+    assert stream_errors == []
+
+
+def test_stop_transport_gate_orders_idle_after_inflight_servoj() -> None:
+    arm, sdk = enabled_arm()
+    approved_generation = arm.stop_generation
+    write_entered = threading.Event()
+    release_write = threading.Event()
+    stop_latched = threading.Event()
+    sdk.driver.servoj_write_entered = write_entered
+    sdk.driver.servoj_write_release = release_write
+    original_latch_stop = arm._latch_stop
+    stream_results: list[object] = []
+    errors: list[BaseException] = []
+
+    def latch_stop() -> int:
+        generation = original_latch_stop()
+        stop_latched.set()
+        return generation
+
+    arm._latch_stop = latch_stop  # type: ignore[method-assign]
+    stream = ServoJStream(
+        commands=(
+            (0.0, 0.1, 0.2, 0.3, 0.4, 0.5),
+            (0.01, 0.1, 0.2, 0.3, 0.4, 0.5),
+        ),
+        dt_s=0.004,
+    )
+
+    def run_stream() -> None:
+        try:
+            stream_results.append(
+                arm._guarded_stream_servoj(
+                    stream,
+                    config=ServoJStreamConfig(dt_s=0.004),
+                    expected_stop_generation=approved_generation,
+                    capability=_GUARDED_MOTION_CAPABILITY,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def request_stop() -> None:
+        try:
+            arm.stop()
+        except BaseException as exc:
+            errors.append(exc)
+
+    stream_thread = threading.Thread(target=run_stream)
+    stream_thread.start()
+    assert write_entered.wait(timeout=1.0)
+    stop_thread = threading.Thread(target=request_stop)
+    stop_thread.start()
+    assert stop_latched.wait(timeout=1.0)
+    assert stop_thread.is_alive()
+
+    release_write.set()
+    stream_thread.join(timeout=2.0)
+    stop_thread.join(timeout=2.0)
+
+    assert errors == []
+    assert not stream_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert len(stream_results) == 1
+    assert stream_results[0].ok is False
+    assert stream_results[0].abort_reason == "operator_stop"
+    transport_names = [
+        name for name, _ in sdk.driver.calls if name in {"writeServoj", "writeIdle"}
+    ]
+    assert transport_names == ["writeServoj", "writeIdle"]
+
+
+def test_stop_latched_before_prepare_gate_prevents_servoj_write() -> None:
+    arm, sdk = enabled_arm()
+    approved_generation = arm.stop_generation
+    prepare_waiting = threading.Event()
+    stop_latched = threading.Event()
+    release_gate = threading.Event()
+    original_write = arm._write_servoj_joint
+    original_latch_stop = arm._latch_stop
+    errors: list[BaseException] = []
+
+    def waiting_write(*args, **kwargs) -> None:
+        prepare_waiting.set()
+        original_write(*args, **kwargs)
+
+    def latch_stop() -> int:
+        generation = original_latch_stop()
+        stop_latched.set()
+        return generation
+
+    arm._write_servoj_joint = waiting_write  # type: ignore[method-assign]
+    arm._latch_stop = latch_stop  # type: ignore[method-assign]
+    arm._command_io_lock.acquire()
+
+    def prepare() -> None:
+        try:
+            arm._guarded_prepare_servoj_stream(
+                dt_s=0.004,
+                expected_stop_generation=approved_generation,
+                capability=_GUARDED_MOTION_CAPABILITY,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def request_stop() -> None:
+        try:
+            arm.stop()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            release_gate.set()
+
+    prepare_thread = threading.Thread(target=prepare)
+    stop_thread = threading.Thread(target=request_stop)
+    prepare_thread.start()
+    assert prepare_waiting.wait(timeout=1.0)
+    stop_thread.start()
+    assert stop_latched.wait(timeout=1.0)
+    arm._command_io_lock.release()
+
+    prepare_thread.join(timeout=2.0)
+    stop_thread.join(timeout=2.0)
+    assert release_gate.is_set()
+    assert not prepare_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert any(isinstance(exc, RobotMotionInterruptedError) for exc in errors)
+    transport_names = [
+        name for name, _ in sdk.driver.calls if name in {"writeServoj", "writeIdle"}
+    ]
+    assert transport_names == ["writeIdle"]
 
 
 def test_public_motion_methods_are_permanently_guarded() -> None:
@@ -357,7 +748,11 @@ def test_guarded_motion_primitive_rejects_missing_capability() -> None:
     arm, sdk = enabled_arm()
 
     with pytest.raises(PermissionError, match="guarded-executor capability"):
-        arm._guarded_prepare_servoj_stream(dt_s=0.004, capability=object())
+        arm._guarded_prepare_servoj_stream(
+            dt_s=0.004,
+            expected_stop_generation=arm.stop_generation,
+            capability=object(),
+        )
 
     assert not any(name == "writeServoj" for name, _ in sdk.driver.calls)
 
@@ -408,6 +803,7 @@ def test_prepare_servoj_stream_primes_with_long_hold_timeout() -> None:
 
     arm._guarded_prepare_servoj_stream(
         dt_s=0.004,
+        expected_stop_generation=arm.stop_generation,
         capability=_GUARDED_MOTION_CAPABILITY,
     )
 
@@ -429,6 +825,7 @@ def test_stream_servoj_writes_every_command_with_short_timeout() -> None:
     result = arm._guarded_stream_servoj(
         stream,
         capability=_GUARDED_MOTION_CAPABILITY,
+        expected_stop_generation=arm.stop_generation,
         config=ServoJStreamConfig(
             dt_s=0.004,
             tracking_check_every_n_commands=99,
@@ -455,6 +852,7 @@ def test_stream_servoj_aborts_on_tracking_error() -> None:
     result = arm._guarded_stream_servoj(
         stream,
         capability=_GUARDED_MOTION_CAPABILITY,
+        expected_stop_generation=arm.stop_generation,
         config=ServoJStreamConfig(
             dt_s=0.004,
             tracking_error_rad=0.01,
@@ -475,6 +873,7 @@ def test_stream_servoj_rejected_write_fails_closed() -> None:
     result = arm._guarded_stream_servoj(
         stream,
         config=ServoJStreamConfig(dt_s=0.004),
+        expected_stop_generation=arm.stop_generation,
         capability=_GUARDED_MOTION_CAPABILITY,
     )
 

@@ -26,6 +26,11 @@ from biblade_fusion.storage.depth_comparison import (
     read_depth_comparison,
     write_depth_comparison,
 )
+from biblade_fusion.storage.inference_stationarity import (
+    StoredInferenceStationarity,
+    read_inference_stationarity,
+    write_inference_stationarity,
+)
 from biblade_fusion.storage.initialization import (
     StoredInitialization,
     read_initialization,
@@ -72,6 +77,13 @@ from biblade_fusion.storage.stereo_inference import (
     verify_stereo_inference_source,
     write_stereo_inference,
 )
+from biblade_fusion.storage.stop_scan_run import (
+    StopScanRunEvent,
+    StopScanRunFormatError,
+    StopScanRunWriter,
+    StoredStopScanRun,
+    read_stop_scan_run,
+)
 from biblade_fusion.storage.view_plan import (
     StoredViewPlan,
     read_view_plan,
@@ -88,6 +100,7 @@ __all__ = [
     "StoredDepthComparison",
     "StoredDepthAggregate",
     "StoredInitialization",
+    "StoredInferenceStationarity",
     "StoredMotionPreflight",
     "StoredNativeOverlapReport",
     "LegacyNativeOverlapReplay",
@@ -96,9 +109,11 @@ __all__ = [
     "StoredPathValidation",
     "StoredReconstructedBladeView",
     "StoredStereoInference",
+    "StoredStopScanRun",
     "StoredViewPlan",
     "StoredViewDescriptor",
     "read_initialization",
+    "read_inference_stationarity",
     "read_coarse_model_summary",
     "read_motion_preflight",
     "read_native_overlap_report",
@@ -112,9 +127,11 @@ __all__ = [
     "read_reconstructed_view",
     "read_coverage_ledger",
     "read_stereo_inference",
+    "read_stop_scan_run",
     "verify_stereo_inference_source",
     "read_view_plan",
     "write_initialization",
+    "write_inference_stationarity",
     "write_coarse_model",
     "write_motion_preflight",
     "write_native_overlap_report",
@@ -127,5 +144,8 @@ __all__ = [
     "write_reconstructed_view",
     "write_coverage_ledger",
     "write_stereo_inference",
+    "StopScanRunEvent",
+    "StopScanRunFormatError",
+    "StopScanRunWriter",
     "write_view_plan",
 ]

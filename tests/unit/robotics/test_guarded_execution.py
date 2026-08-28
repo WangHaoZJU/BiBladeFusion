@@ -13,7 +13,10 @@ from biblade_fusion.devices.robot import (
     StreamServoJResult,
 )
 from biblade_fusion.devices.robot.base import RobotState
-from biblade_fusion.devices.robot.errors import RobotCommandError
+from biblade_fusion.devices.robot.errors import (
+    RobotCommandError,
+    RobotMotionInterruptedError,
+)
 from biblade_fusion.robotics import (
     CollisionCheckStatus,
     Cs68PinocchioCollisionChecker,
@@ -99,11 +102,24 @@ def _changed_snapshot(snapshot):
 @dataclass
 class FakeGuardedArm:
     joint_positions_rad: np.ndarray = field(default_factory=lambda: np.zeros(6))
+    recovered_joint_positions_rad: np.ndarray | None = None
+    resumed: bool = False
     prepared: bool = False
     streamed: bool = False
     stopped: bool = False
+    _stop_generation: int = 0
+    events: list[str] = field(default_factory=list)
+    resume_exception: BaseException | None = None
+    prepare_exception: BaseException | None = None
+    stream_exception: BaseException | None = None
+    stop_exception: BaseException | None = None
+
+    @property
+    def stop_generation(self) -> int:
+        return self._stop_generation
 
     def read_state(self) -> RobotState:
+        self.events.append("read_state")
         return RobotState(
             monotonic_time_ns=1,
             controller_time_s=1.0,
@@ -114,34 +130,67 @@ class FakeGuardedArm:
             speed_scaling=0.3,
         )
 
+    def _guarded_resume_servoj_control(
+        self,
+        *,
+        expected_stop_generation: int,
+        capability: object,
+    ) -> None:
+        assert capability is not None
+        self.events.append("resume")
+        self.resumed = True
+        if self.resume_exception is not None:
+            raise self.resume_exception
+        if self._stop_generation != expected_stop_generation:
+            raise RobotCommandError("stop generation changed during fake recovery")
+        self.stopped = False
+        if self.recovered_joint_positions_rad is not None:
+            self.joint_positions_rad = self.recovered_joint_positions_rad
+
     def _guarded_prepare_servoj_stream(
         self,
         *,
         dt_s: float,
         warmup_duration_s: float = 0.0,
+        expected_stop_generation: int,
         capability: object,
     ) -> None:
         assert capability is not None
         assert dt_s == 0.004
         assert warmup_duration_s == 0.0
+        if self._stop_generation != expected_stop_generation or self.stopped:
+            raise RobotMotionInterruptedError("stop generation changed before prepare")
+        self.events.append("prepare")
         self.prepared = True
+        if self.prepare_exception is not None:
+            raise self.prepare_exception
 
     def _guarded_stream_servoj(
         self,
         stream,
         *,
         config,
+        expected_stop_generation,
         capability,
         tracking_samples=None,
     ):
         assert capability is not None
         assert config.dt_s == stream.dt_s
         assert tracking_samples is None
+        if self._stop_generation != expected_stop_generation or self.stopped:
+            raise RobotMotionInterruptedError("stop generation changed before stream")
+        self.events.append("stream")
         self.streamed = True
+        if self.stream_exception is not None:
+            raise self.stream_exception
         return StreamServoJResult(ok=True, commands_sent=len(stream.commands))
 
     def stop(self) -> None:
+        self.events.append("stop")
+        self._stop_generation += 1
         self.stopped = True
+        if self.stop_exception is not None:
+            raise self.stop_exception
 
 
 @pytest.fixture(scope="module")
@@ -204,10 +253,437 @@ def test_execute_revalidates_and_consumes_one_shot_permit(
     result = executor.execute(clear_preflight, permit)
 
     assert result.ok is True
+    assert arm.events == [
+        "read_state",
+        "resume",
+        "read_state",
+        "prepare",
+        "stream",
+        "stop",
+    ]
+    assert arm.resumed is True
     assert arm.prepared is True
     assert arm.streamed is True
+    assert arm.stopped is True
+    completed_events = list(arm.events)
     with pytest.raises(RobotCommandError, match="already consumed"):
         executor.execute(clear_preflight, permit)
+    assert arm.events == completed_events
+
+
+def test_execute_stops_arm_when_driver_prepare_raises(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm(prepare_exception=RuntimeError("prepare failed"))
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        executor.execute(clear_preflight, permit)
+
+    assert arm.prepared is True
+    assert arm.streamed is False
+    assert arm.stopped is True
+
+
+def test_execute_stops_arm_when_driver_stream_raises(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm(stream_exception=RuntimeError("stream failed"))
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    with pytest.raises(RuntimeError, match="stream failed"):
+        executor.execute(clear_preflight, permit)
+
+    assert arm.prepared is True
+    assert arm.streamed is True
+    assert arm.stopped is True
+
+
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit])
+def test_execute_stops_arm_and_preserves_base_exception_from_driver_prepare(
+    checker, occupancy_checker, clear_preflight, exception_type
+) -> None:
+    original = exception_type("prepare interrupted")
+    arm = FakeGuardedArm(prepare_exception=original)
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    with pytest.raises(exception_type) as raised:
+        executor.execute(clear_preflight, permit)
+
+    assert raised.value is original
+    assert arm.prepared is True
+    assert arm.streamed is False
+    assert arm.stopped is True
+
+
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit])
+def test_execute_stops_arm_and_preserves_base_exception_from_driver_stream(
+    checker, occupancy_checker, clear_preflight, exception_type
+) -> None:
+    original = exception_type("stream interrupted")
+    arm = FakeGuardedArm(stream_exception=original)
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    with pytest.raises(exception_type) as raised:
+        executor.execute(clear_preflight, permit)
+
+    assert raised.value is original
+    assert arm.prepared is True
+    assert arm.streamed is True
+    assert arm.stopped is True
+
+
+def test_execute_preserves_original_base_exception_when_emergency_stop_raises(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    original = KeyboardInterrupt("stream interrupted")
+    arm = FakeGuardedArm(
+        stream_exception=original,
+        stop_exception=SystemExit("stop interrupted"),
+    )
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        executor.execute(clear_preflight, permit)
+
+    assert raised.value is original
+    assert arm.stopped is True
+
+
+def test_execute_stops_if_control_recovery_raises(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    original = KeyboardInterrupt("resume interrupted")
+    arm = FakeGuardedArm(resume_exception=original)
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        executor.execute(clear_preflight, permit)
+
+    assert raised.value is original
+    assert arm.events == ["read_state", "resume", "stop"]
+    assert arm.prepared is False
+    assert arm.streamed is False
+
+
+def test_execute_revalidates_live_start_after_control_recovery(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm(
+        recovered_joint_positions_rad=np.full(6, 0.02),
+    )
+    executor = GuardedEliteExecutor(
+        arm,
+        checker,
+        occupancy_checker,
+        live_start_tolerance_rad=0.01,
+    )
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    with pytest.raises(RobotCommandError, match="changed during control recovery"):
+        executor.execute(clear_preflight, permit)
+
+    assert arm.events == ["read_state", "resume", "read_state", "stop"]
+    assert arm.prepared is False
+    assert arm.streamed is False
+
+
+def test_execute_never_reports_success_when_same_arm_stop_fails(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    original = RuntimeError("writeIdle failed")
+    arm = FakeGuardedArm(stop_exception=original)
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        executor.execute(clear_preflight, permit)
+
+    assert raised.value is original
+    assert arm.events[-3:] == ["prepare", "stream", "stop"]
+    assert arm.stopped is True
+
+
+def test_execute_rejects_stop_generation_newer_than_one_shot_permit(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm()
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+    assert permit.stop_generation == 0
+    arm.stop()
+
+    with pytest.raises(RobotCommandError, match="stop generation changed"):
+        executor.execute(clear_preflight, permit)
+
+    assert arm.events == ["stop", "read_state", "stop"]
+    assert arm.resumed is False
+    assert arm.prepared is False
+    assert arm.streamed is False
+
+
+def test_execute_detects_stop_race_after_prepare_even_if_callback_returns_false(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm()
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+    calls = 0
+
+    def concurrent_stop_without_cancel_flag() -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            arm.stop()
+        return False
+
+    with pytest.raises(RobotCommandError, match="after_servoj_prepare"):
+        executor.execute(
+            clear_preflight,
+            permit,
+            cancellation_requested=concurrent_stop_without_cancel_flag,
+        )
+
+    assert arm.events == [
+        "read_state",
+        "resume",
+        "read_state",
+        "prepare",
+        "stop",
+        "stop",
+    ]
+    assert arm.streamed is False
+    assert arm.stop_generation == permit.stop_generation + 2
+
+
+def test_execute_checks_cancellation_in_required_order(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm()
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    def not_cancelled() -> bool:
+        arm.events.append("cancel_check")
+        return False
+
+    result = executor.execute(
+        clear_preflight,
+        permit,
+        cancellation_requested=not_cancelled,
+    )
+
+    assert result.ok is True
+    assert arm.events == [
+        "read_state",
+        "cancel_check",
+        "resume",
+        "cancel_check",
+        "read_state",
+        "prepare",
+        "cancel_check",
+        "stream",
+        "stop",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("cancel_on_call", "expected_events", "stage"),
+    [
+        (1, ["read_state", "stop"], "before_control_recovery"),
+        (2, ["read_state", "resume", "stop"], "after_control_recovery"),
+        (
+            3,
+            ["read_state", "resume", "read_state", "prepare", "stop"],
+            "after_servoj_prepare",
+        ),
+    ],
+)
+def test_execute_cancellation_race_blocks_every_later_motion_stage(
+    checker,
+    occupancy_checker,
+    clear_preflight,
+    cancel_on_call,
+    expected_events,
+    stage,
+) -> None:
+    arm = FakeGuardedArm()
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+    calls = 0
+
+    def cancellation_requested() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls == cancel_on_call
+
+    with pytest.raises(RobotCommandError, match=stage):
+        executor.execute(
+            clear_preflight,
+            permit,
+            cancellation_requested=cancellation_requested,
+        )
+
+    assert calls == cancel_on_call
+    assert arm.events == expected_events
+    assert arm.streamed is False
+    assert arm.stopped is True
+
+
+def test_execute_cancellation_callback_exception_stops_and_propagates(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    original = SystemExit("cancel callback failed")
+    arm = FakeGuardedArm()
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    def broken_callback() -> bool:
+        raise original
+
+    with pytest.raises(SystemExit) as raised:
+        executor.execute(
+            clear_preflight,
+            permit,
+            cancellation_requested=broken_callback,
+        )
+
+    assert raised.value is original
+    assert arm.events == ["read_state", "stop"]
+    assert arm.resumed is False
+    assert arm.prepared is False
+    assert arm.streamed is False
+
+
+def test_execute_non_boolean_cancellation_result_fails_closed(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm()
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    with pytest.raises(RobotCommandError, match="non-boolean"):
+        executor.execute(
+            clear_preflight,
+            permit,
+            cancellation_requested=lambda: 1,  # type: ignore[return-value]
+        )
+
+    assert arm.events == ["read_state", "stop"]
+    assert arm.resumed is False
+
+
+def test_execute_rechecks_permit_expiry_after_revalidation(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm()
+    clock_values = iter((0.0, 0.0, 0.0, 2.0))
+    executor = GuardedEliteExecutor(
+        arm,
+        checker,
+        occupancy_checker,
+        permit_lifetime_s=1.0,
+        clock=lambda: next(clock_values),
+    )
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    with pytest.raises(RobotCommandError, match="post-recovery revalidation"):
+        executor.execute(clear_preflight, permit)
+
+    assert arm.prepared is False
+    assert arm.streamed is False
+    assert arm.stopped is True
+
+
+def test_execute_rechecks_permit_expiry_after_servoj_prepare(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm()
+    executor = GuardedEliteExecutor(
+        arm,
+        checker,
+        occupancy_checker,
+        permit_lifetime_s=1.0,
+        clock=lambda: 2.0 if arm.prepared else 0.0,
+    )
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    with pytest.raises(RobotCommandError, match="ServoJ preparation"):
+        executor.execute(clear_preflight, permit)
+
+    assert arm.prepared is True
+    assert arm.streamed is False
+    assert arm.stopped is True
 
 
 def test_live_start_mismatch_blocks_before_driver_prepare(
@@ -231,6 +707,8 @@ def test_live_start_mismatch_blocks_before_driver_prepare(
 
     assert arm.prepared is False
     assert arm.streamed is False
+    assert arm.resumed is False
+    assert arm.events == ["read_state"]
 
 
 def test_expired_permit_is_consumed_without_motion(
@@ -256,6 +734,8 @@ def test_expired_permit_is_consumed_without_motion(
         executor.execute(clear_preflight, permit)
 
     assert arm.prepared is False
+    assert arm.resumed is False
+    assert arm.events == []
 
 
 def test_caller_cannot_extend_expired_permit(
@@ -284,6 +764,35 @@ def test_caller_cannot_extend_expired_permit(
         )
 
     assert arm.prepared is False
+
+
+def test_caller_cannot_mutate_authoritative_permit_through_returned_alias(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm()
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    # frozen=True blocks normal assignment but deliberately does not make the
+    # object tamper-proof.  The internal permit must therefore be a distinct
+    # value object, allowing this mutation to be detected on consumption.
+    object.__setattr__(
+        permit,
+        "expires_monotonic_s",
+        permit.expires_monotonic_s + 1_000_000.0,
+    )
+
+    with pytest.raises(RobotCommandError, match="permit payload was modified"):
+        executor.execute(clear_preflight, permit)
+
+    assert arm.prepared is False
+    assert arm.streamed is False
+    assert arm.resumed is False
+    assert arm.events == []
 
 
 @pytest.mark.parametrize(
@@ -465,6 +974,7 @@ def test_permit_carries_explicit_occupancy_binding(
         == evidence.semantic_attestation_hash
     )
     assert permit.continuous_occupancy_sweep_verified is True
+    assert permit.stop_generation == 0
     assert permit.collision_model_id == checker.collision_model_id
     assert permit.collision_model_hash == checker.collision_model_hash
     assert permit.robot_geometry_hash == checker.robot_geometry_hash

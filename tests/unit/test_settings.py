@@ -6,6 +6,8 @@ from pydantic import ValidationError
 from biblade_fusion.core.settings import (
     AppSettings,
     OccupancyConfig,
+    RobotConfig,
+    StopAndCaptureConfig,
     SurfacePartitionConfig,
     load_settings,
 )
@@ -57,6 +59,12 @@ def test_default_settings_load_safely() -> None:
     assert settings.kinematics.ik_timeout_s == 0.05
     assert settings.motion_preflight.servoj_dt_s == 0.004
     assert settings.motion_preflight.speed_scaling == 0.08
+    assert settings.stop_and_capture.enabled is False
+    assert settings.stop_and_capture.depth_backend == "foundation_stereo"
+    assert settings.stop_and_capture.maximum_segment_joint_delta_rad is None
+    assert settings.stop_and_capture.require_operator_approval is True
+    assert settings.stop_and_capture.require_capture_after_every_segment is True
+    assert settings.stop_and_capture.maximum_robot_state_staleness_s == 0.25
     assert settings.surface_partition.fin_mode == "required_single_per_side"
     assert settings.surface_partition.derive_footprint_from_intrinsics is True
     assert settings.surface_partition.usable_footprint_m is None
@@ -149,6 +157,166 @@ def test_occupancy_requires_at_least_three_source_views() -> None:
 def test_occupancy_requires_multiple_free_observations() -> None:
     with pytest.raises(ValidationError, match="greater than or equal to 2"):
         OccupancyConfig(minimum_free_observations=1)
+
+
+def test_enabled_stop_and_capture_requires_measured_short_segment_bound() -> None:
+    with pytest.raises(ValidationError, match="maximum_segment_joint_delta_rad"):
+        StopAndCaptureConfig(enabled=True)
+
+
+def test_enabled_stop_and_capture_requires_enabled_occupancy() -> None:
+    raw = {
+        "project": {},
+        "robot": {"sdk_wheel": "/tmp/elite.whl"},
+        "realsense": {},
+        "thermal": {},
+        "stop_and_capture": {
+            "enabled": True,
+            "maximum_segment_joint_delta_rad": 0.05,
+        },
+        "occupancy": {"enabled": False},
+    }
+
+    with pytest.raises(ValidationError, match="requires occupancy mapping"):
+        AppSettings.model_validate(raw)
+
+
+def _enabled_stop_and_capture_settings() -> dict[str, object]:
+    return {
+        "project": {},
+        "robot": {
+            "sdk_wheel": "/tmp/elite.whl",
+            "settle_time_s": 1.0,
+            "motion_enabled": True,
+        },
+        "realsense": {},
+        "thermal": {},
+        "stop_and_capture": {
+            "enabled": True,
+            "maximum_segment_joint_delta_rad": 0.05,
+            "settle_timeout_s": 2.0,
+            "settle_poll_period_s": 0.05,
+            "maximum_robot_state_staleness_s": 0.25,
+        },
+        "occupancy": {
+            "enabled": True,
+            "workspace_bounds_min_m": (-0.2, -0.2, -0.2),
+            "workspace_bounds_max_m": (0.2, 0.2, 0.2),
+        },
+    }
+
+
+def test_enabled_stop_and_capture_requires_positive_robot_settle_time() -> None:
+    raw = _enabled_stop_and_capture_settings()
+    raw["robot"] = {
+        "sdk_wheel": "/tmp/elite.whl",
+        "settle_time_s": 0.0,
+        "motion_enabled": True,
+    }
+
+    with pytest.raises(ValidationError, match=r"robot\.settle_time_s.*positive"):
+        AppSettings.model_validate(raw)
+
+
+def test_settle_timeout_must_cover_settle_window_and_one_poll() -> None:
+    raw = _enabled_stop_and_capture_settings()
+    raw["stop_and_capture"] = {
+        "enabled": True,
+        "maximum_segment_joint_delta_rad": 0.05,
+        "settle_timeout_s": 1.049,
+        "settle_poll_period_s": 0.05,
+        "maximum_robot_state_staleness_s": 0.25,
+    }
+
+    with pytest.raises(
+        ValidationError,
+        match=r"settle_timeout_s.*settle_time_s \+ settle_poll_period_s",
+    ):
+        AppSettings.model_validate(raw)
+
+
+def test_enabled_stop_scan_requires_one_servoj_period_contract() -> None:
+    raw = _enabled_stop_and_capture_settings()
+    raw["robot"] = {
+        "sdk_wheel": "/tmp/elite.whl",
+        "settle_time_s": 1.0,
+        "servoj_time_s": 0.008,
+        "motion_enabled": True,
+    }
+
+    with pytest.raises(
+        ValidationError,
+        match=r"robot\.servoj_time_s.*motion_preflight\.servoj_dt_s",
+    ):
+        AppSettings.model_validate(raw)
+
+
+@pytest.mark.parametrize("lr_threshold", [None, 2.0])
+def test_enabled_stop_scan_requires_occupancy_compatible_lr_threshold(
+    lr_threshold: float | None,
+) -> None:
+    raw = _enabled_stop_and_capture_settings()
+    raw["foundation_stereo"] = {
+        "left_right_consistency_threshold_px": lr_threshold,
+    }
+
+    with pytest.raises(
+        ValidationError,
+        match="FoundationStereo left-right consistency threshold",
+    ):
+        AppSettings.model_validate(raw)
+
+
+def test_nested_model_construct_cannot_bypass_enabled_settle_contract() -> None:
+    raw = _enabled_stop_and_capture_settings()
+    raw["robot"] = RobotConfig.model_construct(
+        sdk_wheel=Path("/tmp/elite.whl"),
+        settle_time_s=0.0,
+        motion_enabled=True,
+    )
+
+    with pytest.raises(ValidationError, match=r"robot\.settle_time_s.*positive"):
+        AppSettings.model_validate(raw)
+
+
+def test_nested_stop_config_cannot_bypass_settle_timeout_contract() -> None:
+    raw = _enabled_stop_and_capture_settings()
+    raw["stop_and_capture"] = StopAndCaptureConfig.model_construct(
+        enabled=True,
+        maximum_segment_joint_delta_rad=0.05,
+        settle_timeout_s=1.0,
+        settle_poll_period_s=0.05,
+        maximum_robot_state_staleness_s=0.25,
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match=r"settle_timeout_s.*settle_time_s \+ settle_poll_period_s",
+    ):
+        AppSettings.model_validate(raw)
+
+
+def test_robot_state_staleness_must_cover_the_poll_period() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="maximum_robot_state_staleness_s",
+    ):
+        StopAndCaptureConfig(
+            settle_poll_period_s=0.2,
+            maximum_robot_state_staleness_s=0.1,
+        )
+
+
+def test_enabled_stop_scan_requires_motion_driver_boundary() -> None:
+    raw = _enabled_stop_and_capture_settings()
+    raw["robot"] = {
+        "sdk_wheel": "/tmp/elite.whl",
+        "settle_time_s": 1.0,
+        "motion_enabled": False,
+    }
+
+    with pytest.raises(ValidationError, match="robot.motion_enabled=true"):
+        AppSettings.model_validate(raw)
 
 
 def test_free_vote_threshold_is_independent_from_source_view_readiness() -> None:

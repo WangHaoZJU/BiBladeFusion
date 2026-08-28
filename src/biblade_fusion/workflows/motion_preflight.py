@@ -9,6 +9,7 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from biblade_fusion.calibration import HandEyeCalibration
+from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import MotionPreflightConfig
 from biblade_fusion.planning import CandidateStatus, FilteredViewPlan
 from biblade_fusion.robotics import (
@@ -43,6 +44,29 @@ class PreflightedMotionLeg:
     goal_base_t_tcp_matrix: tuple[tuple[float, float, float, float], ...]
     endpoint_consistency: EndpointPoseConsistency
     preflight: JointMotionPreflight
+
+
+@dataclass(frozen=True, slots=True)
+class LiveJointSegmentPreflight:
+    """One live-start, occupancy-bound segment; never an authorization by itself."""
+
+    preflight: JointMotionPreflight
+    endpoint_consistency: EndpointPoseConsistency | None
+    final_target: bool
+
+    @property
+    def ready_for_approval(self) -> bool:
+        return self.preflight.ready_for_approval and (
+            not self.final_target
+            or (
+                self.endpoint_consistency is not None
+                and self.endpoint_consistency.status is CollisionCheckStatus.CLEAR
+            )
+        )
+
+    @property
+    def motion_authorized(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +158,7 @@ def preflight_view_sequence_motion(
         goal_matrix = tuple(
             tuple(float(value) for value in row) for row in base_t_tcp.matrix
         )
-        endpoint_consistency = _endpoint_pose_consistency(
+        endpoint_consistency = evaluate_endpoint_pose_consistency(
             evaluation.joint_positions_rad,
             base_t_tcp.matrix,
             collision_checker,
@@ -199,7 +223,7 @@ def preflight_view_sequence_motion(
     )
 
 
-def _endpoint_pose_consistency(
+def evaluate_endpoint_pose_consistency(
     joint_positions_rad: ArrayLike,
     target_base_t_tcp: ArrayLike,
     collision_checker: Cs68PinocchioCollisionChecker | None,
@@ -237,8 +261,14 @@ def _endpoint_pose_consistency(
             ),
             dtype=np.float64,
         )
-        target = np.asarray(target_base_t_tcp, dtype=np.float64)
-        predicted = base_t_flange @ load_es68_flange_t_tcp().matrix
+        target_pose = PoseSE3("base", "tcp", target_base_t_tcp)
+        predicted_pose = PoseSE3(
+            "base",
+            "tcp",
+            base_t_flange @ load_es68_flange_t_tcp().matrix,
+        )
+        target = target_pose.matrix
+        predicted = predicted_pose.matrix
         if (
             base_t_flange.shape != (4, 4)
             or target.shape != (4, 4)
@@ -290,7 +320,67 @@ def _endpoint_pose_consistency(
             rotation_limit,
             None,
             (f"endpoint_pose_consistency_error:{type(exc).__name__}",),
+    )
+
+
+def preflight_live_joint_segment(
+    start_joint_positions_rad: ArrayLike,
+    goal_joint_positions_rad: ArrayLike,
+    config: MotionPreflightConfig,
+    *,
+    collision_checker: Cs68PinocchioCollisionChecker | None,
+    occupancy_checker: OccupancyRobotCollisionChecker | None,
+    final_target: bool,
+    target_base_t_tcp_matrix: ArrayLike | None = None,
+    collision_checker_unavailable_reason: str = "checker_unavailable",
+    execution_freshness_margin_s: float = 1.0,
+    evaluated_at_utc: datetime | None = None,
+) -> LiveJointSegmentPreflight:
+    """Preflight exactly one receding-horizon segment from measured live joints.
+
+    Intermediate short segments have no geometric view endpoint.  The final segment
+    additionally proves that ES68 FK reproduces the target ``base_T_tcp`` that produced
+    the stored IK solution.  Every call creates a fresh preflight bound to the supplied
+    occupancy checker; callers must never cache it across a map publication.
+    """
+
+    if final_target and target_base_t_tcp_matrix is None:
+        raise ValueError("Final live segment requires target_base_t_tcp_matrix")
+    if not final_target and target_base_t_tcp_matrix is not None:
+        raise ValueError("Intermediate live segment must not claim a view endpoint")
+    evaluation_time = None
+    if evaluated_at_utc is not None:
+        if evaluated_at_utc.tzinfo is None:
+            raise ValueError("Motion-preflight evaluation time must be timezone-aware")
+        evaluation_time = evaluated_at_utc.astimezone(UTC).isoformat()
+    preflight = preflight_linear_joint_motion(
+        start_joint_positions_rad,
+        goal_joint_positions_rad,
+        collision_checker=collision_checker,
+        checker_unavailable_reason=collision_checker_unavailable_reason,
+        occupancy_checker=occupancy_checker,
+        maximum_joint_step_rad=config.maximum_joint_step_rad,
+        servoj_dt_s=config.servoj_dt_s,
+        speed_scaling=config.speed_scaling,
+        velocity_margin=config.velocity_margin,
+        execution_freshness_margin_s=execution_freshness_margin_s,
+    )
+    endpoint = None
+    if final_target:
+        endpoint = evaluate_endpoint_pose_consistency(
+            goal_joint_positions_rad,
+            target_base_t_tcp_matrix,
+            collision_checker,
+            maximum_translation_error_m=config.maximum_endpoint_translation_error_m,
+            maximum_rotation_error_deg=config.maximum_endpoint_rotation_error_deg,
         )
+        preflight = _apply_endpoint_gate(preflight, endpoint)
+    if evaluation_time is not None:
+        preflight = replace(
+            preflight,
+            diagnostics={**preflight.diagnostics, "evaluated_at_utc": evaluation_time},
+        )
+    return LiveJointSegmentPreflight(preflight, endpoint, bool(final_target))
 
 
 def _apply_endpoint_gate(

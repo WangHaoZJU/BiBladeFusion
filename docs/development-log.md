@@ -1,5 +1,38 @@
 # Development log
 
+## 2026-08-28 — FoundationStereo-only stop-and-capture motion coordinator
+
+- Added a library-level receding-horizon state machine for the ES68 eye-in-hand scan:
+  explicit stop, sampled settle gate, one closed stereo capture, FoundationStereo
+  inference, fresh-window occupancy rebuild, one short joint leg, per-leg approval,
+  guarded ServoJ, explicit stop, settle and mandatory recapture. Native D435i depth is
+  not a selectable fallback, and no motion command was added to the public CLI.
+- Made perception acceptance transactional. Candidate raw/stereo/occupancy/stationarity
+  assets do not enter the source window or become the current occupancy generation until
+  independent disk-semantic verification succeeds. Source-window acceptance and map
+  publication share one publisher lock, so concurrent readers cannot observe or freeze a
+  half-committed generation; failed acceptance leaves the prior generation unchanged.
+  `MAP_READY` and its event are emitted only after this commit completes.
+- Added bounded-gap sampled stationarity evidence and write-once, hash-chained run events.
+  Event persistence failure is an irreversible terminal latch for that coordinator
+  instance. The evidence detects sampled drift, sampled out-and-return motion, stale or
+  frozen feedback, clock regressions and invalid controller state; it is explicitly not
+  claimed as continuous immobility proof between RTSI samples.
+- Hardened the asynchronous stop boundary. Stop first increments a monotonic generation
+  and locks out motion, then shares a short transport gate with every ServoJ write. A
+  permit binds that generation across control recovery, preparation and streaming; after
+  `stop()` returns, an older permit cannot write another ServoJ frame. Configuration now
+  rejects non-ES68 coordination, a disabled motion driver, divergent planned/driver
+  ServoJ periods, incompatible LR-consistency thresholds, and unequal component policy
+  snapshots before the run starts.
+- Production motion remains intentionally unavailable: defaults are disabled, the short
+  segment limit and workspace bounds require measured values, and the current collision
+  backends cannot issue either continuous swept-mesh or continuous robot-versus-occupancy
+  evidence. The expected production result is therefore `MOTION_BLOCKED`, pending those
+  proofs and hardware acceptance. Verification closed with `538 passed`, repository-wide
+  Ruff and bytecode compilation, whitespace checks, lockfile consistency, and an offline
+  sdist/wheel build containing all new modules.
+
 ## 2026-08-28 — coverage-derived coarse-scan ordering and preflight binding
 
 - Coverage-plan schema 2 now turns incomplete proxy patches into a deterministic,
@@ -366,6 +399,31 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Conservative linear-joint motion preflight using copied velocity limits, plus exact
   preflight-hash confirmation, expiring one-shot execution permits, live-start checks,
   and immediate collision revalidation. No motion command is exposed through the CLI.
+- Added a library-level, FoundationStereo-only receding-horizon coordinator for the
+  explicit stop/settle, single-view capture, inference, fresh-map rebuild, one-short-leg
+  preflight, per-leg operator approval, execution, explicit stop, settle and recapture
+  sequence. The coordinator starts with operator-guided bootstrap, reads each segment
+  start from the live settled joints, freezes one fully attested occupancy generation
+  during authorization/execution, and rejects concurrent perception/motion operations.
+  It remains disabled by default, has no motion CLI, and correctly reaches
+  `MOTION_BLOCKED` with the current production checkers because continuous mesh and
+  occupancy sweeps are still unavailable.
+- Added the concrete stop-scan FoundationStereo perception transaction. Every accepted
+  view is a separately closed one-view raw session; inference source hashes are verified,
+  robot stationarity is sampled throughout inference, and every occupancy generation is
+  rebuilt from scratch from the still-fresh sliding source window before full semantic
+  replay. Native RealSense depth is forbidden in this coordinator. The current concrete
+  engine produces stereo and safety-occupancy assets; online reconstructed-view and
+  coverage outputs remain integration work.
+- Added inference-window stationarity evidence and an append-only stop-scan event store.
+  Stationarity checks arbitrary sample-pair joint/TCP drift, goal error and independent
+  clock duration rather than relying on sleep alone. The event API publishes each JSON
+  path once, while a forward SHA-256 chain makes later filesystem tampering detectable;
+  `run.json` is explicitly navigation-only and the reader replays event files without
+  trusting that index.
+- The exact coordinator protocol, asset boundaries and fail-closed states are documented
+  in `docs/stop-and-capture-coordinator.md`; that document explicitly does not authorize
+  hardware motion.
 - Immutable ordered view-sequence motion-preflight schema-5 artifacts bind plan,
   initialization, occupancy, and motion-model hashes and re-derive the fail-closed report
   on read. The production path currently stops at missing continuous swept-mesh evidence
@@ -384,9 +442,12 @@ authoritative fine-grained record; this page records the experiment-facing state
 
 - Robot-stack migration to the pinned HoloRobot implementation is active. Model,
   self/workcell collision, control, ServoJ trajectory, guarded-execution, and ordered
-  tool-goal preflight artifact layers are copied/adapted. FoundationStereo occupancy
-  storage, conservative queries and replay visualization are implemented, but the live
-  stop-and-capture coordinator is not implemented; hardware acceptance remains.
+  tool-goal preflight artifact layers are copied/adapted. The library-level
+  FoundationStereo-only stop-and-capture coordinator, fresh-window occupancy transaction,
+  stationarity interlocks and run-event evidence chain are now implemented and covered by
+  deterministic tests. End-to-end online reconstruction/coverage selection, the two
+  continuous swept-volume proofs and hardware acceptance remain; consequently no
+  production motion path or CLI is released.
 - The migration sequence and safety boundary are recorded in
   `docs/robot-stack-migration.md`. Existing MDH/capsule code remains temporarily for
   artifact compatibility and will not receive new motion functionality.
@@ -408,10 +469,13 @@ authoritative fine-grained record; this page records the experiment-facing state
    two independent continuous proofs for every segment: swept ES68+D435i mesh/FCL
    clearance and swept robot-versus-voxel occupancy clearance. Discrete bounding-sphere
    samples remain diagnostic only.
-5. Implement and hardware-verify the native stop-and-capture coordinator that publishes
-   fresh `MAP_READY` snapshots, invalidates plans on every update, and preserves the
-   required freshness horizon through execution. Offline `build-replay` must remain
-   `STALE/BLOCKED`.
+5. After the two continuous sweep proofs exist, connect the concrete reconstruction,
+   coverage ledger and coverage-derived `NextViewSelector` to the implemented
+   FoundationStereo-only coordinator and perform controlled hardware acceptance. Measure
+   FoundationStereo latency, bootstrap-window duration, map replay, preflight, operator
+   response, short-segment execution and settle time; the default 5 s map age and null
+   segment bound are software placeholders, not accepted physical values. Offline
+   `build-replay` must remain `STALE/BLOCKED`.
 6. Hardware-validate the deterministic coverage-derived sequence from separately
    approved known-safe poses. Joint-motion cost may later be evaluated only as a
    non-safety tie-breaker, not as a reachability or clearance substitute.

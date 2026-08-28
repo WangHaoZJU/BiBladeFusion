@@ -33,8 +33,20 @@ class SynchronizedAcquirer:
         self._robot = robot
         self._stereo_camera = stereo_camera
         self._thermal_camera = thermal_camera
-        self._config = config
+        self._config = config.model_copy(deep=True)
         self._require_thermal = require_thermal
+
+    @property
+    def robot_state_source(self) -> RobotStateSource:
+        """Return the exact robot object used to bracket every camera exposure."""
+
+        return self._robot
+
+    @property
+    def acquisition_config(self) -> AcquisitionConfig:
+        """Return a defensive copy of the capture policy used by this acquirer."""
+
+        return self._config.model_copy(deep=True)
 
     def capture(self, view_id: str, sequence_index: int) -> SynchronizedFrameBundle:
         """Capture one bundle or reject it if the robot moved during acquisition."""

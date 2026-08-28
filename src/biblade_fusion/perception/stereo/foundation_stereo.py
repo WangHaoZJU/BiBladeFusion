@@ -378,8 +378,14 @@ class FoundationStereoBackend:
         config: FoundationStereoConfig,
         runtime: FoundationStereoRuntime | None = None,
     ) -> None:
-        self._config = config
+        self._config = config.model_copy(deep=True)
         self._runtime = runtime
+
+    @property
+    def config(self) -> FoundationStereoConfig:
+        """Return a defensive copy of the configuration bound to this backend."""
+
+        return self._config.model_copy(deep=True)
 
     def _get_runtime(self) -> FoundationStereoRuntime:
         if self._runtime is None:

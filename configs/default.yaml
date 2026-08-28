@@ -325,6 +325,22 @@ motion_preflight:
   maximum_endpoint_translation_error_m: 0.002
   maximum_endpoint_rotation_error_deg: 0.3
 
+# Receding-horizon coordinator: stop/settle, capture, FoundationStereo, publish one
+# immutable occupancy generation, preflight exactly one short segment, approve, move,
+# and stop again. It remains disabled until the segment bound and workcell are accepted.
+stop_and_capture:
+  enabled: false
+  depth_backend: foundation_stereo
+  bootstrap_mode: operator_guided
+  maximum_segment_joint_delta_rad: null
+  settle_timeout_s: 15.0
+  settle_poll_period_s: 0.05
+  maximum_robot_state_staleness_s: 0.25
+  maximum_goal_joint_error_rad: 0.01
+  execution_freshness_margin_s: 1.0
+  require_operator_approval: true
+  require_capture_after_every_segment: true
+
 # Unknown-blade safety mapping. Enable only after measuring the workcell bounds and
 # validating the final ES68+D435i robot self-filter. UNKNOWN and stale maps block motion.
 # Numeric defaults below are software/test starting points, not hardware-accepted safety

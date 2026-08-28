@@ -593,6 +593,53 @@ class MotionPreflightConfig(BaseModel):
     maximum_endpoint_rotation_error_deg: float = Field(default=0.3, gt=0.0, le=180.0)
 
 
+class StopAndCaptureConfig(BaseModel):
+    """Fail-closed receding-horizon motion/perception coordination settings.
+
+    The feature remains disabled until the workcell-specific segment bound has been
+    measured and configured.  Native RealSense depth is deliberately not selectable:
+    this coordinator has one scientific/safety depth backend, FoundationStereo.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    depth_backend: Literal["foundation_stereo"] = "foundation_stereo"
+    bootstrap_mode: Literal["operator_guided"] = "operator_guided"
+    maximum_segment_joint_delta_rad: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=0.5,
+    )
+    settle_timeout_s: float = Field(default=15.0, gt=0.0, le=300.0)
+    settle_poll_period_s: float = Field(default=0.05, gt=0.0, le=1.0)
+    maximum_robot_state_staleness_s: float = Field(
+        default=0.25,
+        gt=0.0,
+        le=5.0,
+    )
+    maximum_goal_joint_error_rad: float = Field(default=0.01, gt=0.0, le=0.2)
+    execution_freshness_margin_s: float = Field(default=1.0, ge=0.0, le=60.0)
+    require_operator_approval: Literal[True] = True
+    require_capture_after_every_segment: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_enabled_contract(self) -> Self:
+        if self.enabled and self.maximum_segment_joint_delta_rad is None:
+            raise ValueError(
+                "Enabled stop-and-capture coordination requires a measured "
+                "maximum_segment_joint_delta_rad"
+            )
+        if self.settle_poll_period_s > self.settle_timeout_s:
+            raise ValueError("settle_poll_period_s must not exceed settle_timeout_s")
+        if self.maximum_robot_state_staleness_s < self.settle_poll_period_s:
+            raise ValueError(
+                "maximum_robot_state_staleness_s must be at least "
+                "settle_poll_period_s"
+            )
+        return self
+
+
 class OccupancyConfig(BaseModel):
     """Fail-closed online environment mapping for the unknown blade workcell."""
 
@@ -687,7 +734,64 @@ class AppSettings(BaseModel):
     kinematics: KinematicsConfig = Field(default_factory=KinematicsConfig)
     collision: CollisionConfig = Field(default_factory=CollisionConfig)
     motion_preflight: MotionPreflightConfig = Field(default_factory=MotionPreflightConfig)
+    stop_and_capture: StopAndCaptureConfig = Field(default_factory=StopAndCaptureConfig)
     occupancy: OccupancyConfig = Field(default_factory=OccupancyConfig)
+
+    @model_validator(mode="after")
+    def validate_stop_and_capture_dependencies(self) -> Self:
+        if self.stop_and_capture.enabled and not self.occupancy.enabled:
+            raise ValueError(
+                "Enabled stop-and-capture coordination requires occupancy mapping"
+            )
+        if self.stop_and_capture.enabled and self.robot.model != "es68":
+            raise ValueError(
+                "Enabled stop-and-capture coordination requires robot.model='es68'"
+            )
+        if self.stop_and_capture.enabled and not self.robot.motion_enabled:
+            raise ValueError(
+                "Enabled stop-and-capture coordination requires "
+                "robot.motion_enabled=true for its explicit stop boundary"
+            )
+        if self.stop_and_capture.enabled and self.robot.settle_time_s <= 0.0:
+            raise ValueError(
+                "Enabled stop-and-capture coordination requires robot.settle_time_s "
+                "to be positive"
+            )
+        minimum_settle_timeout_s = (
+            self.robot.settle_time_s
+            + self.stop_and_capture.settle_poll_period_s
+        )
+        if (
+            self.stop_and_capture.enabled
+            and self.stop_and_capture.settle_timeout_s
+            < minimum_settle_timeout_s
+        ):
+            raise ValueError(
+                "Enabled stop-and-capture settle_timeout_s must be at least "
+                "robot.settle_time_s + settle_poll_period_s"
+            )
+        if self.stop_and_capture.enabled and not np.isclose(
+            self.robot.servoj_time_s,
+            self.motion_preflight.servoj_dt_s,
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                "Enabled stop-and-capture requires robot.servoj_time_s to equal "
+                "motion_preflight.servoj_dt_s"
+            )
+        lr_threshold = (
+            self.foundation_stereo.left_right_consistency_threshold_px
+        )
+        if self.stop_and_capture.enabled and (
+            lr_threshold is None
+            or lr_threshold > self.occupancy.maximum_lr_consistency_error_px
+        ):
+            raise ValueError(
+                "Enabled stop-and-capture requires a FoundationStereo left-right "
+                "consistency threshold no larger than the occupancy threshold"
+            )
+        return self
 
 
 def load_settings(path: str | Path) -> AppSettings:

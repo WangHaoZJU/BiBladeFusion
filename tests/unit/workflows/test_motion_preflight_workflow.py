@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
@@ -22,7 +23,10 @@ from biblade_fusion.robotics import (
     JointPathMeshCollisionReport,
     load_es68_flange_t_tcp,
 )
-from biblade_fusion.workflows import preflight_view_sequence_motion
+from biblade_fusion.workflows import (
+    preflight_live_joint_segment,
+    preflight_view_sequence_motion,
+)
 
 
 class _FakeEs68Kinematics:
@@ -138,3 +142,35 @@ def test_view_sequence_blocks_endpoint_that_disagrees_with_es68_fk() -> None:
     )
     assert leg.preflight.servoj_stream is None
     assert report.ready_for_approval is False
+
+
+def test_live_segment_uses_measured_start_and_checks_final_tcp_endpoint() -> None:
+    result = preflight_live_joint_segment(
+        (0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+        (0.02, 0.0, 0.0, 0.0, 0.0, 0.0),
+        MotionPreflightConfig(),
+        collision_checker=_FakeEs68Checker(),
+        occupancy_checker=None,
+        final_target=True,
+        target_base_t_tcp_matrix=load_es68_flange_t_tcp().matrix,
+    )
+
+    assert result.preflight.start_joint_positions_rad[0] == 0.01
+    assert result.preflight.goal_joint_positions_rad[0] == 0.02
+    assert result.endpoint_consistency is not None
+    assert result.endpoint_consistency.status is CollisionCheckStatus.CLEAR
+    assert result.ready_for_approval is False
+    assert "continuous_swept_mesh_unavailable" in result.preflight.blocking_reasons
+
+
+def test_intermediate_segment_cannot_claim_a_view_endpoint() -> None:
+    with pytest.raises(ValueError, match="must not claim"):
+        preflight_live_joint_segment(
+            np.zeros(6),
+            np.full(6, 0.01),
+            MotionPreflightConfig(),
+            collision_checker=_FakeEs68Checker(),
+            occupancy_checker=None,
+            final_target=False,
+            target_base_t_tcp_matrix=np.eye(4),
+        )

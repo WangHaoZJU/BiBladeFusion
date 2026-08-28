@@ -7,8 +7,9 @@ import json
 import math
 import secrets
 import time
+from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Protocol
 
 import numpy as np
@@ -46,13 +47,24 @@ def _is_sha256_digest(value: object) -> bool:
 
 
 class GuardedArm(Protocol):
+    @property
+    def stop_generation(self) -> int: ...
+
     def read_state(self) -> RobotState: ...
+
+    def _guarded_resume_servoj_control(
+        self,
+        *,
+        expected_stop_generation: int,
+        capability: object,
+    ) -> None: ...
 
     def _guarded_prepare_servoj_stream(
         self,
         *,
         dt_s: float,
         warmup_duration_s: float = 0.0,
+        expected_stop_generation: int,
         capability: object,
     ) -> None: ...
 
@@ -61,6 +73,7 @@ class GuardedArm(Protocol):
         stream: ServoJStream,
         *,
         config: ServoJStreamConfig,
+        expected_stop_generation: int,
         capability: object,
         tracking_samples: list[dict[str, object]] | None = None,
     ) -> StreamServoJResult: ...
@@ -89,6 +102,7 @@ class MotionExecutionPermit:
     occupancy_semantic_attestation_hash: str
     occupancy_policy_contract_hash: str
     continuous_occupancy_sweep_verified: bool
+    stop_generation: int
     issued_monotonic_s: float
     expires_monotonic_s: float
 
@@ -211,6 +225,7 @@ class GuardedEliteExecutor:
         expires = issued + self._permit_lifetime_s
         if not math.isfinite(expires):
             raise RobotCommandError("motion execution permit expiry is not finite")
+        stop_generation = self._require_arm_stop_generation()
         permit = MotionExecutionPermit(
             permit_id=secrets.token_hex(16),
             preflight_fingerprint=self.preflight_fingerprint(preflight),
@@ -239,10 +254,15 @@ class GuardedEliteExecutor:
                 self._occupancy_checker.policy_contract_hash
             ),
             continuous_occupancy_sweep_verified=True,
+            stop_generation=stop_generation,
             issued_monotonic_s=issued,
             expires_monotonic_s=expires,
         )
-        self._active_permits[permit.permit_id] = permit
+        # A frozen dataclass prevents ordinary assignment, but it is not a
+        # security boundary: object.__setattr__ can still mutate an instance.
+        # Keep a distinct authoritative value so a caller-side mutation cannot
+        # rewrite the executor's expiry or any other approval binding in place.
+        self._active_permits[permit.permit_id] = replace(permit)
         return permit
 
     def execute(
@@ -251,6 +271,7 @@ class GuardedEliteExecutor:
         permit: MotionExecutionPermit,
         *,
         stream_config: ServoJStreamConfig | None = None,
+        cancellation_requested: Callable[[], bool] | None = None,
     ) -> StreamServoJResult:
         """Consume a permit, recheck live start/collision, then execute exact ServoJ."""
 
@@ -332,22 +353,153 @@ class GuardedEliteExecutor:
             != self._servoj_runtime_config_hash(approved_runtime_config)
         ):
             raise RobotCommandError("motion execution permit ServoJ-config binding mismatch")
-        self._arm._guarded_prepare_servoj_stream(
-            dt_s=stream.dt_s,
-            capability=_GUARDED_MOTION_CAPABILITY,
-        )
-        result = self._arm._guarded_stream_servoj(
-            stream,
-            config=config,
-            capability=_GUARDED_MOTION_CAPABILITY,
-        )
-        if not result.ok:
-            with suppress(Exception):
+        try:
+            self._require_unchanged_stop_generation(
+                permit.stop_generation,
+                stage="before_control_recovery",
+            )
+            self._raise_if_cancellation_requested(
+                cancellation_requested,
+                stage="before_control_recovery",
+            )
+            self._arm._guarded_resume_servoj_control(
+                expected_stop_generation=permit.stop_generation,
+                capability=_GUARDED_MOTION_CAPABILITY,
+            )
+            self._raise_if_cancellation_requested(
+                cancellation_requested,
+                stage="after_control_recovery",
+            )
+            self._require_unchanged_stop_generation(
+                permit.stop_generation,
+                stage="after_control_recovery",
+            )
+            if self._finite_clock_value(label="post-recovery execution time") > (
+                permit.expires_monotonic_s
+            ):
+                raise RobotCommandError(
+                    "motion execution permit expired during control recovery"
+                )
+            recovered_state = self._arm.read_state()
+            recovered_start_error = float(
+                np.max(
+                    np.abs(
+                        recovered_state.joint_positions_rad
+                        - np.asarray(preflight.start_joint_positions_rad)
+                    )
+                )
+            )
+            if recovered_start_error > self._live_start_tolerance_rad:
+                raise RobotCommandError(
+                    "live robot state changed during control recovery "
+                    f"({recovered_start_error:.6f} rad)"
+                )
+            self._revalidate_exact_stream_path(
+                recovered_state.joint_positions_rad,
+                stream,
+                preflight,
+                expected_occupancy,
+            )
+            try:
+                self._occupancy_checker.assert_current_evidence(
+                    expected_occupancy,
+                    required_freshness_horizon_s=(
+                        self._required_freshness_horizon_s(preflight)
+                    ),
+                )
+            except OccupancyEvidenceError as exc:
+                raise RobotCommandError(
+                    f"occupancy snapshot changed during control recovery: {exc}"
+                ) from exc
+            if self._finite_clock_value(
+                label="post-revalidation execution time"
+            ) > permit.expires_monotonic_s:
+                raise RobotCommandError(
+                    "motion execution permit expired during post-recovery revalidation"
+                )
+            self._require_unchanged_stop_generation(
+                permit.stop_generation,
+                stage="before_servoj_prepare",
+            )
+            self._arm._guarded_prepare_servoj_stream(
+                dt_s=stream.dt_s,
+                expected_stop_generation=permit.stop_generation,
+                capability=_GUARDED_MOTION_CAPABILITY,
+            )
+            self._raise_if_cancellation_requested(
+                cancellation_requested,
+                stage="after_servoj_prepare",
+            )
+            self._require_unchanged_stop_generation(
+                permit.stop_generation,
+                stage="after_servoj_prepare",
+            )
+            if self._finite_clock_value(
+                label="post-prepare execution time"
+            ) > permit.expires_monotonic_s:
+                raise RobotCommandError(
+                    "motion execution permit expired during ServoJ preparation"
+                )
+            result = self._arm._guarded_stream_servoj(
+                stream,
+                config=config,
+                expected_stop_generation=permit.stop_generation,
+                capability=_GUARDED_MOTION_CAPABILITY,
+            )
+        except BaseException:
+            # Driver preparation may already have primed ServoJ before failing,
+            # while a streaming backend may raise instead of returning an abort
+            # result.  In either case, make a best-effort transition to idle and
+            # preserve the original exception for the caller.
+            with suppress(BaseException):
                 self._arm.stop()
+            raise
+        # A successful execution is not complete until the exact same arm has
+        # acknowledged the segment-boundary stop.  Stop failures propagate and
+        # therefore cannot be reported as successful motion.
+        self._arm.stop()
+        if not result.ok:
             raise RobotCommandError(
                 f"ServoJ execution aborted: {result.abort_reason or 'unknown'}"
             )
         return result
+
+    @staticmethod
+    def _raise_if_cancellation_requested(
+        callback: Callable[[], bool] | None,
+        *,
+        stage: str,
+    ) -> None:
+        if callback is None:
+            return
+        requested = callback()
+        if type(requested) is not bool:
+            raise RobotCommandError(
+                "motion cancellation callback returned a non-boolean value"
+            )
+        if requested:
+            raise RobotCommandError(f"motion execution cancelled at {stage}")
+
+    def _require_arm_stop_generation(self) -> int:
+        generation = self._arm.stop_generation
+        if type(generation) is not int or generation < 0:
+            raise RobotCommandError(
+                "Elite arm stop generation must be a non-negative integer"
+            )
+        return generation
+
+    def _require_unchanged_stop_generation(
+        self,
+        expected: int,
+        *,
+        stage: str,
+    ) -> None:
+        current = self._require_arm_stop_generation()
+        if current != expected:
+            raise RobotCommandError(
+                "Elite arm stop generation changed at "
+                f"{stage} (approved={expected}, current={current})"
+            )
 
     def _consume_permit(
         self,

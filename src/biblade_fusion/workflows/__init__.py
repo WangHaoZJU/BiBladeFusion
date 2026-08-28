@@ -33,9 +33,12 @@ from biblade_fusion.workflows.initialization import (
 )
 from biblade_fusion.workflows.motion_preflight import (
     EndpointPoseConsistency,
+    LiveJointSegmentPreflight,
     MotionSequenceCost,
     PreflightedMotionLeg,
     ViewSequenceMotionPreflight,
+    evaluate_endpoint_pose_consistency,
+    preflight_live_joint_segment,
     preflight_view_sequence_motion,
 )
 from biblade_fusion.workflows.native_overlap import (
@@ -95,6 +98,7 @@ __all__ = [
     "InitializationError",
     "OfflineViewPlanningResult",
     "MotionSequenceCost",
+    "LiveJointSegmentPreflight",
     "EndpointPoseConsistency",
     "IcpCorrectionDiagnostic",
     "NativeOverlapPairMetrics",
@@ -122,6 +126,8 @@ __all__ = [
     "mark_snapshot_stale_if_expired",
     "plan_initial_observation",
     "preflight_view_sequence_motion",
+    "preflight_live_joint_segment",
+    "evaluate_endpoint_pose_consistency",
     "validate_view_sequence_collision",
     "reconstruct_foundation_stereo_view",
     "reconstruct_native_depth_view",
