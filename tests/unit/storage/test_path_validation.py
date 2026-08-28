@@ -14,6 +14,7 @@ from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     CollisionConfig,
     CollisionObstacleConfig,
+    CoverageConfig,
     HandEyeConfig,
     KinematicsConfig,
     MotionPreflightConfig,
@@ -30,12 +31,17 @@ from biblade_fusion.planning import (
     CandidateStatus,
     EvaluatedCandidate,
     FilteredViewPlan,
+    create_coverage_ledger,
     generate_bilateral_view_plan,
 )
 from biblade_fusion.robotics import Es68KinematicModel, load_es68_flange_t_tcp
 from biblade_fusion.storage import (
+    read_coverage_driven_plan,
     read_motion_preflight,
     read_path_validation,
+    read_view_plan,
+    write_coverage_driven_plan,
+    write_coverage_ledger,
     write_initialization,
     write_motion_preflight,
     write_path_validation,
@@ -315,6 +321,109 @@ def test_motion_preflight_without_occupancy_is_rederived_as_blocked(tmp_path: Pa
     metadata_path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="does not match"):
         read_motion_preflight(output)
+
+
+def test_motion_preflight_binds_the_coverage_derived_order(tmp_path: Path) -> None:
+    initialization, plan, _, collision, _ = _sources(tmp_path)
+    stored_plan = read_view_plan(plan)
+    ledger = create_coverage_ledger(
+        stored_plan.result.geometric_plan,
+        CoverageConfig(),
+    )
+    coverage = write_coverage_ledger(
+        tmp_path / "coverage",
+        ledger,
+        source_plan=plan,
+        source_initialization=initialization,
+    )
+    coverage_plan = write_coverage_driven_plan(
+        tmp_path / "coverage_plan",
+        source_plan=plan,
+        source_coverage=coverage,
+    )
+    ordered_view_ids = read_coverage_driven_plan(
+        coverage_plan
+    ).plan.sequence.ordered_view_ids
+
+    output = write_motion_preflight(
+        tmp_path / "motion_preflight",
+        ordered_view_ids,
+        MotionPreflightConfig(maximum_joint_step_rad=0.02),
+        collision,
+        source_plan=plan,
+        source_initialization=initialization,
+        source_coverage_plan=coverage_plan,
+        joint_zero_offsets_rad=(0.0,) * 6,
+    )
+    stored = read_motion_preflight(output)
+
+    assert stored.report.ordered_view_ids == ordered_view_ids
+    assert stored.metadata["sources"]["coverage_plan"]["sha256"]
+    assert stored.metadata["motion_authorized"] is False
+
+    with pytest.raises(ValueError, match="differs from the bound coverage sequence"):
+        write_motion_preflight(
+            tmp_path / "wrong_motion_preflight",
+            tuple(reversed(ordered_view_ids)),
+            MotionPreflightConfig(maximum_joint_step_rad=0.02),
+            collision,
+            source_plan=plan,
+            source_initialization=initialization,
+            source_coverage_plan=coverage_plan,
+            joint_zero_offsets_rad=(0.0,) * 6,
+        )
+
+    coverage_payload_path = coverage_plan / "coverage_plan.json"
+    coverage_payload = json.loads(
+        coverage_payload_path.read_text(encoding="utf-8")
+    )
+    coverage_payload["ordering"]["ordered_view_ids"] = []
+    coverage_payload_path.write_text(json.dumps(coverage_payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="source checksum mismatch"):
+        read_motion_preflight(output)
+
+
+def test_motion_preflight_rejects_legacy_coverage_plan_without_stored_order(
+    tmp_path: Path,
+) -> None:
+    initialization, plan, _, collision, _ = _sources(tmp_path)
+    stored_plan = read_view_plan(plan)
+    coverage = write_coverage_ledger(
+        tmp_path / "coverage",
+        create_coverage_ledger(
+            stored_plan.result.geometric_plan,
+            CoverageConfig(),
+        ),
+        source_plan=plan,
+        source_initialization=initialization,
+    )
+    coverage_plan = write_coverage_driven_plan(
+        tmp_path / "coverage_plan",
+        source_plan=plan,
+        source_coverage=coverage,
+    )
+    ordered_view_ids = read_coverage_driven_plan(
+        coverage_plan
+    ).plan.sequence.ordered_view_ids
+    payload_path = coverage_plan / "coverage_plan.json"
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 1
+    payload.pop("ordering")
+    payload["summary"].pop("ordered_endpoint_feasible_views")
+    payload["summary"].pop("deferred_unverified_views")
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="requires coverage-plan schema 2"):
+        write_motion_preflight(
+            tmp_path / "motion_preflight",
+            ordered_view_ids,
+            MotionPreflightConfig(maximum_joint_step_rad=0.02),
+            collision,
+            source_plan=plan,
+            source_initialization=initialization,
+            source_coverage_plan=coverage_plan,
+            joint_zero_offsets_rad=(0.0,) * 6,
+        )
 
 
 def test_motion_preflight_refuses_offsets_different_from_view_plan(

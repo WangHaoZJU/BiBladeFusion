@@ -1,5 +1,27 @@
 # Development log
 
+## 2026-08-28 — coverage-derived coarse-scan ordering and preflight binding
+
+- Coverage-plan schema 2 now turns incomplete proxy patches into a deterministic,
+  non-executable traversal proposal. It finishes the selected proxy side first and
+  applies a stable row-wise snake using the original row parity, so deleting completed
+  cells cannot reverse a later row during replanning.
+- Coverage and reachability remain separate hard gates. Only `endpoint_feasible` views
+  carrying persisted six-axis joint solutions enter `ordered_view_ids`;
+  `geometry_only` views are retained as `deferred_unverified_view_ids`, while rejected
+  incomplete patches remain blocked. Occupied fraction is persisted as audit evidence
+  but does not reorder the path, and joint travel is deliberately not an objective.
+- `bbf safety preflight-path` accepts exactly one ordering source: repeated manual
+  `--view-id` values or a coverage-plan artifact. Automatic mode verifies the source
+  view-plan identity, requires exact ordered-ID equality, includes the coverage manifest
+  in the SHA-256 source chain, and repeats the checks during artifact readback.
+- The order is still only a proposal. It does not authorize motion or prove the
+  front-to-back leg. Mesh and robot-versus-voxel paths remain independently fail-closed
+  because their current bounded-step checks do not constitute continuous swept-volume
+  evidence.
+- Closed the increment with `423 passed`, repository-wide Ruff, bytecode compilation,
+  and whitespace-integrity checks.
+
 ## 2026-08-28 — active ES68+D435i collision assembly and offline inspector
 
 - Activated the current D435i-only ES68 collision manifest from the matching HoloRobot
@@ -344,7 +366,7 @@ authoritative fine-grained record; this page records the experiment-facing state
 - Conservative linear-joint motion preflight using copied velocity limits, plus exact
   preflight-hash confirmation, expiring one-shot execution permits, live-start checks,
   and immediate collision revalidation. No motion command is exposed through the CLI.
-- Immutable ordered view-sequence motion-preflight schema-4 artifacts bind plan,
+- Immutable ordered view-sequence motion-preflight schema-5 artifacts bind plan,
   initialization, occupancy, and motion-model hashes and re-derive the fail-closed report
   on read. The production path currently stops at missing continuous swept-mesh evidence
   before ServoJ generation; diagnostic-only library overrides do not create approval
@@ -364,8 +386,7 @@ authoritative fine-grained record; this page records the experiment-facing state
   self/workcell collision, control, ServoJ trajectory, guarded-execution, and ordered
   tool-goal preflight artifact layers are copied/adapted. FoundationStereo occupancy
   storage, conservative queries and replay visualization are implemented, but the live
-  stop-and-capture coordinator is not implemented; hardware acceptance and traversal-order
-  optimization also remain.
+  stop-and-capture coordinator is not implemented; hardware acceptance remains.
 - The migration sequence and safety boundary are recorded in
   `docs/robot-stack-migration.md`. Existing MDH/capsule code remains temporarily for
   artifact compatibility and will not receive new motion functionality.
@@ -391,7 +412,7 @@ authoritative fine-grained record; this page records the experiment-facing state
    fresh `MAP_READY` snapshots, invalidates plans on every update, and preserves the
    required freshness horizon through execution. Offline `build-replay` must remain
    `STALE/BLOCKED`.
-6. Optimize front/back traversal order using the persisted motion cost, then perform a
-   separately approved known-safe-pose hardware acceptance before considering an
-   interactive execution command.
+6. Hardware-validate the deterministic coverage-derived sequence from separately
+   approved known-safe poses. Joint-motion cost may later be evaluated only as a
+   non-safety tie-breaker, not as a reachability or clearance substitute.
 7. Implement the thermal-camera adapter after its model and radiometric SDK are known.

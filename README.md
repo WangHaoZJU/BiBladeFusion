@@ -225,6 +225,12 @@ uv run bbf coverage seed \
   --initialization outputs/initialization \
   --config configs/local.yaml \
   --output outputs/coverage_000
+
+uv run bbf coverage next-plan \
+  --ledger outputs/coverage_000 \
+  --plan outputs/view_plan \
+  --start-side front \
+  --output outputs/next_view_plan_000
 ```
 
 The planner creates both front and back partitions from the conservative proxy. Each
@@ -238,6 +244,13 @@ executes a planned pose.
 The coverage ledger uses pose-registered base-frame blade points to fill independent
 front/back per-patch occupancy grids. See [coverage and replanning](docs/coverage.md) for
 its evidence rules and current limitations.
+
+Coverage-plan schema 2 removes completed proxy patches, admits only
+`endpoint_feasible` candidates with stored joint solutions into the proposed order, and
+finishes the selected side with a deterministic row-wise snake before changing sides.
+`front` is the initial camera-visible proxy side by construction. `geometry_only` views
+remain auditable but deferred. Joint travel is not an ordering objective, and this
+proposal carries no collision evidence or motion authority.
 
 After proxy views have produced overlapping coarse observations on both physical sides,
 use the [paper-derived curved reconstruction](docs/curved-reconstruction.md) workflow.
@@ -262,7 +275,7 @@ unverified and cannot authorize motion.
 uv sync --extra supervision-gui
 ```
 
-Explicit ordered view sequences can be checked offline with the fail-closed
+Manual or coverage-derived ordered view sequences can be checked offline with the fail-closed
 [ES68 collision and path validator](docs/collision-validation.md). It uses configured
 capsule/workcell geometry and controller-specific MDH data, but remains a conservative
 prefilter and never authorizes motion.
@@ -367,8 +380,7 @@ uv run bbf safety preflight-path \
   --plan outputs/view_plan \
   --initialization outputs/initialization \
   --occupancy outputs/fresh_map_ready_occupancy \
-  --view-id front_r00_c00 \
-  --view-id back_r00_c00 \
+  --coverage-plan outputs/next_view_plan_000 \
   --config configs/local.yaml \
   --output outputs/motion_preflight
 ```
@@ -388,6 +400,12 @@ duration is a blocked diagnostic, not an executable trajectory. Even after that 
 exists, the independent continuous robot-versus-voxel proof must also pass. This command
 does not connect to the robot. Passing an offline `build-replay` occupancy asset is
 intentionally blocked because that asset is `STALE`.
+
+Exactly one ordering source is accepted: repeated manual `--view-id` options or one
+`--coverage-plan`. In the latter mode, preflight verifies the coverage artifact's source
+view-plan identity, requires the exact stored order, binds its checksum, and repeats
+those checks during readback. Automatic ordering remains a non-executable selection
+proposal; it is not mesh, occupancy, or trajectory clearance.
 
 The current implementation must not be interpreted as physical motion clearance. Robot
 pixels removed by self-masking remain `UNKNOWN`, so the robot's own volume can block its

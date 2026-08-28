@@ -40,6 +40,7 @@ from biblade_fusion.perception.stereo import (
     run_foundation_stereo_doctor,
 )
 from biblade_fusion.planning import (
+    BladeSide,
     EliteCs68IkChecker,
     coverage_observation_id,
     create_coverage_ledger,
@@ -1976,6 +1977,16 @@ def coverage_next_plan(
         typer.Option("--plan", exists=True, file_okay=False, readable=True),
     ],
     output: Annotated[Path, typer.Option("--output", "-o")],
+    start_side: Annotated[
+        BladeSide,
+        typer.Option(
+            "--start-side",
+            help=(
+                "Proxy side to finish first. 'front' is the initial camera-visible "
+                "side by construction."
+            ),
+        ),
+    ] = BladeSide.FRONT,
 ) -> None:
     """Export remaining, completed, and blocked patches without authorizing motion."""
 
@@ -1984,6 +1995,7 @@ def coverage_next_plan(
             output,
             source_plan=plan,
             source_coverage=ledger,
+            start_side=start_side,
         )
         stored = read_coverage_driven_plan(destination)
     except Exception as exc:
@@ -1993,7 +2005,11 @@ def coverage_next_plan(
     typer.echo(
         f"Completed patches: {len(stored.plan.completed_patch_ids)}; "
         f"remaining views: {len(stored.plan.remaining)}; "
-        f"blocked patches: {len(stored.plan.blocked_patch_ids)}"
+        f"blocked patches: {len(stored.plan.blocked_patch_ids)}; "
+        "ordered endpoint-feasible views: "
+        f"{len(stored.plan.sequence.ordered_view_ids)}; "
+        "deferred unverified views: "
+        f"{len(stored.plan.sequence.deferred_unverified_view_ids)}"
     )
     typer.echo("Motion authorized: no")
 
@@ -2314,14 +2330,27 @@ def safety_preflight_path(
             help="Versioned occupancy-mapping artifact bound to this preflight.",
         ),
     ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
     view_ids: Annotated[
-        list[str],
+        list[str] | None,
         typer.Option(
             "--view-id",
-            help="Repeat in the exact traversal order to preflight.",
+            help=(
+                "Repeat in the exact traversal order, or use --coverage-plan for "
+                "the coverage-derived order."
+            ),
         ),
-    ],
-    output: Annotated[Path, typer.Option("--output", "-o")],
+    ] = None,
+    coverage_plan: Annotated[
+        Path | None,
+        typer.Option(
+            "--coverage-plan",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Coverage next-plan artifact supplying the bound automatic order.",
+        ),
+    ] = None,
     config: Annotated[
         Path,
         typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
@@ -2331,15 +2360,43 @@ def safety_preflight_path(
 
     try:
         settings = load_settings(config)
+        manual_view_ids = tuple(view_ids or ())
+        if bool(manual_view_ids) == (coverage_plan is not None):
+            raise ValueError(
+                "Supply exactly one ordering source: repeated --view-id or "
+                "--coverage-plan"
+            )
+        if coverage_plan is not None:
+            stored_coverage_plan = read_coverage_driven_plan(coverage_plan)
+            bound_view_plan = Path(
+                str(
+                    stored_coverage_plan.metadata["sources"]["view_plan"][
+                        "root"
+                    ]
+                )
+            ).resolve()
+            if bound_view_plan != plan.resolve():
+                raise ValueError(
+                    "Coverage sequence does not belong to the supplied view plan"
+                )
+            ordered_view_ids = stored_coverage_plan.plan.sequence.ordered_view_ids
+            if not ordered_view_ids:
+                raise ValueError(
+                    "Coverage plan contains no endpoint-feasible ordered views; "
+                    "resolve deferred reachability first"
+                )
+        else:
+            ordered_view_ids = manual_view_ids
         destination = write_motion_preflight(
             output,
-            tuple(view_ids),
+            ordered_view_ids,
             settings.motion_preflight,
             settings.collision,
             settings.occupancy,
             source_plan=plan,
             source_initialization=initialization,
             source_occupancy=occupancy,
+            source_coverage_plan=coverage_plan,
             joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
         )
         stored = read_motion_preflight(destination)

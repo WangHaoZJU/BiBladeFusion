@@ -13,7 +13,7 @@ from biblade_fusion.core.settings import (
 from biblade_fusion.devices.depth_camera import CameraIntrinsics
 from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import BilateralBladeProxy
-from biblade_fusion.planning import create_coverage_ledger, update_coverage
+from biblade_fusion.planning import BladeSide, create_coverage_ledger, update_coverage
 from biblade_fusion.storage import (
     read_coverage_driven_plan,
     write_coverage_driven_plan,
@@ -111,6 +111,13 @@ def test_coverage_driven_plan_round_trip_is_non_executable(tmp_path: Path) -> No
     assert stored.plan.completed_patch_ids == ("front_r00_c00",)
     assert len(stored.plan.remaining) == 3
     assert not stored.plan.blocked_patch_ids
+    assert stored.plan.sequence.ordered_view_ids == ()
+    assert stored.plan.sequence.deferred_unverified_view_ids == (
+        "front_r00_c01",
+        "back_r00_c00",
+        "back_r00_c01",
+    )
+    assert stored.metadata["ordering"]["motion_authorized"] is False
 
 
 def test_coverage_driven_plan_detects_source_and_summary_tampering(
@@ -129,3 +136,58 @@ def test_coverage_driven_plan_detects_source_and_summary_tampering(
 
     with pytest.raises(ValueError, match="remaining_view_ids"):
         read_coverage_driven_plan(output)
+
+
+def test_coverage_driven_plan_detects_ordering_tampering(tmp_path: Path) -> None:
+    view_plan, coverage = _write_sources(tmp_path)
+    output = write_coverage_driven_plan(
+        tmp_path / "next-plan",
+        source_plan=view_plan,
+        source_coverage=coverage,
+    )
+    payload_path = output / "coverage_plan.json"
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload["ordering"]["deferred_unverified_view_ids"] = []
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ordering"):
+        read_coverage_driven_plan(output)
+
+
+def test_legacy_schema_one_coverage_plan_remains_readable(tmp_path: Path) -> None:
+    view_plan, coverage = _write_sources(tmp_path)
+    output = write_coverage_driven_plan(
+        tmp_path / "next-plan",
+        source_plan=view_plan,
+        source_coverage=coverage,
+    )
+    payload_path = output / "coverage_plan.json"
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 1
+    payload.pop("ordering")
+    payload["summary"].pop("ordered_endpoint_feasible_views")
+    payload["summary"].pop("deferred_unverified_views")
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    stored = read_coverage_driven_plan(output)
+
+    assert stored.plan.sequence.ordered_view_ids == ()
+    assert len(stored.plan.sequence.deferred_unverified_view_ids) == 3
+
+
+def test_coverage_plan_persists_explicit_back_side_priority(tmp_path: Path) -> None:
+    view_plan, coverage = _write_sources(tmp_path)
+    output = write_coverage_driven_plan(
+        tmp_path / "next-plan",
+        source_plan=view_plan,
+        source_coverage=coverage,
+        start_side=BladeSide.BACK,
+    )
+
+    stored = read_coverage_driven_plan(output)
+
+    assert stored.plan.sequence.start_side is BladeSide.BACK
+    assert stored.plan.sequence.deferred_unverified_view_ids[:2] == (
+        "back_r00_c00",
+        "back_r00_c01",
+    )

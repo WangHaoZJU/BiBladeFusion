@@ -107,6 +107,67 @@ class CoverageDrivenViewPlan:
     remaining: tuple[EvaluatedCandidate, ...]
     completed_patch_ids: tuple[str, ...]
     blocked_patch_ids: tuple[str, ...]
+    sequence: CoverageSequenceProposal
+
+    @property
+    def motion_authorized(self) -> bool:
+        return False
+
+
+COARSE_COVERAGE_SEQUENCE_POLICY = (
+    "proxy_coarse_incomplete_endpoint_feasible_same_side_serpentine_v1"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageSequenceEntry:
+    """One auditable, endpoint-feasible item in a non-executable scan order."""
+
+    view_id: str
+    patch_id: str
+    side: BladeSide
+    row: int
+    column: int
+    snake_rank: int
+    occupied_fraction: float
+    endpoint_status: CandidateStatus
+
+    def __post_init__(self) -> None:
+        if not self.view_id or not self.patch_id:
+            raise ValueError("Coverage sequence IDs must be non-empty")
+        if self.row < 0 or self.column < 0 or self.snake_rank < 0:
+            raise ValueError("Coverage sequence indices must be non-negative")
+        if not 0.0 <= self.occupied_fraction <= 1.0:
+            raise ValueError("Coverage sequence occupied fraction must lie in [0, 1]")
+        if self.endpoint_status is not CandidateStatus.ENDPOINT_FEASIBLE:
+            raise ValueError("Coverage sequence entries must be endpoint feasible")
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageSequenceProposal:
+    """Coverage-first coarse-view order; it is evidence, never motion permission."""
+
+    entries: tuple[CoverageSequenceEntry, ...]
+    deferred_unverified_view_ids: tuple[str, ...]
+    start_side: BladeSide
+    policy: str = COARSE_COVERAGE_SEQUENCE_POLICY
+
+    def __post_init__(self) -> None:
+        ordered = self.ordered_view_ids
+        if len(set(ordered)) != len(ordered):
+            raise ValueError("Ordered coverage view IDs must be unique")
+        if len(set(self.deferred_unverified_view_ids)) != len(
+            self.deferred_unverified_view_ids
+        ):
+            raise ValueError("Deferred coverage view IDs must be unique")
+        if set(ordered) & set(self.deferred_unverified_view_ids):
+            raise ValueError("Ordered and deferred coverage views must be disjoint")
+        if not self.policy:
+            raise ValueError("Coverage sequence policy must be non-empty")
+
+    @property
+    def ordered_view_ids(self) -> tuple[str, ...]:
+        return tuple(entry.view_id for entry in self.entries)
 
     @property
     def motion_authorized(self) -> bool:
@@ -215,8 +276,16 @@ def update_coverage(
 def select_uncovered_candidates(
     filtered_plan: FilteredViewPlan,
     ledger: CoverageLedger,
+    *,
+    start_side: BladeSide = BladeSide.FRONT,
 ) -> CoverageDrivenViewPlan:
-    """Return accepted candidates for incomplete patches and report blocked gaps."""
+    """Return incomplete candidates plus a non-executable coarse-scan sequence.
+
+    Coverage completion and endpoint feasibility are hard gates.  The ordering policy
+    then keeps one proxy side together and traverses its original grid rows in a
+    deterministic boustrophedon pattern.  Geometry-only candidates are retained in
+    ``remaining`` for audit, but are never placed in ``ordered_view_ids``.
+    """
 
     evaluations = {item.candidate.patch.patch_id: item for item in filtered_plan.candidates}
     if set(evaluations) != {patch.patch_id for patch in ledger.patches}:
@@ -235,4 +304,73 @@ def select_uncovered_candidates(
         for patch_id in incomplete
         if evaluations[patch_id].status is CandidateStatus.REJECTED
     )
-    return CoverageDrivenViewPlan(remaining, completed, blocked)
+    side_order = (start_side, _opposite_side(start_side))
+
+    def sequence_key(item: EvaluatedCandidate) -> tuple[int, int, int, str]:
+        patch = item.candidate.patch
+        if patch.row >= ledger.rows or patch.column >= ledger.columns:
+            raise CoverageError(
+                f"Patch {patch.patch_id!r} lies outside the coverage grid"
+            )
+        side_rank = side_order.index(patch.side)
+        snake_column = patch.column if patch.row % 2 == 0 else -patch.column
+        return side_rank, patch.row, snake_column, item.candidate.view_id
+
+    ordered_candidates = tuple(
+        sorted(
+            (
+                item
+                for item in remaining
+                if item.status is CandidateStatus.ENDPOINT_FEASIBLE
+                and item.joint_positions_rad is not None
+            ),
+            key=sequence_key,
+        )
+    )
+    deferred = tuple(
+        item.candidate.view_id
+        for item in sorted(
+            (
+                item
+                for item in remaining
+                if item.status is not CandidateStatus.ENDPOINT_FEASIBLE
+                or item.joint_positions_rad is None
+            ),
+            key=sequence_key,
+        )
+    )
+    sequence = CoverageSequenceProposal(
+        tuple(
+            CoverageSequenceEntry(
+                view_id=item.candidate.view_id,
+                patch_id=item.candidate.patch.patch_id,
+                side=item.candidate.patch.side,
+                row=item.candidate.patch.row,
+                column=item.candidate.patch.column,
+                snake_rank=(
+                    item.candidate.patch.row * ledger.columns
+                    + (
+                        item.candidate.patch.column
+                        if item.candidate.patch.row % 2 == 0
+                        else ledger.columns - 1 - item.candidate.patch.column
+                    )
+                ),
+                occupied_fraction=ledger.patch(
+                    item.candidate.patch.patch_id
+                ).occupied_fraction(ledger.config.minimum_points_per_bin),
+                endpoint_status=item.status,
+            )
+            for item in ordered_candidates
+        ),
+        deferred,
+        start_side,
+    )
+    return CoverageDrivenViewPlan(remaining, completed, blocked, sequence)
+
+
+def _opposite_side(side: BladeSide) -> BladeSide:
+    if side is BladeSide.FRONT:
+        return BladeSide.BACK
+    if side is BladeSide.BACK:
+        return BladeSide.FRONT
+    raise CoverageError(f"Unsupported blade side: {side!r}")

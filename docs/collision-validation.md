@@ -82,6 +82,14 @@ clearance-expanded FCL boxes in `base`. Non-adjacent robot mesh pairs also use F
 distance queries, so a self gap below the effective minimum clearance blocks before
 contact.
 
+The traversal may be supplied manually with repeated `--view-id`, or read from a
+coverage-derived proxy plan with `--coverage-plan`; the two inputs are mutually
+exclusive. In automatic mode, preflight verifies that the coverage artifact belongs to
+the supplied view plan, requires exact equality with its endpoint-feasible ordered IDs,
+and binds `coverage_plan.json` into the preflight source hashes. A geometry-only view is
+deferred rather than silently promoted, and the front-to-back transfer remains an
+ordinary collision-checked leg.
+
 For each ordered leg, this preflight derives the target as
 `base_T_left_ir · inverse(flange_T_left_ir) · flange_T_tcp`, records that calibrated
 `base_T_tcp` goal, and evaluates bounded-step discrete joint samples. It also rejects a
@@ -97,8 +105,8 @@ records the blocked leg and diagnostic joint-travel evidence; zero estimated Ser
 duration is not evidence of a valid or executable trajectory. Library-only options can
 disable a continuous-proof requirement for offline stream inspection, but such output is
 explicitly diagnostic and cannot become approval evidence. The artifact binds its view
-plan, initialization, occupancy, and motion-model inputs by SHA-256 and fully re-derives
-the blocked report when read.
+plan, optional coverage-order proposal, initialization, occupancy, and motion-model
+inputs by SHA-256 and fully re-derives the blocked report when read.
 
 The original `validate-path` artifact remains for compatibility and for comparing the
 conservative capsule model with the mesh model. Neither command connects to hardware or
@@ -118,3 +126,5 @@ volume evidence. The occupancy path is independently discretely sampled and like
 lacks continuous robot-versus-voxel swept-volume evidence; one proof cannot substitute
 for the other. Consequently both are diagnostics, and production preflight plus guarded
 execution remain blocked until both continuous backends are implemented and validated.
+Same-side snake ordering reduces unnecessary side changes, but supplies no collision
+evidence and does not weaken either continuous-proof requirement.

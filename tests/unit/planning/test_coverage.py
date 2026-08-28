@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -8,7 +10,9 @@ from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import BilateralBladeProxy
 from biblade_fusion.planning import (
     BladeSide,
+    CandidateStatus,
     CoverageError,
+    FilteredViewPlan,
     create_coverage_ledger,
     filter_candidate_views,
     generate_bilateral_view_plan,
@@ -34,6 +38,19 @@ def make_plan():
     return generate_bilateral_view_plan(
         make_proxy(),
         CameraIntrinsics(101, 101, 50.0, 50.0, 50.0, 50.0, "none", ()),
+        ViewPlanningConfig(
+            standoff_distance_m=0.1,
+            overlap_fraction=0.0,
+            footprint_utilization=1.0,
+            edge_margin_m=0.0,
+        ),
+    )
+
+
+def make_serpentine_plan():
+    return generate_bilateral_view_plan(
+        make_proxy(),
+        CameraIntrinsics(101, 101, 100.0, 100.0, 50.0, 50.0, "none", ()),
         ViewPlanningConfig(
             standoff_distance_m=0.1,
             overlap_fraction=0.0,
@@ -154,3 +171,101 @@ def test_coverage_rejects_duplicate_observation_and_midplane_camera() -> None:
             PoseSE3.identity("base", "left_ir"),
             "ambiguous-side",
         )
+
+
+def test_coverage_sequence_is_endpoint_gated_same_side_serpentine() -> None:
+    plan = make_serpentine_plan()
+    assert (plan.rows, plan.columns) == (2, 4)
+    geometric = filter_candidate_views(
+        plan.candidates,
+        make_proxy(),
+        ViewFilterConfig(camera_clearance_radius_m=0.01),
+    )
+    candidates = []
+    for index, item in enumerate(geometric.candidates):
+        status = CandidateStatus.ENDPOINT_FEASIBLE
+        joints = np.full(6, index / 100.0)
+        if item.candidate.view_id == "front_r00_c01":
+            status = CandidateStatus.GEOMETRY_ONLY
+            joints = None
+        elif item.candidate.view_id == "front_r00_c02":
+            status = CandidateStatus.REJECTED
+            joints = None
+        candidates.append(
+            replace(item, status=status, joint_positions_rad=joints)
+        )
+    filtered = FilteredViewPlan(tuple(candidates), ())
+    ledger = create_coverage_ledger(plan, coverage_config())
+    completed_patch = "front_r01_c03"
+    ledger = replace(
+        ledger,
+        patches=tuple(
+            replace(
+                patch,
+                bin_point_counts=(
+                    np.ones_like(patch.bin_point_counts)
+                    if patch.patch_id == completed_patch
+                    else patch.bin_point_counts
+                ),
+            )
+            for patch in ledger.patches
+        ),
+    )
+
+    replanned = select_uncovered_candidates(filtered, ledger)
+
+    assert replanned.sequence.ordered_view_ids[:5] == (
+        "front_r00_c00",
+        "front_r00_c03",
+        "front_r01_c02",
+        "front_r01_c01",
+        "front_r01_c00",
+    )
+    assert replanned.sequence.ordered_view_ids[5:] == (
+        "back_r00_c00",
+        "back_r00_c01",
+        "back_r00_c02",
+        "back_r00_c03",
+        "back_r01_c03",
+        "back_r01_c02",
+        "back_r01_c01",
+        "back_r01_c00",
+    )
+    assert replanned.sequence.deferred_unverified_view_ids == (
+        "front_r00_c01",
+    )
+    assert replanned.blocked_patch_ids == ("front_r00_c02",)
+    assert completed_patch in replanned.completed_patch_ids
+    assert replanned.sequence.motion_authorized is False
+    assert replanned.motion_authorized is False
+
+
+def test_coverage_sequence_can_finish_the_current_back_side_first() -> None:
+    plan = make_serpentine_plan()
+    geometric = filter_candidate_views(
+        plan.candidates,
+        make_proxy(),
+        ViewFilterConfig(camera_clearance_radius_m=0.01),
+    )
+    filtered = FilteredViewPlan(
+        tuple(
+            replace(
+                item,
+                status=CandidateStatus.ENDPOINT_FEASIBLE,
+                joint_positions_rad=np.zeros(6),
+            )
+            for item in geometric.candidates
+        ),
+        (),
+    )
+
+    replanned = select_uncovered_candidates(
+        filtered,
+        create_coverage_ledger(plan, coverage_config()),
+        start_side=BladeSide.BACK,
+    )
+
+    assert replanned.sequence.start_side is BladeSide.BACK
+    assert replanned.sequence.ordered_view_ids[0] == "back_r00_c00"
+    assert replanned.sequence.ordered_view_ids[7] == "back_r01_c00"
+    assert replanned.sequence.ordered_view_ids[8] == "front_r00_c00"

@@ -1,9 +1,12 @@
 """Geometric view planning without robot motion execution."""
 
 from biblade_fusion.planning.coverage import (
+    COARSE_COVERAGE_SEQUENCE_POLICY,
     CoverageDrivenViewPlan,
     CoverageError,
     CoverageLedger,
+    CoverageSequenceEntry,
+    CoverageSequenceProposal,
     PatchCoverage,
     coverage_observation_id,
     create_coverage_ledger,
@@ -45,6 +48,9 @@ __all__ = [
     "CoverageDrivenViewPlan",
     "CoverageError",
     "CoverageLedger",
+    "CoverageSequenceEntry",
+    "CoverageSequenceProposal",
+    "COARSE_COVERAGE_SEQUENCE_POLICY",
     "EvaluatedCandidate",
     "EliteCs68IkChecker",
     "EliteIkError",

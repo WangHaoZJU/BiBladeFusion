@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from typer.testing import CliRunner
 
@@ -62,6 +64,10 @@ def test_coverage_command_is_exposed() -> None:
     assert "seed" in result.stdout
     assert "add" in result.stdout
     assert "next-plan" in result.stdout
+
+    next_plan_help = runner.invoke(app, ["coverage", "next-plan", "--help"])
+    assert next_plan_help.exit_code == 0
+    assert "--start-side" in next_plan_help.stdout
 
 
 def test_reconstruction_commands_are_exposed() -> None:
@@ -155,6 +161,47 @@ def test_safety_path_validation_is_exposed() -> None:
     assert result.exit_code == 0
     assert "validate-path" in result.stdout
     assert "preflight-path" in result.stdout
+
+    preflight_help = runner.invoke(app, ["safety", "preflight-path", "--help"])
+    assert preflight_help.exit_code == 0
+    assert "--coverage-plan" in preflight_help.stdout
+
+
+@pytest.mark.parametrize("supply_both", [False, True])
+def test_safety_preflight_requires_exactly_one_ordering_source(
+    tmp_path: Path,
+    supply_both: bool,
+) -> None:
+    for directory in ("plan", "initialization", "occupancy", "coverage-plan"):
+        (tmp_path / directory).mkdir()
+    ordering_args = (
+        [
+            "--view-id",
+            "front_r00_c00",
+            "--coverage-plan",
+            str(tmp_path / "coverage-plan"),
+        ]
+        if supply_both
+        else []
+    )
+    args = [
+        "safety",
+        "preflight-path",
+        "--plan",
+        str(tmp_path / "plan"),
+        "--initialization",
+        str(tmp_path / "initialization"),
+        "--occupancy",
+        str(tmp_path / "occupancy"),
+        "--output",
+        str(tmp_path / "output"),
+        *ordering_args,
+    ]
+
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 1
+    assert "Supply exactly one ordering source" in result.stderr
 
 
 def test_read_only_supervisory_replay_is_exposed() -> None:

@@ -22,6 +22,7 @@ from biblade_fusion.robotics import (
     Es68PinocchioCollisionChecker,
     OccupancyRobotCollisionChecker,
 )
+from biblade_fusion.storage.coverage_plan import read_coverage_driven_plan
 from biblade_fusion.storage.initialization import read_initialization
 from biblade_fusion.storage.occupancy_mapping import read_occupancy_mapping
 from biblade_fusion.storage.view_plan import read_view_plan
@@ -85,6 +86,27 @@ def _verify_source(record: dict[str, Any]) -> Path:
     if _sha256(path) != str(record["sha256"]):
         raise ValueError(f"Motion-preflight source checksum mismatch: {path}")
     return root
+
+
+def _validate_coverage_sequence_binding(
+    coverage_plan: Path,
+    view_plan: Path,
+    ordered_view_ids: tuple[str, ...],
+) -> None:
+    stored = read_coverage_driven_plan(coverage_plan)
+    if int(stored.metadata["schema_version"]) < 2:
+        raise ValueError(
+            "Motion preflight requires coverage-plan schema 2 ordering evidence"
+        )
+    bound_view_plan = Path(
+        str(stored.metadata["sources"]["view_plan"]["root"])
+    ).resolve()
+    if bound_view_plan != view_plan.resolve():
+        raise ValueError("Coverage sequence does not belong to the supplied view plan")
+    if stored.plan.sequence.ordered_view_ids != ordered_view_ids:
+        raise ValueError(
+            "Motion-preflight order differs from the bound coverage sequence"
+        )
 
 
 def _derive(
@@ -218,6 +240,7 @@ def write_motion_preflight(
     source_plan: str | Path,
     source_initialization: str | Path,
     source_occupancy: str | Path | None = None,
+    source_coverage_plan: str | Path | None = None,
     joint_zero_offsets_rad: Sequence[float] = (),
     execution_freshness_margin_s: float = 1.0,
 ) -> Path:
@@ -231,6 +254,17 @@ def write_motion_preflight(
     occupancy = (
         Path(source_occupancy).resolve() if source_occupancy is not None else None
     )
+    coverage_plan = (
+        Path(source_coverage_plan).resolve()
+        if source_coverage_plan is not None
+        else None
+    )
+    if coverage_plan is not None:
+        _validate_coverage_sequence_binding(
+            coverage_plan,
+            plan,
+            ordered_view_ids,
+        )
     offsets = _joint_zero_offsets(joint_zero_offsets_rad)
     freshness_margin_s = float(execution_freshness_margin_s)
     if not math.isfinite(freshness_margin_s) or freshness_margin_s < 0.0:
@@ -266,6 +300,11 @@ def write_motion_preflight(
                 "occupancy": (
                     _directory_source(occupancy, "metadata.json")
                     if occupancy is not None
+                    else None
+                ),
+                "coverage_plan": (
+                    _directory_source(coverage_plan, "coverage_plan.json")
+                    if coverage_plan is not None
                     else None
                 ),
             },
@@ -314,6 +353,11 @@ def read_motion_preflight(path: str | Path) -> StoredMotionPreflight:
             if sources.get("occupancy") is not None
             else None
         )
+        coverage_plan = (
+            _verify_source(sources["coverage_plan"])
+            if sources.get("coverage_plan") is not None
+            else None
+        )
         configuration = payload["configuration"]
         config = MotionPreflightConfig.model_validate(
             configuration["motion_preflight"]
@@ -337,6 +381,12 @@ def read_motion_preflight(path: str | Path) -> StoredMotionPreflight:
                 "Motion-preflight creation and evaluation instants must match"
             )
         ordered_view_ids = tuple(str(value) for value in payload["ordered_view_ids"])
+        if coverage_plan is not None:
+            _validate_coverage_sequence_binding(
+                coverage_plan,
+                plan,
+                ordered_view_ids,
+            )
         report = _derive(
             plan,
             initialization,

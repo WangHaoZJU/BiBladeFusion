@@ -78,10 +78,50 @@ Export the next offline view set from any ledger version:
 uv run bbf coverage next-plan \
   --ledger outputs/coverage_001 \
   --plan outputs/view_plan \
+  --start-side front \
   --output outputs/next_view_plan_001
 ```
 
 The resulting JSON references SHA-256-verified plan and coverage sources and separates
-completed patches, remaining non-rejected views, and blocked patches. Reading it derives
-the selection again from its sources and rejects stale or edited summaries. No
-reconstruction or coverage command moves the robot.
+completed patches, remaining non-rejected views, and blocked patches. It also records a
+deterministic **proxy-coarse-scan proposal**:
+
+1. completed patches are removed as a hard coverage gate;
+2. only `endpoint_feasible` candidates carrying a stored six-axis IK solution enter the
+   ordered list;
+3. the selected start side is completed first, row by row, with even rows traversed in
+   ascending column order and odd rows in descending order;
+4. the opposite side follows with the same snake rule; and
+5. `geometry_only` views remain visible as `deferred_unverified_view_ids` and can never
+   enter a motion preflight.
+
+`front` is the default because proxy construction defines the initial camera-visible
+surface as the proxy front. `--start-side back` is available when replanning after the
+camera has already changed sides. Removing completed cells does not renumber rows or
+reverse their original snake direction. Joint travel is not an optimization objective;
+the proposal prioritizes coverage topology and endpoint reachability.
+
+Every ordered entry preserves side, row, column, snake rank, measured occupied fraction,
+and endpoint status. Reading the artifact derives all fields again from the hashed source
+plan and ledger and rejects stale or edited ordering evidence. This first policy applies
+only to the bilateral proxy coarse grid; the irregular curved/fin fine plan requires its
+own region-aware ordering policy.
+
+The ordering is a proposal, not a path-safety result. Bind it to the latest eligible
+occupancy asset when creating the per-leg preflight:
+
+```bash
+uv run bbf safety preflight-path \
+  --plan outputs/view_plan \
+  --initialization outputs/initialization \
+  --occupancy outputs/fresh_map_ready_occupancy \
+  --coverage-plan outputs/next_view_plan_001 \
+  --config configs/local.yaml \
+  --output outputs/motion_preflight_001
+```
+
+The command rejects a coverage artifact from another view plan or any order that differs
+from the hashed coverage proposal. Each leg is still independently subject to endpoint,
+mesh, occupancy, freshness, and continuous-sweep gates. No reconstruction, coverage, or
+preflight command connects to or moves the robot, and every artifact retains
+`motion_authorized: false`.
