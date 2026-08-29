@@ -211,7 +211,15 @@ def evaluate_surface_quality(
         )
         consistency = float(np.mean(evidence.best_normal_cosines[observed])) if count else 0.0
         reasons: list[str] = []
-        if count < config.minimum_observed_points:
+        # Visibility and fin topology may deliberately create a patch with fewer
+        # reference samples than the global absolute floor.  Requiring more measured
+        # reference samples than actually exist would make completion impossible;
+        # the independent coverage-fraction gate still scales with patch size.
+        required_observed_points = min(
+            config.minimum_observed_points,
+            len(patch.points_m),
+        )
+        if count < required_observed_points:
             reasons.append("too few measured reference samples")
         if coverage < config.completed_fraction:
             reasons.append("measured curved-surface coverage is incomplete")

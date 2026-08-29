@@ -73,6 +73,14 @@ class StopScanBlocked(StopScanError):
     """A fail-closed gate prevented the next motion segment."""
 
 
+class NextViewUnavailable(StopScanBlocked):
+    """Coverage is incomplete, but no endpoint-feasible next view exists."""
+
+
+class BladePlanningAssetError(StopScanError):
+    """The scientific reconstruction/coverage evidence is invalid or inconsistent."""
+
+
 class StopScanAbortRequested(StopScanError):
     """An asynchronous operator stop request interrupted the active transaction."""
 
@@ -389,6 +397,10 @@ class PerceptionCycleResult:
             "inference_stationarity_path",
         ):
             object.__setattr__(self, name, Path(getattr(self, name)).resolve())
+        for name in ("reconstructed_view_path", "coverage_path"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, Path(value).resolve())
         if not self.inference_robot_state_trace:
             raise ValueError("FoundationStereo inference requires a stationarity trace")
         if type(self.stationarity_reference) is not RobotState:
@@ -459,6 +471,46 @@ class NextViewTarget:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class NextViewSelection:
+    """Auditable selector decision bound to one semantic surface generation."""
+
+    target: NextViewTarget | None
+    surface_generation_id: str
+    reference_model_sha256: str
+    selection_policy_sha256: str
+    required_patch_count: int
+    incomplete_patch_count: int
+    coverage_complete: bool
+    diagnostics: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in (
+            "surface_generation_id",
+            "reference_model_sha256",
+            "selection_policy_sha256",
+        ):
+            if _SHA256.fullmatch(str(getattr(self, name))) is None:
+                raise ValueError(f"Next-view decision {name} must be a SHA-256 digest")
+        if self.required_patch_count <= 0:
+            raise ValueError("Next-view decision requires at least one reference patch")
+        if not 0 <= self.incomplete_patch_count <= self.required_patch_count:
+            raise ValueError("Next-view incomplete-patch count is invalid")
+        if self.coverage_complete:
+            if self.target is not None or self.incomplete_patch_count != 0:
+                raise ValueError(
+                    "Completed next-view decision cannot contain a target or gaps"
+                )
+        elif self.target is None or self.incomplete_patch_count == 0:
+            raise ValueError(
+                "Incomplete next-view decision requires a concrete target and gaps"
+            )
+        diagnostics = tuple(str(value).strip() for value in self.diagnostics)
+        if any(not value for value in diagnostics):
+            raise ValueError("Next-view diagnostics must be non-empty strings")
+        object.__setattr__(self, "diagnostics", diagnostics)
+
+
 def next_view_target_from_candidate(
     candidate: EvaluatedCandidate,
     hand_eye: HandEyeCalibration,
@@ -487,7 +539,7 @@ class NextViewSelector(Protocol):
         self,
         observation: PerceptionCycleResult,
         generation: OccupancyGeneration,
-    ) -> NextViewTarget | None: ...
+    ) -> NextViewSelection: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,6 +555,47 @@ class SegmentProposal:
     occupancy_binding: OccupancyBinding
     occupancy_generation_id: str
     inference_stationarity_sha256: str
+    surface_generation_id: str
+    reference_model_sha256: str
+    selection_policy_sha256: str
+
+    def __post_init__(self) -> None:
+        if not self.target_view_id.strip() or not self.capture_view_id.strip():
+            raise ValueError("Segment proposal view IDs must be non-empty")
+        for name in (
+            "proposal_id",
+            "occupancy_generation_id",
+            "inference_stationarity_sha256",
+            "surface_generation_id",
+            "reference_model_sha256",
+            "selection_policy_sha256",
+        ):
+            if _SHA256.fullmatch(str(getattr(self, name))) is None:
+                raise ValueError(f"Segment proposal {name} must be a SHA-256 digest")
+        object.__setattr__(
+            self,
+            "start_joint_positions_rad",
+            _joint_vector(self.start_joint_positions_rad, label="segment start"),
+        )
+        object.__setattr__(
+            self,
+            "goal_joint_positions_rad",
+            _joint_vector(self.goal_joint_positions_rad, label="segment goal"),
+        )
+        object.__setattr__(
+            self,
+            "final_target_joint_positions_rad",
+            _joint_vector(
+                self.final_target_joint_positions_rad,
+                label="segment final target",
+            ),
+        )
+        pose = PoseSE3("base", "tcp", self.target_base_t_tcp_matrix)
+        object.__setattr__(
+            self,
+            "target_base_t_tcp_matrix",
+            tuple(tuple(float(value) for value in row) for row in pose.matrix),
+        )
 
     @property
     def motion_authorized(self) -> bool:
@@ -699,6 +792,9 @@ class GuardedSegmentSafetyFactory:
                 "inference_stationarity_sha256": (
                     generation.inference_stationarity_sha256
                 ),
+                "surface_generation_id": proposal.surface_generation_id,
+                "reference_model_sha256": proposal.reference_model_sha256,
+                "selection_policy_sha256": proposal.selection_policy_sha256,
             },
         )
         executor: ApprovedSegmentExecutor | None = None
@@ -829,6 +925,8 @@ class StopScanCoordinator:
         self._observation_generation_id: str | None = None
         self._prepared: _PreparedSegmentExecution | None = None
         self._expected_capture_view_id: str | None = None
+        self._run_reference_model_sha256: str | None = None
+        self._run_selection_policy_sha256: str | None = None
         self._blocking_reasons: tuple[str, ...] = ()
         self._event_store_failure_reason: str | None = None
 
@@ -1073,15 +1171,45 @@ class StopScanCoordinator:
                 )
             self._transition(StopScanPhase.PLANNING, "next_view_selection_started", {})
             try:
-                target = self._selector.select_next(self._observation, generation)
+                selection = self._selector.select_next(self._observation, generation)
+                if type(selection) is not NextViewSelection:
+                    raise BladePlanningAssetError(
+                        "Next-view selector returned an untyped decision"
+                    )
+                self._validate_selection_run_binding(selection)
                 self._raise_if_stop_requested()
-                if target is None:
-                    self._transition(StopScanPhase.COMPLETE, "coverage_complete", {})
+                if selection.coverage_complete:
+                    self._transition(
+                        StopScanPhase.COMPLETE,
+                        "coverage_complete",
+                        {
+                            "surface_generation_id": (
+                                selection.surface_generation_id
+                            ),
+                            "reference_model_sha256": (
+                                selection.reference_model_sha256
+                            ),
+                            "selection_policy_sha256": (
+                                selection.selection_policy_sha256
+                            ),
+                            "required_patch_count": (
+                                selection.required_patch_count
+                            ),
+                            "incomplete_patch_count": 0,
+                            "diagnostics": list(selection.diagnostics),
+                        },
+                    )
                     return None
+                target = selection.target
+                if target is None:  # guarded again at the trust boundary
+                    raise BladePlanningAssetError(
+                        "Incomplete selector decision has no target"
+                    )
                 live_state = self._robot.read_state()
                 self._raise_if_stop_requested()
                 proposal = self._propose_short_segment(
                     target,
+                    selection,
                     live_state,
                     generation,
                 )
@@ -1092,6 +1220,9 @@ class StopScanCoordinator:
                         "proposal_id": proposal.proposal_id,
                         "target_view_id": proposal.target_view_id,
                         "final_target": proposal.final_target,
+                        "surface_generation_id": proposal.surface_generation_id,
+                        "reference_model_sha256": proposal.reference_model_sha256,
+                        "selection_policy_sha256": proposal.selection_policy_sha256,
                     },
                 )
                 prepared = self._safety_factory.prepare(proposal, generation)
@@ -1104,6 +1235,28 @@ class StopScanCoordinator:
                     StopScanPhase.ABORTED,
                     "operator_stop_observed",
                     {"reason": str(exc)},
+                )
+                raise
+            except NextViewUnavailable as exc:
+                self._prepared = None
+                self._blocking_reasons = (
+                    f"next_view_unavailable:{type(exc).__name__}:{exc}",
+                )
+                self._transition(
+                    StopScanPhase.MOTION_BLOCKED,
+                    "next_view_unavailable",
+                    {"reason": self._blocking_reasons[0]},
+                )
+                raise
+            except BladePlanningAssetError as exc:
+                self._prepared = None
+                self._blocking_reasons = (
+                    f"blade_planning_asset_failed:{type(exc).__name__}:{exc}",
+                )
+                self._transition(
+                    StopScanPhase.FAILED,
+                    "blade_planning_asset_failed",
+                    {"reason": self._blocking_reasons[0]},
                 )
                 raise
             except Exception as exc:
@@ -1348,6 +1501,35 @@ class StopScanCoordinator:
         ):
             if not path.resolve().is_relative_to(cycle_root):
                 raise StopScanBlocked(f"{label} escaped the immutable cycle root")
+        reconstructed_path = result.reconstructed_view_path
+        if reconstructed_path is not None and (
+            not reconstructed_path.is_dir()
+            or not reconstructed_path.resolve().is_relative_to(cycle_root)
+        ):
+            raise StopScanBlocked(
+                "reconstructed blade view is missing or escaped the immutable cycle root"
+            )
+        coverage_path = result.coverage_path
+        if coverage_path is not None:
+            if not coverage_path.is_dir():
+                raise StopScanBlocked("surface coverage generation is missing")
+            coverage_is_local = coverage_path.resolve().is_relative_to(cycle_root)
+            # A transit capture may carry the latest independently verified immutable
+            # generation from an earlier cycle.  A cycle that did produce a new science
+            # reconstruction must publish its matching successor transaction locally.
+            # The concrete selector pins the exact carried path/generation before any
+            # subsequent completion decision or motion proposal.
+            if reconstructed_path is not None and not coverage_is_local:
+                raise StopScanBlocked(
+                    "new surface coverage escaped the immutable cycle root"
+                )
+            if not coverage_is_local and (
+                self._expected_capture_view_id is None
+                or not self._expected_capture_view_id.startswith("transit_")
+            ):
+                raise StopScanBlocked(
+                    "external surface coverage is allowed only for an expected transit capture"
+                )
 
         recomputed = validate_stationary_trace(
             result.stationarity_reference,
@@ -1522,9 +1704,14 @@ class StopScanCoordinator:
     def _propose_short_segment(
         self,
         target: NextViewTarget,
+        selection: NextViewSelection,
         live_state: RobotState,
         generation: OccupancyGeneration,
     ) -> SegmentProposal:
+        if selection.coverage_complete or selection.target != target:
+            raise BladePlanningAssetError(
+                "Segment target does not match the incomplete selector decision"
+            )
         start = np.asarray(live_state.joint_positions_rad, dtype=np.float64)
         final = np.asarray(target.joint_positions_rad, dtype=np.float64)
         delta = final - start
@@ -1552,6 +1739,9 @@ class StopScanCoordinator:
             "inference_stationarity_sha256": (
                 generation.inference_stationarity_sha256
             ),
+            "surface_generation_id": selection.surface_generation_id,
+            "reference_model_sha256": selection.reference_model_sha256,
+            "selection_policy_sha256": selection.selection_policy_sha256,
         }
         proposal_id = hashlib.sha256(
             json.dumps(
@@ -1573,7 +1763,28 @@ class StopScanCoordinator:
             generation.binding,
             generation.generation_id,
             generation.inference_stationarity_sha256,
+            selection.surface_generation_id,
+            selection.reference_model_sha256,
+            selection.selection_policy_sha256,
         )
+
+    def _validate_selection_run_binding(
+        self,
+        selection: NextViewSelection,
+    ) -> None:
+        if self._run_reference_model_sha256 is None:
+            self._run_reference_model_sha256 = selection.reference_model_sha256
+            self._run_selection_policy_sha256 = selection.selection_policy_sha256
+            return
+        if (
+            selection.reference_model_sha256
+            != self._run_reference_model_sha256
+            or selection.selection_policy_sha256
+            != self._run_selection_policy_sha256
+        ):
+            raise BladePlanningAssetError(
+                "Next-view reference or selection policy changed within one run"
+            )
 
     @staticmethod
     def _validate_prepared_segment(
@@ -1614,9 +1825,15 @@ class StopScanCoordinator:
                 != generation.generation_id
                 or diagnostics.get("inference_stationarity_sha256")
                 != generation.inference_stationarity_sha256
+                or diagnostics.get("surface_generation_id")
+                != proposal.surface_generation_id
+                or diagnostics.get("reference_model_sha256")
+                != proposal.reference_model_sha256
+                or diagnostics.get("selection_policy_sha256")
+                != proposal.selection_policy_sha256
             ):
                 raise StopScanBlocked(
-                    "Approval-eligible preflight lacks perception-generation binding"
+                    "Approval-eligible preflight lacks perception/selection binding"
                 )
 
     def _transition(

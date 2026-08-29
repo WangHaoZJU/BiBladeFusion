@@ -129,10 +129,14 @@ cycles/<sequence>_<view>/
 返回对象或文件SHA；它重新读取该文件，复算状态证据，并逐项核对view/sequence、阈值、
 manifest、完整状态序列和采集before/selected/after状态，然后才允许发布占用generation。
 
-`PerceptionCycleResult`为`reconstructed_view_path`和`coverage_path`保留了可选字段，但当前
-具体周期引擎只生成原始session、FoundationStereo资产和安全占用资产。叶片点云重建、覆盖
-账本以及覆盖驱动的具体`NextViewSelector`仍需在后续集成，不能把协议接口写成已经完成的
-端到端在线重建。
+`PerceptionCycleResult`为`reconstructed_view_path`和`coverage_path`保留了可选字段。独立精扫
+覆盖代际和具体`BladeCoverageNextViewSelector`现已实现：粗扫coverage不能进入精扫账本，
+selector从真实曲面分区质量、raw/rectified相机链和当前停稳关节生成一个候选，并把选择策略、
+参考粗模型和覆盖代际哈希绑定到短段提议。具体周期引擎仍只自动生成原始session、
+FoundationStereo资产和安全占用资产；它尚未拥有可验证的叶片mask来源，因此不会把全部有效
+深度或安全占用图错误写成科学重建。在线`reconstructed_view_path`/`coverage_path`接线仍是
+待完成环节，缺少它们时selector按设计失败关闭。详细契约见
+`docs/coverage-next-view-selector.md`。
 
 ### 4.1 感知结果的两阶段提交
 
@@ -192,14 +196,26 @@ FoundationStereo推理、占用重放、预检、人工确认和短段执行很�
 
 ## 6. 下一视点与短段运动
 
-协调器每次只向`NextViewSelector`请求一个下一目标。目标必须已经具有端点可达的ES68关节
-解和对应`base_T_tcp`。当前关节位置从停稳后的机器人实时状态读取，不再错误复用初始化时的
-seed关节。
+协调器每次只向`NextViewSelector`请求一个下一目标。具体selector只使用累积精扫曲面账本
+判断完成和排序，短时安全占用generation不参与科学得分；占用图只在后续预检中否决不安全
+短段。目标必须已经具有端点可达的ES68关节解和对应`base_T_tcp`，并通过独立标定FK回代。
+IK seed来自本次停稳感知轨迹的最新关节状态；协调器随后再读取实时关节作为短段真实起点，
+不复用初始化姿态。
+
+覆盖尚未完成但没有工作空间/IK/FK均可接受的未使用候选时，selector抛出
+`NextViewUnavailable`并进入`MOTION_BLOCKED`，绝不返回空目标冒充扫描完成。只有正反两侧
+全部必需主表面、四边界、鳍片双面、鳍片根部和自由边分区均通过覆盖率、RMSE、法向一致性
+门限时，才产生带固定参考和策略哈希的`coverage_complete`事件。
 
 若目标与当前状态的最大单关节差值超过实测配置
 `maximum_segment_joint_delta_rad`，协调器沿关节直线方向按比例截断，只提出一个中间短段。
 中间段用独立的`transit_*`视图ID，并在段后强制重新停稳、重新采集和重新规划。到达最终
 目标的短段才应用目标TCP的FK一致性门限；中间段仍必须通过相同的网格和占用安全检查。
+`transit_*`周期允许只刷新安全占用并引用上一周期已验证的不可变精扫代际；正式候选ID的
+采集则必须在当前周期内同时提交叶片重建和覆盖后继代际。这样短段重规划不会清空或伪增科学
+覆盖，而正式精扫漏产资产也不会静默重试。跨周期selector同时钉住粗模型metadata哈希，并
+要求transit精确保持generation路径/ID、科学后继精确指向前一代；另一运行的自洽coverage
+不能通过这条连续性门。
 
 每个`SegmentProposal`哈希绑定：
 
@@ -325,9 +341,11 @@ IDLE
 - 执行、stop或执行后停稳异常：`ABORTED`；
 - 操作员主动中止：`ABORTED`；
 - 任一运行事件持久化失败：不可逆`FAILED`，清除待审批段且本协调器实例不得恢复；
-- selector确认无剩余视点：`COMPLETE`。
+- selector以独立重算的精扫曲面质量证明全部必需分区完成：`COMPLETE`；
+- 覆盖未完成但没有可用候选：`MOTION_BLOCKED`，不能等同于`COMPLETE`；
+- 精扫代际、固定参考、FoundationStereo来源或选择策略语义不一致：`FAILED`。
 
 生产放行前至少还要完成：最终ES68+D435i STL与自遮罩真机验收、两个连续扫掠证明、
 FoundationStereo/CUDA实测、地图年龄与短段关节上限测量、RTSI采样/未观测运动边界验收、
-具体覆盖selector和重建反馈接入，以及受控硬件验收。完成这些条件前，应把
+在线叶片mask/重建反馈接入，以及受控硬件验收。完成这些条件前，应把
 `MOTION_BLOCKED`视为正确结果，而不是需要绕开的程序错误；硬件急停仍是最终安全边界。

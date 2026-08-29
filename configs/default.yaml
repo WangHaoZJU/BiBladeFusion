@@ -249,7 +249,21 @@ surface_quality:
   completed_fraction: 0.85
   maximum_rmse_m: 0.003
   minimum_normal_consistency: 0.75
+  # This absolute floor is capped by each topology/visibility patch's own reference
+  # sample count; completed_fraction, RMSE, and normal consistency remain mandatory.
   minimum_observed_points: 30
+
+next_view_selection:
+  # Completion requires every listed region on both main blade sides.  The two
+  # protruding fins must each have independently observed face geometry.
+  required_regions:
+    [surface, leading_edge, trailing_edge, root, tip, fin_face, fin_root, fin_free_edge]
+  region_priority:
+    [fin_root, fin_free_edge, leading_edge, trailing_edge, root, tip, fin_face, surface]
+  require_each_region_on_both_blade_sides: true
+  require_two_observed_fin_faces_per_side: true
+  exclude_already_captured_candidate_ids: true
+  use_joint_travel_only_as_tiebreak: true
 
 depth_comparison:
   minimum_overlap_points: 100

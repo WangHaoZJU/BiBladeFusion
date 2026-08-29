@@ -110,9 +110,19 @@ def inspect_fine_plan(
     patch_by_id = {str(item["patch_id"]): item for item in patch_payloads}
     if len(patch_by_id) != len(patch_payloads):
         raise FinePlanInspectionError("Patch identifiers are not unique")
-    stored_transforms = np.asarray(_array(summary, "candidate_base_T_left_ir"), dtype=np.float64)
-    if stored_transforms.shape != (len(candidate_payloads), 4, 4):
-        raise FinePlanInspectionError("Persisted candidate transforms have invalid shape")
+    stored_raw_transforms = np.asarray(
+        _array(summary, "candidate_base_T_left_ir"), dtype=np.float64
+    )
+    expected_transform_shape = (len(candidate_payloads), 4, 4)
+    if stored_raw_transforms.shape != expected_transform_shape:
+        raise FinePlanInspectionError("Persisted raw candidate transforms have invalid shape")
+    stored_geometry_transforms = (
+        np.asarray(_array(summary, "candidate_base_T_left_rectified"), dtype=np.float64)
+        if schema >= 5
+        else stored_raw_transforms
+    )
+    if stored_geometry_transforms.shape != expected_transform_shape:
+        raise FinePlanInspectionError("Persisted rectified candidate transforms have invalid shape")
 
     planning = metadata["view_plan"]["configuration"]
     baseline = float(metadata["view_plan"]["baseline_standoff_distance_m"])
@@ -127,7 +137,12 @@ def inspect_fine_plan(
         if patch_id not in patch_by_id:
             raise FinePlanInspectionError(f"Fine view references unknown patch {patch_id}")
         patch = patch_by_id[patch_id]
-        matrix = np.asarray(candidate["base_T_left_ir"], dtype=np.float64)
+        raw_matrix = np.asarray(candidate["base_T_left_ir"], dtype=np.float64)
+        geometry_matrix = (
+            np.asarray(candidate["base_T_left_rectified"], dtype=np.float64)
+            if schema >= 5
+            else raw_matrix
+        )
         target = np.asarray(patch["obb_center_m"], dtype=np.float64)
         normal = np.asarray(patch["main_normal"], dtype=np.float64)
         distance = float(candidate["standoff_distance_m"])
@@ -135,23 +150,52 @@ def inspect_fine_plan(
         visibility = float(candidate["visibility_fraction"])
         footprint = tuple(float(value) for value in candidate["footprint_m"])
         reasons: list[str] = []
-        if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
-            reasons.append("camera transform is not a finite 4x4 matrix")
+        if raw_matrix.shape != (4, 4) or not np.isfinite(raw_matrix).all():
+            reasons.append("raw camera transform is not a finite 4x4 matrix")
         else:
-            rotation = matrix[:3, :3]
-            if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6) or not np.isclose(
-                np.linalg.det(rotation), 1.0, atol=1e-6
+            raw_rotation = raw_matrix[:3, :3]
+            if not np.allclose(
+                raw_rotation.T @ raw_rotation, np.eye(3), atol=1e-6
+            ) or not np.isclose(np.linalg.det(raw_rotation), 1.0, atol=1e-6):
+                reasons.append("raw camera rotation is not right-handed and orthonormal")
+            if not np.allclose(
+                raw_matrix,
+                stored_raw_transforms[index],
+                rtol=0.0,
+                atol=1e-10,
             ):
-                reasons.append("camera rotation is not right-handed and orthonormal")
-            if not np.allclose(matrix, stored_transforms[index], atol=1e-10):
-                reasons.append("metadata and checksummed camera transforms disagree")
-            view_vector = target - matrix[:3, 3]
+                reasons.append("metadata and checksummed raw camera transforms disagree")
+        geometry_valid = geometry_matrix.shape == (4, 4) and np.isfinite(geometry_matrix).all()
+        if not geometry_valid:
+            reasons.append("rectified camera transform is not a finite 4x4 matrix")
+        else:
+            geometry_rotation = geometry_matrix[:3, :3]
+            if not np.allclose(
+                geometry_rotation.T @ geometry_rotation,
+                np.eye(3),
+                atol=1e-6,
+            ) or not np.isclose(np.linalg.det(geometry_rotation), 1.0, atol=1e-6):
+                reasons.append("rectified camera rotation is not right-handed and orthonormal")
+            if not np.allclose(
+                geometry_matrix,
+                stored_geometry_transforms[index],
+                rtol=0.0,
+                atol=1e-10,
+            ):
+                reasons.append("metadata and checksummed rectified camera transforms disagree")
+            view_vector = target - geometry_matrix[:3, 3]
             measured_distance = float(np.linalg.norm(view_vector))
             if abs(measured_distance - distance) > filter_config.maximum_standoff_error_m:
                 reasons.append("camera-to-target distance does not match selected standoff")
-            if float(rotation[:, 2] @ _unit(view_vector)) < filter_config.minimum_look_at_cosine:
+            if (
+                float(geometry_rotation[:, 2] @ _unit(view_vector))
+                < filter_config.minimum_look_at_cosine
+            ):
                 reasons.append("camera optical axis does not look at the patch centre")
-            if float((-rotation[:, 2]) @ _unit(normal)) < filter_config.minimum_incidence_cosine:
+            if (
+                float((-geometry_rotation[:, 2]) @ _unit(normal))
+                < filter_config.minimum_incidence_cosine
+            ):
                 reasons.append("camera incidence does not match the planned outward normal")
         if projection + 1e-12 < projection_gate:
             reasons.append("patch projection fraction is below the configured gate")
@@ -175,7 +219,7 @@ def inspect_fine_plan(
                 projection,
                 visibility,
                 str(candidate["distance_policy"]),
-                matrix,
+                raw_matrix,
                 target,
                 normal,
                 not reasons,

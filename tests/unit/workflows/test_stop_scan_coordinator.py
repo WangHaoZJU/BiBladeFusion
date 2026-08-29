@@ -39,8 +39,11 @@ from biblade_fusion.storage.inference_stationarity import (
 from biblade_fusion.storage.occupancy_mapping import StoredOccupancyMapping
 from biblade_fusion.storage.stop_scan_run import StopScanRunWriter, read_stop_scan_run
 from biblade_fusion.workflows.stop_scan_coordinator import (
+    BladePlanningAssetError,
     CapturedStopScanView,
+    NextViewSelection,
     NextViewTarget,
+    NextViewUnavailable,
     OccupancyGeneration,
     OccupancyGenerationPublisher,
     PerceptionCycleResult,
@@ -390,7 +393,16 @@ class FakeSelector:
 
     def select_next(self, observation, generation):
         del observation, generation
-        return self.target
+        return NextViewSelection(
+            target=self.target,
+            surface_generation_id="a" * 64,
+            reference_model_sha256="b" * 64,
+            selection_policy_sha256="c" * 64,
+            required_patch_count=4,
+            incomplete_patch_count=0 if self.target is None else 1,
+            coverage_complete=self.target is None,
+            diagnostics=("synthetic selector evidence",),
+        )
 
 
 class FakeExecutor:
@@ -481,6 +493,9 @@ class FakeSafetyFactory:
                 "inference_stationarity_sha256": (
                     generation.inference_stationarity_sha256
                 ),
+                "surface_generation_id": proposal.surface_generation_id,
+                "reference_model_sha256": proposal.reference_model_sha256,
+                "selection_policy_sha256": proposal.selection_policy_sha256,
             },
         )
         if self.clear:
@@ -608,6 +623,68 @@ def test_bootstrap_then_one_short_segment_requires_new_capture(tmp_path: Path) -
     assert len(perception.committed) == 4
 
 
+def test_transit_cycle_may_carry_prior_coverage_but_not_publish_external_successor(
+    tmp_path: Path,
+) -> None:
+    coordinator, _, _, perception, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=None,
+    )
+    coordinator.start()
+    captured = perception.capture("transit_fine-front-001_cycle_0000", 0)
+    result = perception.infer_and_update(captured)
+    prior_coverage = tmp_path / "persistent_surface_coverage"
+    prior_coverage.mkdir()
+    carried = replace(result, coverage_path=prior_coverage)
+
+    with pytest.raises(StopScanBlocked, match="only for an expected transit"):
+        coordinator._validate_perception_result(captured, carried)
+
+    coordinator._expected_capture_view_id = captured.bundle.view_id
+    verified = coordinator._validate_perception_result(captured, carried)
+
+    assert verified.snapshot == result.stored_occupancy.snapshot
+
+    reconstruction = captured.cycle_root / "reconstructed_view"
+    reconstruction.mkdir()
+    invalid_successor = replace(
+        carried,
+        reconstructed_view_path=reconstruction,
+    )
+    with pytest.raises(StopScanBlocked, match="new surface coverage escaped"):
+        coordinator._validate_perception_result(captured, invalid_successor)
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    ["reference_model_sha256", "selection_policy_sha256"],
+)
+def test_run_rejects_reference_or_selector_policy_drift(
+    tmp_path: Path,
+    changed_field: str,
+) -> None:
+    coordinator, _, _, _, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=None,
+    )
+    first = NextViewSelection(
+        target=_target(),
+        surface_generation_id="a" * 64,
+        reference_model_sha256="b" * 64,
+        selection_policy_sha256="c" * 64,
+        required_patch_count=4,
+        incomplete_patch_count=1,
+        coverage_complete=False,
+    )
+    coordinator._validate_selection_run_binding(first)
+    changed = replace(first, **{changed_field: "d" * 64})
+
+    with pytest.raises(BladePlanningAssetError, match="changed within one run"):
+        coordinator._validate_selection_run_binding(changed)
+
+
 def test_missing_continuous_proof_blocks_without_executor(tmp_path: Path) -> None:
     coordinator, _, stop, _, safety, _ = _coordinator(
         tmp_path,
@@ -709,7 +786,68 @@ def test_coordinator_writes_a_verifiable_hash_chained_event_run(tmp_path: Path) 
 
     assert stored.events[0].event_type == "run_started"
     assert stored.events[-1].phase == StopScanPhase.COMPLETE.value
+    assert stored.events[-1].payload["surface_generation_id"] == "a" * 64
+    assert stored.events[-1].payload["reference_model_sha256"] == "b" * 64
+    assert stored.events[-1].payload["selection_policy_sha256"] == "c" * 64
+    assert stored.events[-1].payload["required_patch_count"] == 4
     assert all(event.event_sha256 for event in stored.events)
+
+
+def test_next_view_completion_requires_typed_zero_gap_evidence() -> None:
+    with pytest.raises(ValueError, match="requires a concrete target"):
+        NextViewSelection(
+            target=None,
+            surface_generation_id="a" * 64,
+            reference_model_sha256="b" * 64,
+            selection_policy_sha256="c" * 64,
+            required_patch_count=4,
+            incomplete_patch_count=0,
+            coverage_complete=False,
+        )
+
+
+def test_untyped_selector_result_is_terminal_asset_failure(tmp_path: Path) -> None:
+    class UntypedSelector:
+        def select_next(self, observation, generation):
+            del observation, generation
+            return None
+
+    coordinator, *_ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=None,
+    )
+    coordinator._selector = UntypedSelector()  # type: ignore[assignment]
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+
+    with pytest.raises(BladePlanningAssetError, match="untyped decision"):
+        coordinator.prepare_next_segment()
+
+    assert coordinator.checkpoint.phase is StopScanPhase.FAILED
+
+
+def test_incomplete_coverage_without_reachable_view_is_motion_blocked(
+    tmp_path: Path,
+) -> None:
+    class BlockedSelector:
+        def select_next(self, observation, generation):
+            del observation, generation
+            raise NextViewUnavailable("no endpoint-feasible incomplete patch")
+
+    coordinator, *_ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=None,
+    )
+    coordinator._selector = BlockedSelector()  # type: ignore[assignment]
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+
+    with pytest.raises(NextViewUnavailable, match="no endpoint-feasible"):
+        coordinator.prepare_next_segment()
+
+    assert coordinator.checkpoint.phase is StopScanPhase.MOTION_BLOCKED
 
 
 def test_next_view_target_rejects_non_rigid_tcp_matrix() -> None:

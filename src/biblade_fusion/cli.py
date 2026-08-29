@@ -82,6 +82,7 @@ from biblade_fusion.storage import (
 from biblade_fusion.workflows import (
     build_coarse_blade_model,
     compare_paired_depth,
+    derive_consistent_left_rectified_t_left_ir,
     evaluate_native_overlap,
     extract_hand_eye_samples,
     infer_rectified_stereo,
@@ -91,7 +92,6 @@ from biblade_fusion.workflows import (
     plan_initial_observation,
     reconstruct_foundation_stereo_view,
     reconstruct_native_depth_view,
-    registered_cloud_view,
 )
 
 
@@ -1656,15 +1656,18 @@ def reconstruct_coarse_model(
             raise ValueError("Coarse views use different hand-eye calibration matrices")
         planning_intrinsics = stored[0].view.planning_intrinsics
         if any(item.view.planning_intrinsics != planning_intrinsics for item in stored[1:]):
-            raise ValueError("Coarse views use different left-IR planning intrinsics")
+            raise ValueError("Coarse views use different rectified planning intrinsics")
+        reconstructed_views = tuple(item.view for item in stored)
+        left_rectified_t_left_ir = derive_consistent_left_rectified_t_left_ir(reconstructed_views)
         result = build_coarse_blade_model(
-            tuple(registered_cloud_view(item.view) for item in stored),
+            reconstructed_views,
             planning_intrinsics,
             settings.multi_view_fusion,
             settings.surface_partition,
             settings.view_planning,
             settings.tsdf,
             settings.surface_quality,
+            left_rectified_t_left_ir=left_rectified_t_left_ir,
         )
         destination = write_coarse_model(
             output,
@@ -1696,7 +1699,7 @@ def reconstruct_inspect_fine_plan(
             exists=True,
             file_okay=False,
             readable=True,
-            help="Schema-4 paper-derived coarse-model artifact.",
+            help="Schema-4+ paper-derived coarse-model artifact.",
         ),
     ],
     output: Annotated[Path, typer.Option("--output", "-o")],

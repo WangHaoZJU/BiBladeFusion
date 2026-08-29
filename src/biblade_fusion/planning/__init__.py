@@ -15,6 +15,7 @@ from biblade_fusion.planning.coverage import (
 )
 from biblade_fusion.planning.elite_ik import EliteCs68IkChecker, EliteIkError
 from biblade_fusion.planning.filtering import (
+    BladeClearanceEnvelope,
     CandidateMetrics,
     CandidateStatus,
     EvaluatedCandidate,
@@ -42,6 +43,7 @@ __all__ = [
     "validate_joint_path_collision",
     "BilateralViewPlan",
     "BladeSide",
+    "BladeClearanceEnvelope",
     "CandidateView",
     "CandidateMetrics",
     "CandidateStatus",

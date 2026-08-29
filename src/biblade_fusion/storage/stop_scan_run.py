@@ -420,6 +420,16 @@ class StopScanRunWriter:
             previous_event_sha256=previous,
             created_at_utc=created_at_utc,
         )
+        if self._events:
+            previous_created = datetime.fromisoformat(
+                self._events[-1].created_at_utc
+            )
+            current_created = datetime.fromisoformat(event.created_at_utc)
+            if current_created < previous_created:
+                raise ValueError(
+                    "Refusing to append a stop-and-scan event whose UTC timestamp "
+                    "precedes the previous event"
+                )
         destination = self.root / "events" / _event_filename(sequence)
         _write_new_json(destination, event.to_payload())
         self._events.append(event)

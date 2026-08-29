@@ -426,6 +426,63 @@ class SurfaceQualityConfig(BaseModel):
     minimum_observed_points: int = Field(default=30, ge=3)
 
 
+SurfaceRegionName = Literal[
+    "surface",
+    "leading_edge",
+    "trailing_edge",
+    "root",
+    "tip",
+    "fin_face",
+    "fin_root",
+    "fin_free_edge",
+]
+
+
+class NextViewSelectionConfig(BaseModel):
+    """Versioned, coverage-first policy for the bilateral fin-blade selector."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    required_regions: tuple[SurfaceRegionName, ...] = (
+        "surface",
+        "leading_edge",
+        "trailing_edge",
+        "root",
+        "tip",
+        "fin_face",
+        "fin_root",
+        "fin_free_edge",
+    )
+    region_priority: tuple[SurfaceRegionName, ...] = (
+        "fin_root",
+        "fin_free_edge",
+        "leading_edge",
+        "trailing_edge",
+        "root",
+        "tip",
+        "fin_face",
+        "surface",
+    )
+    require_each_region_on_both_blade_sides: bool = True
+    require_two_observed_fin_faces_per_side: bool = True
+    exclude_already_captured_candidate_ids: bool = True
+    use_joint_travel_only_as_tiebreak: bool = True
+
+    @model_validator(mode="after")
+    def validate_region_contract(self) -> Self:
+        if not self.required_regions or len(set(self.required_regions)) != len(
+            self.required_regions
+        ):
+            raise ValueError("Next-view required regions must be non-empty and unique")
+        if len(set(self.region_priority)) != len(self.region_priority):
+            raise ValueError("Next-view region priority must contain unique values")
+        if set(self.region_priority) != set(self.required_regions):
+            raise ValueError(
+                "Next-view region priority must contain exactly the required regions"
+            )
+        return self
+
+
 class DepthComparisonConfig(BaseModel):
     """Reproducible native-versus-stereo comparison settings."""
 
@@ -727,6 +784,9 @@ class AppSettings(BaseModel):
     surface_partition: SurfacePartitionConfig = Field(default_factory=SurfacePartitionConfig)
     tsdf: TSDFConfig = Field(default_factory=TSDFConfig)
     surface_quality: SurfaceQualityConfig = Field(default_factory=SurfaceQualityConfig)
+    next_view_selection: NextViewSelectionConfig = Field(
+        default_factory=NextViewSelectionConfig
+    )
     depth_comparison: DepthComparisonConfig = Field(default_factory=DepthComparisonConfig)
     native_overlap_validation: NativeOverlapValidationConfig = Field(
         default_factory=NativeOverlapValidationConfig

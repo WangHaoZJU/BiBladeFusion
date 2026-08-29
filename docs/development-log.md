@@ -1,5 +1,45 @@
 # Development log
 
+## 2026-08-29 — fixed-reference fine coverage and concrete next-view selection
+
+- Corrected fine-view camera semantics for non-identity stereo rectification. Look-at,
+  projection, visibility and standoff are now generated and checked in
+  `base_T_left_rectified`; the persisted calibration is then composed to obtain physical
+  `base_T_left_ir` for hand-eye, IK and execution. Coarse-model schema 5 stores and
+  cross-verifies both pose arrays and the transform between them.
+- Added immutable fine-surface coverage generations against one fixed schema-5 coarse
+  model. Generation zero is empty and never imports coarse-acquisition coverage; each
+  successor replays exactly one FoundationStereo reconstructed candidate view from its
+  predecessor. Readers verify complete source lineage, checksums, raw/rectified frames,
+  bilateral single-fin semantics and independently recompute every patch quality value.
+  Fixed coarse mesh diagnostics are not relabelled as fine reconstruction quality.
+- Added `BladeCoverageNextViewSelector`. Completion now requires configured regions on
+  both blade sides, two resolved physical faces for each protruding fin, and every
+  required patch passing coverage, surface-RMSE and local-normal gates. Incomplete
+  coverage with no unused workspace/IK/FK-feasible candidate raises a typed blocked
+  result; it can never be returned as completion.
+- Candidate image geometry uses rectified poses while workspace and IK use raw left-IR
+  poses. IK is rebuilt from the current stopped joints and every solution is independently
+  checked by calibrated ES68 FK against the target TCP. Deterministic ranking is
+  coverage-first; joint travel is only a final tie-break. Selection policy, fixed coarse
+  reference and fine generation hashes propagate into segment proposals, preflight
+  diagnostics and completion events.
+- Kept safety and science histories independent: fresh-window occupancy is consumed only
+  by downstream short-segment safety, while fine coverage is cumulative. Online blade-mask
+  production and reconstruction/coverage staging are still not connected to the concrete
+  cycle engine, so missing science assets fail closed. Workspace remains unconfigured and
+  continuous swept-volume proofs remain absent; no robot-motion CLI was released.
+- Closed the receding-horizon transit contract: a `transit_*` capture may carry forward
+  the preceding verified fine generation while refreshing safety occupancy, whereas a
+  captured reference-candidate ID must publish its reconstruction and matching successor
+  generation in the same cycle. New science successors cannot escape that cycle root;
+  the selector pins the expected coarse-model path/hash and enforces exact generation
+  continuity so another blade/run cannot be cross-wired into transit planning.
+- Closed this increment with `576 passed`, repository-wide Ruff and bytecode compilation,
+  whitespace-integrity checks, lockfile consistency, and a CLI smoke test. The optional
+  offline package build was not used as evidence because its isolated cache did not contain
+  the `hatchling` build dependency.
+
 ## 2026-08-28 — FoundationStereo-only stop-and-capture motion coordinator
 
 - Added a library-level receding-horizon state machine for the ES68 eye-in-hand scan:
@@ -235,7 +275,7 @@
   acquisition, plus unit coverage for fixed-input provenance, successful ideal
   geometry, checksum tamper rejection, and calibration/stream resolution mismatch.
 
-Last updated: 2026-08-28
+Last updated: 2026-08-29
 
 This log distinguishes verified implementation from pending work. Commit history is the
 authoritative fine-grained record; this page records the experiment-facing state.
@@ -445,9 +485,10 @@ authoritative fine-grained record; this page records the experiment-facing state
   tool-goal preflight artifact layers are copied/adapted. The library-level
   FoundationStereo-only stop-and-capture coordinator, fresh-window occupancy transaction,
   stationarity interlocks and run-event evidence chain are now implemented and covered by
-  deterministic tests. End-to-end online reconstruction/coverage selection, the two
-  continuous swept-volume proofs and hardware acceptance remain; consequently no
-  production motion path or CLI is released.
+  deterministic tests. Fixed-reference coverage and deterministic next-view selection
+  are implemented; online blade-mask/reconstruction staging, the two continuous
+  swept-volume proofs and hardware acceptance remain. Consequently no production motion
+  path or CLI is released.
 - The migration sequence and safety boundary are recorded in
   `docs/robot-stack-migration.md`. Existing MDH/capsule code remains temporarily for
   artifact compatibility and will not receive new motion functionality.
@@ -469,9 +510,10 @@ authoritative fine-grained record; this page records the experiment-facing state
    two independent continuous proofs for every segment: swept ES68+D435i mesh/FCL
    clearance and swept robot-versus-voxel occupancy clearance. Discrete bounding-sphere
    samples remain diagnostic only.
-5. After the two continuous sweep proofs exist, connect the concrete reconstruction,
-   coverage ledger and coverage-derived `NextViewSelector` to the implemented
-   FoundationStereo-only coordinator and perform controlled hardware acceptance. Measure
+5. Add a verified blade-mask provider, then stage each FoundationStereo reconstructed
+   view and successor fine-coverage generation inside the concrete cycle transaction.
+   Connect the implemented selector only after those source bindings pass, then perform
+   controlled hardware acceptance after both continuous sweep proofs exist. Measure
    FoundationStereo latency, bootstrap-window duration, map replay, preflight, operator
    response, short-segment execution and settle time; the default 5 s map age and null
    segment bound are software placeholders, not accepted physical values. Offline

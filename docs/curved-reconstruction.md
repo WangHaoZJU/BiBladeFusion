@@ -73,9 +73,12 @@ below.
    feasible distance. Every patch point must pass the conservative image/depth gate, and
    a coarse-cloud z-buffer enforces the visibility threshold. An infeasible patch is
    recursively split; exhausting the split limit fails closed. Per-view distance,
-   footprint, projection fraction, visibility fraction, and policy are persisted. The
-   resulting view set remains `motion_authorized: false`; workspace, IK, full camera/
-   robot collision, and trajectory preflight are still required separately.
+   footprint, projection fraction, visibility fraction, and policy are persisted.
+   Projection geometry is generated as `base_T_left_rectified`, then composed with the
+   persisted `left_rectified_T_left_ir` calibration to obtain physical
+   `base_T_left_ir` for hand-eye and IK. Both poses are stored and verified. The view set
+   remains `motion_authorized: false`; workspace, IK, full camera/robot collision, and
+   trajectory preflight are still required separately.
 12. **Thin-wall TSDF and mesh.** Front and back use separate volumes. Their truncation
    band is `min(configured_truncation, measured_thickness * thin_wall_band_fraction)`,
    where the fraction must be below 0.5. This prevents opposing observations from
@@ -83,11 +86,14 @@ below.
    limits the truncation band. Calibrated image metadata uses the optional Open3D scalable
    backend when installed; otherwise a dependency-free sparse projective TSDF and
    marching-tetrahedra extractor are used.
-13. **Real-surface feedback.** Coverage is measured against every coarse curved-surface
-   sample, not a proxy plane. Per patch it records observed fraction, surface RMSE,
-   normal consistency, curvature, and failure reasons. Leading/trailing/root/tip plus
-   fin-root/free-rim completion are reported separately. Mesh triangle count, boundary
-   edges, boundary components, and watertightness are also recorded.
+13. **Real-surface feedback.** Fine coverage is measured against every fixed coarse
+   curved-surface sample, not a proxy plane. Generation zero is empty and deliberately
+   does not import the views that created the coarse reference. Each successor appends
+   exactly one verified FoundationStereo reconstructed candidate view and is replayed
+   from its predecessor. Per patch it records observed fraction, surface RMSE, normal
+   consistency, curvature, and failure reasons. Leading/trailing/root/tip plus fin-face,
+   fin-root, and free-rim completion are reported separately. The fixed coarse mesh is
+   not presented as fine reconstruction mesh quality.
 
 ## Running on reconstructed coarse views
 
@@ -108,9 +114,12 @@ uv run bbf reconstruct coarse-model \
 ```
 
 The command rejects mixed hand-eye matrices and fails when both camera sides are not
-represented. The immutable output contains checksummed fused points/normals/side labels,
-patch samples and metadata, fine-view transforms, both sparse TSDFs, extracted mesh,
-coverage evidence, pose refinements, configurations, source hashes, and quality results.
+represented. The immutable schema-5 output contains checksummed fused
+points/normals/side labels, patch samples and metadata, raw and rectified fine-view
+transforms plus their calibration, both sparse TSDFs, extracted mesh, coarse-workflow
+diagnostics, pose refinements, configurations, source hashes, and quality results.
+Independent fine coverage starts in a separate surface-coverage generation; coarse
+acquisition views never count as fine scans.
 
 ## Inspecting the fine plan before robot feasibility
 
@@ -172,10 +181,11 @@ same-side refinement, support filtering of isolated AC false candidates, four ju
 robust four-curve fitting, approximately equal-arc sampling, curve-driven coordinates,
 explicit fallback/fail-closed behaviour, shared bilateral base cells, all five regions,
 OBB/main-normal construction, adaptive splitting, true-normal viewpoints, protected
-TSDF, non-empty mesh extraction, real-surface quality feedback, artifact checksums, and
-the non-motion invariant. The fin tests additionally verify main-surface decontamination,
+TSDF, non-empty mesh extraction, independent real-surface quality feedback, artifact
+checksums, raw/rectified frame composition, and the non-motion invariant. The fin tests
+additionally verify main-surface decontamination,
 two-face separation, root/free-rim regions, opposing and bisector views, fin-thickness
-TSDF protection, coverage categories, schema-4 persistence, and missing-fin failure.
+TSDF protection, coverage categories, schema-5 persistence, and missing-fin failure.
 Hardware accuracy, final thresholds, reflective-metal depth completeness, final
 line-of-sight acceptance, and real Open3D output still require recorded D435i/ES68 coarse
 scans and calibrated transforms.

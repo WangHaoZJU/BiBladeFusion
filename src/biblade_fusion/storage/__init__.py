@@ -84,6 +84,11 @@ from biblade_fusion.storage.stop_scan_run import (
     StoredStopScanRun,
     read_stop_scan_run,
 )
+from biblade_fusion.storage.surface_coverage import (
+    StoredSurfaceCoverageGeneration,
+    read_surface_coverage_generation,
+    write_surface_coverage_generation,
+)
 from biblade_fusion.storage.view_plan import (
     StoredViewPlan,
     read_view_plan,
@@ -110,6 +115,7 @@ __all__ = [
     "StoredReconstructedBladeView",
     "StoredStereoInference",
     "StoredStopScanRun",
+    "StoredSurfaceCoverageGeneration",
     "StoredViewPlan",
     "StoredViewDescriptor",
     "read_initialization",
@@ -128,6 +134,7 @@ __all__ = [
     "read_coverage_ledger",
     "read_stereo_inference",
     "read_stop_scan_run",
+    "read_surface_coverage_generation",
     "verify_stereo_inference_source",
     "read_view_plan",
     "write_initialization",
@@ -144,6 +151,7 @@ __all__ = [
     "write_reconstructed_view",
     "write_coverage_ledger",
     "write_stereo_inference",
+    "write_surface_coverage_generation",
     "StopScanRunEvent",
     "StopScanRunFormatError",
     "StopScanRunWriter",

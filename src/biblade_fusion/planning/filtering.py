@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from math import acos, degrees
@@ -30,10 +31,18 @@ class ReachabilityResult:
 
     def __post_init__(self) -> None:
         if self.joint_positions_rad is None:
+            if self.state is ReachabilityState.REACHABLE:
+                raise ValueError(
+                    "Reachable endpoint result requires a concrete joint solution"
+                )
             return
         joints = np.array(self.joint_positions_rad, dtype=np.float64, copy=True)
         if joints.shape != (6,) or not np.isfinite(joints).all():
             raise ValueError("Reachability joint solution must be a finite six-vector")
+        if self.state is not ReachabilityState.REACHABLE:
+            raise ValueError(
+                "Only a reachable endpoint may carry a joint solution"
+            )
         joints.setflags(write=False)
         object.__setattr__(self, "joint_positions_rad", joints)
 
@@ -49,6 +58,25 @@ class CandidateStatus(StrEnum):
     REJECTED = "rejected"
     GEOMETRY_ONLY = "geometry_only"
     ENDPOINT_FEASIBLE = "endpoint_feasible"
+
+
+@dataclass(frozen=True, slots=True)
+class BladeClearanceEnvelope:
+    """Conservative full-surface OBB used only for camera clearance."""
+
+    frame_t_envelope: PoseSE3
+    extents_m: NDArray[np.float64]
+
+    def __post_init__(self) -> None:
+        if self.frame_t_envelope.parent_frame != "base":
+            raise ValueError("Blade clearance envelope must be expressed in base")
+        extents = np.array(self.extents_m, dtype=np.float64, copy=True)
+        if extents.shape != (3,) or not np.isfinite(extents).all() or np.any(
+            extents <= 0.0
+        ):
+            raise ValueError("Blade clearance envelope extents must be positive")
+        extents.setflags(write=False)
+        object.__setattr__(self, "extents_m", extents)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,26 +153,48 @@ def _sphere_intersects_box(position: np.ndarray, box: AxisAlignedBoxConfig, radi
     return bool(np.linalg.norm(position - closest) <= radius)
 
 
-def _proxy_clearance(position: np.ndarray, proxy: BilateralBladeProxy) -> float:
-    local = proxy.frame_T_proxy.inverse().transform_points(position)
+def _proxy_clearance(
+    position: np.ndarray,
+    proxy: BilateralBladeProxy | BladeClearanceEnvelope,
+) -> float:
+    frame = (
+        proxy.frame_T_proxy
+        if isinstance(proxy, BilateralBladeProxy)
+        else proxy.frame_t_envelope
+    )
+    local = frame.inverse().transform_points(position)
     outside = np.maximum(np.abs(local) - proxy.extents_m / 2.0, 0.0)
     return float(np.linalg.norm(outside))
 
 
-def _metrics(candidate: CandidateView, proxy: BilateralBladeProxy) -> CandidateMetrics:
-    camera_position = candidate.base_t_left_ir.translation_m
+def _metrics(
+    candidate: CandidateView,
+    proxy: BilateralBladeProxy | BladeClearanceEnvelope,
+    projection_pose: PoseSE3 | None = None,
+) -> CandidateMetrics:
+    geometry_pose = projection_pose or candidate.base_t_left_ir
+    camera_position = geometry_pose.translation_m
     view_vector = candidate.patch.target_m - camera_position
     view_distance = float(np.linalg.norm(view_vector))
     if view_distance <= 1e-12:
         look_at_cosine = -1.0
     else:
-        look_at_cosine = float(candidate.optical_axis @ (view_vector / view_distance))
-    incidence_cosine = float((-candidate.optical_axis) @ candidate.patch.outward_normal)
+        look_at_cosine = float(
+            geometry_pose.rotation[:, 2] @ (view_vector / view_distance)
+        )
+    incidence_cosine = float(
+        (-geometry_pose.rotation[:, 2]) @ candidate.patch.outward_normal
+    )
     coverage_ratio = float(
         min(1.0, candidate.footprint_m[0] / candidate.patch.planar_extents_m[0])
         * min(1.0, candidate.footprint_m[1] / candidate.patch.planar_extents_m[1])
     )
-    proxy_clearance_m = _proxy_clearance(camera_position, proxy)
+    # Clearance and workspace checks remain tied to the physical raw camera pose;
+    # only the projection geometry may use the virtual rectified camera frame.
+    proxy_clearance_m = _proxy_clearance(
+        candidate.base_t_left_ir.translation_m,
+        proxy,
+    )
     standoff_error_m = abs(view_distance - candidate.standoff_distance_m)
     geometric_score = float(
         np.clip(0.4 * look_at_cosine + 0.4 * incidence_cosine + 0.2 * coverage_ratio, 0, 1)
@@ -180,16 +230,44 @@ def _is_duplicate(
 
 def filter_candidate_views(
     candidates: tuple[CandidateView, ...],
-    proxy: BilateralBladeProxy,
+    proxy: BilateralBladeProxy | BladeClearanceEnvelope,
     config: ViewFilterConfig,
     reachability_checker: ReachabilityChecker | None = None,
+    *,
+    projection_poses: Mapping[str, PoseSE3] | None = None,
+    deduplicate: bool = True,
 ) -> FilteredViewPlan:
-    """Apply endpoint-only checks while retaining explicit uncertainty state."""
+    """Apply endpoint-only checks while retaining explicit uncertainty state.
+
+    ``projection_poses`` supplies the virtual rectified-camera poses used for
+    look-at, incidence, and standoff geometry.  Raw ``base_T_left_ir`` remains the
+    sole pose passed to robot IK and physical workspace/clearance checks.
+    """
+
+    candidate_ids = tuple(candidate.view_id for candidate in candidates)
+    if projection_poses is not None:
+        if set(projection_poses) != set(candidate_ids):
+            raise ValueError(
+                "Projection-pose identities must exactly match candidate views"
+            )
+        for pose in projection_poses.values():
+            if (pose.parent_frame, pose.child_frame) != (
+                "base",
+                "left_rectified",
+            ):
+                raise ValueError(
+                    "Projection geometry requires base_T_left_rectified poses"
+                )
 
     evaluated: list[EvaluatedCandidate] = []
     duplicates: list[str] = []
     for candidate in candidates:
-        metrics = _metrics(candidate, proxy)
+        projection_pose = (
+            projection_poses[candidate.view_id]
+            if projection_poses is not None
+            else None
+        )
+        metrics = _metrics(candidate, proxy, projection_pose)
         reasons: list[str] = []
         rejected = False
         if metrics.look_at_cosine < config.minimum_look_at_cosine:
@@ -256,7 +334,7 @@ def filter_candidate_views(
             tuple(reasons),
             joint_solution,
         )
-        if item.status is not CandidateStatus.REJECTED:
+        if deduplicate and item.status is not CandidateStatus.REJECTED:
             duplicate_index = next(
                 (
                     index

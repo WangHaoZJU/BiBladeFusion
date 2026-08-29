@@ -152,6 +152,33 @@ def test_writer_rejects_non_utc_or_noncanonical_timestamp(tmp_path: Path) -> Non
         )
 
 
+def test_writer_rejects_backwards_utc_before_publishing_event(tmp_path: Path) -> None:
+    start = datetime(2026, 8, 28, 8, 0, tzinfo=UTC)
+    writer = StopScanRunWriter.create(tmp_path / "run", run_id="run-001")
+    first = writer.append_event(
+        phase="stopped",
+        cycle_index=0,
+        event_type="run_started",
+        payload={},
+        created_at_utc=start,
+    )
+
+    with pytest.raises(ValueError, match="precedes the previous event"):
+        writer.append_event(
+            phase="capturing",
+            cycle_index=0,
+            event_type="capture_started",
+            payload={},
+            created_at_utc=start - timedelta(seconds=1),
+        )
+
+    assert writer.events == (first,)
+    assert [item.name for item in (writer.root / "events").iterdir()] == [
+        "00000000.json"
+    ]
+    assert read_stop_scan_run(writer.root).events == (first,)
+
+
 def test_writer_rejects_non_string_identity_fields(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="run_id must be a string"):
         StopScanRunWriter.create(tmp_path / "run", run_id=7)  # type: ignore[arg-type]

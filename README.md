@@ -9,7 +9,9 @@ from an Intel RealSense D435i, reproducible session storage, a calibrated
 FoundationStereo inference path, paired native/stereo depth evaluation, a conservative
 single-view blade proxy, paper-derived true curved-surface partitioning, thin-wall-aware
 multi-view TSDF/mesh reconstruction, real-surface quality feedback, and offline Elite KDL
-endpoint IK. It also contains a fail-closed, FoundationStereo-derived three-state safety
+endpoint IK. A fixed-reference fine-coverage ledger and deterministic bilateral-fin
+next-view selector are implemented at library level. It also contains a fail-closed,
+FoundationStereo-derived three-state safety
 occupancy layer and a read-only supervisory replay console. The curved reconstruction
 chain is currently regression-verified on deterministic synthetic bilateral-blade data;
 real-blade accuracy and hardware thresholds still require recorded experiments. Thermal
@@ -262,12 +264,16 @@ attachment roots, and free rims with dedicated normals, protects both blade and 
 fin thickness during TSDF integration, and reports component-level surface/mesh quality.
 These functions are software-verified on deterministic synthetic data; real D435i/ES68
 coarse scans and dimensional references are still required for physical validation.
+The [coverage-driven fine selector](docs/coverage-next-view-selector.md) keeps cumulative
+scientific surface evidence separate from the short-lived safety occupancy window and
+never interprets an unreachable incomplete state as completion. Online mask/reconstruction
+staging into the concrete stop-and-capture cycle remains pending.
 Install
 `uv sync --extra tsdf-open3d` to enable the optional calibrated Open3D backend; the
 locked NumPy fallback remains available without it.
 
 Before attempting robot feasibility, run `bbf reconstruct inspect-fine-plan` on the
-schema-4 coarse model. It exports portable inspection geometry/reports and can open a
+schema-5 coarse model. It exports portable inspection geometry/reports and can open a
 read-only PySide6 orbit viewer; a geometric pass still records robot feasibility as
 unverified and cannot authorize motion.
 

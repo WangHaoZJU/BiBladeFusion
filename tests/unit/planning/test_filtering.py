@@ -1,4 +1,7 @@
+from dataclasses import replace
+
 import numpy as np
+import pytest
 
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import AxisAlignedBoxConfig, ViewFilterConfig, ViewPlanningConfig
@@ -28,7 +31,11 @@ def make_proxy(extents=(0.4, 0.2, 0.02)) -> BilateralBladeProxy:
 
 class AlwaysReachable:
     def check(self, base_t_left_ir):
-        return ReachabilityResult(ReachabilityState.REACHABLE, "offline IK solution found")
+        return ReachabilityResult(
+            ReachabilityState.REACHABLE,
+            "offline IK solution found",
+            np.zeros(6),
+        )
 
 
 class FailingChecker:
@@ -129,6 +136,36 @@ def test_duplicate_candidate_pose_is_removed() -> None:
     assert result.duplicate_view_ids == (original[0].view_id,)
 
 
+def test_fine_scan_can_preserve_distinct_patch_candidates_at_same_pose() -> None:
+    original = candidates()
+    duplicate_patch = replace(
+        original[0].patch,
+        patch_id=original[1].patch.patch_id,
+        row=original[1].patch.row,
+        column=original[1].patch.column,
+    )
+    duplicate_pose = replace(
+        original[0],
+        view_id=original[1].view_id,
+        patch=duplicate_patch,
+    )
+    result = filter_candidate_views(
+        (original[0], duplicate_pose),
+        make_proxy(),
+        ViewFilterConfig(workspace=workspace(), camera_clearance_radius_m=0.01),
+        AlwaysReachable(),
+        deduplicate=False,
+    )
+
+    assert len(result.endpoint_feasible) == 2
+    assert result.duplicate_view_ids == ()
+
+
+def test_reachable_result_requires_concrete_joint_solution() -> None:
+    with pytest.raises(ValueError, match="requires a concrete joint solution"):
+        ReachabilityResult(ReachabilityState.REACHABLE, "missing joints")
+
+
 def test_ik_failure_never_marks_endpoint_feasible() -> None:
     result = filter_candidate_views(
         candidates(),
@@ -139,3 +176,41 @@ def test_ik_failure_never_marks_endpoint_feasible() -> None:
 
     assert all(item.status is CandidateStatus.GEOMETRY_ONLY for item in result.candidates)
     assert "solver unavailable" in " ".join(result.candidates[0].reasons)
+
+
+def test_rectified_projection_pose_drives_geometry_but_raw_pose_drives_ik() -> None:
+    original = candidates()[0]
+    raw_rotation = original.base_t_left_ir.rotation @ np.diag([-1.0, 1.0, -1.0])
+    raw_pose = PoseSE3.from_rotation_translation(
+        "base",
+        original.base_t_left_ir.child_frame,
+        raw_rotation,
+        original.base_t_left_ir.translation_m,
+    )
+    candidate = replace(original, base_t_left_ir=raw_pose)
+    rectified_pose = PoseSE3(
+        "base",
+        "left_rectified",
+        original.base_t_left_ir.matrix,
+    )
+    config = ViewFilterConfig(
+        workspace=workspace(),
+        camera_clearance_radius_m=0.01,
+    )
+
+    raw_geometry = filter_candidate_views(
+        (candidate,),
+        make_proxy(),
+        config,
+        AlwaysReachable(),
+    )
+    rectified_geometry = filter_candidate_views(
+        (candidate,),
+        make_proxy(),
+        config,
+        AlwaysReachable(),
+        projection_poses={candidate.view_id: rectified_pose},
+    )
+
+    assert raw_geometry.candidates[0].status is CandidateStatus.REJECTED
+    assert rectified_geometry.candidates[0].status is CandidateStatus.ENDPOINT_FEASIBLE

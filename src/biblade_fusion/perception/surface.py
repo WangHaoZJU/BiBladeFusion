@@ -175,6 +175,8 @@ class CurvedBladeSurface:
 class CurvedViewPlan:
     surface: CurvedBladeSurface
     candidates: tuple[CandidateView, ...]
+    candidate_base_t_left_rectified: tuple[PoseSE3, ...]
+    left_rectified_t_left_ir: PoseSE3
     footprint_m: tuple[float, float]
 
     def __post_init__(self) -> None:
@@ -182,6 +184,38 @@ class CurvedViewPlan:
         candidate_ids = tuple(candidate.patch.patch_id for candidate in self.candidates)
         if patch_ids != candidate_ids:
             raise ValueError("Curved view candidates must preserve surface patch order")
+        if len(self.candidate_base_t_left_rectified) != len(self.candidates):
+            raise ValueError("Curved view plan requires one rectified pose per candidate")
+        if (
+            self.left_rectified_t_left_ir.parent_frame,
+            self.left_rectified_t_left_ir.child_frame,
+        ) != ("left_rectified", "left_ir"):
+            raise ValueError("Curved view plan requires left_rectified_T_left_ir")
+        for base_t_left_rectified, candidate in zip(
+            self.candidate_base_t_left_rectified,
+            self.candidates,
+            strict=True,
+        ):
+            if (
+                base_t_left_rectified.parent_frame,
+                base_t_left_rectified.child_frame,
+            ) != ("base", "left_rectified"):
+                raise ValueError("Curved view plan requires base_T_left_rectified poses")
+            if (
+                candidate.base_t_left_ir.parent_frame,
+                candidate.base_t_left_ir.child_frame,
+            ) != ("base", "left_ir"):
+                raise ValueError("Curved view candidates require base_T_left_ir poses")
+            expected_base_t_left_ir = base_t_left_rectified.compose(self.left_rectified_t_left_ir)
+            if not np.allclose(
+                expected_base_t_left_ir.matrix,
+                candidate.base_t_left_ir.matrix,
+                rtol=0.0,
+                atol=1e-9,
+            ):
+                raise ValueError(
+                    "Curved view raw and rectified candidate poses violate calibration"
+                )
 
     @property
     def motion_authorized(self) -> bool:
@@ -949,9 +983,16 @@ def generate_curved_view_plan(
     intrinsics: CameraIntrinsics,
     config: ViewPlanningConfig,
     partition_config: SurfacePartitionConfig,
+    *,
+    left_rectified_t_left_ir: PoseSE3,
 ) -> CurvedViewPlan:
     """Search a bounded per-region standoff and fail closed on invisible patches."""
 
+    if (
+        left_rectified_t_left_ir.parent_frame,
+        left_rectified_t_left_ir.child_frame,
+    ) != ("left_rectified", "left_ir"):
+        raise ValueError("Fine-view planning requires left_rectified_T_left_ir")
     baseline = config.standoff_distance_m
     if baseline is None:
         raise SurfacePartitionError("standoff_distance_m is required for curved views")
@@ -959,6 +1000,7 @@ def generate_curved_view_plan(
     all_surface_points = np.vstack([patch.points_m for patch in surface.patches])
     planned_patches: list[CurvedSurfacePatch] = []
     candidates: list[CandidateView] = []
+    rectified_poses: list[PoseSE3] = []
 
     detail_regions = {
         SurfaceRegion.LEADING_EDGE,
@@ -1009,9 +1051,10 @@ def generate_curved_view_plan(
                 rich_patch.main_normal,
                 rich_patch.planar_extents_m,
             )
-            pose = PoseSE3.from_rotation_translation(
-                "base", f"{rich_patch.patch_id}_left_ir", rotation, camera_position
+            base_t_left_rectified = PoseSE3.from_rotation_translation(
+                "base", "left_rectified", rotation, camera_position
             )
+            base_t_left_ir = base_t_left_rectified.compose(left_rectified_t_left_ir)
             footprint = tuple(
                 float(value * distance / baseline) for value in surface.base_footprint_m
             )
@@ -1023,11 +1066,12 @@ def generate_curved_view_plan(
                 else "fixed_baseline"
             )
             planned_patches.append(rich_patch)
+            rectified_poses.append(base_t_left_rectified)
             candidates.append(
                 CandidateView(
                     rich_patch.patch_id,
                     patch,
-                    pose,
+                    base_t_left_ir,
                     distance,
                     footprint,
                     projection,
@@ -1058,5 +1102,7 @@ def generate_curved_view_plan(
     return CurvedViewPlan(
         planned_surface,
         tuple(candidates),
+        tuple(rectified_poses),
+        left_rectified_t_left_ir,
         planned_surface.base_footprint_m,
     )

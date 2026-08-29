@@ -13,10 +13,11 @@ from uuid import uuid4
 
 import numpy as np
 
+from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import AppSettings
 from biblade_fusion.workflows.coarse_model import CoarseModelResult
 
-COARSE_MODEL_SCHEMA_VERSION = 4
+COARSE_MODEL_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +154,9 @@ def write_coarse_model(
         "candidate_base_T_left_ir": np.stack(
             [candidate.base_t_left_ir.matrix for candidate in result.view_plan.candidates]
         ),
+        "candidate_base_T_left_rectified": np.stack(
+            [pose.matrix for pose in result.view_plan.candidate_base_t_left_rectified]
+        ),
         "front_tsdf_indices": result.tsdf.front.voxel_indices,
         "front_tsdf_values": result.tsdf.front.tsdf,
         "front_tsdf_weights": result.tsdf.front.weights,
@@ -283,6 +287,9 @@ def write_coarse_model(
             "view_plan": {
                 "baseline_standoff_distance_m": settings.view_planning.standoff_distance_m,
                 "baseline_footprint_m": list(result.view_plan.footprint_m),
+                "left_rectified_T_left_ir": (
+                    result.view_plan.left_rectified_t_left_ir.matrix.tolist()
+                ),
                 "configuration": settings.view_planning.model_dump(mode="json"),
                 "candidate_ids": [candidate.view_id for candidate in result.view_plan.candidates],
                 "candidates": [
@@ -294,9 +301,14 @@ def write_coarse_model(
                         "projection_fraction": candidate.projection_fraction,
                         "visibility_fraction": candidate.visibility_fraction,
                         "distance_policy": candidate.distance_policy,
+                        "base_T_left_rectified": base_t_left_rectified.matrix.tolist(),
                         "base_T_left_ir": candidate.base_t_left_ir.matrix.tolist(),
                     }
-                    for candidate in result.view_plan.candidates
+                    for candidate, base_t_left_rectified in zip(
+                        result.view_plan.candidates,
+                        result.view_plan.candidate_base_t_left_rectified,
+                        strict=True,
+                    )
                 ],
             },
             "tsdf": {
@@ -352,7 +364,8 @@ def read_coarse_model_summary(path: str | Path) -> StoredCoarseModelSummary:
     root = Path(path)
     try:
         payload = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
-        if int(payload["schema_version"]) not in {1, 2, 3, COARSE_MODEL_SCHEMA_VERSION}:
+        schema = int(payload["schema_version"])
+        if schema not in {1, 2, 3, 4, COARSE_MODEL_SCHEMA_VERSION}:
             raise ValueError(f"unsupported schema {payload['schema_version']}")
         if payload.get("motion_authorized") is not False:
             raise ValueError("coarse-model artifact must explicitly forbid motion")
@@ -373,6 +386,74 @@ def read_coarse_model_summary(path: str | Path) -> StoredCoarseModelSummary:
                     raise ValueError(f"coarse-model array manifest mismatch: {relative}")
             finally:
                 del array
+        if schema == COARSE_MODEL_SCHEMA_VERSION:
+            view_plan = payload["view_plan"]
+            candidates = view_plan["candidates"]
+            candidate_ids = view_plan["candidate_ids"]
+            if len(candidate_ids) != len(candidates) or len(set(candidate_ids)) != len(
+                candidate_ids
+            ):
+                raise ValueError("coarse-model candidate identities are inconsistent")
+            calibration = PoseSE3(
+                "left_rectified",
+                "left_ir",
+                view_plan["left_rectified_T_left_ir"],
+            )
+            rectified_transforms = np.asarray(
+                np.load(
+                    root / str(payload["files"]["candidate_base_T_left_rectified"]["path"]),
+                    allow_pickle=False,
+                ),
+                dtype=np.float64,
+            )
+            raw_transforms = np.asarray(
+                np.load(
+                    root / str(payload["files"]["candidate_base_T_left_ir"]["path"]),
+                    allow_pickle=False,
+                ),
+                dtype=np.float64,
+            )
+            expected_shape = (len(candidates), 4, 4)
+            if (
+                rectified_transforms.shape != expected_shape
+                or raw_transforms.shape != expected_shape
+            ):
+                raise ValueError("coarse-model candidate transforms have invalid shape")
+            for index, candidate in enumerate(candidates):
+                if str(candidate["view_id"]) != str(candidate_ids[index]):
+                    raise ValueError("coarse-model candidate order is inconsistent")
+                metadata_rectified = np.asarray(
+                    candidate["base_T_left_rectified"], dtype=np.float64
+                )
+                metadata_raw = np.asarray(candidate["base_T_left_ir"], dtype=np.float64)
+                if not np.allclose(
+                    metadata_rectified,
+                    rectified_transforms[index],
+                    rtol=0.0,
+                    atol=1e-10,
+                ) or not np.allclose(
+                    metadata_raw,
+                    raw_transforms[index],
+                    rtol=0.0,
+                    atol=1e-10,
+                ):
+                    raise ValueError(
+                        "coarse-model metadata and checksummed candidate transforms disagree"
+                    )
+                base_t_left_rectified = PoseSE3(
+                    "base", "left_rectified", rectified_transforms[index]
+                )
+                base_t_left_ir = PoseSE3("base", "left_ir", raw_transforms[index])
+                expected_raw = base_t_left_rectified.compose(calibration)
+                if not np.allclose(
+                    expected_raw.matrix,
+                    base_t_left_ir.matrix,
+                    rtol=0.0,
+                    atol=1e-9,
+                ):
+                    raise ValueError(
+                        "coarse-model raw and rectified candidate poses violate calibration"
+                    )
         return StoredCoarseModelSummary(root.resolve(), payload)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid coarse-model artifact {root}: {exc}") from exc

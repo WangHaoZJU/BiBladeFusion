@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     MultiViewFusionConfig,
     SurfacePartitionConfig,
@@ -21,6 +22,8 @@ from biblade_fusion.perception.surface import (
 )
 from biblade_fusion.perception.tsdf import integrate_bilateral_tsdf
 from biblade_fusion.planning.surface_coverage import (
+    SurfaceCoverageLedger,
+    SurfacePatchEvidence,
     create_surface_coverage_ledger,
     evaluate_surface_quality,
 )
@@ -97,6 +100,10 @@ def _planning() -> ViewPlanningConfig:
         image_edge_margin_px=20,
         maximum_candidates=500,
     )
+
+
+def _identity_rectification() -> PoseSE3:
+    return PoseSE3.identity("left_rectified", "left_ir")
 
 
 def _fused_fin_blade() -> FusedBladeCloud:
@@ -187,6 +194,7 @@ def test_bilateral_fin_partition_generates_face_root_and_free_edge_views() -> No
         _intrinsics(),
         _planning(),
         _config(),
+        left_rectified_t_left_ir=_identity_rectification(),
     )
     assert len(plan.candidates) == len(surface.patches)
     assert all(
@@ -227,6 +235,33 @@ def test_fin_thickness_protects_tsdf_truncation_band() -> None:
     assert result.protected_truncation_distance_m == pytest.approx(0.00128)
 
 
+def test_small_topology_patch_uses_its_reference_count_as_absolute_ceiling() -> None:
+    surface = partition_curved_blade(_fused_fin_blade(), _config())
+    ledger = create_surface_coverage_ledger(surface)
+    index = next(
+        index
+        for index, patch in enumerate(surface.patches)
+        if len(patch.points_m) < 30
+    )
+    patch = surface.patches[index]
+    evidence = list(ledger.evidence)
+    evidence[index] = SurfacePatchEvidence(
+        patch.patch_id,
+        np.zeros(len(patch.points_m)),
+        np.ones(len(patch.points_m)),
+    )
+    report = evaluate_surface_quality(
+        SurfaceCoverageLedger(tuple(evidence), ()),
+        surface,
+        SurfaceQualityConfig(minimum_observed_points=30),
+    )
+
+    quality = report.patches[index]
+    assert quality.reference_point_count < 30
+    assert quality.observed_point_count == quality.reference_point_count
+    assert quality.complete is True
+
+
 def test_fin_workflow_persists_component_geometry_and_quality(tmp_path) -> None:
     fused = _fused_fin_blade()
     views = (
@@ -256,7 +291,14 @@ def test_fin_workflow_persists_component_geometry_and_quality(tmp_path) -> None:
         minimum_observed_points=3,
     )
     result = build_coarse_blade_model(
-        views, _intrinsics(), fusion, partition, planning, tsdf, quality
+        views,
+        _intrinsics(),
+        fusion,
+        partition,
+        planning,
+        tsdf,
+        quality,
+        left_rectified_t_left_ir=_identity_rectification(),
     )
     settings = load_settings("configs/default.yaml").model_copy(
         update={
@@ -281,7 +323,7 @@ def test_fin_workflow_persists_component_geometry_and_quality(tmp_path) -> None:
     )
     stored = read_coarse_model_summary(output)
 
-    assert stored.metadata["schema_version"] == 4
+    assert stored.metadata["schema_version"] == 5
     assert len(stored.metadata["surface"]["fin_components"]) == 2
     assert "fin_component_points_m" in stored.metadata["files"]
     assert len(stored.metadata["tsdf"]["feature_thicknesses_m"]) == 2

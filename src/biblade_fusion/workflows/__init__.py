@@ -3,6 +3,7 @@
 from biblade_fusion.workflows.coarse_model import (
     CoarseModelResult,
     build_coarse_blade_model,
+    derive_consistent_left_rectified_t_left_ir,
     registered_cloud_view,
 )
 from biblade_fusion.workflows.depth_aggregation import (
@@ -133,5 +134,6 @@ __all__ = [
     "reconstruct_native_depth_view",
     "resolve_authoritative_robot_pose",
     "build_coarse_blade_model",
+    "derive_consistent_left_rectified_t_left_ir",
     "registered_cloud_view",
 ]
