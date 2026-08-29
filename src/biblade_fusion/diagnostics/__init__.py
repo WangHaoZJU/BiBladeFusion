@@ -15,4 +15,5 @@ def run_doctor(settings: AppSettings) -> list[CheckResult]:
 
     return implementation(settings)
 
+
 __all__ = ["CheckLevel", "CheckResult", "run_doctor"]

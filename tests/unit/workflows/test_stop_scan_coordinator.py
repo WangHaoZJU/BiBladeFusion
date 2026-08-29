@@ -29,6 +29,8 @@ from biblade_fusion.devices.depth_camera import (
 from biblade_fusion.devices.robot.base import RobotState
 from biblade_fusion.devices.robot.streaming import StreamServoJResult
 from biblade_fusion.mapping import OccupancyMapState, OccupancySnapshot
+from biblade_fusion.robotics import MotionExecutionPermit
+from biblade_fusion.robotics.guarded_execution import EmergencyStopUnconfirmedError
 from biblade_fusion.robotics.occupancy_collision import (
     _issue_occupancy_semantic_attestation,
 )
@@ -36,12 +38,16 @@ from biblade_fusion.robotics.stationarity import validate_stationary_trace
 from biblade_fusion.storage.inference_stationarity import (
     write_inference_stationarity,
 )
+from biblade_fusion.storage.motion_envelope_acceptance import (
+    StoredMotionEnvelopeAcceptance,
+)
 from biblade_fusion.storage.occupancy_mapping import StoredOccupancyMapping
 from biblade_fusion.storage.stop_scan_run import StopScanRunWriter, read_stop_scan_run
 from biblade_fusion.workflows.stop_scan_coordinator import (
     BladePlanningAssetError,
     CapturedStopScanView,
     CapturePurpose,
+    GuardedSegmentSafetyFactory,
     NextViewSelection,
     NextViewTarget,
     NextViewUnavailable,
@@ -58,6 +64,128 @@ from biblade_fusion.workflows.stop_scan_coordinator import (
 
 NOW = datetime(2026, 8, 28, 1, 0, tzinfo=UTC)
 _FAKE_OCCUPANCY_ASSETS: dict[Path, StoredOccupancyMapping] = {}
+
+
+def _motion_envelope(path: Path) -> StoredMotionEnvelopeAcceptance:
+    return StoredMotionEnvelopeAcceptance(
+        path=path,
+        acceptance_id="6" * 64,
+        workcell_id="test",
+        operator_id="operator",
+        accepted_at_utc=NOW,
+        robot_geometry_hash="2" * 64,
+        motion_model_contract_hash="3" * 64,
+        motion_control_contract_hash="4" * 64,
+        maximum_tracking_deviation_rad=(0.001,) * 6,
+        maximum_stop_drift_rad=(0.001,) * 6,
+        safety_margin_factor=1.0,
+        maximum_feedback_interval_s=0.01,
+        maximum_stop_acknowledgement_s=0.1,
+        maximum_stopped_actual_joint_velocity_rad_s=0.002,
+        maximum_stopped_target_joint_velocity_rad_s=0.002,
+        maximum_stopped_actual_tcp_linear_velocity_m_s=0.001,
+        maximum_stopped_actual_tcp_angular_velocity_rad_s=0.002,
+        maximum_stopped_target_tcp_linear_velocity_m_s=0.001,
+        maximum_stopped_target_tcp_angular_velocity_rad_s=0.002,
+        trial_count=3,
+        metadata_sha256="7" * 64,
+    )
+
+
+def test_safety_factory_binds_verified_static_free_acceptance(monkeypatch, tmp_path) -> None:
+    accepted_path = tmp_path / "accepted-static-free"
+    calls: dict[str, object] = {}
+
+    class Acceptance:
+        def assert_matches(self, **kwargs) -> None:
+            calls.update(kwargs)
+
+    monkeypatch.setattr(
+        stop_scan_module,
+        "read_static_free_acceptance",
+        lambda path: Acceptance() if Path(path) == accepted_path else None,
+    )
+    region = {
+        "name": "robot_staging",
+        "minimum_m": (-0.2, -0.2, 0.0),
+        "maximum_m": (0.2, 0.2, 0.5),
+    }
+    occupancy = OccupancyConfig(
+        workspace_bounds_min_m=(-0.5, -0.5, 0.0),
+        workspace_bounds_max_m=(0.5, 0.5, 1.0),
+        accepted_static_free_aabbs=(region,),
+        accepted_static_free_acceptance_id="a" * 64,
+        accepted_static_free_acceptance_path=accepted_path,
+    )
+    checker = SimpleNamespace(
+        robot_geometry_hash="2" * 64,
+        motion_model_contract_hash="3" * 64,
+    )
+    motion_path = tmp_path / "motion-envelope"
+
+    factory = GuardedSegmentSafetyFactory(
+        SimpleNamespace(),
+        checker,
+        SimpleNamespace(),
+        MotionPreflightConfig(
+            motion_envelope_acceptance_path=motion_path,
+            motion_envelope_acceptance_id="6" * 64,
+        ),
+        occupancy,
+        StopAndCaptureConfig(),
+        _motion_envelope(motion_path),
+        "4" * 64,
+    )
+
+    assert factory.occupancy_config == occupancy
+    assert calls["acceptance_id"] == "a" * 64
+    assert calls["robot_geometry_hash"] == "2" * 64
+    assert calls["workspace_minimum_m"] == (-0.5, -0.5, 0.0)
+    assert calls["workspace_maximum_m"] == (0.5, 0.5, 1.0)
+    assert tuple(item.name for item in calls["regions"]) == ("robot_staging",)
+
+
+def test_coordinator_independently_verifies_coarse_science_binding(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import biblade_fusion.storage.coarse_scan as coarse_storage
+
+    cycle = (tmp_path / "cycle").resolve()
+    coarse = cycle / "coarse_scan_view"
+    stereo = cycle / "stereo_inference"
+    occupancy = cycle / "occupancy_mapping"
+    coarse.mkdir(parents=True)
+    bundle = SimpleNamespace(view_id="front_r00_c00", sequence_index=4)
+    bundle.stereo = SimpleNamespace(frame_number=19)
+    stored = SimpleNamespace(
+        reconstructed=SimpleNamespace(
+            view=SimpleNamespace(
+                source_view_id=bundle.view_id,
+                source_sequence_index=bundle.sequence_index,
+                source_frame_number=bundle.stereo.frame_number,
+            )
+        ),
+        metadata={
+            "sources": {
+                "stereo_inference": {"root": str(stereo)},
+                "occupancy_mapping": {"root": str(occupancy)},
+            }
+        },
+    )
+    monkeypatch.setattr(coarse_storage, "read_coarse_scan_view", lambda path: stored)
+    captured = SimpleNamespace(bundle=bundle, cycle_root=cycle)
+    result = SimpleNamespace(
+        coarse_scan_view_path=coarse,
+        stereo_inference_path=stereo,
+        occupancy_mapping_path=occupancy,
+    )
+
+    StopScanCoordinator._validate_coarse_science_asset(captured, result)
+
+    stored.reconstructed.view.source_frame_number += 1
+    with pytest.raises(StopScanBlocked, match="Coarse-science asset"):
+        StopScanCoordinator._validate_coarse_science_asset(captured, result)
 
 
 @pytest.fixture(autouse=True)
@@ -88,6 +216,11 @@ def _state(joints: np.ndarray, timestamp: int) -> RobotState:
         robot_mode="IDLE",
         safety_status="NORMAL",
         speed_scaling=0.1,
+        runtime_state="STOPPED",
+        actual_joint_velocity_rad_s=np.zeros(6),
+        target_joint_velocity_rad_s=np.zeros(6),
+        actual_tcp_velocity=np.zeros(6),
+        target_tcp_velocity=np.zeros(6),
     )
 
 
@@ -96,6 +229,8 @@ class FakeStateSource:
         self.joints = np.zeros(6)
         self.timestamp = 1_000_000_000
         self.calls = 0
+        self._stop_generation = 0
+        self._stopped = False
         self._robot_config = robot_config.model_copy(deep=True)
 
     @property
@@ -118,6 +253,12 @@ class FakeStateSource:
 
     def stop(self) -> None:
         self.calls += 1
+        self._stop_generation += 1
+        self._stopped = True
+
+    @property
+    def stop_snapshot(self) -> tuple[int, bool]:
+        return self._stop_generation, self._stopped
 
 
 def _bundle(view_id: str, sequence: int, state: RobotState) -> SynchronizedFrameBundle:
@@ -244,7 +385,14 @@ class FakePerception:
         if self.pending is not None and (captured is None or self.pending[0] is captured):
             self.pending = None
 
-    def commit_perception_cycle(self, captured, result) -> None:
+    def commit_perception_cycle(
+        self,
+        captured,
+        result,
+        *,
+        before_commit=lambda _stage: None,
+    ) -> None:
+        before_commit("before_fake_pending_validation")
         if (
             self.pending is None
             or self.pending[0] is not captured
@@ -252,6 +400,7 @@ class FakePerception:
             or self.pending[1].inference_stationarity_sha256 != result.inference_stationarity_sha256
         ):
             raise RuntimeError("synthetic perception commit mismatch")
+        before_commit("before_fake_source_advance")
         self.committed.append((captured.bundle.view_id, captured.bundle.sequence_index))
         self.pending = None
 
@@ -413,7 +562,32 @@ class FakeExecutor:
         del preflight
         if operator_id != "operator" or confirmation != "EXECUTE synthetic":
             raise RuntimeError("approval mismatch")
-        return object()
+        return MotionExecutionPermit(
+            permit_id="fake-permit",
+            preflight_fingerprint="1" * 64,
+            operator_id=operator_id,
+            collision_model_id="fake-model",
+            collision_model_hash="2" * 64,
+            robot_geometry_hash="3" * 64,
+            motion_model_contract_hash="4" * 64,
+            servoj_runtime_config_hash="5" * 64,
+            motion_envelope_acceptance_id="6" * 64,
+            motion_envelope_metadata_sha256="7" * 64,
+            accepted_joint_uncertainty_rad=(0.001,) * 6,
+            occupancy_sequence=3,
+            occupancy_content_hash="6" * 64,
+            occupancy_mapping_context_hash="7" * 64,
+            occupancy_quality_evidence_hash="8" * 64,
+            occupancy_metadata_sha256="9" * 64,
+            occupancy_semantic_verifier_contract_hash="a" * 64,
+            occupancy_semantic_attestation_hash="b" * 64,
+            occupancy_policy_contract_hash="c" * 64,
+            continuous_occupancy_sweep_verified=True,
+            stop_generation=4,
+            stop_latched=True,
+            issued_monotonic_s=1.0,
+            expires_monotonic_s=2.0,
+        )
 
     def execute(
         self,
@@ -421,8 +595,10 @@ class FakeExecutor:
         permit,
         *,
         cancellation_requested=lambda: False,
+        maximum_duration_s=None,
     ) -> StreamServoJResult:
         del preflight, permit
+        assert maximum_duration_s is None or maximum_duration_s > 0.0
         if cancellation_requested():
             raise StopScanAbortRequested("cancelled before fake execution")
         self.execute_calls += 1
@@ -450,6 +626,7 @@ class FakeSafetyFactory:
         self.clear = clear
         self.executor: FakeExecutor | None = None
         self.authoritative_preflight = None
+        self._motion_envelope = _motion_envelope(Path("/tmp/synthetic-motion-envelope"))
 
     @property
     def motion_robot(self):
@@ -471,6 +648,10 @@ class FakeSafetyFactory:
     def coordinator_config(self):
         return self._coordinator_config
 
+    @property
+    def motion_envelope_acceptance(self):
+        return self._motion_envelope
+
     def prepare(self, proposal, generation) -> _PreparedSegmentExecution:
         evidence = SimpleNamespace(binding=generation.binding.tuple)
         occupancy = SimpleNamespace(evidence=evidence)
@@ -486,6 +667,7 @@ class FakeSafetyFactory:
                 "surface_generation_id": proposal.surface_generation_id,
                 "reference_model_sha256": proposal.reference_model_sha256,
                 "selection_policy_sha256": proposal.selection_policy_sha256,
+                "planned_servoj_duration_s": 0.1,
             },
         )
         if self.clear:
@@ -506,6 +688,8 @@ def _coordinator(
     robot_servoj_time_s: float = 0.004,
     motion_servoj_dt_s: float = 0.004,
     robot_motion_enabled: bool = True,
+    coordinator_updates: dict[str, object] | None = None,
+    monotonic_clock=None,
 ):
     robot_config = RobotConfig(
         model=robot_model,
@@ -517,12 +701,14 @@ def _coordinator(
     motion_config = MotionPreflightConfig(servoj_dt_s=motion_servoj_dt_s)
     source = FakeStateSource(robot_config)
     publisher = OccupancyGenerationPublisher()
-    coordinator_config = StopAndCaptureConfig(
-        enabled=True,
-        maximum_segment_joint_delta_rad=0.05,
-        settle_timeout_s=1.0,
-        settle_poll_period_s=0.001,
-    )
+    coordinator_values: dict[str, object] = {
+        "enabled": True,
+        "maximum_segment_joint_delta_rad": 0.05,
+        "settle_timeout_s": 1.0,
+        "settle_poll_period_s": 0.001,
+    }
+    coordinator_values.update(coordinator_updates or {})
+    coordinator_config = StopAndCaptureConfig(**coordinator_values)
     acquisition_config = AcquisitionConfig()
     occupancy_config = OccupancyConfig(
         enabled=True,
@@ -546,6 +732,9 @@ def _coordinator(
         coordinator_config,
         clear=clear,
     )
+    coordinator_kwargs = {}
+    if monotonic_clock is not None:
+        coordinator_kwargs["monotonic_clock"] = monotonic_clock
     coordinator = StopScanCoordinator(
         config=coordinator_config,
         acquisition_config=acquisition_config,
@@ -559,6 +748,7 @@ def _coordinator(
         publisher=publisher,
         event_sink=event_sink,
         utc_clock=lambda: NOW,
+        **coordinator_kwargs,
     )
     return coordinator, source, source, perception, safety, publisher
 
@@ -609,6 +799,7 @@ def test_bootstrap_then_one_short_segment_requires_new_capture(
         operator_id="operator",
         confirmation="EXECUTE synthetic",
     )
+
     assert coordinator.checkpoint.phase is StopScanPhase.AWAITING_CAPTURE
     assert safety.executor is not None and safety.executor.execute_calls == 1
     assert stop.calls == 4
@@ -643,6 +834,261 @@ def test_bootstrap_then_one_short_segment_requires_new_capture(
     )
     assert coordinator.checkpoint.phase is StopScanPhase.MAP_READY
     assert len(perception.committed) == 4
+
+
+def test_exact_approval_is_persisted_once_before_motion(tmp_path: Path) -> None:
+    class RecordingSink:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def append_event(self, *, phase, cycle_index, event_type, payload):
+            del phase, cycle_index
+            self.events.append((event_type, dict(payload)))
+
+    sink = RecordingSink()
+    coordinator, _, _, _, safety, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        event_sink=sink,
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    coordinator.prepare_next_segment()
+
+    coordinator.execute_approved(
+        operator_id="operator",
+        confirmation="EXECUTE synthetic",
+    )
+
+    approved = [payload for kind, payload in sink.events if kind == "single_segment_approved"]
+    assert len(approved) == 1
+    assert approved[0]["operator_id"] == "operator"
+    assert approved[0]["proposal_id"]
+    assert approved[0]["permit_id"] == "fake-permit"
+    assert approved[0]["permit_sha256"]
+    assert approved[0]["preflight_fingerprint"] == "1" * 64
+    assert approved[0]["stop_generation"] == 4
+    assert approved[0]["stop_latched"] is True
+    assert approved[0]["occupancy_content_hash"] == "6" * 64
+    assert approved[0]["robot_geometry_hash"] == "3" * 64
+    assert safety.executor is not None and safety.executor.execute_calls == 1
+
+
+def test_perception_timing_budget_blocks_before_map_publish(tmp_path: Path) -> None:
+    clock = iter((10.0, 11.000001))
+    coordinator, _, _, perception, _, publisher = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        coordinator_updates={"maximum_perception_cycle_duration_s": 1.0},
+        monotonic_clock=lambda: next(clock),
+    )
+    coordinator.start()
+
+    with pytest.raises(StopScanBlocked, match="before publish"):
+        coordinator.capture_infer_update("too-slow")
+
+    assert coordinator.checkpoint.phase is StopScanPhase.FAILED
+    assert perception.committed == []
+    assert publisher.current_if_available() is None
+
+
+def test_perception_timing_budget_accepts_exact_boundary_and_records_duration(
+    tmp_path: Path,
+) -> None:
+    class RecordingSink:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def append_event(self, *, phase, cycle_index, event_type, payload):
+            del phase, cycle_index
+            self.events.append((event_type, dict(payload)))
+
+    sink = RecordingSink()
+    clock = iter((10.0, *([11.0] * 16)))
+    coordinator, _, _, perception, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        coordinator_updates={"maximum_perception_cycle_duration_s": 1.0},
+        monotonic_clock=lambda: next(clock),
+        event_sink=sink,
+    )
+    coordinator.start()
+
+    coordinator.capture_infer_update("exact-boundary")
+
+    assert len(perception.committed) == 1
+    completed = next(
+        payload
+        for name, payload in sink.events
+        if name == "foundation_stereo_completed"
+    )
+    assert completed["perception_cycle_duration_s"] == pytest.approx(1.0)
+    assert completed["maximum_perception_cycle_duration_s"] == pytest.approx(1.0)
+
+
+def test_perception_validation_time_is_checked_at_publish_boundary(
+    tmp_path: Path,
+) -> None:
+    clock = SimpleNamespace(value=0.0)
+    coordinator, _, _, perception, _, publisher = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        coordinator_updates={"maximum_perception_cycle_duration_s": 1.0},
+        monotonic_clock=lambda: clock.value,
+    )
+    original_validate = coordinator._validate_perception_result  # noqa: SLF001
+
+    def slow_validation(*args, **kwargs):
+        result = original_validate(*args, **kwargs)
+        clock.value = 1.000001
+        return result
+
+    coordinator._validate_perception_result = slow_validation  # type: ignore[method-assign]  # noqa: SLF001
+    coordinator.start()
+
+    with pytest.raises(StopScanBlocked, match="before publish"):
+        coordinator.capture_infer_update("slow-validation")
+
+    assert perception.committed == []
+    assert publisher.current_if_available() is None
+
+
+def test_planned_segment_timing_budget_blocks_before_approval(tmp_path: Path) -> None:
+    coordinator, _, _, _, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        coordinator_updates={"maximum_segment_execution_duration_s": 0.05},
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+
+    with pytest.raises(StopScanBlocked, match="planned segment exceeds"):
+        coordinator.prepare_next_segment()
+
+    assert coordinator.checkpoint.phase is StopScanPhase.MOTION_BLOCKED
+
+
+def test_actual_segment_timing_overrun_stops_and_aborts(tmp_path: Path) -> None:
+    # The perception transaction now rechecks its deadline at every commit gate.
+    clock = iter((0.0, *([0.1] * 8), 10.0, 11.000001))
+    coordinator, source, _, _, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        coordinator_updates={
+            "maximum_perception_cycle_duration_s": 1.0,
+            "maximum_segment_execution_duration_s": 1.0,
+        },
+        monotonic_clock=lambda: next(clock),
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    coordinator.prepare_next_segment()
+    stops_before = source.calls
+
+    with pytest.raises(StopScanBlocked, match="segment execution exceeded"):
+        coordinator.execute_approved(
+            operator_id="operator",
+            confirmation="EXECUTE synthetic",
+        )
+
+    assert coordinator.checkpoint.phase is StopScanPhase.ABORTED
+    assert source.calls > stops_before
+
+
+def test_unconfirmed_emergency_stop_is_persisted_as_terminal_failed(
+    tmp_path: Path,
+) -> None:
+    class RecordingSink:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, str, dict[str, object]]] = []
+
+        def append_event(self, *, phase, cycle_index, event_type, payload):
+            del cycle_index
+            self.events.append((phase, event_type, dict(payload)))
+
+    sink = RecordingSink()
+    coordinator, source, _, _, safety, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        event_sink=sink,
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    coordinator.prepare_next_segment()
+    executor = safety.executor
+    assert executor is not None
+    operation_error = RuntimeError("ServoJ transport failed")
+    executor_error = EmergencyStopUnconfirmedError(
+        operation_error,
+        (
+            RuntimeError("watchdog Dashboard stop failed"),
+            RuntimeError("executor boundary stop failed"),
+        ),
+    )
+
+    def fail_execution(*args, **kwargs):
+        del args, kwargs
+        raise executor_error
+
+    def fail_coordinator_stop() -> None:
+        source.calls += 1
+        raise RuntimeError("coordinator fallback stop failed")
+
+    executor.execute = fail_execution  # type: ignore[method-assign]
+    source.stop = fail_coordinator_stop  # type: ignore[method-assign]
+
+    with pytest.raises(EmergencyStopUnconfirmedError) as raised:
+        coordinator.execute_approved(
+            operator_id="operator",
+            confirmation="EXECUTE synthetic",
+        )
+
+    assert raised.value.operation_error is operation_error
+    assert len(raised.value.stop_errors) == 3
+    assert coordinator.checkpoint.phase is StopScanPhase.FAILED
+    terminal = [event for event in sink.events if event[1].endswith("stop_unconfirmed")]
+    assert len(terminal) == 1
+    phase, event_type, payload = terminal[0]
+    assert phase == StopScanPhase.FAILED.value
+    assert event_type == "single_segment_emergency_stop_unconfirmed"
+    assert payload["error_code"] == "emergency_stop_unconfirmed"
+    assert len(payload["stop_failures"]) == 3
+    with pytest.raises(StopScanError, match="Cannot capture from phase failed"):
+        coordinator.capture_infer_update("ordinary-recovery-forbidden")
+
+
+def test_approval_event_failure_prevents_all_motion(tmp_path: Path) -> None:
+    class FailApprovalEvent:
+        def append_event(self, *, phase, cycle_index, event_type, payload):
+            del phase, cycle_index, payload
+            if event_type == "single_segment_approved":
+                raise OSError("approval audit store unavailable")
+
+    coordinator, _, _, _, safety, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        event_sink=FailApprovalEvent(),
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    coordinator.prepare_next_segment()
+
+    with pytest.raises(StopScanError, match="persistence"):
+        coordinator.execute_approved(
+            operator_id="operator",
+            confirmation="EXECUTE synthetic",
+        )
+
+    assert coordinator.checkpoint.phase is StopScanPhase.FAILED
+    assert safety.executor is not None and safety.executor.execute_calls == 0
 
 
 def test_final_target_capture_is_explicit_candidate_purpose(tmp_path: Path) -> None:
@@ -1008,6 +1454,7 @@ def test_map_change_after_preflight_aborts_before_execute(tmp_path: Path) -> Non
         sequence_offset=10,
         occupancy_metadata_sha256=hashlib.sha256(changed_metadata.read_bytes()).hexdigest(),
     )
+    _FAKE_OCCUPANCY_ASSETS[changed_path.resolve()] = changed
     current = publisher.current
     publisher.publish(
         OccupancyGeneration.verified(
@@ -1027,6 +1474,143 @@ def test_map_change_after_preflight_aborts_before_execute(tmp_path: Path) -> Non
     assert coordinator.checkpoint.phase is StopScanPhase.ABORTED
     assert safety.executor is not None and safety.executor.execute_calls == 0
     assert stop.calls == 2
+
+
+def test_disk_tamper_after_preflight_blocks_at_freeze_before_motion(
+    tmp_path: Path,
+) -> None:
+    coordinator, _, stop, _, safety, publisher = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    coordinator.prepare_next_segment()
+    current = publisher.current
+    metadata = current.artifact_path / "metadata.json"
+    metadata.write_text(metadata.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+    with pytest.raises(StopScanBlocked, match="disk-authority readback before freeze"):
+        coordinator.execute_approved(
+            operator_id="operator",
+            confirmation="EXECUTE synthetic",
+        )
+
+    assert coordinator.checkpoint.phase is StopScanPhase.ABORTED
+    assert safety.executor is not None and safety.executor.execute_calls == 0
+    assert stop.calls == 2
+
+
+def test_publish_acceptance_timeout_keeps_previous_generation(
+    tmp_path: Path,
+) -> None:
+    coordinator, _, _, _, _, publisher = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=None,
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    current = publisher.current
+    candidate_path = tmp_path / "candidate-generation"
+    candidate_path.mkdir()
+    candidate_metadata = candidate_path / "metadata.json"
+    candidate_metadata.write_text("{}", encoding="utf-8")
+    candidate_mapping = _stored_mapping(
+        3,
+        sequence_offset=30,
+        occupancy_metadata_sha256=hashlib.sha256(candidate_metadata.read_bytes()).hexdigest(),
+    )
+    _FAKE_OCCUPANCY_ASSETS[candidate_path.resolve()] = candidate_mapping
+    candidate = OccupancyGeneration.verified(
+        candidate_path,
+        candidate_mapping,
+        inference_stationarity_path=current.inference_stationarity_path,
+        inference_stationarity_sha256=current.inference_stationarity_sha256,
+    )
+
+    def timed_out_acceptance() -> None:
+        raise TimeoutError("synthetic commit-boundary deadline")
+
+    with pytest.raises(TimeoutError, match="commit-boundary deadline"):
+        publisher.publish_after_acceptance(candidate, timed_out_acceptance)
+
+    assert publisher.current.generation_id == current.generation_id
+
+
+def test_publish_commit_and_freeze_are_serialized_by_one_authority_lock(
+    tmp_path: Path,
+) -> None:
+    coordinator, _, _, _, _, publisher = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=None,
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    original = publisher.current
+    candidate_path = tmp_path / "serialized-generation"
+    candidate_path.mkdir()
+    candidate_metadata = candidate_path / "metadata.json"
+    candidate_metadata.write_text("{}", encoding="utf-8")
+    candidate_mapping = _stored_mapping(
+        3,
+        sequence_offset=40,
+        occupancy_metadata_sha256=hashlib.sha256(candidate_metadata.read_bytes()).hexdigest(),
+    )
+    _FAKE_OCCUPANCY_ASSETS[candidate_path.resolve()] = candidate_mapping
+    candidate = OccupancyGeneration.verified(
+        candidate_path,
+        candidate_mapping,
+        inference_stationarity_path=original.inference_stationarity_path,
+        inference_stationarity_sha256=original.inference_stationarity_sha256,
+    )
+    accept_entered = threading.Event()
+    release_accept = threading.Event()
+    publish_failures: list[BaseException] = []
+
+    def accept() -> None:
+        accept_entered.set()
+        assert release_accept.wait(timeout=2.0)
+
+    def publish() -> None:
+        try:
+            publisher.publish_after_acceptance(candidate, accept)
+        except BaseException as exc:
+            publish_failures.append(exc)
+
+    worker = threading.Thread(target=publish)
+    worker.start()
+    assert accept_entered.wait(timeout=2.0)
+    freeze_finished = threading.Event()
+    freeze_failures: list[BaseException] = []
+
+    def freeze_old() -> None:
+        try:
+            with publisher.freeze(
+                expected_generation_id=original.generation_id,
+                expected_binding=original.binding,
+                expected_inference_stationarity_sha256=(original.inference_stationarity_sha256),
+            ):
+                pass
+        except BaseException as exc:
+            freeze_failures.append(exc)
+        finally:
+            freeze_finished.set()
+
+    freezer = threading.Thread(target=freeze_old)
+    freezer.start()
+    assert not freeze_finished.wait(timeout=0.05)
+    release_accept.set()
+    worker.join(timeout=2.0)
+    freezer.join(timeout=2.0)
+
+    assert not worker.is_alive() and not freezer.is_alive()
+    assert publish_failures == []
+    assert len(freeze_failures) == 1
+    assert isinstance(freeze_failures[0], StopScanBlocked)
+    assert "changed before freeze" in str(freeze_failures[0])
 
 
 def test_multi_view_raw_session_is_rejected_before_inference(tmp_path: Path) -> None:
@@ -1084,6 +1668,47 @@ def test_coordinator_writes_a_verifiable_hash_chained_event_run(tmp_path: Path) 
     assert stored.events[-1].payload["selection_policy_sha256"] == "c" * 64
     assert stored.events[-1].payload["required_patch_count"] == 4
     assert all(event.event_sha256 for event in stored.events)
+
+
+def test_completion_event_binds_terminal_reconstruction_evidence(tmp_path: Path) -> None:
+    final_root = (tmp_path / "final_reconstruction").resolve()
+    final_root.mkdir()
+
+    class FinalSelector:
+        def select_next(self, observation, generation):
+            del observation, generation
+            return NextViewSelection(
+                target=None,
+                surface_generation_id="a" * 64,
+                reference_model_sha256="b" * 64,
+                selection_policy_sha256="c" * 64,
+                required_patch_count=4,
+                incomplete_patch_count=0,
+                coverage_complete=True,
+                diagnostics=("terminal reconstruction replayed",),
+                final_reconstruction_path=final_root,
+                final_reconstruction_id="d" * 64,
+                final_reconstruction_metadata_sha256="e" * 64,
+            )
+
+    writer = StopScanRunWriter.create(tmp_path / "run", run_id="final-evidence-test")
+    coordinator, *_ = _coordinator(
+        tmp_path / "cycles",
+        mapping_counts=[3],
+        target=None,
+        event_sink=writer,
+    )
+    coordinator._selector = FinalSelector()
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    assert coordinator.prepare_next_segment() is None
+
+    terminal = read_stop_scan_run(tmp_path / "run").events[-1]
+    assert terminal.payload["final_reconstruction"] == {
+        "path": str(final_root),
+        "artifact_id": "d" * 64,
+        "metadata_sha256": "e" * 64,
+    }
 
 
 def test_next_view_completion_requires_typed_zero_gap_evidence() -> None:
@@ -1194,8 +1819,15 @@ def test_request_stop_interrupts_execution_without_transaction_lock(
     entered = threading.Event()
     release = threading.Event()
 
-    def blocking_execute(preflight, permit, *, cancellation_requested):
+    def blocking_execute(
+        preflight,
+        permit,
+        *,
+        cancellation_requested,
+        maximum_duration_s,
+    ):
         del preflight, permit
+        assert maximum_duration_s is None
         entered.set()
         assert release.wait(timeout=2.0)
         if cancellation_requested():
@@ -1227,6 +1859,40 @@ def test_request_stop_interrupts_execution_without_transaction_lock(
     assert not worker.is_alive()
     assert failures and isinstance(failures[0], StopScanAbortRequested)
     assert coordinator.checkpoint.phase is StopScanPhase.ABORTED
+
+
+def test_aborted_without_transport_ack_retries_physical_stop(tmp_path: Path) -> None:
+    coordinator, _, stop, _, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+    )
+    coordinator.start()
+    stop_attempts = 0
+    original_stop = stop.stop
+
+    def fail_once_then_stop() -> None:
+        nonlocal stop_attempts
+        stop_attempts += 1
+        if stop_attempts == 1:
+            raise RuntimeError("synthetic stop transport failure")
+        original_stop()
+
+    stop.stop = fail_once_then_stop  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="stop transport failure"):
+        coordinator.request_stop("operator stop")
+
+    failed = coordinator.checkpoint
+    assert failed.phase is StopScanPhase.ABORTED
+    assert failed.stop_requested is True
+    assert failed.stop_transport_acknowledged is False
+
+    retried = coordinator.request_stop("operator stop retry")
+
+    assert stop_attempts == 2
+    assert retried.phase is StopScanPhase.ABORTED
+    assert retried.stop_transport_acknowledged is True
 
 
 def test_stop_latched_at_success_tail_cannot_return_motion_success(
@@ -1407,6 +2073,7 @@ def test_external_map_replacement_breaks_observation_generation_binding(
         sequence_offset=20,
         occupancy_metadata_sha256=hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
     )
+    _FAKE_OCCUPANCY_ASSETS[changed_path.resolve()] = changed_mapping
     publisher.publish(
         OccupancyGeneration.verified(
             changed_path,
@@ -1544,10 +2211,10 @@ def test_blocked_commit_never_delays_operator_physical_stop(tmp_path: Path) -> N
     commit_entered = threading.Event()
     release_commit = threading.Event()
 
-    def blocking_commit(captured, result):
+    def blocking_commit(captured, result, *, before_commit=lambda _stage: None):
         commit_entered.set()
         assert release_commit.wait(timeout=2.0)
-        original_commit(captured, result)
+        original_commit(captured, result, before_commit=before_commit)
 
     perception.commit_perception_cycle = blocking_commit  # type: ignore[method-assign]
     coordinator.start()
@@ -1589,8 +2256,9 @@ def test_failed_source_commit_never_exposes_candidate_generation(
     commit_entered = threading.Event()
     release_commit = threading.Event()
 
-    def failing_commit(captured, result):
+    def failing_commit(captured, result, *, before_commit=lambda _stage: None):
         del captured, result
+        before_commit("before_synthetic_failure")
         commit_entered.set()
         assert release_commit.wait(timeout=2.0)
         raise RuntimeError("synthetic source-window commit failure")

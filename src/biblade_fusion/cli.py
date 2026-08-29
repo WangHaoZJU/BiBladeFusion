@@ -125,7 +125,10 @@ app = typer.Typer(
 robot_app = typer.Typer(help="Safe Elite ES68 state tools.", no_args_is_help=True)
 camera_app = typer.Typer(help="Intel RealSense D435i tools.", no_args_is_help=True)
 acquire_app = typer.Typer(help="Synchronized read-only acquisition.", no_args_is_help=True)
-calibration_app = typer.Typer(help="Offline calibration tools.", no_args_is_help=True)
+calibration_app = typer.Typer(
+    help="Calibration acquisition and offline solving tools.",
+    no_args_is_help=True,
+)
 stereo_app = typer.Typer(help="Stereo inference tools.", no_args_is_help=True)
 initialize_app = typer.Typer(help="Offline initial-model construction.", no_args_is_help=True)
 plan_app = typer.Typer(help="Offline bilateral view planning.", no_args_is_help=True)
@@ -141,6 +144,10 @@ supervise_app = typer.Typer(
     help="Read-only, snapshot-driven supervision and evidence replay.",
     no_args_is_help=True,
 )
+scan_app = typer.Typer(
+    help="Fail-closed supervised blade-scan preparation and runtime tools.",
+    no_args_is_help=True,
+)
 app.add_typer(robot_app, name="robot")
 app.add_typer(camera_app, name="camera")
 app.add_typer(acquire_app, name="acquire")
@@ -154,11 +161,340 @@ app.add_typer(evaluate_app, name="evaluate")
 app.add_typer(safety_app, name="safety")
 app.add_typer(occupancy_app, name="occupancy")
 app.add_typer(supervise_app, name="supervise")
+app.add_typer(scan_app, name="scan")
 
 
 @app.callback()
 def main() -> None:
     """BiBladeFusion command group."""
+
+
+@scan_app.command("doctor")
+def scan_doctor(
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+    mode: Annotated[
+        str,
+        typer.Option(
+            "--mode",
+            help=(
+                "Use 'unknown' for the complete coarse-to-fine runtime, 'bootstrap' "
+                "for occupancy/coarse prerequisites, or 'fine' with a schema-5 reference."
+            ),
+        ),
+    ] = "bootstrap",
+    reference_coarse_model: Annotated[
+        Path | None,
+        typer.Option(
+            "--reference-coarse-model",
+            exists=True,
+            file_okay=False,
+            readable=True,
+        ),
+    ] = None,
+    output_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Audit all pre-acceptance scan prerequisites without touching hardware."""
+
+    normalized_mode = mode.strip().lower()
+    if normalized_mode not in {"unknown", "bootstrap", "fine"}:
+        typer.echo("Scan mode must be 'unknown', 'bootstrap', or 'fine'.", err=True)
+        raise typer.Exit(code=2)
+    try:
+        settings = load_settings(config)
+        if normalized_mode == "unknown":
+            from biblade_fusion.workflows.unknown_blade_runtime import (
+                unknown_blade_runtime_readiness,
+            )
+
+            if reference_coarse_model is not None:
+                raise ValueError("Unknown mode creates its own schema-5 reference")
+            results = unknown_blade_runtime_readiness(settings)
+        else:
+            from biblade_fusion.diagnostics.supervised_scan import (
+                run_supervised_scan_readiness,
+            )
+
+            results = run_supervised_scan_readiness(
+                settings,
+                mode=normalized_mode,  # type: ignore[arg-type]
+                reference_coarse_model=reference_coarse_model,
+            )
+    except Exception as exc:
+        typer.echo(f"Supervised-scan readiness audit failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if output_json:
+        typer.echo(json.dumps([asdict(result) for result in results], indent=2))
+    else:
+        table = Table(title="Supervised blade-scan readiness (non-moving)")
+        table.add_column("Check")
+        table.add_column("Status")
+        table.add_column("Message")
+        for result in results:
+            style = {
+                CheckLevel.PASS: "green",
+                CheckLevel.WARN: "yellow",
+                CheckLevel.FAIL: "red",
+            }[result.level]
+            table.add_row(result.name, f"[{style}]{result.level.upper()}[/]", result.message)
+        Console().print(table)
+        typer.echo("Motion authorized: no; hardware acceptance is a separate gate.")
+    if any(result.level is CheckLevel.FAIL for result in results):
+        raise typer.Exit(code=1)
+
+
+@scan_app.command("run-unknown")
+def scan_run_unknown(
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help=(
+                "Explicit experiment root: must be new normally and must already "
+                "exist with a valid handoff chain under --resume."
+            ),
+        ),
+    ],
+    operator_id: Annotated[
+        str,
+        typer.Option("--operator-id", help="Identity persisted with exact approvals."),
+    ],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+    run_id: Annotated[
+        str | None,
+        typer.Option("--run-id", help="Optional durable run identity."),
+    ] = None,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "--resume",
+            help="Resume exactly this output root from its verified experiment chain.",
+        ),
+    ] = False,
+    bootstrap_rectangle: Annotated[
+        str | None,
+        typer.Option(
+            "--bootstrap-rectangle",
+            help="Optional first-view rectified-left seed u0,v0,u1,v1.",
+        ),
+    ] = None,
+    bootstrap_polygon: Annotated[
+        Path | None,
+        typer.Option(
+            "--bootstrap-polygon",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Optional first-view rectified-left polygon JSON.",
+        ),
+    ] = None,
+    bootstrap_seed_mode: Annotated[
+        str,
+        typer.Option(
+            "--bootstrap-seed-mode",
+            help="Use component_hint or hard_roi for the first-view seed.",
+        ),
+    ] = "component_hint",
+    first_side: Annotated[
+        str | None,
+        typer.Option(
+            "--first-side",
+            help="Optional first physical side label; only 'front' is valid initially.",
+        ),
+    ] = None,
+) -> None:
+    """MOTION-CAPABLE: run the attended unknown-blade coarse-to-fine console."""
+
+    if not operator_id.strip():
+        typer.echo("--operator-id must be non-empty.", err=True)
+        raise typer.Exit(code=2)
+    if bootstrap_rectangle is not None and bootstrap_polygon is not None:
+        typer.echo(
+            "Supply at most one of --bootstrap-rectangle and --bootstrap-polygon.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    try:
+        from biblade_fusion.perception.bootstrap_foreground import BootstrapSeed
+        from biblade_fusion.planning import BladeSide
+        from biblade_fusion.workflows.unknown_blade_runtime import (
+            open_production_unknown_blade_runtime,
+            run_unknown_blade_operator_console,
+        )
+
+        normalized_seed_mode = bootstrap_seed_mode.strip().lower()
+        if normalized_seed_mode not in {"component_hint", "hard_roi"}:
+            raise ValueError("--bootstrap-seed-mode must be 'component_hint' or 'hard_roi'")
+        seed = None
+        if bootstrap_rectangle is not None:
+            values = tuple(float(value.strip()) for value in bootstrap_rectangle.split(","))
+            if len(values) != 4:
+                raise ValueError(
+                    "--bootstrap-rectangle requires exactly four comma-separated values"
+                )
+            seed = BootstrapSeed(
+                kind="rectangle",
+                mode=normalized_seed_mode,  # type: ignore[arg-type]
+                vertices_uv=((values[0], values[1]), (values[2], values[3])),
+            )
+        elif bootstrap_polygon is not None:
+            payload = json.loads(bootstrap_polygon.read_text(encoding="utf-8"))
+            vertices = payload.get("vertices_uv") if isinstance(payload, dict) else payload
+            if not isinstance(vertices, list):
+                raise ValueError("Bootstrap polygon must be a vertex array or contain vertices_uv")
+            seed = BootstrapSeed(
+                kind="polygon",
+                mode=normalized_seed_mode,  # type: ignore[arg-type]
+                vertices_uv=tuple((float(vertex[0]), float(vertex[1])) for vertex in vertices),
+            )
+        initial_side = None
+        if first_side is not None:
+            normalized_side = first_side.strip().lower()
+            if normalized_side != BladeSide.FRONT.value:
+                raise ValueError("--first-side may only be 'front'")
+            initial_side = BladeSide.FRONT
+        settings = load_settings(config)
+        with open_production_unknown_blade_runtime(
+            settings,
+            output_root=output,
+            operator_id=operator_id,
+            run_id=run_id,
+            resume=resume,
+        ) as runtime:
+            if seed is None and initial_side is None:
+                return_code = run_unknown_blade_operator_console(runtime)
+            else:
+                return_code = run_unknown_blade_operator_console(
+                    runtime,
+                    initial_bootstrap_seed=seed,
+                    initial_operator_side=initial_side,
+                )
+    except KeyboardInterrupt as exc:
+        typer.echo("Operator interrupt observed; runtime requested stop and released devices.")
+        raise typer.Exit(code=130) from exc
+    except Exception as exc:
+        typer.echo(f"Unknown-blade runtime failed closed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if return_code:
+        raise typer.Exit(code=return_code)
+
+
+@scan_app.command("bootstrap-mask")
+def scan_bootstrap_mask(
+    stereo: Annotated[
+        Path,
+        typer.Option(
+            "--stereo",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Immutable FoundationStereo inference artifact for the initial view.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+    rectangle: Annotated[
+        str | None,
+        typer.Option(
+            "--rectangle",
+            help="Optional rectified-left ROI as u0,v0,u1,v1.",
+        ),
+    ] = None,
+    polygon: Annotated[
+        Path | None,
+        typer.Option(
+            "--polygon",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Optional JSON array of [u,v] vertices in rectified-left pixels.",
+        ),
+    ] = None,
+    seed_mode: Annotated[
+        str,
+        typer.Option(
+            "--seed-mode",
+            help="Use hard_roi to retain every valid annotated pixel, or component_hint.",
+        ),
+    ] = "component_hint",
+) -> None:
+    """Create a replay-verified initial unknown-blade foreground asset."""
+
+    if rectangle is not None and polygon is not None:
+        typer.echo("Supply at most one of --rectangle and --polygon.", err=True)
+        raise typer.Exit(code=2)
+    normalized_mode = seed_mode.strip().lower()
+    if normalized_mode not in {"hard_roi", "component_hint"}:
+        typer.echo("--seed-mode must be 'hard_roi' or 'component_hint'.", err=True)
+        raise typer.Exit(code=2)
+    try:
+        from biblade_fusion.perception.bootstrap_foreground import (
+            BootstrapForegroundConfig,
+            BootstrapSeed,
+        )
+        from biblade_fusion.storage.bootstrap_foreground import (
+            write_bootstrap_foreground,
+        )
+        from biblade_fusion.workflows.bootstrap_foreground import (
+            bootstrap_foundation_stereo_foreground,
+        )
+
+        settings = load_settings(config)
+        policy = BootstrapForegroundConfig(
+            **settings.bootstrap_foreground.model_dump(mode="python")
+        )
+        seed = None
+        if rectangle is not None:
+            values = tuple(float(value.strip()) for value in rectangle.split(","))
+            if len(values) != 4:
+                raise ValueError("--rectangle requires exactly four comma-separated values")
+            seed = BootstrapSeed(
+                kind="rectangle",
+                mode=normalized_mode,  # type: ignore[arg-type]
+                vertices_uv=((values[0], values[1]), (values[2], values[3])),
+            )
+        elif polygon is not None:
+            payload = json.loads(polygon.read_text(encoding="utf-8"))
+            vertices = payload.get("vertices_uv") if isinstance(payload, dict) else payload
+            if not isinstance(vertices, list):
+                raise ValueError("Polygon JSON must be a vertex array or contain vertices_uv")
+            seed = BootstrapSeed(
+                kind="polygon",
+                mode=normalized_mode,  # type: ignore[arg-type]
+                vertices_uv=tuple((float(vertex[0]), float(vertex[1])) for vertex in vertices),
+            )
+        stored = read_stereo_inference(stereo)
+        observation = bootstrap_foundation_stereo_foreground(
+            stored.observation,
+            policy,
+            seed,
+        )
+        root = write_bootstrap_foreground(
+            output,
+            observation,
+            source_stereo_inference=stereo,
+        )
+    except Exception as exc:
+        typer.echo(f"Initial blade foreground failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    diagnostics = observation.result.diagnostics
+    typer.echo(f"Saved bootstrap foreground: {root}")
+    typer.echo(
+        "mask_pixels="
+        f"{diagnostics.mask_pixel_count}, "
+        f"mask_fraction={diagnostics.mask_fraction:.6f}, "
+        f"selection={(observation.result.seed.mode if observation.result.seed else 'automatic')}"
+    )
 
 
 @occupancy_app.command("build-replay")
@@ -232,9 +568,7 @@ def occupancy_build_replay(
             descriptor = reader.descriptor(stored.observation.source_view_id)
             relative_view = Path(descriptor.relative_path)
             view_metadata = (source_session / relative_view / "metadata.json").resolve()
-            if relative_view.is_absolute() or not view_metadata.is_relative_to(
-                source_session
-            ):
+            if relative_view.is_absolute() or not view_metadata.is_relative_to(source_session):
                 raise ValueError("Selected source view metadata escapes its session")
             update = integrate_foundation_stereo_occupancy(
                 snapshot,
@@ -245,12 +579,8 @@ def occupancy_build_replay(
                 settings.acquisition,
                 renderer,
                 captured_at_utc=captured_at,
-                source_stereo_metadata_sha256=_file_sha256(
-                    resolved_stereo / "metadata.json"
-                ),
-                source_session_manifest_sha256=_file_sha256(
-                    source_session / "manifest.json"
-                ),
+                source_stereo_metadata_sha256=_file_sha256(resolved_stereo / "metadata.json"),
+                source_session_manifest_sha256=_file_sha256(source_session / "manifest.json"),
                 source_session_view_metadata_sha256=_file_sha256(view_metadata),
                 previous_evidence_hash=previous_evidence_hash,
             )
@@ -322,8 +652,7 @@ def supervise_replay(
             exists=True,
             readable=True,
             help=(
-                "A snapshot JSON/directory, or a directory containing an ordered "
-                "snapshot timeline."
+                "A snapshot JSON/directory, or a directory containing an ordered snapshot timeline."
             ),
         ),
     ],
@@ -641,8 +970,7 @@ def robot_inspect_model(
     except ModuleNotFoundError as exc:
         if exc.name == "PySide6" or (exc.name or "").startswith("PySide6."):
             typer.echo(
-                "PySide6/Qt3D is not installed; run "
-                "`uv sync --extra robot-model-gui`.",
+                "PySide6/Qt3D is not installed; run `uv sync --extra robot-model-gui`.",
                 err=True,
             )
         else:
@@ -1046,9 +1374,7 @@ def calibration_stereo_validate_gui(
         settings = load_settings(config)
         calibration_path = calibration or settings.realsense.stereo_calibration_path
         if calibration_path is None:
-            raise ValueError(
-                "--calibration or realsense.stereo_calibration_path is required"
-            )
+            raise ValueError("--calibration or realsense.stereo_calibration_path is required")
         thresholds = StereoValidationThresholds(
             minimum_accepted_pairs=minimum_pairs,
             maximum_vertical_disparity_rmse_px=maximum_vertical_rmse_px,
@@ -1098,8 +1424,7 @@ def calibration_stereo_validate_assets(
     metrics = result.metrics
     typer.echo(f"Result: {'PASS' if metrics.passed else 'FAIL'}")
     typer.echo(
-        f"Accepted/rejected pairs: {metrics.accepted_pair_count}/"
-        f"{metrics.rejected_pair_count}"
+        f"Accepted/rejected pairs: {metrics.accepted_pair_count}/{metrics.rejected_pair_count}"
     )
     typer.echo(
         "Vertical disparity RMSE/P95/max: "
@@ -1926,13 +2251,10 @@ def coverage_add(
             != initialization.resolve()
         ):
             raise ValueError("Coverage ledger does not belong to the supplied initialization")
-        if (
-            stored_initialization.hand_eye.flange_t_left_ir is None
-            or not np.allclose(
-                stored_view.metadata["hand_eye"]["flange_T_left_ir"],
-                stored_initialization.hand_eye.flange_t_left_ir.matrix,
-                atol=1e-9,
-            )
+        if stored_initialization.hand_eye.flange_t_left_ir is None or not np.allclose(
+            stored_view.metadata["hand_eye"]["flange_T_left_ir"],
+            stored_initialization.hand_eye.flange_t_left_ir.matrix,
+            atol=1e-9,
         ):
             raise ValueError("Reconstructed view uses a different hand-eye calibration")
         source = stored_view.metadata["source"]
@@ -2313,6 +2635,546 @@ def safety_validate_path(
     typer.echo("Motion authorized: no")
 
 
+@safety_app.command("record-static-free-acceptance")
+def safety_record_static_free_acceptance(
+    declaration: Annotated[
+        Path,
+        typer.Option(
+            "--declaration",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Operator-completed physical acceptance declaration JSON.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Record, but never authorize, accepted UNKNOWN-only static free volumes."""
+
+    try:
+        from biblade_fusion.robotics import (
+            AcceptedStaticFreeAabb,
+            Cs68PinocchioCollisionChecker,
+            Es68D435iCollisionResources,
+        )
+        from biblade_fusion.storage import write_static_free_acceptance
+
+        settings = load_settings(config)
+        payload = json.loads(declaration.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Acceptance declaration must be a JSON object")
+        expected = {
+            "workcell_id",
+            "operator_id",
+            "accepted_at_utc",
+            "workspace_bounds_m",
+            "accepted_static_free_aabbs",
+            "checklist",
+        }
+        if set(payload) != expected:
+            raise ValueError(
+                "Acceptance declaration fields must be exactly: " + ", ".join(sorted(expected))
+            )
+        bounds = payload["workspace_bounds_m"]
+        if not isinstance(bounds, dict) or set(bounds) != {"minimum", "maximum"}:
+            raise ValueError("workspace_bounds_m must contain minimum and maximum")
+        raw_regions = payload["accepted_static_free_aabbs"]
+        if not isinstance(raw_regions, list):
+            raise ValueError("accepted_static_free_aabbs must be an array")
+        regions = tuple(
+            AcceptedStaticFreeAabb(
+                name=str(item["name"]),
+                minimum_m=tuple(item["minimum_m"]),
+                maximum_m=tuple(item["maximum_m"]),
+            )
+            for item in raw_regions
+            if isinstance(item, dict)
+        )
+        if len(regions) != len(raw_regions):
+            raise ValueError("Every accepted static-free region must be an object")
+        checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+            Es68D435iCollisionResources.packaged_template(),
+            joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
+            environment_obstacles=settings.collision.obstacles,
+            minimum_clearance_m=settings.collision.minimum_clearance_m,
+        )
+        stored = write_static_free_acceptance(
+            output,
+            workcell_id=str(payload["workcell_id"]),
+            operator_id=str(payload["operator_id"]),
+            accepted_at_utc=datetime.fromisoformat(str(payload["accepted_at_utc"])),
+            robot_geometry_hash=checker.robot_geometry_hash,
+            workspace_minimum_m=tuple(bounds["minimum"]),
+            workspace_maximum_m=tuple(bounds["maximum"]),
+            regions=regions,
+            checklist=dict(payload["checklist"]),
+        )
+    except Exception as exc:
+        typer.echo(f"Static-free acceptance recording failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved immutable static-free acceptance: {stored.path}")
+    typer.echo(f"Acceptance ID: {stored.acceptance_id}")
+    typer.echo("Motion authorized: no; copy the path and ID into the reviewed config")
+
+
+@safety_app.command("record-motion-envelope-acceptance")
+def safety_record_motion_envelope_acceptance(
+    declaration: Annotated[
+        Path,
+        typer.Option(
+            "--declaration",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Completed tracking-error and stop-drift physical declaration JSON.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Record measured ServoJ following/stop uncertainty without authorizing motion."""
+
+    try:
+        from biblade_fusion.robotics import (
+            Cs68PinocchioCollisionChecker,
+            Es68D435iCollisionResources,
+        )
+        from biblade_fusion.storage import (
+            motion_control_contract_for_settings,
+            write_motion_envelope_acceptance,
+        )
+
+        settings = load_settings(config)
+        payload = json.loads(declaration.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Motion-envelope declaration must be a JSON object")
+        expected = {
+            "workcell_id",
+            "operator_id",
+            "accepted_at_utc",
+            "maximum_tracking_deviation_rad",
+            "maximum_stop_drift_rad",
+            "safety_margin_factor",
+            "maximum_feedback_interval_s",
+            "maximum_stop_acknowledgement_s",
+            "maximum_stopped_actual_joint_velocity_rad_s",
+            "maximum_stopped_target_joint_velocity_rad_s",
+            "maximum_stopped_actual_tcp_linear_velocity_m_s",
+            "maximum_stopped_actual_tcp_angular_velocity_rad_s",
+            "maximum_stopped_target_tcp_linear_velocity_m_s",
+            "maximum_stopped_target_tcp_angular_velocity_rad_s",
+            "trial_count",
+            "checklist",
+        }
+        if set(payload) != expected:
+            raise ValueError(
+                "Motion-envelope declaration fields must be exactly: " + ", ".join(sorted(expected))
+            )
+        checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+            Es68D435iCollisionResources.packaged_template(),
+            joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
+            environment_obstacles=settings.collision.obstacles,
+            minimum_clearance_m=settings.collision.minimum_clearance_m,
+        )
+        stored = write_motion_envelope_acceptance(
+            output,
+            workcell_id=str(payload["workcell_id"]),
+            operator_id=str(payload["operator_id"]),
+            accepted_at_utc=datetime.fromisoformat(str(payload["accepted_at_utc"])),
+            robot_geometry_hash=checker.robot_geometry_hash,
+            motion_model_contract_hash=checker.motion_model_contract_hash,
+            motion_control_contract_hash=motion_control_contract_for_settings(settings),
+            maximum_tracking_deviation_rad=tuple(payload["maximum_tracking_deviation_rad"]),
+            maximum_stop_drift_rad=tuple(payload["maximum_stop_drift_rad"]),
+            safety_margin_factor=float(payload["safety_margin_factor"]),
+            maximum_feedback_interval_s=float(payload["maximum_feedback_interval_s"]),
+            maximum_stop_acknowledgement_s=float(payload["maximum_stop_acknowledgement_s"]),
+            maximum_stopped_actual_joint_velocity_rad_s=float(
+                payload["maximum_stopped_actual_joint_velocity_rad_s"]
+            ),
+            maximum_stopped_target_joint_velocity_rad_s=float(
+                payload["maximum_stopped_target_joint_velocity_rad_s"]
+            ),
+            maximum_stopped_actual_tcp_linear_velocity_m_s=float(
+                payload["maximum_stopped_actual_tcp_linear_velocity_m_s"]
+            ),
+            maximum_stopped_actual_tcp_angular_velocity_rad_s=float(
+                payload["maximum_stopped_actual_tcp_angular_velocity_rad_s"]
+            ),
+            maximum_stopped_target_tcp_linear_velocity_m_s=float(
+                payload["maximum_stopped_target_tcp_linear_velocity_m_s"]
+            ),
+            maximum_stopped_target_tcp_angular_velocity_rad_s=float(
+                payload["maximum_stopped_target_tcp_angular_velocity_rad_s"]
+            ),
+            trial_count=int(payload["trial_count"]),
+            checklist=dict(payload["checklist"]),
+        )
+    except Exception as exc:
+        typer.echo(f"Motion-envelope acceptance recording failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved immutable motion-envelope acceptance: {stored.path}")
+    typer.echo(f"Acceptance ID: {stored.acceptance_id}")
+    typer.echo(f"Metadata SHA-256: {stored.metadata_sha256}")
+    typer.echo("Motion authorized: no; copy the path and ID into the reviewed config")
+
+
+@safety_app.command("canonicalize-science-evidence")
+def safety_canonicalize_science_evidence(
+    kind: Annotated[
+        str,
+        typer.Option(
+            "--kind",
+            help="One of raw-manifest, evaluation, or review.",
+        ),
+    ],
+    input_path: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Completed semantic evidence JSON; pretty formatting is allowed.",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="New canonical evidence file; existing files are never overwritten.",
+        ),
+    ],
+) -> None:
+    """Strictly validate and canonicalize one non-moving science evidence file."""
+
+    try:
+        from biblade_fusion.storage.science_acceptance import (
+            canonicalize_science_evidence,
+        )
+
+        stored = canonicalize_science_evidence(
+            kind=kind,
+            input_path=input_path,
+            output_path=output,
+        )
+    except Exception as exc:
+        typer.echo(f"Science evidence canonicalization failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved canonical science evidence: {stored.path}")
+    typer.echo(f"Kind: {stored.kind}")
+    typer.echo(f"SHA-256: {stored.sha256}")
+    typer.echo(f"Size bytes: {stored.size_bytes}")
+    typer.echo("Motion authorized: no")
+
+
+@safety_app.command("science-runtime-contract")
+def safety_science_runtime_contract(
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional new file receiving the canonical, path-free contract JSON.",
+        ),
+    ] = None,
+) -> None:
+    """Print the actual non-moving science runtime identity for evidence generation."""
+
+    try:
+        from biblade_fusion.storage.science_acceptance import (
+            science_runtime_contract_payload,
+            science_runtime_contract_sha256,
+        )
+
+        payload = science_runtime_contract_payload(load_settings(config))
+        digest = science_runtime_contract_sha256(payload)
+        content = (
+            json.dumps(
+                payload,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        if output is not None:
+            destination = output.resolve()
+            if destination.exists():
+                raise FileExistsError(f"science runtime contract already exists: {destination}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content, encoding="utf-8")
+            typer.echo(f"Saved canonical science runtime contract: {destination}")
+        typer.echo(f"Science runtime contract SHA-256: {digest}")
+        typer.echo("Motion authorized: no")
+    except Exception as exc:
+        typer.echo(f"Science runtime contract export failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@safety_app.command("record-science-acceptance")
+def safety_record_science_acceptance(
+    declaration: Annotated[
+        Path,
+        typer.Option(
+            "--declaration",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Completed depth/mask/final-surface physical acceptance JSON.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Record measured geometry quality without authorizing robot motion."""
+
+    try:
+        from biblade_fusion.storage.science_acceptance import (
+            ScienceTestEnvelope,
+            load_science_acceptance_declaration,
+            required_science_test_envelope_for_settings,
+            science_runtime_contract_payload,
+            science_runtime_contract_sha256,
+            write_science_acceptance,
+        )
+
+        settings = load_settings(config)
+        payload = load_science_acceptance_declaration(declaration)
+        envelope = dict(payload["test_envelope"])
+        counts = dict(payload["sample_counts"])
+        required_envelope = required_science_test_envelope_for_settings(settings)
+        declared_envelope = ScienceTestEnvelope(
+            minimum_distance_m=float(envelope["minimum_distance_m"]),
+            maximum_distance_m=float(envelope["maximum_distance_m"]),
+            minimum_incidence_deg=float(envelope["minimum_incidence_deg"]),
+            maximum_incidence_deg=float(envelope["maximum_incidence_deg"]),
+        )
+        declared_envelope.assert_covers(required_envelope)
+        runtime_contract = science_runtime_contract_payload(settings)
+        contract_sha256 = science_runtime_contract_sha256(runtime_contract)
+        evidence = dict(payload["evidence"])
+        declaration_root = declaration.resolve().parent
+
+        def evidence_path(name: str) -> Path:
+            candidate = Path(str(evidence[name]))
+            return (
+                candidate.resolve()
+                if candidate.is_absolute()
+                else (declaration_root / candidate).resolve()
+            )
+
+        stored = write_science_acceptance(
+            output,
+            workcell_id=str(payload["workcell_id"]),
+            operator_id=str(payload["operator_id"]),
+            accepted_at_utc=datetime.fromisoformat(str(payload["accepted_at_utc"])),
+            science_runtime_contract=runtime_contract,
+            geometry_evaluation_report_path=evidence_path("geometry_evaluation_report"),
+            raw_acceptance_asset_manifest_path=evidence_path("raw_acceptance_asset_manifest"),
+            independent_review_report_path=evidence_path("independent_review_report"),
+            limits=dict(payload["limits"]),
+            measurements=dict(payload["measurements"]),
+            minimum_test_distance_m=float(envelope["minimum_distance_m"]),
+            maximum_test_distance_m=float(envelope["maximum_distance_m"]),
+            minimum_test_incidence_deg=float(envelope["minimum_incidence_deg"]),
+            maximum_test_incidence_deg=float(envelope["maximum_incidence_deg"]),
+            depth_reference_sample_count=int(counts["depth_reference"]),
+            annotated_frame_count=int(counts["annotated_frames"]),
+            reconstructed_specimen_count=int(counts["reconstructed_specimens"]),
+            checklist=dict(payload["checklist"]),
+        )
+        stored.assert_matches(
+            acceptance_id=stored.acceptance_id,
+            runtime_contract_sha256=contract_sha256,
+            required_test_envelope=required_envelope,
+        )
+    except Exception as exc:
+        typer.echo(f"Geometry-science acceptance recording failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved immutable geometry-science acceptance: {stored.path}")
+    typer.echo(f"Acceptance ID: {stored.acceptance_id}")
+    typer.echo(f"Metadata SHA-256: {stored.metadata_sha256}")
+    typer.echo("Motion authorized: no; copy the path and ID into the reviewed config")
+
+
+@safety_app.command("begin-runtime-timing-session")
+def safety_begin_runtime_timing_session(
+    host_run_id: Annotated[
+        str,
+        typer.Option(
+            "--host-run-id",
+            help="Unique identifier shared by all cold/warm trials in this host run.",
+        ),
+    ],
+    workcell_id: Annotated[str, typer.Option("--workcell-id")],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Seal the non-moving runtime/boot identity used by timing trace v2."""
+
+    try:
+        from biblade_fusion.storage.runtime_timing_acceptance import (
+            write_runtime_timing_measurement_session,
+        )
+
+        session = write_runtime_timing_measurement_session(
+            output,
+            settings=load_settings(config),
+            host_run_id=host_run_id,
+            workcell_id=workcell_id,
+        )
+    except Exception as exc:
+        typer.echo(f"Runtime-timing measurement session failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved runtime-timing measurement session: {session.path}")
+    typer.echo(f"Measurement session ID: {session.measurement_session_id}")
+    typer.echo(f"Boot ID SHA-256: {session.boot_id_sha256}")
+    typer.echo("Motion authorized: no")
+
+
+@safety_app.command("record-runtime-timing-acceptance")
+def safety_record_runtime_timing_acceptance(
+    declaration: Annotated[
+        Path,
+        typer.Option(
+            "--declaration",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Completed runtime-timing acceptance checklist JSON.",
+        ),
+    ],
+    trial_report: Annotated[
+        Path,
+        typer.Option(
+            "--trial-report",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Machine-generated complete timing-trial report JSON.",
+        ),
+    ],
+    raw_timing_manifest: Annotated[
+        Path,
+        typer.Option(
+            "--raw-timing-manifest",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Machine-generated raw timing source manifest.",
+        ),
+    ],
+    traces: Annotated[
+        list[Path],
+        typer.Option(
+            "--trace",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help=(
+                "Canonical raw timing trace; repeat for every manifest evidence "
+                "entry. All traces are copied into the sealed acceptance asset."
+            ),
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Record measured timing limits without authorizing robot motion."""
+
+    try:
+        from biblade_fusion.storage.runtime_timing_acceptance import (
+            load_runtime_timing_acceptance_declaration,
+            write_runtime_timing_acceptance,
+        )
+
+        payload = load_runtime_timing_acceptance_declaration(declaration)
+        stored = write_runtime_timing_acceptance(
+            output,
+            settings=load_settings(config),
+            workcell_id=payload["workcell_id"],
+            operator_id=payload["operator_id"],
+            accepted_at_utc=datetime.fromisoformat(payload["accepted_at_utc"]),
+            trial_report=trial_report,
+            raw_timing_manifest=raw_timing_manifest,
+            raw_timing_traces=traces,
+            checklist=dict(payload["checklist"]),
+        )
+    except Exception as exc:
+        typer.echo(f"Runtime-timing acceptance recording failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved immutable runtime-timing acceptance: {stored.path}")
+    typer.echo(f"Acceptance ID: {stored.acceptance_id}")
+    typer.echo(f"Metadata SHA-256: {stored.metadata_sha256}")
+    typer.echo("Motion authorized: no; copy the path and ID into the reviewed config")
+
+
+@safety_app.command("build-runtime-timing-report")
+def safety_build_runtime_timing_report(
+    traces: Annotated[
+        list[Path],
+        typer.Option(
+            "--trace",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help=(
+                "Canonical machine timing trace; repeat for all four roles in at least "
+                "three trials."
+            ),
+        ),
+    ],
+    trial_report: Annotated[Path, typer.Option("--trial-report")],
+    raw_timing_manifest: Annotated[Path, typer.Option("--raw-timing-manifest")],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Build canonical acceptance inputs from machine-produced role traces."""
+
+    try:
+        from biblade_fusion.storage.runtime_timing_acceptance import (
+            build_runtime_timing_reports,
+        )
+
+        report, manifest = build_runtime_timing_reports(
+            traces,
+            settings=load_settings(config),
+            trial_report=trial_report,
+            raw_timing_manifest=raw_timing_manifest,
+        )
+    except Exception as exc:
+        typer.echo(f"Runtime-timing report aggregation failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved canonical runtime timing trial report: {report}")
+    typer.echo(f"Saved canonical raw timing manifest: {manifest}")
+    typer.echo("Motion authorized: no")
+
+
 @safety_app.command("preflight-path")
 def safety_preflight_path(
     plan: Annotated[
@@ -2366,22 +3228,15 @@ def safety_preflight_path(
         manual_view_ids = tuple(view_ids or ())
         if bool(manual_view_ids) == (coverage_plan is not None):
             raise ValueError(
-                "Supply exactly one ordering source: repeated --view-id or "
-                "--coverage-plan"
+                "Supply exactly one ordering source: repeated --view-id or --coverage-plan"
             )
         if coverage_plan is not None:
             stored_coverage_plan = read_coverage_driven_plan(coverage_plan)
             bound_view_plan = Path(
-                str(
-                    stored_coverage_plan.metadata["sources"]["view_plan"][
-                        "root"
-                    ]
-                )
+                str(stored_coverage_plan.metadata["sources"]["view_plan"]["root"])
             ).resolve()
             if bound_view_plan != plan.resolve():
-                raise ValueError(
-                    "Coverage sequence does not belong to the supplied view plan"
-                )
+                raise ValueError("Coverage sequence does not belong to the supplied view plan")
             ordered_view_ids = stored_coverage_plan.plan.sequence.ordered_view_ids
             if not ordered_view_ids:
                 raise ValueError(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -112,7 +113,7 @@ def test_pinocchio_collision_fails_closed_for_invalid_joint_state() -> None:
     assert result.motion_authorized is False
 
 
-def test_pinocchio_path_sampling_catches_folded_endpoint() -> None:
+def test_pinocchio_swept_proof_catches_folded_endpoint() -> None:
     report = Cs68PinocchioCollisionChecker.from_resources().check_path(
         (0.0,) * 6,
         (0.0, -3.0, 3.0, -3.0, 0.0, 0.0),
@@ -120,9 +121,103 @@ def test_pinocchio_path_sampling_catches_folded_endpoint() -> None:
     )
 
     assert report.status is CollisionCheckStatus.BLOCKED
-    assert report.sample_count == 31
+    assert report.sample_count >= 1
     assert report.blocked_sample_index is not None
+    assert report.proof_evidence is not None
+    assert report.proof_evidence.termination_reason == "collision_witness"
+    assert report.continuous_swept_volume_verified is False
     assert report.motion_authorized is False
+
+
+def test_pinocchio_swept_proof_catches_collision_between_clear_endpoints() -> None:
+    start = (
+        -0.2737750906072358,
+        -2.54313081933306,
+        2.279988088139635,
+        0.22151955229468578,
+        3.430021029598457,
+        1.29868549579151,
+    )
+    goal = (
+        -0.03207170843024487,
+        -2.5216118685608597,
+        2.230088509205807,
+        0.6655138082761458,
+        4.092408338680695,
+        2.199323664730734,
+    )
+    checker = Cs68PinocchioCollisionChecker.from_resources()
+    assert checker.check(start).status is CollisionCheckStatus.CLEAR
+    assert checker.check(goal).status is CollisionCheckStatus.CLEAR
+
+    report = checker.check_path(
+        start,
+        goal,
+        maximum_joint_step_rad=1.0,
+    )
+
+    assert report.status is CollisionCheckStatus.BLOCKED
+    assert report.blocked_path_fraction == 0.5
+    assert report.proof_evidence is not None
+    assert report.proof_evidence.termination_reason == "collision_witness"
+
+
+def test_pinocchio_clear_path_has_integrity_bound_continuous_proof() -> None:
+    start = (0.0,) * 6
+    goal = (0.02, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    report = Cs68PinocchioCollisionChecker.from_resources().check_path(
+        start,
+        goal,
+        maximum_joint_step_rad=0.02,
+    )
+
+    assert report.status is CollisionCheckStatus.CLEAR
+    assert report.continuous_swept_volume_verified is True
+    assert report.continuous_swept_volume_evidence_valid is True
+    assert report.proof_evidence is not None
+    assert report.proof_evidence.matches_path(start, goal)
+    assert report.proof_evidence.certified_interval_count >= 1
+    assert report.proof_evidence.minimum_certificate_margin_m is not None
+    assert report.proof_evidence.minimum_certificate_margin_m > 0.0
+    assert report.result.diagnostics["continuous_sweep_backend"] == (
+        "adaptive_midpoint_fcl_lipschitz_tracking_envelope_sweep"
+    )
+
+
+def test_pinocchio_swept_proof_limit_returns_unknown_not_sampled_clear() -> None:
+    report = Cs68PinocchioCollisionChecker.from_resources().check_path(
+        (0.0,) * 6,
+        (0.02, 0.0, 0.0, 0.0, 0.0, 0.0),
+        maximum_joint_step_rad=0.02,
+        maximum_subdivision_depth=0,
+    )
+
+    assert report.status is CollisionCheckStatus.UNKNOWN
+    assert report.continuous_swept_volume_verified is False
+    assert report.proof_evidence is not None
+    assert report.proof_evidence.termination_reason == "subdivision_limit"
+    assert "unproven:subdivision_limit" in report.result.blocking_reasons[0]
+
+
+def test_pinocchio_swept_proof_tampering_invalidates_certificate() -> None:
+    report = Cs68PinocchioCollisionChecker.from_resources().check_path(
+        (0.0,) * 6,
+        (0.02, 0.0, 0.0, 0.0, 0.0, 0.0),
+        maximum_joint_step_rad=0.02,
+    )
+    assert report.proof_evidence is not None
+
+    tampered = replace(
+        report,
+        proof_evidence=replace(
+            report.proof_evidence,
+            certified_interval_count=report.proof_evidence.certified_interval_count + 1,
+        ),
+    )
+
+    assert tampered.continuous_swept_volume_verified is True
+    assert tampered.continuous_swept_volume_evidence_valid is False
 
 
 def test_pinocchio_workcell_box_is_checked_against_robot_meshes() -> None:
@@ -197,6 +292,25 @@ def test_strict_es68_checker_binds_active_manifest_and_mesh_hash(tmp_path: Path)
     assert checker.collision_model_hash is not None
     assert len(checker.collision_model_hash) == 64
     assert checker.geometry_model.ngeoms == 8
+
+    swept = checker.check_path(
+        (0.0,) * 6,
+        (0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+        maximum_joint_step_rad=0.01,
+    )
+    assert swept.status is CollisionCheckStatus.CLEAR
+    assert swept.continuous_swept_volume_evidence_valid is True
+    assert swept.proof_evidence is not None
+    assert swept.result.diagnostics["model"] == "elite_es68"
+    assert swept.result.diagnostics["collision_model_hash"] == (
+        checker.collision_model_hash
+    )
+    assert swept.result.diagnostics["robot_geometry_hash"] == (
+        checker.robot_geometry_hash
+    )
+    assert swept.result.diagnostics["motion_model_contract_hash"] == (
+        checker.motion_model_contract_hash
+    )
 
 
 def test_renderer_and_checker_share_nonzero_offset_robot_geometry_hash(

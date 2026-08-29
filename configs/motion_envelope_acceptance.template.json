@@ -1,0 +1,26 @@
+{
+  "workcell_id": "REPLACE_WITH_WORKCELL_ID",
+  "operator_id": "REPLACE_WITH_OPERATOR_ID",
+  "accepted_at_utc": "REPLACE_WITH_UTC_ISO8601",
+  "maximum_tracking_deviation_rad": [null, null, null, null, null, null],
+  "maximum_stop_drift_rad": [null, null, null, null, null, null],
+  "safety_margin_factor": null,
+  "maximum_feedback_interval_s": null,
+  "maximum_stop_acknowledgement_s": null,
+  "maximum_stopped_actual_joint_velocity_rad_s": null,
+  "maximum_stopped_target_joint_velocity_rad_s": null,
+  "maximum_stopped_actual_tcp_linear_velocity_m_s": null,
+  "maximum_stopped_actual_tcp_angular_velocity_rad_s": null,
+  "maximum_stopped_target_tcp_linear_velocity_m_s": null,
+  "maximum_stopped_target_tcp_angular_velocity_rad_s": null,
+  "trial_count": null,
+  "checklist": {
+    "final_collision_assembly_verified": false,
+    "final_servoj_configuration_verified": false,
+    "representative_workspace_paths_verified": false,
+    "intentional_tracking_fault_stop_verified": false,
+    "bootstrap_multichannel_stop_verified": false,
+    "segment_boundary_stop_verified": false,
+    "emergency_stop_verified": false
+  }
+}

@@ -197,8 +197,9 @@ def test_motion_readiness_warns_while_motion_is_disabled() -> None:
 
     assert result.level is doctor.CheckLevel.WARN
     assert result.details["motion_ready"] is False
-    assert result.details["continuous_swept_mesh_supported"] is False
-    assert result.details["continuous_swept_occupancy_supported"] is False
+    assert result.details["continuous_swept_mesh_supported"] is True
+    assert result.details["continuous_swept_occupancy_supported"] is True
+    assert result.details["accepted_static_free_configured"] is False
     assert result.details["doctor_authorizes_motion"] is False
 
 
@@ -210,3 +211,48 @@ def test_motion_readiness_fails_if_motion_is_enabled() -> None:
 
     assert result.level is doctor.CheckLevel.FAIL
     assert result.details["motion_enabled"] is True
+
+
+def test_runtime_timing_doctor_warns_offline_and_fails_when_enabled() -> None:
+    settings = load_settings("configs/default.yaml")
+
+    offline = doctor._check_runtime_timing_acceptance(settings)
+    settings.stop_and_capture.enabled = True
+    enabled = doctor._check_runtime_timing_acceptance(settings)
+
+    assert offline.level is doctor.CheckLevel.WARN
+    assert enabled.level is doctor.CheckLevel.FAIL
+    assert "runtime_timing_acceptance_path/id" in enabled.details["missing"]
+
+
+def test_runtime_timing_doctor_strictly_checks_bound_asset(monkeypatch) -> None:
+    settings = load_settings("configs/default.yaml")
+    stop = settings.stop_and_capture.model_copy(
+        update={
+            "maximum_perception_cycle_duration_s": 2.0,
+            "maximum_operator_reposition_interval_s": 4.0,
+            "maximum_segment_execution_duration_s": 6.0,
+            "maximum_schema5_handoff_duration_s": 5.0,
+            "runtime_timing_acceptance_path": Path("/tmp/timing").resolve(),
+            "runtime_timing_acceptance_id": "a" * 64,
+        }
+    )
+    settings = settings.model_copy(update={"stop_and_capture": stop})
+    calls = []
+    acceptance = SimpleNamespace(
+        metadata_sha256="b" * 64,
+        trial_count=3,
+        raw_evidence_count=12,
+        assert_matches=lambda **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "read_runtime_timing_acceptance",
+        lambda path: acceptance if Path(path).resolve() == Path("/tmp/timing") else None,
+    )
+
+    result = doctor._check_runtime_timing_acceptance(settings)
+
+    assert result.level is doctor.CheckLevel.PASS
+    assert calls == [{"settings": settings, "acceptance_id": "a" * 64}]
+    assert result.details["raw_evidence_count"] == 12

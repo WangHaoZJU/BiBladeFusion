@@ -57,11 +57,15 @@ _MOTION_SAFE_SAFETY_MODES = {1, 2}  # NORMAL, REDUCED
 _OUTPUT_RECIPE = [
     "actual_joint_positions",
     "actual_joint_speeds",
+    "target_joint_speeds",
     "actual_joint_torques",
     "actual_TCP_pose",
+    "actual_TCP_speed",
+    "target_TCP_speed",
     "robot_mode",
     "safety_status",
     "speed_scaling",
+    "runtime_state",
     "timestamp",
 ]
 _INPUT_RECIPE = ["speed_slider_fraction"]
@@ -182,6 +186,12 @@ class EliteArm:
 
         with self._stop_lock:
             return self._stop_generation
+
+    @property
+    def stop_snapshot(self) -> tuple[int, bool]:
+        """Return one atomic, read-only ``(generation, stopped)`` snapshot."""
+
+        return self._stop_snapshot()
 
     @property
     def robot_config(self) -> RobotConfig:
@@ -322,12 +332,21 @@ class EliteArm:
         with self._state_lock:
             rtsi = self._rtsi
             controller_time_s = float(rtsi.getTimestamp())
-            joint_positions_rad = np.asarray(
-                rtsi.getActualJointPositions(), dtype=np.float64
+            joint_positions_rad = np.asarray(rtsi.getActualJointPositions(), dtype=np.float64)
+            actual_joint_velocity = np.asarray(
+                rtsi.getActualJointVelocity(),
+                dtype=np.float64,
+            )
+            target_joint_velocity = np.asarray(
+                rtsi.getTargetJointVelocity(),
+                dtype=np.float64,
             )
             base_t_tcp = elite_tcp_pose_to_se3(rtsi.getActualTCPPose())
+            actual_tcp_velocity = np.asarray(rtsi.getActualTCPVelocity(), dtype=np.float64)
+            target_tcp_velocity = np.asarray(rtsi.getTargetTCPVelocity(), dtype=np.float64)
             robot_mode = _enum_label(rtsi.getRobotMode())
             safety_status = _enum_label(rtsi.getSafetyStatus())
+            runtime_state = _enum_label(rtsi.getRuntimeState())
             speed_scaling = float(rtsi.getActualSpeedScaling())
             # Timestamp the completed serialized RTSI snapshot, not the beginning
             # of a sequence of vendor getters whose latency is otherwise hidden.
@@ -340,6 +359,11 @@ class EliteArm:
             robot_mode=robot_mode,
             safety_status=safety_status,
             speed_scaling=speed_scaling,
+            runtime_state=runtime_state,
+            actual_joint_velocity_rad_s=actual_joint_velocity,
+            target_joint_velocity_rad_s=target_joint_velocity,
+            actual_tcp_velocity=actual_tcp_velocity,
+            target_tcp_velocity=target_tcp_velocity,
         )
 
     def move_joints(
@@ -349,9 +373,7 @@ class EliteArm:
         timeout_s: float | None = None,
     ) -> None:
         del joint_positions_rad, timeout_s
-        raise RobotMotionDisabledError(
-            "Direct joint motion is disabled; use GuardedEliteExecutor"
-        )
+        raise RobotMotionDisabledError("Direct joint motion is disabled; use GuardedEliteExecutor")
 
     def _guarded_move_joints(
         self,
@@ -385,9 +407,7 @@ class EliteArm:
     ) -> None:
         require_guarded_motion_capability(capability)
         if target.parent_frame not in {"base", "elite_b_base"}:
-            raise RobotCommandError(
-                "Elite TCP target must be expressed in base or elite_b_base"
-            )
+            raise RobotCommandError("Elite TCP target must be expressed in base or elite_b_base")
         pose = se3_to_elite_tcp_pose(target).tolist()
         with self._motion_lock:
             self._ensure_ready_for_motion()
@@ -399,8 +419,6 @@ class EliteArm:
 
     def stop(self) -> None:
         self._ensure_connected()
-        if self._driver is None:
-            raise RobotNotEnabledError("EliteDriver is unavailable")
         # Latch software motion off before touching the transport.  A rejected or
         # failed writeIdle leaves physical state uncertain and must never leave the
         # backend locally eligible for another unreviewed command.
@@ -410,11 +428,78 @@ class EliteArm:
             # stream.  Any in-flight old-generation ServoJ completes before this
             # writeIdle; all later old-generation writes fail inside the same gate.
             with self._command_io_lock:
-                accepted = self._driver.writeIdle(0)
+                if self._driver is not None and self._driver.isRobotConnected():
+                    accepted = self._driver.writeIdle(0)
+                    stop_transport = "writeIdle"
+                else:
+                    # Bootstrap is intentionally unpowered and may have no reverse
+                    # EliteDriver session yet.  Dashboard stopProgram is the only
+                    # non-motion controller stop available in that state.  The
+                    # caller must still verify sampled RTSI stationarity before
+                    # treating a capture as stopped.
+                    stop_program = getattr(self._dashboard, "stopProgram", None)
+                    if stop_program is None:
+                        raise RobotCommandError(
+                            "Dashboard does not expose stopProgram for bootstrap stop"
+                        )
+                    accepted = stop_program()
+                    stop_transport = "Dashboard stopProgram"
+        except RobotCommandError:
+            raise
         except Exception as exc:
             raise RobotCommandError("failed to stop Elite arm") from exc
         if accepted is False:
-            raise RobotCommandError("writeIdle rejected stop command")
+            raise RobotCommandError(f"{stop_transport} rejected stop command")
+
+    def _guarded_deadline_stop(self, *, capability: object) -> None:
+        """Latch motion off and request Dashboard stop outside ServoJ's I/O lock.
+
+        ``writeServoj`` is a vendor call made while ``_command_io_lock`` is held.
+        A deadline watchdog must not queue behind that same lock, so this private,
+        capability-gated path uses the already connected Dashboard channel
+        directly.  Dashboard acceptance is still a transport acknowledgement,
+        not proof of controller stationarity; the coordinator retains its normal
+        boundary stop and stationarity checks.
+        """
+
+        require_guarded_motion_capability(capability)
+        self._ensure_connected()
+        self._latch_stop()
+        dashboard = self._dashboard
+        stop_program = getattr(dashboard, "stopProgram", None)
+        if stop_program is None:
+            raise RobotCommandError(
+                "Dashboard does not expose independent deadline stopProgram"
+            )
+        try:
+            accepted = stop_program()
+        except Exception as exc:
+            raise RobotCommandError("independent deadline stopProgram failed") from exc
+        if accepted is False:
+            raise RobotCommandError("Dashboard rejected independent deadline stopProgram")
+
+    def establish_bootstrap_controller_stop(self) -> int:
+        """Issue the explicit unpowered startup stop contract via Dashboard only.
+
+        This is deliberately distinct from a segment-boundary ``writeIdle``.  It
+        never creates reverse control, powers the arm, releases brakes, or clears a
+        stop latch.  The caller must still prove multi-channel RTSI stationarity.
+        """
+
+        self._ensure_connected()
+        if self._enabled or self._driver is not None:
+            raise RobotCommandError(
+                "Bootstrap controller stop requires an unpowered, driver-free connection"
+            )
+        generation = self._latch_stop()
+        try:
+            with self._command_io_lock:
+                accepted = self._dashboard.stopProgram()
+        except Exception as exc:
+            raise RobotCommandError("Dashboard bootstrap stopProgram failed") from exc
+        if accepted is False:
+            raise RobotCommandError("Dashboard rejected bootstrap stopProgram")
+        return generation
 
     def write_joint_velocity(
         self,
@@ -423,9 +508,7 @@ class EliteArm:
         timeout_ms: int,
     ) -> None:
         del joint_velocity_rad_s, timeout_ms
-        raise RobotMotionDisabledError(
-            "Direct SpeedJ motion is disabled; use GuardedEliteExecutor"
-        )
+        raise RobotMotionDisabledError("Direct SpeedJ motion is disabled; use GuardedEliteExecutor")
 
     def _guarded_write_joint_velocity(
         self,
@@ -499,6 +582,7 @@ class EliteArm:
         *,
         expected_stop_generation: int,
         capability: object,
+        deadline_exceeded: Callable[[], bool] | None = None,
     ) -> None:
         """Clear a prior stop latch without sending a motion command.
 
@@ -509,17 +593,18 @@ class EliteArm:
         """
 
         require_guarded_motion_capability(capability)
-        if (
-            type(expected_stop_generation) is not int
-            or expected_stop_generation < 0
-        ):
+        self._raise_if_execution_deadline(
+            deadline_exceeded,
+            stage="before approved ServoJ recovery",
+        )
+        if type(expected_stop_generation) is not int or expected_stop_generation < 0:
             raise ValueError("expected_stop_generation must be a non-negative integer")
         self._ensure_motion_configured()
         self._ensure_connected()
-        generation, _ = self._stop_snapshot()
-        if generation != expected_stop_generation:
+        generation, stopped = self._stop_snapshot()
+        if generation != expected_stop_generation or not stopped:
             raise RobotMotionInterruptedError(
-                "Elite stop generation changed before approved ServoJ recovery"
+                "Elite stop latch changed before approved ServoJ recovery"
             )
         with self._motion_lock:
             if not self._enabled:
@@ -530,15 +615,127 @@ class EliteArm:
             if self._driver is None:
                 raise RobotNotEnabledError("EliteDriver is unavailable")
             self._ensure_driver_reverse_connected()
+            self._raise_if_execution_deadline(
+                deadline_exceeded,
+                stage="during approved ServoJ recovery",
+            )
             # Compare-and-clear only after every non-motion prerequisite.  stop()
             # never takes _motion_lock, so a newer stop can win while recovery is
             # waiting on reverse-control setup.
             with self._stop_lock:
-                if self._stop_generation != expected_stop_generation:
+                if self._stop_generation != expected_stop_generation or not self._stopped:
                     raise RobotMotionInterruptedError(
-                        "Elite stop generation changed during approved ServoJ recovery"
+                        "Elite stop latch changed during approved ServoJ recovery"
                     )
+                # The generation comparison and latch clear are one atomic state
+                # transition with respect to stop().  Clearing outside this lock
+                # could otherwise overwrite a concurrently latched newer stop.
                 self._stopped = False
+
+    def _guarded_enable_for_servoj_control(
+        self,
+        *,
+        expected_stop_generation: int,
+        capability: object,
+        deadline_exceeded: Callable[[], bool] | None = None,
+    ) -> None:
+        """Power/brake the arm after permit consumption without clearing its stop.
+
+        Unknown-space bootstrap deliberately keeps the controller stopped and does
+        not power the arm merely because the runtime was opened.  Consequently the
+        first approved segment may need hardware preparation.  This private,
+        capability-gated primitive performs only Dashboard/reverse-control setup;
+        the stop generation and stop latch must remain unchanged.  The existing
+        guarded resume primitive is the sole operation that may compare-and-clear
+        that latch before ServoJ.
+        """
+
+        require_guarded_motion_capability(capability)
+        self._raise_if_execution_deadline(
+            deadline_exceeded,
+            stage="before guarded enable",
+        )
+        if type(expected_stop_generation) is not int or expected_stop_generation < 0:
+            raise ValueError("expected_stop_generation must be a non-negative integer")
+        self._ensure_motion_configured()
+        self._ensure_connected()
+        generation, stopped = self._stop_snapshot()
+        if generation != expected_stop_generation or not stopped:
+            raise RobotMotionInterruptedError(
+                "Guarded enable requires the exact approved stop latch"
+            )
+        if self._enabled:
+            self._raise_if_execution_deadline(
+                deadline_exceeded,
+                stage="during guarded enable",
+            )
+            return
+        self._connect_driver()
+
+        def require_exact_latch(stage: str) -> None:
+            current_generation, current_stopped = self._stop_snapshot()
+            if current_generation != expected_stop_generation or not current_stopped:
+                raise RobotMotionInterruptedError(
+                    f"Elite arm stop latch changed {stage} during guarded enable"
+                )
+
+        try:
+            if not self._dashboard.powerOn():
+                raise RobotNotEnabledError("Dashboard powerOn() failed")
+            self._raise_if_execution_deadline(
+                deadline_exceeded,
+                stage="after powerOn",
+            )
+            require_exact_latch("after powerOn")
+            if not self._dashboard.brakeRelease():
+                raise RobotNotEnabledError("Dashboard brakeRelease() failed")
+            self._raise_if_execution_deadline(
+                deadline_exceeded,
+                stage="after brakeRelease",
+            )
+            require_exact_latch("after brakeRelease")
+            scaling = min(
+                self._config.default_speed_scaling,
+                self._config.maximum_speed_scaling,
+            )
+            self._dashboard.setSpeedScaling(max(1, min(100, int(scaling * 100))))
+            self._raise_if_execution_deadline(
+                deadline_exceeded,
+                stage="after speed scaling",
+            )
+            require_exact_latch("after speed scaling")
+            self._wait_driver_connected()
+            self._raise_if_execution_deadline(
+                deadline_exceeded,
+                stage="after reverse connection",
+            )
+            require_exact_latch("after reverse connection")
+            with self._stop_lock:
+                if self._stop_generation != expected_stop_generation or not self._stopped:
+                    raise RobotMotionInterruptedError(
+                        "Elite arm stop latch changed during guarded enable"
+                    )
+                self._enabled = True
+        except BaseException as exc:
+            # Power/brake may already have partially succeeded.  Never leave that
+            # partial preparation standing after a newer stop or setup failure.
+            self._enabled = False
+            with suppress(BaseException):
+                if self._driver is not None and self._driver.isRobotConnected():
+                    with self._command_io_lock:
+                        self._driver.writeIdle(0)
+                else:
+                    stop_program = getattr(self._dashboard, "stopProgram", None)
+                    if stop_program is not None:
+                        stop_program()
+            with suppress(BaseException):
+                self._dashboard.powerOff()
+            if isinstance(
+                exc,
+                (RobotMotionInterruptedError, RobotNotEnabledError),
+            ):
+                raise
+            raise RobotNotEnabledError("failed to guarded-enable Elite arm") from exc
 
     def _guarded_prepare_servoj_stream(
         self,
@@ -547,27 +744,42 @@ class EliteArm:
         warmup_duration_s: float = 0.0,
         expected_stop_generation: int,
         capability: object,
+        deadline_exceeded: Callable[[], bool] | None = None,
     ) -> None:
         """Prime the reverse socket with the current joint position before ServoJ."""
 
         require_guarded_motion_capability(capability)
+        self._raise_if_execution_deadline(
+            deadline_exceeded,
+            stage="before ServoJ preparation",
+        )
         if dt_s <= 0.0 or warmup_duration_s < 0.0:
             raise ValueError("ServoJ timing values are invalid")
         self._ensure_ready_for_motion()
         self._ensure_driver_reverse_connected()
-        positions = self._validated_joint_vector(
-            self._read_actual_joint_positions()
-        )
+        positions = self._validated_joint_vector(self._read_actual_joint_positions())
         with self._motion_lock:
             if warmup_duration_s == 0.0:
+                self._raise_if_execution_deadline(
+                    deadline_exceeded,
+                    stage="before ServoJ preparation write",
+                )
                 self._write_servoj_joint(
                     positions,
                     timeout_ms=_SERVOJ_HOLD_TIMEOUT_MS,
                     expected_stop_generation=expected_stop_generation,
                 )
+                self._raise_if_execution_deadline(
+                    deadline_exceeded,
+                    stage="after ServoJ preparation write",
+                )
                 return
             deadline = self._stream_time() + warmup_duration_s
             while self._stream_time() < deadline:
+                self._raise_if_execution_deadline(
+                    deadline_exceeded,
+                    stage="during ServoJ warmup",
+                )
                 tick = self._stream_time()
                 self._write_servoj_joint(
                     positions,
@@ -580,6 +792,10 @@ class EliteArm:
                 )
                 if remaining:
                     self._sleep(remaining)
+            self._raise_if_execution_deadline(
+                deadline_exceeded,
+                stage="after ServoJ warmup",
+            )
 
     def write_servoj_hold(
         self,
@@ -588,9 +804,7 @@ class EliteArm:
         timeout_ms: int = _SERVOJ_HOLD_TIMEOUT_MS,
     ) -> None:
         del joint_positions_rad, timeout_ms
-        raise RobotMotionDisabledError(
-            "Direct ServoJ hold is disabled; use GuardedEliteExecutor"
-        )
+        raise RobotMotionDisabledError("Direct ServoJ hold is disabled; use GuardedEliteExecutor")
 
     def _guarded_write_servoj_hold(
         self,
@@ -633,6 +847,7 @@ class EliteArm:
         expected_stop_generation: int,
         capability: object,
         tracking_samples: list[dict[str, Any]] | None = None,
+        deadline_exceeded: Callable[[], bool] | None = None,
     ) -> StreamServoJResult:
         """Send a fixed-rate ServoJ stream with HoloRobot timing/tracking aborts."""
 
@@ -651,6 +866,7 @@ class EliteArm:
                 config=config,
                 expected_stop_generation=expected_stop_generation,
                 tracking_samples=tracking_samples,
+                deadline_exceeded=deadline_exceeded,
             )
 
     def _stream_servoj_locked(
@@ -660,6 +876,7 @@ class EliteArm:
         config: ServoJStreamConfig,
         expected_stop_generation: int,
         tracking_samples: list[dict[str, Any]] | None,
+        deadline_exceeded: Callable[[], bool] | None,
     ) -> StreamServoJResult:
         now = self._stream_time
         start = now()
@@ -696,6 +913,9 @@ class EliteArm:
             previous_tick = tick
             if self._is_stopped():
                 return result(False, "operator_stop")
+            if self._execution_deadline_exceeded(deadline_exceeded):
+                self._latch_stop()
+                return result(False, "execution_deadline_exceeded")
             write_start = now()
             try:
                 self._write_servoj_joint(
@@ -712,28 +932,28 @@ class EliteArm:
             write_durations.append(write_end - write_start)
             commands_sent = index + 1
             last_index = index
+            if self._execution_deadline_exceeded(deadline_exceeded):
+                self._latch_stop()
+                return result(False, "execution_deadline_exceeded")
 
-            tracking_check = (
-                index > 0
-                and index % config.tracking_check_every_n_commands == 0
-            )
+            tracking_check = index > 0 and index % config.tracking_check_every_n_commands == 0
             actual: list[float] | None = None
             if tracking_check or tracking_samples is not None:
                 try:
-                    actual = self._validated_joint_vector(
-                        self._read_actual_joint_positions()
-                    )
+                    actual = self._validated_joint_vector(self._read_actual_joint_positions())
                 except Exception:
                     self._latch_stop()
                     return result(False, "feedback_stale")
             loop_end = now()
             loop_duration = loop_end - tick
             loop_durations.append(loop_duration)
+            if self._execution_deadline_exceeded(deadline_exceeded):
+                self._latch_stop()
+                return result(False, "execution_deadline_exceeded")
 
             if actual is not None:
                 error = max(
-                    abs(target - measured)
-                    for target, measured in zip(command, actual, strict=True)
+                    abs(target - measured) for target, measured in zip(command, actual, strict=True)
                 )
                 maximum_tracking_error = max(maximum_tracking_error, error)
                 if tracking_samples is not None:
@@ -742,9 +962,7 @@ class EliteArm:
                             "index": index,
                             "planned_t_s": round(index * stream.dt_s, 6),
                             "send_t_s": round(write_start - start, 6),
-                            "write_duration_ms": round(
-                                (write_end - write_start) * 1000.0, 3
-                            ),
+                            "write_duration_ms": round((write_end - write_start) * 1000.0, 3),
                             "q_cmd": list(command),
                             "q_actual": actual,
                             "max_error_rad": error,
@@ -753,21 +971,13 @@ class EliteArm:
                     )
                 if tracking_check:
                     consecutive_tracking = (
-                        consecutive_tracking + 1
-                        if error > config.tracking_error_rad
-                        else 0
+                        consecutive_tracking + 1 if error > config.tracking_error_rad else 0
                     )
-                    if (
-                        consecutive_tracking
-                        >= config.max_consecutive_tracking_violations
-                    ):
+                    if consecutive_tracking >= config.max_consecutive_tracking_violations:
                         self._latch_stop()
                         return result(False, "tracking_error_exceeded")
 
-            if (
-                index > 0
-                and loop_duration > config.timing_violation_factor * stream.dt_s
-            ):
+            if index > 0 and loop_duration > config.timing_violation_factor * stream.dt_s:
                 consecutive_timing += 1
             else:
                 consecutive_timing = 0
@@ -780,6 +990,9 @@ class EliteArm:
                 while now() < deadline:
                     if self._is_stopped():
                         return result(False, "operator_stop")
+                    if self._execution_deadline_exceeded(deadline_exceeded):
+                        self._latch_stop()
+                        return result(False, "execution_deadline_exceeded")
                     self._sleep(min(0.01, deadline - now()))
         return result(True, None)
 
@@ -900,9 +1113,7 @@ class EliteArm:
                 "failed to read or parse robot safety status; motion is blocked"
             ) from exc
         if safety not in _MOTION_SAFE_SAFETY_MODES:
-            raise RobotHardwareFaultError(
-                f"robot safety mode {safety} forbids motion"
-            )
+            raise RobotHardwareFaultError(f"robot safety mode {safety} forbids motion")
 
     def _wait_driver_connected(self) -> None:
         if self._driver is None:
@@ -948,9 +1159,7 @@ class EliteArm:
         if not self._enabled:
             raise RobotNotEnabledError("Elite arm is not enabled")
         if self._is_stopped():
-            raise RobotMotionInterruptedError(
-                "Elite arm is stopped; call enable() before motion"
-            )
+            raise RobotMotionInterruptedError("Elite arm is stopped; call enable() before motion")
         self._raise_for_safety()
 
     def _stop_snapshot(self) -> tuple[int, bool]:
@@ -959,6 +1168,29 @@ class EliteArm:
 
     def _is_stopped(self) -> bool:
         return self._stop_snapshot()[1]
+
+    @staticmethod
+    def _execution_deadline_exceeded(
+        callback: Callable[[], bool] | None,
+    ) -> bool:
+        if callback is None:
+            return False
+        value = callback()
+        if type(value) is not bool:
+            raise RobotCommandError("execution deadline callback must return bool")
+        return value
+
+    def _raise_if_execution_deadline(
+        self,
+        callback: Callable[[], bool] | None,
+        *,
+        stage: str,
+    ) -> None:
+        if self._execution_deadline_exceeded(callback):
+            self._latch_stop()
+            raise RobotMotionInterruptedError(
+                f"segment execution deadline exceeded {stage}"
+            )
 
     def _latch_stop(self) -> int:
         """Atomically publish a new stop before any potentially blocking I/O."""
@@ -992,11 +1224,7 @@ class EliteArm:
             return self._rtsi.getSafetyStatus()
 
     def _normalize_timeout(self, timeout_s: float | None) -> float:
-        timeout = (
-            self._config.default_motion_timeout_s
-            if timeout_s is None
-            else float(timeout_s)
-        )
+        timeout = self._config.default_motion_timeout_s if timeout_s is None else float(timeout_s)
         if timeout <= 0.0 or timeout > self._config.maximum_motion_timeout_s:
             raise ValueError(
                 "motion timeout must be positive and not exceed "

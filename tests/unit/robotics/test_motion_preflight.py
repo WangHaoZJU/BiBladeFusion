@@ -65,7 +65,7 @@ def test_preflight_fails_closed_without_required_occupancy(checker) -> None:
     assert report.ready_for_approval is False
 
 
-def test_discrete_mesh_checker_is_blocked_without_swept_volume_evidence() -> None:
+def test_real_mesh_checker_produces_swept_volume_evidence() -> None:
     checker = Cs68PinocchioCollisionChecker.from_resources()
     report = preflight_linear_joint_motion(
         (0.0,) * 6,
@@ -74,9 +74,10 @@ def test_discrete_mesh_checker_is_blocked_without_swept_volume_evidence() -> Non
         require_occupancy=False,
     )
 
-    assert report.status is MotionPreflightStatus.BLOCKED
-    assert report.blocking_reasons == ("continuous_swept_mesh_unavailable",)
-    assert report.servoj_stream is None
+    assert report.status is MotionPreflightStatus.CLEAR
+    assert report.collision is not None
+    assert report.collision.continuous_swept_volume_evidence_valid is True
+    assert report.servoj_stream is not None
     assert report.ready_for_approval is False
 
 
@@ -163,7 +164,7 @@ def test_mesh_only_diagnostic_cannot_be_approved(checker) -> None:
     assert "continuous_swept_mesh_disabled_offline_diagnostic_only" in report.warnings
 
 
-def test_discrete_occupancy_path_is_blocked_without_continuous_sweep_proof(
+def test_real_occupancy_checker_produces_continuous_sweep_proof(
     checker, occupancy_snapshot
 ) -> None:
     occupancy = OccupancyRobotCollisionChecker(
@@ -179,12 +180,12 @@ def test_discrete_occupancy_path_is_blocked_without_continuous_sweep_proof(
         occupancy_checker=occupancy,
     )
 
-    assert report.status is MotionPreflightStatus.BLOCKED
-    assert report.blocking_reasons == ("continuous_swept_occupancy_unavailable",)
-    assert report.servoj_stream is None
+    assert report.status is MotionPreflightStatus.CLEAR
+    assert report.blocking_reasons == ()
+    assert report.servoj_stream is not None
     assert report.occupancy is not None
     assert report.occupancy.status.value == "clear"
-    assert report.occupancy.continuous_swept_volume_verified is False
+    assert report.occupancy.continuous_swept_volume_evidence_valid is True
     assert report.ready_for_approval is False
 
 

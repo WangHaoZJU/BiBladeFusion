@@ -1,10 +1,10 @@
 """Serial FoundationStereo stop-and-capture coordination for one short motion leg.
 
-This module deliberately exposes no CLI and no raw robot command.  It composes the
-existing full semantic occupancy reader, one-leg preflight, guarded executor, and
-stationarity gate into a receding-horizon state machine.  The production collision
-checkers currently lack both continuous sweep proofs, so the same code reaches
-``MOTION_BLOCKED`` before any driver call until those independent proofs exist.
+This module deliberately exposes no raw robot command.  It composes the existing
+full semantic occupancy reader, one-leg preflight, guarded executor, and stationarity
+gate into a receding-horizon state machine.  Both continuous proofs remain bound to
+the exact path, geometry, occupancy generation, and safety policy used for a segment;
+any missing or stale evidence blocks before the driver call.
 """
 
 from __future__ import annotations
@@ -14,10 +14,11 @@ import json
 import math
 import re
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -40,6 +41,7 @@ from biblade_fusion.devices.robot.streaming import StreamServoJResult
 from biblade_fusion.mapping import OccupancyMapState, OccupancySnapshot
 from biblade_fusion.planning import CandidateStatus, EvaluatedCandidate
 from biblade_fusion.robotics import (
+    AcceptedStaticFreeAabb,
     Cs68PinocchioCollisionChecker,
     GuardedEliteExecutor,
     JointMotionPreflight,
@@ -47,7 +49,10 @@ from biblade_fusion.robotics import (
     OccupancyRobotCollisionChecker,
     load_es68_flange_t_tcp,
 )
-from biblade_fusion.robotics.guarded_execution import GuardedArm
+from biblade_fusion.robotics.guarded_execution import (
+    EmergencyStopUnconfirmedError,
+    GuardedArm,
+)
 from biblade_fusion.robotics.stationarity import (
     StationarityEvidence,
     validate_stationary_trace,
@@ -57,6 +62,9 @@ from biblade_fusion.storage.blade_foreground import read_blade_foreground_mask
 from biblade_fusion.storage.inference_stationarity import (
     read_inference_stationarity,
 )
+from biblade_fusion.storage.motion_envelope_acceptance import (
+    StoredMotionEnvelopeAcceptance,
+)
 from biblade_fusion.storage.occupancy_mapping import (
     StoredOccupancyMapping,
     read_occupancy_mapping,
@@ -64,6 +72,9 @@ from biblade_fusion.storage.occupancy_mapping import (
 from biblade_fusion.storage.reconstructed_view import (
     SCIENCE_RECONSTRUCTED_VIEW_SCHEMA_VERSION,
     read_reconstructed_view,
+)
+from biblade_fusion.storage.static_free_acceptance import (
+    read_static_free_acceptance,
 )
 from biblade_fusion.storage.surface_coverage import (
     read_surface_coverage_generation,
@@ -258,6 +269,26 @@ class OccupancyGeneration:
     def snapshot(self) -> OccupancySnapshot:
         return self.mapping.snapshot
 
+    def reverified_from_disk(self) -> OccupancyGeneration:
+        """Reconstruct this generation from its immutable disk authority."""
+
+        authoritative_mapping = read_occupancy_mapping(self.artifact_path)
+        authoritative = type(self).verified(
+            self.artifact_path,
+            authoritative_mapping,
+            inference_stationarity_path=self.inference_stationarity_path,
+            inference_stationarity_sha256=self.inference_stationarity_sha256,
+        )
+        if (
+            authoritative.generation_id != self.generation_id
+            or authoritative.binding != self.binding
+            or authoritative.inference_stationarity_path != self.inference_stationarity_path
+        ):
+            raise ValueError(
+                "Occupancy generation disk authority differs from the pinned generation"
+            )
+        return authoritative
+
 
 class OccupancyGenerationPublisher:
     """Atomically publish a generation and forbid replacement while it is frozen."""
@@ -305,12 +336,20 @@ class OccupancyGenerationPublisher:
         with self._lock:
             if self._frozen_generation_id is not None:
                 raise StopScanBlocked("Occupancy generation is frozen for execution")
-            self._current = generation
+            try:
+                authoritative = generation.reverified_from_disk()
+            except (OSError, TypeError, ValueError) as exc:
+                raise StopScanBlocked(
+                    "Occupancy generation failed disk-authority readback before publish"
+                ) from exc
+            self._current = authoritative
 
     def publish_after_acceptance(
         self,
         generation: OccupancyGeneration,
         accept: Callable[[], None],
+        *,
+        before_publish: Callable[[str], None] = lambda _stage: None,
     ) -> None:
         """Accept a source transaction before exposing its matching generation.
 
@@ -324,8 +363,20 @@ class OccupancyGenerationPublisher:
         with self._lock:
             if self._frozen_generation_id is not None:
                 raise StopScanBlocked("Occupancy generation is frozen for execution")
+            # Complete every fallible generation read before accepting the source
+            # transaction.  Once ``accept`` installs its immutable logical marker,
+            # publication below is only an in-memory pointer swap and cannot strand
+            # an accepted source behind a failed post-acceptance readback.
+            before_publish("before_generation_disk_readback")
+            try:
+                authoritative = generation.reverified_from_disk()
+            except (OSError, TypeError, ValueError) as exc:
+                raise StopScanBlocked(
+                    "Occupancy generation failed disk-authority readback before acceptance"
+                ) from exc
+            before_publish("after_generation_disk_readback")
             accept()
-            self._current = generation
+            self._current = authoritative
 
     @contextmanager
     def freeze(
@@ -337,6 +388,12 @@ class OccupancyGenerationPublisher:
     ):
         with self._lock:
             current = self.current
+            try:
+                current = current.reverified_from_disk()
+            except (OSError, TypeError, ValueError) as exc:
+                raise StopScanBlocked(
+                    "Published occupancy generation failed disk-authority readback before freeze"
+                ) from exc
             if (
                 current.generation_id != expected_generation_id
                 or current.binding != expected_binding
@@ -347,6 +404,7 @@ class OccupancyGenerationPublisher:
                 )
             if self._frozen_generation_id is not None:
                 raise StopScanBlocked("Occupancy generation is already frozen")
+            self._current = current
             self._frozen_generation_id = current.generation_id
         try:
             yield current
@@ -401,6 +459,7 @@ class PerceptionCycleResult:
     blade_foreground_path: Path | None = None
     reconstructed_view_path: Path | None = None
     coverage_path: Path | None = None
+    coarse_scan_view_path: Path | None = None
 
     def __post_init__(self) -> None:
         if type(self.purpose) is not CapturePurpose:
@@ -418,6 +477,7 @@ class PerceptionCycleResult:
             "blade_foreground_path",
             "reconstructed_view_path",
             "coverage_path",
+            "coarse_scan_view_path",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -466,6 +526,8 @@ class FoundationStereoPerceptionEngine(Protocol):
         self,
         captured: CapturedStopScanView,
         result: PerceptionCycleResult,
+        *,
+        before_commit: Callable[[str], None] = lambda _stage: None,
     ) -> None: ...
 
     def cancel_pending_capture(
@@ -505,6 +567,9 @@ class NextViewSelection:
     incomplete_patch_count: int
     coverage_complete: bool
     diagnostics: tuple[str, ...] = ()
+    final_reconstruction_path: Path | None = None
+    final_reconstruction_id: str | None = None
+    final_reconstruction_metadata_sha256: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -527,6 +592,30 @@ class NextViewSelection:
         if any(not value for value in diagnostics):
             raise ValueError("Next-view diagnostics must be non-empty strings")
         object.__setattr__(self, "diagnostics", diagnostics)
+        terminal_values = (
+            self.final_reconstruction_path,
+            self.final_reconstruction_id,
+            self.final_reconstruction_metadata_sha256,
+        )
+        if any(value is not None for value in terminal_values) and not all(
+            value is not None for value in terminal_values
+        ):
+            raise ValueError("Final reconstruction completion evidence is inseparable")
+        if not self.coverage_complete and any(
+            value is not None for value in terminal_values
+        ):
+            raise ValueError("Incomplete next-view decision cannot cite a final reconstruction")
+        if self.final_reconstruction_path is not None:
+            path = Path(self.final_reconstruction_path).resolve()
+            if not path.is_dir():
+                raise ValueError("Final reconstruction completion path does not exist")
+            for name in (
+                "final_reconstruction_id",
+                "final_reconstruction_metadata_sha256",
+            ):
+                if _SHA256.fullmatch(str(getattr(self, name))) is None:
+                    raise ValueError(f"Next-view decision {name} must be a SHA-256 digest")
+            object.__setattr__(self, "final_reconstruction_path", path)
 
 
 def next_view_target_from_candidate(
@@ -637,6 +726,7 @@ class ApprovedSegmentExecutor(Protocol):
         permit: MotionExecutionPermit,
         *,
         cancellation_requested: Callable[[], bool] = lambda: False,
+        maximum_duration_s: float | None = None,
     ) -> StreamServoJResult: ...
 
 
@@ -690,6 +780,9 @@ class SegmentSafetyFactory(Protocol):
     @property
     def motion_config(self) -> MotionPreflightConfig: ...
 
+    @property
+    def motion_envelope_acceptance(self) -> StoredMotionEnvelopeAcceptance: ...
+
     def prepare(
         self,
         proposal: SegmentProposal,
@@ -706,6 +799,9 @@ class CoordinatedRobot(RobotStateSource, StopController, Protocol):
 
     @property
     def robot_config(self) -> RobotConfig: ...
+
+    @property
+    def stop_snapshot(self) -> tuple[int, bool]: ...
 
 
 class RunEventSink(Protocol):
@@ -730,6 +826,8 @@ class GuardedSegmentSafetyFactory:
         motion_config: MotionPreflightConfig,
         occupancy_config: OccupancyConfig,
         coordinator_config: StopAndCaptureConfig,
+        motion_envelope_acceptance: StoredMotionEnvelopeAcceptance,
+        motion_control_contract_hash: str,
         *,
         utc_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -739,7 +837,49 @@ class GuardedSegmentSafetyFactory:
         self._motion_config = motion_config.model_copy(deep=True)
         self._occupancy_config = occupancy_config.model_copy(deep=True)
         self._coordinator_config = coordinator_config.model_copy(deep=True)
+        if type(motion_envelope_acceptance) is not StoredMotionEnvelopeAcceptance:
+            raise ValueError("Guarded segment safety requires a strong motion-envelope asset")
+        configured_acceptance_id = self._motion_config.motion_envelope_acceptance_id
+        if configured_acceptance_id is None:
+            raise ValueError("Guarded segment safety requires motion-envelope configuration")
+        motion_envelope_acceptance.assert_matches(
+            acceptance_id=configured_acceptance_id,
+            robot_geometry_hash=collision_checker.robot_geometry_hash,
+            motion_model_contract_hash=collision_checker.motion_model_contract_hash,
+            motion_control_contract_hash=motion_control_contract_hash,
+        )
+        self._motion_envelope = motion_envelope_acceptance
         self._utc_clock = utc_clock
+        self._accepted_static_free_aabbs = tuple(
+            AcceptedStaticFreeAabb(
+                name=volume.name,
+                minimum_m=volume.minimum_m,
+                maximum_m=volume.maximum_m,
+            )
+            for volume in self._occupancy_config.accepted_static_free_aabbs
+        )
+        if self._accepted_static_free_aabbs:
+            acceptance_path = self._occupancy_config.accepted_static_free_acceptance_path
+            acceptance_id = self._occupancy_config.accepted_static_free_acceptance_id
+            workspace_minimum = self._occupancy_config.workspace_bounds_min_m
+            workspace_maximum = self._occupancy_config.workspace_bounds_max_m
+            if (
+                acceptance_path is None
+                or acceptance_id is None
+                or workspace_minimum is None
+                or workspace_maximum is None
+            ):
+                raise ValueError(
+                    "Static-free regions require a complete immutable acceptance binding"
+                )
+            acceptance = read_static_free_acceptance(acceptance_path)
+            acceptance.assert_matches(
+                acceptance_id=acceptance_id,
+                robot_geometry_hash=self._collision_checker.robot_geometry_hash,
+                workspace_minimum_m=workspace_minimum,
+                workspace_maximum_m=workspace_maximum,
+                regions=self._accepted_static_free_aabbs,
+            )
 
     @property
     def motion_robot(self) -> GuardedArm:
@@ -760,6 +900,10 @@ class GuardedSegmentSafetyFactory:
     @property
     def motion_config(self) -> MotionPreflightConfig:
         return self._motion_config.model_copy(deep=True)
+
+    @property
+    def motion_envelope_acceptance(self) -> StoredMotionEnvelopeAcceptance:
+        return self._motion_envelope
 
     def prepare(
         self,
@@ -783,7 +927,21 @@ class GuardedSegmentSafetyFactory:
                 self._occupancy_config.obstacle_inflation_m
                 + self._collision_checker.minimum_clearance_m
             ),
+            accepted_static_free_aabbs=self._accepted_static_free_aabbs,
+            accepted_static_free_acceptance_id=(
+                self._occupancy_config.accepted_static_free_acceptance_id
+            ),
+            accepted_static_free_mapping_context_hash=(
+                generation.snapshot.mapping_context_hash
+                if self._occupancy_config.accepted_static_free_aabbs
+                else None
+            ),
             semantic_attestation=generation.mapping.semantic_attestation,
+            accepted_joint_uncertainty_rad=(
+                self._motion_envelope.accepted_joint_uncertainty_rad
+            ),
+            motion_envelope_acceptance_id=self._motion_envelope.acceptance_id,
+            motion_envelope_metadata_sha256=self._motion_envelope.metadata_sha256,
             utc_clock=self._utc_clock,
         )
         live = preflight_live_joint_segment(
@@ -798,6 +956,11 @@ class GuardedSegmentSafetyFactory:
             ),
             execution_freshness_margin_s=(self._coordinator_config.execution_freshness_margin_s),
             evaluated_at_utc=self._utc_clock(),
+            accepted_joint_uncertainty_rad=(
+                self._motion_envelope.accepted_joint_uncertainty_rad
+            ),
+            motion_envelope_acceptance_id=self._motion_envelope.acceptance_id,
+            motion_envelope_metadata_sha256=self._motion_envelope.metadata_sha256,
         )
         bound_preflight = replace(
             live.preflight,
@@ -834,6 +997,8 @@ class StopScanCheckpoint:
     expected_capture_purpose: CapturePurpose | None
     blocking_reasons: tuple[str, ...]
     stop_requested: bool = False
+    stop_transport_acknowledged: bool = False
+    stop_stationarity_verified: bool = False
     motion_authorized: bool = False
 
 
@@ -866,6 +1031,7 @@ class StopScanCoordinator:
         publisher: OccupancyGenerationPublisher,
         event_sink: RunEventSink | None = None,
         utc_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config.model_copy(deep=True)
         self._acquisition_config = acquisition_config.model_copy(deep=True)
@@ -903,6 +1069,11 @@ class StopScanCoordinator:
             or safety_factory.coordinator_config != self._config
         ):
             raise ValueError("Preflight and coordination safety policies must be identical")
+        if not isinstance(
+            safety_factory.motion_envelope_acceptance,
+            StoredMotionEnvelopeAcceptance,
+        ):
+            raise ValueError("Stop coordination requires a strong motion-envelope acceptance")
         self._robot = robot
         self._perception = perception
         self._selector = selector
@@ -910,6 +1081,7 @@ class StopScanCoordinator:
         self._publisher = publisher
         self._event_sink = event_sink
         self._utc_clock = utc_clock
+        self._monotonic_clock = monotonic_clock
         self._operation_lock = threading.Lock()
         # Reentrant because an event sink may synchronously surface another stop
         # while the terminal abort event is being recorded at the linearization point.
@@ -917,6 +1089,8 @@ class StopScanCoordinator:
         self._stop_reason_lock = threading.Lock()
         self._stop_requested = threading.Event()
         self._stop_request_reason: str | None = None
+        self._stop_transport_acknowledged = False
+        self._stop_stationarity_evidence: StationarityEvidence | None = None
         self._phase = StopScanPhase.IDLE
         self._cycle_index = 0
         self._observation: PerceptionCycleResult | None = None
@@ -949,6 +1123,8 @@ class StopScanCoordinator:
             expected_capture_purpose=self._expected_capture_purpose,
             blocking_reasons=self._blocking_reasons,
             stop_requested=self._stop_requested.is_set(),
+            stop_transport_acknowledged=self._stop_transport_acknowledged,
+            stop_stationarity_verified=self._stop_stationarity_evidence is not None,
         )
 
     def start(self) -> StopScanCheckpoint:
@@ -972,6 +1148,8 @@ class StopScanCoordinator:
             with self._stop_request_lock, self._stop_reason_lock:
                 self._stop_requested.clear()
                 self._stop_request_reason = None
+                self._stop_transport_acknowledged = False
+                self._stop_stationarity_evidence = None
             self._transition(
                 StopScanPhase.BOOTSTRAP_MAP_REQUIRED,
                 "run_started",
@@ -985,6 +1163,25 @@ class StopScanCoordinator:
 
     def capture_infer_update(self, view_id: str | None = None) -> PerceptionCycleResult:
         with self._exclusive_operation() as operation:
+            perception_started_monotonic_s = self._monotonic_now()
+            perception_limit_s = self._config.maximum_perception_cycle_duration_s
+
+            def require_perception_budget(stage: str) -> float:
+                duration = self._elapsed_monotonic(
+                    perception_started_monotonic_s,
+                    label="perception cycle",
+                )
+                if perception_limit_s is not None and duration > perception_limit_s:
+                    raise StopScanBlocked(
+                        "perception cycle exceeded accepted timing budget before publish "
+                        f"({stage}): actual={duration:.9g}s, "
+                        f"limit={perception_limit_s:.9g}s"
+                    )
+                return duration
+
+            def enforce_perception_budget(stage: str) -> None:
+                require_perception_budget(stage)
+
             self._raise_if_stop_requested()
             allowed = {
                 StopScanPhase.BOOTSTRAP_MAP_REQUIRED,
@@ -1053,10 +1250,18 @@ class StopScanCoordinator:
                 )
                 result = self._perception.infer_and_update(captured)
                 self._raise_if_stop_requested()
+                perception_duration_s = require_perception_budget("after backend inference")
                 authoritative_mapping = self._validate_perception_result(
                     captured,
                     result,
                     purpose,
+                )
+                # Validation replays the stored inference/mapping authorities and
+                # is part of the accepted perception cycle.  Recheck at the true
+                # publication boundary so a slow validation cannot bypass the
+                # budget checked immediately after backend inference.
+                perception_duration_s = require_perception_budget(
+                    "after coordinator semantic validation"
                 )
                 result = replace(result, stored_occupancy=authoritative_mapping)
                 self._transition(
@@ -1071,6 +1276,8 @@ class StopScanCoordinator:
                         "occupancy_mapping": str(result.occupancy_mapping_path),
                         "inference_stationarity": str(result.inference_stationarity_path),
                         "inference_stationarity_sha256": (result.inference_stationarity_sha256),
+                        "perception_cycle_duration_s": perception_duration_s,
+                        "maximum_perception_cycle_duration_s": perception_limit_s,
                     },
                 )
                 generation = OccupancyGeneration.verified(
@@ -1079,6 +1286,7 @@ class StopScanCoordinator:
                     inference_stationarity_path=(result.inference_stationarity_path),
                     inference_stationarity_sha256=(result.inference_stationarity_sha256),
                 )
+                require_perception_budget("after generation verification")
                 self._raise_if_stop_requested()
                 snapshot = generation.snapshot
                 if snapshot.map_state is OccupancyMapState.MAPPING:
@@ -1114,12 +1322,14 @@ class StopScanCoordinator:
                         f"occupancy_not_fresh_map_ready:{snapshot.map_state.value}",
                     )
                     next_payload = {"reason": next_blocking_reasons[0]}
+                require_perception_budget("before commit linearization")
                 self._finalize_operation(
                     operation,
                     lambda: self._commit_perception_transaction(
                         captured,
                         result,
                         generation,
+                        before_commit=enforce_perception_budget,
                     ),
                 )
                 self._raise_if_stop_requested()
@@ -1175,17 +1385,26 @@ class StopScanCoordinator:
                 self._validate_selection_run_binding(selection)
                 self._raise_if_stop_requested()
                 if selection.coverage_complete:
+                    completion_payload: dict[str, object] = {
+                        "surface_generation_id": (selection.surface_generation_id),
+                        "reference_model_sha256": (selection.reference_model_sha256),
+                        "selection_policy_sha256": (selection.selection_policy_sha256),
+                        "required_patch_count": (selection.required_patch_count),
+                        "incomplete_patch_count": 0,
+                        "diagnostics": list(selection.diagnostics),
+                    }
+                    if selection.final_reconstruction_path is not None:
+                        completion_payload["final_reconstruction"] = {
+                            "path": str(selection.final_reconstruction_path),
+                            "artifact_id": selection.final_reconstruction_id,
+                            "metadata_sha256": (
+                                selection.final_reconstruction_metadata_sha256
+                            ),
+                        }
                     self._transition(
                         StopScanPhase.COMPLETE,
                         "coverage_complete",
-                        {
-                            "surface_generation_id": (selection.surface_generation_id),
-                            "reference_model_sha256": (selection.reference_model_sha256),
-                            "selection_policy_sha256": (selection.selection_policy_sha256),
-                            "required_patch_count": (selection.required_patch_count),
-                            "incomplete_patch_count": 0,
-                            "diagnostics": list(selection.diagnostics),
-                        },
+                        completion_payload,
                     )
                     return None
                 target = selection.target
@@ -1214,6 +1433,7 @@ class StopScanCoordinator:
                 prepared = self._safety_factory.prepare(proposal, generation)
                 self._raise_if_stop_requested()
                 self._validate_prepared_segment(prepared, generation)
+                self._validate_planned_segment_duration(prepared)
             except StopScanAbortRequested as exc:
                 self._prepared = None
                 self._blocking_reasons = (str(exc),)
@@ -1325,16 +1545,92 @@ class StopScanCoordinator:
                         confirmation=confirmation,
                     )
                     self._raise_if_stop_requested()
+                    permit_payload = asdict(permit)
+                    permit_sha256 = hashlib.sha256(
+                        json.dumps(
+                            permit_payload,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    self._transition(
+                        StopScanPhase.EXECUTING,
+                        "single_segment_approved",
+                        {
+                            "operator_id": permit.operator_id,
+                            "proposal_id": prepared.proposal.proposal_id,
+                            "preflight_fingerprint": permit.preflight_fingerprint,
+                            "confirmation_sha256": hashlib.sha256(
+                                confirmation.encode("utf-8")
+                            ).hexdigest(),
+                            "approval_prompt_sha256": hashlib.sha256(
+                                prepared.executor.approval_prompt(prepared.preflight).encode(
+                                    "utf-8"
+                                )
+                            ).hexdigest(),
+                            "permit_id": permit.permit_id,
+                            "permit_sha256": permit_sha256,
+                            "stop_generation": permit.stop_generation,
+                            "stop_latched": permit.stop_latched,
+                            "issued_monotonic_s": permit.issued_monotonic_s,
+                            "expires_monotonic_s": permit.expires_monotonic_s,
+                            "occupancy_sequence": permit.occupancy_sequence,
+                            "occupancy_content_hash": permit.occupancy_content_hash,
+                            "occupancy_mapping_context_hash": (
+                                permit.occupancy_mapping_context_hash
+                            ),
+                            "occupancy_quality_evidence_hash": (
+                                permit.occupancy_quality_evidence_hash
+                            ),
+                            "occupancy_metadata_sha256": (permit.occupancy_metadata_sha256),
+                            "occupancy_semantic_attestation_hash": (
+                                permit.occupancy_semantic_attestation_hash
+                            ),
+                            "collision_model_hash": permit.collision_model_hash,
+                            "robot_geometry_hash": permit.robot_geometry_hash,
+                            "motion_model_contract_hash": (permit.motion_model_contract_hash),
+                            "servoj_runtime_config_hash": (permit.servoj_runtime_config_hash),
+                            "motion_envelope_acceptance_id": (
+                                permit.motion_envelope_acceptance_id
+                            ),
+                            "motion_envelope_metadata_sha256": (
+                                permit.motion_envelope_metadata_sha256
+                            ),
+                            "accepted_joint_uncertainty_rad": list(
+                                permit.accepted_joint_uncertainty_rad
+                            ),
+                        },
+                    )
+                    self._raise_if_stop_requested()
                     self._transition(
                         StopScanPhase.EXECUTING,
                         "single_segment_executing",
                         {"proposal_id": prepared.proposal.proposal_id},
                     )
+                    execution_limit_s = (
+                        self._config.maximum_segment_execution_duration_s
+                    )
+                    execution_started_monotonic_s = self._monotonic_now()
                     result = prepared.executor.execute(
                         prepared.preflight,
                         permit,
                         cancellation_requested=self._stop_requested.is_set,
+                        maximum_duration_s=execution_limit_s,
                     )
+                    execution_duration_s = self._elapsed_monotonic(
+                        execution_started_monotonic_s,
+                        label="segment execution",
+                    )
+                    if (
+                        execution_limit_s is not None
+                        and execution_duration_s > execution_limit_s
+                    ):
+                        raise StopScanBlocked(
+                            "segment execution exceeded accepted timing budget: "
+                            f"actual={execution_duration_s:.9g}s, "
+                            f"limit={execution_limit_s:.9g}s"
+                        )
                     self._raise_if_stop_requested()
                     self._transition(
                         StopScanPhase.SETTLING,
@@ -1344,9 +1640,42 @@ class StopScanCoordinator:
                     settled = self._wait_until_settled(prepared.proposal.goal_joint_positions_rad)
                     self._raise_if_stop_requested()
             except BaseException as exc:
-                with suppress(BaseException):
+                terminal_error: BaseException = exc
+                try:
                     self._robot.stop()
+                except BaseException as stop_error:
+                    if isinstance(exc, EmergencyStopUnconfirmedError):
+                        terminal_error = exc.including_stop_failure(stop_error)
+                    else:
+                        terminal_error = EmergencyStopUnconfirmedError(
+                            exc,
+                            (stop_error,),
+                        )
                 self._prepared = None
+                if isinstance(terminal_error, EmergencyStopUnconfirmedError):
+                    operation_error = terminal_error.operation_error
+                    self._blocking_reasons = (
+                        "single_segment_emergency_stop_unconfirmed:"
+                        f"{type(operation_error).__name__}:{operation_error}",
+                    )
+                    self._transition(
+                        StopScanPhase.FAILED,
+                        "single_segment_emergency_stop_unconfirmed",
+                        {
+                            "reason": self._blocking_reasons[0],
+                            "error_code": terminal_error.error_code,
+                            "operation_error": (
+                                f"{type(operation_error).__name__}:{operation_error}"
+                            ),
+                            "stop_failures": [
+                                f"{type(error).__name__}:{error}"
+                                for error in terminal_error.stop_errors
+                            ],
+                        },
+                    )
+                    if terminal_error is exc:
+                        raise
+                    raise terminal_error from exc
                 self._blocking_reasons = (
                     f"single_segment_execution_failed:{type(exc).__name__}:{exc}",
                 )
@@ -1372,6 +1701,8 @@ class StopScanCoordinator:
                     "next_capture_purpose": self._expected_capture_purpose.value,
                     "stationarity": _stationarity_payload(settled),
                     "commands_sent": result.commands_sent,
+                    "segment_execution_duration_s": execution_duration_s,
+                    "maximum_segment_execution_duration_s": execution_limit_s,
                 },
             )
             return result
@@ -1395,10 +1726,15 @@ class StopScanCoordinator:
         if self._phase in {
             StopScanPhase.IDLE,
             StopScanPhase.COMPLETE,
-            StopScanPhase.ABORTED,
             StopScanPhase.FAILED,
         }:
             raise StopScanError(f"Cannot request an active-run stop from phase {self._phase.value}")
+        if (
+            self._phase is StopScanPhase.ABORTED
+            and self._stop_transport_acknowledged
+            and self._stop_stationarity_evidence is not None
+        ):
+            return self.checkpoint
         with self._stop_reason_lock:
             if self._stop_request_reason is None:
                 self._stop_request_reason = text
@@ -1411,6 +1747,16 @@ class StopScanCoordinator:
             self._robot.stop()
         except BaseException as exc:
             stop_error = exc
+        else:
+            with self._stop_request_lock:
+                self._stop_transport_acknowledged = True
+            try:
+                settled = self._wait_until_settled(None)
+            except BaseException as exc:
+                stop_error = exc
+            else:
+                with self._stop_request_lock:
+                    self._stop_stationarity_evidence = settled
         if self._operation_lock.acquire(blocking=False):
             try:
                 with self._stop_request_lock:
@@ -1425,6 +1771,7 @@ class StopScanCoordinator:
         self,
         goal_joint_positions_rad: Sequence[float] | None,
     ) -> StationarityEvidence:
+        envelope = self._safety_factory.motion_envelope_acceptance
         return wait_until_settled(
             self._robot,
             goal_joint_positions_rad,
@@ -1435,7 +1782,28 @@ class StopScanCoordinator:
             max_tcp_translation_delta_m=(self._acquisition_config.max_tcp_translation_delta_m),
             max_tcp_rotation_delta_rad=(self._acquisition_config.max_tcp_rotation_delta_rad),
             goal_tolerance_rad=self._config.maximum_goal_joint_error_rad,
-            maximum_robot_state_staleness_s=(self._config.maximum_robot_state_staleness_s),
+            maximum_robot_state_staleness_s=min(
+                self._config.maximum_robot_state_staleness_s,
+                envelope.maximum_feedback_interval_s,
+            ),
+            maximum_stopped_actual_joint_velocity_rad_s=(
+                envelope.maximum_stopped_actual_joint_velocity_rad_s
+            ),
+            maximum_stopped_target_joint_velocity_rad_s=(
+                envelope.maximum_stopped_target_joint_velocity_rad_s
+            ),
+            maximum_stopped_actual_tcp_linear_velocity_m_s=(
+                envelope.maximum_stopped_actual_tcp_linear_velocity_m_s
+            ),
+            maximum_stopped_actual_tcp_angular_velocity_rad_s=(
+                envelope.maximum_stopped_actual_tcp_angular_velocity_rad_s
+            ),
+            maximum_stopped_target_tcp_linear_velocity_m_s=(
+                envelope.maximum_stopped_target_tcp_linear_velocity_m_s
+            ),
+            maximum_stopped_target_tcp_angular_velocity_rad_s=(
+                envelope.maximum_stopped_target_tcp_angular_velocity_rad_s
+            ),
         )
 
     @staticmethod
@@ -1518,6 +1886,7 @@ class StopScanCoordinator:
                 raise StopScanBlocked(f"{label} escaped the immutable cycle root")
         reconstructed_path = result.reconstructed_view_path
         foreground_path = result.blade_foreground_path
+        coarse_path = result.coarse_scan_view_path
         if foreground_path is not None and (
             not foreground_path.is_dir() or not foreground_path.resolve().is_relative_to(cycle_root)
         ):
@@ -1531,6 +1900,10 @@ class StopScanCoordinator:
             raise StopScanBlocked(
                 "reconstructed blade view is missing or escaped the immutable cycle root"
             )
+        if coarse_path is not None and (
+            not coarse_path.is_dir() or not coarse_path.resolve().is_relative_to(cycle_root)
+        ):
+            raise StopScanBlocked("coarse-scan view is missing or escaped the immutable cycle root")
         coverage_path = result.coverage_path
         if coverage_path is not None:
             if not coverage_path.is_dir():
@@ -1558,21 +1931,33 @@ class StopScanCoordinator:
             )
         if reconstructed_path is not None and coverage_path is None:
             raise StopScanBlocked("fine reconstruction has no matching surface-coverage successor")
+        if coarse_path is not None and any(
+            value is not None for value in (foreground_path, reconstructed_path, coverage_path)
+        ):
+            raise StopScanBlocked(
+                "coarse and fine science assets cannot share one perception transaction"
+            )
         if expected_purpose is CapturePurpose.CANDIDATE:
-            if (
-                foreground_path is None
-                or reconstructed_path is None
-                or coverage_path is None
-                or not coverage_path.resolve().is_relative_to(cycle_root)
-            ):
+            fine_complete = bool(
+                foreground_path is not None
+                and reconstructed_path is not None
+                and coverage_path is not None
+                and coverage_path.resolve().is_relative_to(cycle_root)
+            )
+            if not fine_complete and coarse_path is None:
                 raise StopScanBlocked(
-                    "candidate capture requires a local foreground mask, "
-                    "reconstruction, and coverage successor"
+                    "candidate capture requires either one local coarse-science view "
+                    "or the complete local fine-science asset triple"
                 )
         elif foreground_path is not None or reconstructed_path is not None:
             raise StopScanBlocked(
                 f"{expected_purpose.value} capture cannot publish a fine reconstruction"
             )
+        if coarse_path is not None and expected_purpose not in {
+            CapturePurpose.BOOTSTRAP,
+            CapturePurpose.CANDIDATE,
+        }:
+            raise StopScanBlocked(f"{expected_purpose.value} capture cannot publish coarse science")
         if expected_purpose is CapturePurpose.TRANSIT and (
             coverage_path is None or coverage_path.resolve().is_relative_to(cycle_root)
         ):
@@ -1580,6 +1965,7 @@ class StopScanCoordinator:
                 "transit capture must carry one previously accepted external coverage generation"
             )
         self._validate_science_assets(captured, result)
+        self._validate_coarse_science_asset(captured, result)
 
         recomputed = validate_stationary_trace(
             result.stationarity_reference,
@@ -1734,6 +2120,40 @@ class StopScanCoordinator:
             ) from exc
 
     @staticmethod
+    def _validate_coarse_science_asset(
+        captured: CapturedStopScanView,
+        result: PerceptionCycleResult,
+    ) -> None:
+        """Verify the optional unknown-blade coarse wrapper at the trust boundary."""
+
+        coarse_path = result.coarse_scan_view_path
+        if coarse_path is None:
+            return
+        try:
+            # Lazy import avoids making the fine/coordinator module own the coarse
+            # reconstruction implementation while retaining independent readback.
+            from biblade_fusion.storage.coarse_scan import read_coarse_scan_view
+
+            stored = read_coarse_scan_view(coarse_path)
+            view = stored.reconstructed.view
+            sources = stored.metadata["sources"]
+            if (
+                coarse_path.resolve().parent != captured.cycle_root.resolve()
+                or view.source_view_id != captured.bundle.view_id
+                or view.source_sequence_index != captured.bundle.sequence_index
+                or view.source_frame_number != captured.bundle.stereo.frame_number
+                or Path(str(sources["stereo_inference"]["root"])).resolve()
+                != result.stereo_inference_path
+                or Path(str(sources["occupancy_mapping"]["root"])).resolve()
+                != result.occupancy_mapping_path
+            ):
+                raise ValueError("coarse-science source identity or transaction binding changed")
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise StopScanBlocked(
+                f"Coarse-science asset failed independent semantic readback: {exc}"
+            ) from exc
+
+    @staticmethod
     def _validate_current_mapping_source(
         captured: CapturedStopScanView,
         result: PerceptionCycleResult,
@@ -1884,8 +2304,8 @@ class StopScanCoordinator:
                 "Next-view reference or selection policy changed within one run"
             )
 
-    @staticmethod
     def _validate_prepared_segment(
+        self,
         prepared: _PreparedSegmentExecution,
         generation: OccupancyGeneration,
     ) -> None:
@@ -1929,6 +2349,39 @@ class StopScanCoordinator:
                     "Approval-eligible preflight lacks perception/selection binding"
                 )
 
+    def _validate_planned_segment_duration(
+        self,
+        prepared: _PreparedSegmentExecution,
+    ) -> None:
+        limit = self._config.maximum_segment_execution_duration_s
+        if limit is None:
+            return
+        raw = prepared.preflight.diagnostics.get("planned_servoj_duration_s")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, np.number)):
+            raise StopScanBlocked(
+                "Accepted segment timing requires planned_servoj_duration_s evidence"
+            )
+        duration = float(raw)
+        if not math.isfinite(duration) or duration < 0.0:
+            raise StopScanBlocked("Planned segment duration evidence is invalid")
+        if duration > limit:
+            raise StopScanBlocked(
+                "planned segment exceeds accepted timing budget: "
+                f"planned={duration:.9g}s, limit={limit:.9g}s"
+            )
+
+    def _monotonic_now(self) -> float:
+        value = float(self._monotonic_clock())
+        if not math.isfinite(value):
+            raise StopScanBlocked("Monotonic runtime clock returned a non-finite value")
+        return value
+
+    def _elapsed_monotonic(self, start: float, *, label: str) -> float:
+        elapsed = self._monotonic_now() - start
+        if elapsed < 0.0:
+            raise StopScanBlocked(f"Monotonic runtime clock moved backwards during {label}")
+        return elapsed
+
     def _transition(
         self,
         phase: StopScanPhase,
@@ -1971,12 +2424,22 @@ class StopScanCoordinator:
         captured: CapturedStopScanView,
         result: PerceptionCycleResult,
         generation: OccupancyGeneration,
+        *,
+        before_commit: Callable[[str], None],
     ) -> None:
         """Publish and commit one prepared cycle at the stop-latch linearization."""
 
+        def guard(stage: str) -> None:
+            before_commit(stage)
+
         self._publisher.publish_after_acceptance(
             generation,
-            lambda: self._perception.commit_perception_cycle(captured, result),
+            lambda: self._perception.commit_perception_cycle(
+                captured,
+                result,
+                before_commit=lambda stage: guard(f"perception source commit: {stage}"),
+            ),
+            before_publish=lambda stage: guard(f"occupancy publication: {stage}"),
         )
         self._observation_generation_id = generation.generation_id
 
@@ -2044,7 +2507,18 @@ class StopScanCoordinator:
         self._transition(
             StopScanPhase.ABORTED,
             "operator_stop_observed",
-            {"reason": reason},
+            {
+                "reason": reason,
+                "stop_transport_acknowledged": self._stop_transport_acknowledged,
+                "stop_stationarity_verified": (
+                    self._stop_stationarity_evidence is not None
+                ),
+                "stop_stationarity": (
+                    _stationarity_payload(self._stop_stationarity_evidence)
+                    if self._stop_stationarity_evidence is not None
+                    else None
+                ),
+            },
         )
 
     def _stop_reason(self, *, default: str = "operator_stop_requested") -> str:

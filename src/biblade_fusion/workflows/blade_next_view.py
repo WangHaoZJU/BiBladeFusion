@@ -25,13 +25,21 @@ from biblade_fusion.calibration import (
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     AppSettings,
+    FineFinalizationConfig,
     KinematicsConfig,
     MotionPreflightConfig,
+    MultiViewFusionConfig,
     NextViewSelectionConfig,
     SurfaceQualityConfig,
+    TSDFConfig,
     ViewFilterConfig,
+    ViewPlanningConfig,
 )
-from biblade_fusion.perception.surface import CurvedBladeSurface, SurfaceRegion
+from biblade_fusion.perception.surface import (
+    CurvedBladeSurface,
+    SurfaceRegion,
+    generate_reacquisition_view,
+)
 from biblade_fusion.planning import (
     BladeClearanceEnvelope,
     CandidateStatus,
@@ -48,9 +56,16 @@ from biblade_fusion.storage.coarse_model import (
     read_coarse_model_summary,
 )
 from biblade_fusion.storage.reconstructed_view import read_reconstructed_view
+from biblade_fusion.storage.science_authority import ScienceAcceptanceAuthority
 from biblade_fusion.storage.surface_coverage import (
+    REACQUISITION_VIEW_ID_SCHEMA,
     StoredSurfaceCoverageGeneration,
+    reacquisition_view_id,
     read_surface_coverage_generation,
+)
+from biblade_fusion.workflows.fine_completion import (
+    FinalFineCompletionEvidence,
+    finalize_fine_science,
 )
 from biblade_fusion.workflows.stop_scan_coordinator import (
     BladePlanningAssetError,
@@ -61,7 +76,7 @@ from biblade_fusion.workflows.stop_scan_coordinator import (
     next_view_target_from_candidate,
 )
 
-_SELECTOR_ALGORITHM = "bilateral_single_fin_coverage_priority_v1"
+_SELECTOR_ALGORITHM = "bilateral_single_fin_coverage_priority_v2"
 
 
 class FlangeForwardKinematics(Protocol):
@@ -72,6 +87,9 @@ class FlangeForwardKinematics(Protocol):
 
 ReachabilityFactory = Callable[[NDArray[np.float64]], ReachabilityChecker]
 CoverageReader = Callable[[str], StoredSurfaceCoverageGeneration]
+FineFinalizer = Callable[
+    [StoredSurfaceCoverageGeneration], FinalFineCompletionEvidence
+]
 
 
 def _canonical_sha256(payload: object) -> str:
@@ -91,6 +109,96 @@ def _file_sha256(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _reacquisition_view_id(
+    candidate: CandidateView,
+    attempt: int,
+    selection_policy_sha256: str,
+) -> str:
+    if attempt < 1:
+        raise ValueError("Reacquisition attempt indices are one-based")
+    return reacquisition_view_id(
+        candidate.view_id,
+        candidate.patch.patch_id,
+        attempt,
+        selection_policy_sha256,
+    )
+
+
+def _selection_policy_payload(
+    *,
+    hand_eye: HandEyeCalibration,
+    selection_config: NextViewSelectionConfig,
+    surface_quality_config: SurfaceQualityConfig,
+    view_filter_config: ViewFilterConfig,
+    kinematics_config: KinematicsConfig,
+    motion_config: MotionPreflightConfig,
+    expected_reference_root: Path,
+    expected_reference_sha256: str,
+    fk_implementation: str,
+    fusion_config: MultiViewFusionConfig | None,
+    tsdf_config: TSDFConfig | None,
+    finalization_config: FineFinalizationConfig | None,
+) -> dict[str, object]:
+    return {
+        "algorithm": _SELECTOR_ALGORITHM,
+        "selection": selection_config.model_dump(mode="json"),
+        "surface_quality": surface_quality_config.model_dump(mode="json"),
+        "view_filter": view_filter_config.model_dump(mode="json"),
+        "kinematics": kinematics_config.model_dump(mode="json"),
+        "motion_endpoint_gate": {
+            "maximum_translation_error_m": motion_config.maximum_endpoint_translation_error_m,
+            "maximum_rotation_error_deg": motion_config.maximum_endpoint_rotation_error_deg,
+        },
+        "expected_reference": {
+            "root": str(expected_reference_root.resolve()),
+            "metadata_sha256": expected_reference_sha256,
+        },
+        "terminal_reconstruction": (
+            {
+                "fusion": fusion_config.model_dump(mode="json"),
+                "tsdf": tsdf_config.model_dump(mode="json"),
+                "finalization": finalization_config.model_dump(mode="json"),
+            }
+            if fusion_config is not None
+            and tsdf_config is not None
+            and finalization_config is not None
+            else {"implementation": "injected_or_unconfigured"}
+        ),
+        "flange_T_left_ir": hand_eye.require_flange_primary().matrix.tolist(),
+        "fk_implementation": fk_implementation,
+    }
+
+
+def production_selection_policy_payload(
+    settings: AppSettings,
+    hand_eye: HandEyeCalibration,
+    *,
+    reference_coarse_model: str | Path,
+) -> dict[str, object]:
+    """Rebuild the exact policy payload shared by production selection and capture."""
+
+    reference_root = Path(reference_coarse_model).resolve()
+    reference = read_coarse_model_summary(reference_root)
+    if int(reference.metadata["schema_version"]) != COARSE_MODEL_SCHEMA_VERSION:
+        raise BladePlanningAssetError("coverage selection requires a schema-5 coarse model")
+    return _selection_policy_payload(
+        hand_eye=hand_eye,
+        selection_config=settings.next_view_selection,
+        surface_quality_config=settings.surface_quality,
+        view_filter_config=settings.view_filter,
+        kinematics_config=settings.kinematics,
+        motion_config=settings.motion_preflight,
+        expected_reference_root=reference_root,
+        expected_reference_sha256=_file_sha256(reference_root / "metadata.json"),
+        fk_implementation=(
+            f"{Es68KinematicModel.__module__}.{Es68KinematicModel.__qualname__}"
+        ),
+        fusion_config=settings.multi_view_fusion,
+        tsdf_config=settings.tsdf,
+        finalization_config=settings.fine_finalization,
+    )
 
 
 def _rotation_distance_deg(first: PoseSE3, second: PoseSE3) -> float:
@@ -155,6 +263,10 @@ class BladeCoverageNextViewSelector:
         coverage_reader: Callable[
             [str], StoredSurfaceCoverageGeneration
         ] = read_surface_coverage_generation,
+        fine_finalizer: FineFinalizer | None = None,
+        fusion_config: MultiViewFusionConfig | None = None,
+        tsdf_config: TSDFConfig | None = None,
+        finalization_config: FineFinalizationConfig | None = None,
     ) -> None:
         self._hand_eye = hand_eye
         self._flange_t_left_ir = hand_eye.require_flange_primary()
@@ -183,6 +295,7 @@ class BladeCoverageNextViewSelector:
                 "Expected coarse-reference identity must be a SHA-256 digest"
             )
         self._coverage_reader = coverage_reader
+        self._fine_finalizer = fine_finalizer
         self._last_cycle_key: tuple[str, int] | None = None
         self._last_surface_root: Path | None = None
         self._last_surface_generation_id: str | None = None
@@ -221,34 +334,23 @@ class BladeCoverageNextViewSelector:
             raise BladePlanningAssetError(
                 f"Cannot initialize the calibrated ES68 FK verifier: {exc}"
             ) from exc
-        self._policy_sha256 = _canonical_sha256(
-            {
-                "algorithm": _SELECTOR_ALGORITHM,
-                "selection": self._selection_config.model_dump(mode="json"),
-                "surface_quality": self._surface_quality_config.model_dump(
-                    mode="json"
-                ),
-                "view_filter": self._view_filter_config.model_dump(mode="json"),
-                "kinematics": self._kinematics_config.model_dump(mode="json"),
-                "motion_endpoint_gate": {
-                    "maximum_translation_error_m": (
-                        self._motion_config.maximum_endpoint_translation_error_m
-                    ),
-                    "maximum_rotation_error_deg": (
-                        self._motion_config.maximum_endpoint_rotation_error_deg
-                    ),
-                },
-                "expected_reference": {
-                    "root": str(self._expected_reference_root),
-                    "metadata_sha256": self._expected_reference_sha256,
-                },
-                "flange_T_left_ir": self._flange_t_left_ir.matrix.tolist(),
-                "fk_implementation": (
-                    f"{type(self._fk_model).__module__}."
-                    f"{type(self._fk_model).__qualname__}"
-                ),
-            }
+        self._policy_payload = _selection_policy_payload(
+            hand_eye=self._hand_eye,
+            selection_config=self._selection_config,
+            surface_quality_config=self._surface_quality_config,
+            view_filter_config=self._view_filter_config,
+            kinematics_config=self._kinematics_config,
+            motion_config=self._motion_config,
+            expected_reference_root=self._expected_reference_root,
+            expected_reference_sha256=self._expected_reference_sha256,
+            fk_implementation=(
+                f"{type(self._fk_model).__module__}.{type(self._fk_model).__qualname__}"
+            ),
+            fusion_config=fusion_config,
+            tsdf_config=tsdf_config,
+            finalization_config=finalization_config,
         )
+        self._policy_sha256 = _canonical_sha256(self._policy_payload)
 
     @classmethod
     def from_settings(
@@ -257,8 +359,14 @@ class BladeCoverageNextViewSelector:
         hand_eye: HandEyeCalibration,
         *,
         reference_coarse_model: str | Path,
+        science_authority: ScienceAcceptanceAuthority,
     ) -> BladeCoverageNextViewSelector:
         """Build the production selector without connecting to the robot."""
+
+        if science_authority is None:
+            raise BladePlanningAssetError(
+                "Production fine selector requires a science acceptance authority"
+            )
 
         reference_root = Path(reference_coarse_model).resolve()
         try:
@@ -279,11 +387,26 @@ class BladeCoverageNextViewSelector:
             motion_config=settings.motion_preflight,
             expected_reference_root=reference_root,
             expected_reference_sha256=reference_sha256,
+            fine_finalizer=lambda state: finalize_fine_science(
+                state,
+                fusion_config=settings.multi_view_fusion,
+                tsdf_config=settings.tsdf,
+                surface_quality_config=settings.surface_quality,
+                finalization_config=settings.fine_finalization,
+                science_authority=science_authority,
+            ),
+            fusion_config=settings.multi_view_fusion,
+            tsdf_config=settings.tsdf,
+            finalization_config=settings.fine_finalization,
         )
 
     @property
     def selection_policy_sha256(self) -> str:
         return self._policy_sha256
+
+    @property
+    def selection_policy_payload(self) -> dict[str, object]:
+        return json.loads(json.dumps(self._policy_payload))
 
     def _read_state(
         self,
@@ -325,9 +448,7 @@ class BladeCoverageNextViewSelector:
             )
         current = state.current_reconstructed_view_path
         observed = observation.reconstructed_view_path
-        candidate_ids = {
-            candidate.view_id for candidate in state.view_plan.candidates
-        }
+        candidate_ids = self._candidate_capture_ids(state)
         if state.ledger.observation_ids:
             if current is None:
                 raise BladePlanningAssetError(
@@ -349,10 +470,65 @@ class BladeCoverageNextViewSelector:
             )
         if observed is None and observation.bundle.view_id in candidate_ids:
             raise BladePlanningAssetError(
-                "A captured reference candidate lacks its reconstructed view and "
+                "A captured planned fine candidate lacks its reconstructed view and "
                 "fine-coverage successor"
             )
         return state
+
+    def _candidate_capture_ids(
+        self,
+        state: StoredSurfaceCoverageGeneration,
+    ) -> set[str]:
+        base_ids = tuple(candidate.view_id for candidate in state.view_plan.candidates)
+        generated_ids = tuple(
+            _reacquisition_view_id(candidate, attempt, self._policy_sha256)
+            for candidate in state.view_plan.candidates
+            for attempt in range(
+                1,
+                self._selection_config.maximum_reacquisition_attempts_per_patch + 1,
+            )
+        )
+        all_ids = (*base_ids, *generated_ids)
+        if any(not value.strip() for value in base_ids) or len(set(all_ids)) != len(all_ids):
+            raise BladePlanningAssetError(
+                "Fine-view and reacquisition candidate IDs are not globally unique"
+            )
+        return set(all_ids)
+
+    @staticmethod
+    def _reacquisition_standoff_bounds(
+        state: StoredSurfaceCoverageGeneration,
+    ) -> tuple[float, float]:
+        try:
+            config = ViewPlanningConfig.model_validate(
+                state.reference.metadata["view_plan"]["configuration"]
+            )
+        except Exception as exc:
+            raise BladePlanningAssetError(
+                f"Cannot verify coarse-reference standoff bounds for reacquisition: {exc}"
+            ) from exc
+        lower = config.minimum_standoff_distance_m
+        upper = config.maximum_standoff_distance_m
+        if lower is None or upper is None:
+            raise BladePlanningAssetError(
+                "Bounded reacquisition requires coarse-reference minimum and maximum standoff"
+            )
+        return lower, upper
+
+    def _require_reacquisition_policy_binding(
+        self,
+        state: StoredSurfaceCoverageGeneration,
+    ) -> None:
+        record = state.metadata.get("reacquisition_policy")
+        expected = {
+            "id_schema": REACQUISITION_VIEW_ID_SCHEMA,
+            "selection_policy_sha256": self._policy_sha256,
+            "selection_policy": self._policy_payload,
+        }
+        if record != expected:
+            raise BladePlanningAssetError(
+                "Fine coverage retry policy differs from the active selector policy"
+            )
 
     def _validate_cycle_continuity(
         self,
@@ -643,6 +819,21 @@ class BladeCoverageNextViewSelector:
             f"fine_observations={len(state.ledger.observation_ids)}",
         )
         if not incomplete_patch_ids:
+            if self._fine_finalizer is None:
+                raise BladePlanningAssetError(
+                    "Fine coverage passed, but no terminal reconstruction finalizer "
+                    "is configured"
+                )
+            try:
+                final = self._fine_finalizer(state)
+            except Exception as exc:
+                raise BladePlanningAssetError(
+                    f"Fine coverage passed but terminal reconstruction failed: {exc}"
+                ) from exc
+            if type(final) is not FinalFineCompletionEvidence:
+                raise BladePlanningAssetError(
+                    "Fine terminal finalizer returned untyped completion evidence"
+                )
             return NextViewSelection(
                 None,
                 state.generation_id,
@@ -652,6 +843,9 @@ class BladeCoverageNextViewSelector:
                 0,
                 True,
                 (*base_diagnostics, "all required fine patches passed quality gates"),
+                final.root,
+                final.artifact_id,
+                final.metadata_sha256,
             )
 
         candidates_by_patch = {
@@ -673,18 +867,63 @@ class BladeCoverageNextViewSelector:
             )
         }
         captured = set(state.ledger.observation_ids)
-        selectable_patch_ids = tuple(
-            patch_id
-            for patch_id in incomplete_patch_ids
+        selectable: list[tuple[str, CandidateView, PoseSE3, int]] = []
+        exhausted_patch_ids: list[str] = []
+        retry_bounds: tuple[float, float] | None = None
+        for patch_id in incomplete_patch_ids:
+            candidate = candidates_by_patch[patch_id]
+            projection_pose = projection_by_patch[patch_id]
             if not (
                 self._selection_config.exclude_already_captured_candidate_ids
-                and candidates_by_patch[patch_id].view_id in captured
-            )
-        )
-        if not selectable_patch_ids:
+                and candidate.view_id in captured
+            ):
+                selectable.append((patch_id, candidate, projection_pose, 0))
+                continue
+            self._require_reacquisition_policy_binding(state)
+            if retry_bounds is None:
+                retry_bounds = self._reacquisition_standoff_bounds(state)
+            retry_count = 0
+            for attempt, perturbation in enumerate(
+                self._selection_config.reacquisition_perturbations,
+                start=1,
+            ):
+                retry_view_id = _reacquisition_view_id(
+                    candidate,
+                    attempt,
+                    self._policy_sha256,
+                )
+                if retry_view_id in captured:
+                    continue
+                proposed_distance = (
+                    candidate.standoff_distance_m + perturbation.distance_offset_m
+                )
+                if not retry_bounds[0] <= proposed_distance <= retry_bounds[1]:
+                    continue
+                try:
+                    retry_candidate, retry_projection = generate_reacquisition_view(
+                        candidate,
+                        projection_pose,
+                        state.view_plan.left_rectified_t_left_ir,
+                        perturbation,
+                        view_id=retry_view_id,
+                        minimum_standoff_distance_m=retry_bounds[0],
+                        maximum_standoff_distance_m=retry_bounds[1],
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise BladePlanningAssetError(
+                        f"Cannot generate bounded reacquisition view for {patch_id}: {exc}"
+                    ) from exc
+                selectable.append(
+                    (patch_id, retry_candidate, retry_projection, attempt)
+                )
+                retry_count += 1
+            if retry_count == 0:
+                exhausted_patch_ids.append(patch_id)
+        if not selectable:
             raise NextViewUnavailable(
-                "Fine coverage remains incomplete, but every corresponding candidate "
-                "has already been captured"
+                "Fine coverage remains incomplete, but every incomplete patch exhausted "
+                "its bounded reacquisition attempt budget "
+                f"({self._selection_config.maximum_reacquisition_attempts_per_patch} per patch)"
             )
         current_joints = np.asarray(
             observation.inference_robot_state_trace[-1].joint_positions_rad,
@@ -696,13 +935,12 @@ class BladeCoverageNextViewSelector:
             raise NextViewUnavailable(
                 f"Cannot initialize endpoint IK from the current stopped joints: {exc}"
             ) from exc
-        candidates = tuple(
-            candidates_by_patch[patch_id] for patch_id in selectable_patch_ids
-        )
+        candidates = tuple(item[1] for item in selectable)
         projection_poses = {
-            candidates_by_patch[patch_id].view_id: projection_by_patch[patch_id]
-            for patch_id in selectable_patch_ids
+            item[1].view_id: item[2]
+            for item in selectable
         }
+        attempt_by_view_id = {item[1].view_id: item[3] for item in selectable}
         try:
             filtered = filter_candidate_views(
                 candidates,
@@ -754,6 +992,8 @@ class BladeCoverageNextViewSelector:
                 f"selected_region={selected_quality.region.value}",
                 f"selected_side={selected_quality.side.value}",
                 f"coverage_fraction={selected_quality.coverage_fraction:.6f}",
+                f"reacquisition_attempt={attempt_by_view_id[selected.candidate.view_id]}",
+                f"exhausted_patch_count={len(exhausted_patch_ids)}",
                 "occupancy is reserved exclusively for downstream segment safety",
             ),
         )

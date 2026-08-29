@@ -153,16 +153,18 @@ in the recursively replayed lineage to use this schema-3 evidence. These assets 
 staged until coordinator readback and transaction acceptance; cancellation keeps the files
 as diagnostic evidence but does not advance the accepted generation.
 
-This path is currently a library capability, not an experiment command. The default
-configuration disables it, and construction must explicitly pin the schema-5 coarse-model
-path and any recovery generation; no public composition-root or motion CLI supplies those
-arguments. Its visibility owner is a finite coarse-point splat with a configured pixel
-radius, not continuous triangle rasterisation. Consequently the projected sampling gap at
-each real standoff must be measured and accepted (or replaced by mesh rasterisation) before
-using it as experimental occlusion evidence. Mask tolerances, reflective-metal completeness,
-fin retention, latency and all quality thresholds still require real ES68/D435i blade data.
-Continuous swept-mesh and robot-versus-voxel proofs remain independent production-motion
-blockers.
+The default configuration disables this path. The supervised `scan run-unknown`
+composition enters it only after the coarse session has published and re-read a complete
+schema-5 handoff; it forks fresh committed perception sources into a new coordinator and
+does not migrate a permit, prepared segment, occupancy publication or fine coverage. There
+is intentionally no command that lets an operator bypass that handoff by injecting an
+arbitrary reference into a moving run. Its visibility owner is a finite coarse-point splat
+with a configured pixel radius, not continuous triangle rasterisation. Consequently the
+projected sampling gap at each real standoff must be measured and accepted (or replaced by
+mesh rasterisation) before using it as experimental occlusion evidence. Mask tolerances,
+reflective-metal completeness, fin retention, latency and all quality thresholds still
+require real ES68/D435i blade data. Continuous swept-mesh and robot-versus-voxel evidence
+remain independent mandatory gates for each physical segment.
 
 ## Inspecting the fine plan before robot feasibility
 

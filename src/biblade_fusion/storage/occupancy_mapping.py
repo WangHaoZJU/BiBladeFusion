@@ -50,9 +50,12 @@ from biblade_fusion.workflows.occupancy_mapping import (
     OccupancyFrameUpdate,
     OccupancyMappingContext,
     RobotDepthRenderer,
+    occupancy_array_content_hash,
+    occupancy_physical_source_id,
 )
 
-OCCUPANCY_MAPPING_SCHEMA_VERSION = 6
+OCCUPANCY_MAPPING_SCHEMA_VERSION = 7
+LEGACY_OCCUPANCY_MAPPING_SCHEMA_VERSION = 6
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _POSE_TRANSLATION_ATOL_M = 1e-8
@@ -92,6 +95,17 @@ class ReplayOccupancyMapping:
     result_snapshots: tuple[OccupancySnapshot, ...]
     metadata: dict[str, Any]
     verification_status: str = "integrity_only_unverified_for_motion"
+    motion_eligible: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyReplayOccupancyMapping:
+    """Schema-6 integrity replay that is permanently ineligible for motion."""
+
+    snapshot: OccupancySnapshot
+    metadata: dict[str, Any]
+    legacy_schema_version: int = LEGACY_OCCUPANCY_MAPPING_SCHEMA_VERSION
+    verification_status: str = "legacy_integrity_only_unverified_for_motion"
     motion_eligible: bool = False
 
 
@@ -321,9 +335,7 @@ def _read_occupancy_mapping_with_dependencies(
         label="robot.model_content_hash",
     )
     if _sha256(root / "metadata.json") != decoded.metadata_sha256:
-        raise ValueError(
-            "Occupancy metadata changed during full semantic verification"
-        )
+        raise ValueError("Occupancy metadata changed during full semantic verification")
     semantic_attestation = _issue_occupancy_semantic_attestation(
         occupancy_metadata_sha256=decoded.metadata_sha256,
         snapshot=decoded.snapshot,
@@ -357,6 +369,136 @@ def read_occupancy_mapping_for_replay(path: str | Path) -> ReplayOccupancyMappin
         tuple(update.snapshot for update in decoded.updates),
         decoded.metadata,
     )
+
+
+def read_legacy_occupancy_mapping_for_replay(
+    path: str | Path,
+) -> LegacyReplayOccupancyMapping:
+    """Read a schema-6 artifact only through an explicitly non-motion API.
+
+    Legacy frame identities used a logical view label and therefore cannot prove
+    physical-observation uniqueness.  This reader checks file/source integrity for
+    visualization and archival migration, but deliberately does not construct a
+    semantic attestation or a motion-eligible ``StoredOccupancyMapping``.
+    """
+
+    root = Path(path).resolve()
+    try:
+        metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        if not isinstance(metadata, Mapping):
+            raise ValueError("occupancy metadata root must be an object")
+        if int(metadata["schema_version"]) != LEGACY_OCCUPANCY_MAPPING_SCHEMA_VERSION:
+            raise ValueError("explicit legacy reader accepts only schema 6")
+        if metadata.get("artifact_kind") != "biblade_fusion.occupancy_mapping":
+            raise ValueError("unexpected occupancy artifact kind")
+        if metadata.get("motion_authorized") is not False:
+            raise ValueError("Legacy occupancy artifact must explicitly forbid motion")
+        snapshot = _load_snapshot_record(root, _mapping(metadata, "snapshot"))
+        top_sources = _mapping(metadata, "sources")
+        _require_exact_keys(top_sources, {"hand_eye"}, label="artifact sources")
+        _verify_source(_mapping(top_sources, "hand_eye"))
+        frames = _sequence(metadata, "frames")
+        if not frames:
+            raise ValueError("legacy occupancy artifact contains no frame evidence")
+        last_result: OccupancySnapshot | None = None
+        for raw_frame in frames:
+            if not isinstance(raw_frame, Mapping):
+                raise ValueError("legacy occupancy frame record must be an object")
+            evidence = _mapping(raw_frame, "evidence")
+            if "physical_source_id" in evidence:
+                raise ValueError("schema-6 evidence unexpectedly claims a physical source ID")
+            sources = _mapping(raw_frame, "sources")
+            _require_exact_keys(
+                sources,
+                {"stereo_inference", "session"},
+                label="legacy frame sources",
+            )
+            stereo_metadata = _verify_source(
+                _mapping(sources, "stereo_inference"),
+                expected_filename="metadata.json",
+            )
+            session_manifest = _verify_source(
+                _mapping(sources, "session"),
+                expected_filename="manifest.json",
+            )
+            if _sha256(stereo_metadata) != str(evidence["source_stereo_metadata_sha256"]):
+                raise ValueError("legacy stereo metadata SHA-256 differs from evidence")
+            if _sha256(session_manifest) != str(evidence["source_session_manifest_sha256"]):
+                raise ValueError("legacy session manifest SHA-256 differs from evidence")
+            files = _mapping(raw_frame, "files")
+            source_depth = _load_array(root, _mapping(files, "source_depth_m"))
+            stereo_valid = _load_array(root, _mapping(files, "stereo_valid_mask"))
+            stereo_confidence = _load_array(root, _mapping(files, "stereo_confidence"))
+            predicted_depth = _load_array(root, _mapping(files, "predicted_robot_depth_m"))
+            robot_mask = _load_array(root, _mapping(files, "robot_mask"))
+            integration_mask = _load_array(root, _mapping(files, "integration_valid_mask"))
+            _validate_array_dtypes(
+                source_depth=source_depth,
+                stereo_valid=stereo_valid,
+                stereo_confidence=stereo_confidence,
+                predicted_depth=predicted_depth,
+                robot_mask=robot_mask,
+                integration_mask=integration_mask,
+            )
+            mapping_snapshot = _load_snapshot_record(
+                root,
+                _mapping(raw_frame, "mapping_snapshot"),
+            )
+            last_result = _load_snapshot_record(
+                root,
+                _mapping(raw_frame, "result_snapshot"),
+            )
+            logical_id = str(evidence["source_view_id"]).strip()
+            mapping_ids = tuple(str(value).strip() for value in evidence["mapping_source_view_ids"])
+            if not logical_id or not mapping_ids or mapping_ids[-1] != logical_id:
+                raise ValueError("legacy logical source identity is inconsistent")
+            if mapping_snapshot.source_view_ids != mapping_ids:
+                raise ValueError("legacy snapshot logical source identities differ")
+            expected_array_hashes = {
+                "source_depth_content_hash": occupancy_array_content_hash(source_depth),
+                "stereo_valid_mask_content_hash": occupancy_array_content_hash(stereo_valid),
+                "stereo_confidence_content_hash": occupancy_array_content_hash(
+                    stereo_confidence
+                ),
+                "predicted_robot_depth_content_hash": occupancy_array_content_hash(
+                    predicted_depth
+                ),
+                "robot_mask_content_hash": occupancy_array_content_hash(robot_mask),
+                "integration_valid_mask_content_hash": occupancy_array_content_hash(
+                    integration_mask
+                ),
+            }
+            if any(
+                str(evidence[name]) != expected
+                for name, expected in expected_array_hashes.items()
+            ):
+                raise ValueError("legacy occupancy array content hash differs from evidence")
+            if (
+                str(evidence["mapping_snapshot_content_hash"])
+                != mapping_snapshot.content_hash
+                or int(evidence["mapping_snapshot_sequence"]) != mapping_snapshot.sequence
+            ):
+                raise ValueError("legacy mapping snapshot identity differs from evidence")
+            raw_hash_payload = dict(evidence)
+            claimed_evidence_hash = str(raw_hash_payload.pop("quality_evidence_hash"))
+            reproduced_evidence_hash = hashlib.sha256(
+                json.dumps(
+                    raw_hash_payload,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if claimed_evidence_hash != reproduced_evidence_hash:
+                raise ValueError("legacy occupancy evidence hash mismatch")
+            if last_result.quality_evidence_hash != claimed_evidence_hash:
+                raise ValueError("legacy result snapshot is not bound to frame evidence")
+        if last_result is None or snapshot != last_result:
+            raise ValueError("legacy final occupancy snapshot differs from its final frame")
+        return LegacyReplayOccupancyMapping(snapshot, dict(metadata))
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid legacy occupancy-mapping artifact {root}: {exc}") from exc
 
 
 def _read_occupancy_mapping_integrity(path: str | Path) -> _DecodedOccupancyMapping:
@@ -491,8 +633,8 @@ def _read_occupancy_mapping_integrity(path: str | Path) -> _DecodedOccupancyMapp
 def _production_validation_dependencies() -> OccupancyMappingValidationDependencies:
     return OccupancyMappingValidationDependencies(
         stereo_reader=read_stereo_inference,
-        stereo_source_verifier=lambda stored, session: (
-            verify_stereo_inference_source(stored, expected_session=session)
+        stereo_source_verifier=lambda stored, session: verify_stereo_inference_source(
+            stored, expected_session=session
         ),
         session_reader_factory=SessionReader,
         hand_eye_reader=_read_verified_hand_eye_source,
@@ -560,9 +702,7 @@ def _validate_semantic_source_chain(
     hand_eye_path: Path,
     dependencies: OccupancyMappingValidationDependencies,
 ) -> None:
-    if not updates or not (
-        len(updates) == len(stereo_roots) == len(session_roots)
-    ):
+    if not updates or not (len(updates) == len(stereo_roots) == len(session_roots)):
         raise ValueError("Occupancy semantic source lists must match frame updates")
     context = updates[0].mapping_context
     payload = context.to_payload()
@@ -600,9 +740,7 @@ def _validate_semantic_source_chain(
 
     renderer = dependencies.renderer_factory(offsets)
     if renderer.model_content_hash != context_robot_hash:
-        raise ValueError(
-            "Mapping context robot hash is not the active robot geometry hash"
-        )
+        raise ValueError("Mapping context robot hash is not the active robot geometry hash")
     renderer_offsets = tuple(float(value) for value in renderer.joint_zero_offsets_rad)
     if renderer_offsets != offsets:
         raise ValueError("Active robot renderer offsets differ from mapping context")
@@ -657,8 +795,7 @@ def _validate_semantic_source_chain(
             source_identity != expected_identity
             or observation_identity != expected_identity
             or bound_session != session_root
-            or source_monotonic_time_ns
-            != int(stereo.rectified.source_monotonic_time_ns)
+            or source_monotonic_time_ns != int(stereo.rectified.source_monotonic_time_ns)
         ):
             raise ValueError("Occupancy stereo source identity does not match frame evidence")
         _require_array_equal(
@@ -686,9 +823,7 @@ def _validate_semantic_source_chain(
             label="Occupancy source stereo disparity/depth",
             equal_nan=True,
         )
-        if _rectified_stereo_payload(stereo.rectified.calibration) != dict(
-            context_rectified
-        ):
+        if _rectified_stereo_payload(stereo.rectified.calibration) != dict(context_rectified):
             raise ValueError("Occupancy stereo calibration differs from mapping context")
         if dict(stereo.result.metadata) != dict(context_foundation):
             raise ValueError("Occupancy FoundationStereo metadata differs from mapping context")
@@ -696,7 +831,7 @@ def _validate_semantic_source_chain(
         reader = dependencies.session_reader_factory(session_root)
         if Path(reader.path).resolve() != session_root:
             raise ValueError("Occupancy session reader resolved a different root")
-        bundle = reader.load_bundle(evidence.source_view_id)
+        bundle = reader.load_bundle(evidence.source_sequence_index)
         bundle_identity = (
             bundle.view_id,
             bundle.sequence_index,
@@ -705,10 +840,7 @@ def _validate_semantic_source_chain(
         if bundle_identity != expected_identity:
             raise ValueError("Occupancy session source identity does not match frame evidence")
         _validate_session_capture_contract(bundle, acquisition_contract)
-        if (
-            int(bundle.stereo.monotonic_time_ns)
-            != int(stereo.rectified.source_monotonic_time_ns)
-        ):
+        if int(bundle.stereo.monotonic_time_ns) != int(stereo.rectified.source_monotonic_time_ns):
             raise ValueError("Occupancy session/stereo monotonic time differs")
         _require_array_equal(
             np.asarray(bundle.selected_robot_state.joint_positions_rad, dtype=np.float64),
@@ -726,13 +858,22 @@ def _validate_semantic_source_chain(
         )
         if captured != evidence.captured_at_utc:
             raise ValueError("Occupancy session timestamp differs from frame evidence")
-        descriptor = reader.descriptor(evidence.source_view_id)
+        descriptor = reader.descriptor(evidence.source_sequence_index)
         relative_view = Path(str(descriptor.relative_path))
         view_metadata = (session_root / relative_view / "metadata.json").resolve()
         if relative_view.is_absolute() or not view_metadata.is_relative_to(session_root):
             raise ValueError("Occupancy session view metadata escapes its source root")
         if _sha256(view_metadata) != evidence.source_session_view_metadata_sha256:
             raise ValueError("Occupancy session view metadata SHA-256 differs from frame evidence")
+        reproduced_physical_source_id = occupancy_physical_source_id(
+            source_session_manifest_sha256=_sha256(session_root / "manifest.json"),
+            source_session_view_metadata_sha256=_sha256(view_metadata),
+            source_sequence_index=bundle.sequence_index,
+            frame_number=bundle.stereo.frame_number,
+            source_view_id=bundle.view_id,
+        )
+        if reproduced_physical_source_id != evidence.physical_source_id:
+            raise ValueError("Occupancy physical source identity does not reproduce")
 
         rerendered = renderer.render_robot_depth(
             left_intrinsics,
@@ -778,9 +919,7 @@ def _validate_session_capture_contract(
         )
     )
     tcp_translation_delta_m = float(
-        np.linalg.norm(
-            after.base_t_tcp.translation_m - before.base_t_tcp.translation_m
-        )
+        np.linalg.norm(after.base_t_tcp.translation_m - before.base_t_tcp.translation_m)
     )
     tcp_rotation_delta_rad = math.radians(
         _rotation_error_deg(before.base_t_tcp.rotation, after.base_t_tcp.rotation)
@@ -833,8 +972,7 @@ def _validate_session_capture_contract(
         violations.append("TCP rotation")
     if violations:
         raise ValueError(
-            "Occupancy source was not captured at a settled robot pose: "
-            + ", ".join(violations)
+            "Occupancy source was not captured at a settled robot pose: " + ", ".join(violations)
         )
 
 
@@ -871,9 +1009,7 @@ def _rectified_stereo_payload(calibration: Any) -> dict[str, Any]:
             calibration.right_rectified_t_left_rectified.matrix.tolist()
         ),
         "left_rectified_T_left_ir": calibration.left_rectified_t_left_ir.matrix.tolist(),
-        "right_rectified_T_right_ir": (
-            calibration.right_rectified_t_right_ir.matrix.tolist()
-        ),
+        "right_rectified_T_right_ir": (calibration.right_rectified_t_right_ir.matrix.tolist()),
         "disparity_to_depth_q": calibration.disparity_to_depth_q.tolist(),
         "left_valid_roi": list(calibration.left_valid_roi),
         "right_valid_roi": list(calibration.right_valid_roi),
@@ -926,7 +1062,7 @@ def _validate_update_chain(
             raise ValueError("All occupancy frames must share one mapping context")
         _validate_configured_geometry(update.mapping_snapshot, occupancy_config)
         _validate_configured_geometry(update.snapshot, occupancy_config)
-        expected_views.append(update.evidence.source_view_id)
+        expected_views.append(update.evidence.physical_source_id)
         expected_view_tuple = tuple(expected_views)
         if update.evidence.source_sequence_index < 0:
             raise ValueError("Occupancy source sequence index must be non-negative")
@@ -955,8 +1091,6 @@ def _validate_update_chain(
             if update.evidence.previous_evidence_hash is not None:
                 raise ValueError("First occupancy evidence must not have a parent")
         else:
-            if update.evidence.source_sequence_index <= previous.evidence.source_sequence_index:
-                raise ValueError("Occupancy source sequence indices must increase")
             if update.evidence.previous_evidence_hash != previous.evidence.quality_evidence_hash:
                 raise ValueError("Occupancy previous evidence hash is not chain-bound")
             if update.mapping_snapshot.sequence != previous.snapshot.sequence + 1:
@@ -965,26 +1099,18 @@ def _validate_update_chain(
                 update.mapping_snapshot.occupied_indices
             ):
                 raise ValueError("Occupied evidence must be monotonic across frames")
-            previous_free_counts = dict(
-                previous.mapping_snapshot.free_observation_counts
-            )
-            current_free_counts = dict(
-                update.mapping_snapshot.free_observation_counts
-            )
+            previous_free_counts = dict(previous.mapping_snapshot.free_observation_counts)
+            current_free_counts = dict(update.mapping_snapshot.free_observation_counts)
             if any(
                 current_free_counts.get(voxel, 0) < count
                 for voxel, count in previous_free_counts.items()
             ):
-                raise ValueError(
-                    "Free observation counts must be monotonic across frames"
-                )
+                raise ValueError("Free observation counts must be monotonic across frames")
             if any(
                 count - previous_free_counts.get(voxel, 0) not in {0, 1}
                 for voxel, count in current_free_counts.items()
             ):
-                raise ValueError(
-                    "One occupancy frame may cast at most one free vote per voxel"
-                )
+                raise ValueError("One occupancy frame may cast at most one free vote per voxel")
             surviving_free = previous.mapping_snapshot.free_indices.difference(
                 update.mapping_snapshot.occupied_indices
             )
@@ -996,9 +1122,7 @@ def _validate_update_chain(
                 update.mapping_snapshot.rebuild_started_at_utc
                 != previous.mapping_snapshot.rebuild_started_at_utc
             ):
-                raise ValueError(
-                    "Occupancy rebuild freshness reference changed within one cycle"
-                )
+                raise ValueError("Occupancy rebuild freshness reference changed within one cycle")
         _validate_replayed_mapping(update, previous, occupancy_config)
         previous = update
 
@@ -1281,8 +1405,7 @@ def _validate_configured_geometry(
         or not np.isclose(snapshot.voxel_size_m, occupancy_config.voxel_size_m)
         or not np.allclose(snapshot.origin_m, bounds_min)
         or snapshot.grid_shape != _configured_grid_shape(occupancy_config)
-        or snapshot.minimum_free_observations
-        != occupancy_config.minimum_free_observations
+        or snapshot.minimum_free_observations != occupancy_config.minimum_free_observations
         or not np.isclose(
             snapshot.minimum_free_view_translation_m,
             occupancy_config.minimum_free_view_translation_m,
@@ -1349,12 +1472,8 @@ def _validate_replayed_mapping(
             minimum_valid_rays=1,
             free_space_margin_m=config.free_space_margin_m,
             minimum_free_observations=config.minimum_free_observations,
-            minimum_free_view_translation_m=(
-                config.minimum_free_view_translation_m
-            ),
-            minimum_free_view_direction_deg=(
-                config.minimum_free_view_direction_deg
-            ),
+            minimum_free_view_translation_m=(config.minimum_free_view_translation_m),
+            minimum_free_view_direction_deg=(config.minimum_free_view_direction_deg),
         ),
         mapping_context_hash=update.mapping_context.content_hash,
     ).integrate(
@@ -1363,7 +1482,7 @@ def _validate_replayed_mapping(
         intrinsics,
         pose,
         valid_mask=update.integration_valid_mask,
-        source_view_id=update.evidence.source_view_id,
+        source_view_id=update.evidence.physical_source_id,
         observed_at_utc=datetime.fromisoformat(update.evidence.captured_at_utc),
     )
     if replayed != update.mapping_snapshot:
@@ -1378,6 +1497,7 @@ def _evidence_from_payload(raw: Mapping[str, Any]) -> OccupancyFrameEvidence:
     joints = raw["joint_positions_rad"]
     return OccupancyFrameEvidence(
         source_view_id=str(raw["source_view_id"]),
+        physical_source_id=str(raw["physical_source_id"]),
         source_sequence_index=int(raw["source_sequence_index"]),
         frame_number=int(raw["frame_number"]),
         captured_at_utc=str(raw["captured_at_utc"]),
@@ -1385,9 +1505,7 @@ def _evidence_from_payload(raw: Mapping[str, Any]) -> OccupancyFrameEvidence:
         hand_eye_hash=str(raw["hand_eye_hash"]),
         source_stereo_metadata_sha256=str(raw["source_stereo_metadata_sha256"]),
         source_session_manifest_sha256=str(raw["source_session_manifest_sha256"]),
-        source_session_view_metadata_sha256=str(
-            raw["source_session_view_metadata_sha256"]
-        ),
+        source_session_view_metadata_sha256=str(raw["source_session_view_metadata_sha256"]),
         base_t_flange_matrix=tuple(tuple(float(value) for value in row) for row in base_t_flange),
         predicted_base_t_tcp_matrix=tuple(
             tuple(float(value) for value in row) for row in predicted_base_t_tcp
@@ -1492,9 +1610,7 @@ def _verify_source(
     if relative.is_absolute() or not path.is_relative_to(root):
         raise ValueError("Occupancy source escapes its artifact root")
     if expected_filename is not None and relative != Path(expected_filename):
-        raise ValueError(
-            f"Occupancy source filename must be {expected_filename!r}"
-        )
+        raise ValueError(f"Occupancy source filename must be {expected_filename!r}")
     if _sha256(path) != str(record["sha256"]):
         raise ValueError(f"Occupancy source checksum mismatch: {path}")
     return path

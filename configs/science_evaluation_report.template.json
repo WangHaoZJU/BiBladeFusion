@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "report_type": "biblade_fusion.geometry_science_evaluation_report",
+  "generator": {
+    "name": "REPLACE_WITH_EVALUATOR_NAME",
+    "version": "REPLACE_WITH_EVALUATOR_VERSION"
+  },
+  "created_at_utc": "REPLACE_WITH_CANONICAL_UTC_ISO8601",
+  "science_runtime_contract_sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+  "raw_acceptance_asset_manifest_sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+  "measurements": {
+    "depth_rmse_m": null,
+    "depth_p95_m": null,
+    "depth_absolute_bias_m": null,
+    "bootstrap_mask_precision": null,
+    "bootstrap_mask_recall": null,
+    "fine_mask_precision": null,
+    "fine_mask_recall": null,
+    "final_surface_rmse_m": null,
+    "final_surface_p95_m": null,
+    "final_hole_fraction": null,
+    "thickness_absolute_error_m": null
+  },
+  "test_envelope": {
+    "minimum_distance_m": null,
+    "maximum_distance_m": null,
+    "minimum_incidence_deg": null,
+    "maximum_incidence_deg": null
+  },
+  "sample_counts": {
+    "depth_reference": null,
+    "annotated_frames": null,
+    "reconstructed_specimens": null
+  }
+}

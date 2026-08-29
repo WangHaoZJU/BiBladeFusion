@@ -141,11 +141,17 @@ mask会从绑定的stereo、占用integration-valid mask和粗模型重算，点
 点云配置及`base_T_left_rectified`重新去投影和变换。离线/人工schema 2兼容读取不能作为在线精扫
 恢复证据。
 
-该接线仍不是生产放行：`blade_foreground.enabled=false`是默认值；启用时必须由库级composition
-root显式传入固定schema-5参考和可选恢复代际，目前没有公开CLI完成这项组装。真实叶片上的mask
+公开的`scan run-unknown`已把该分支接入监督式粗扫—精扫composition root，但这仍不是生产
+放行。顶层追加链用`FINE_CHECKPOINT`把每个已接受精扫coverage generation绑定到精扫run的
+精确事件边界；恢复只采用指定实验链的最后检查点并递归重放全部科学来源，不搜索可变的
+“latest”目录。候选失败只触发配置上限内的有限retry，每次retry具有新的不可变采集/推理目录和
+原始session、精确view metadata、物理frame、foreground、reconstruction及coverage来源证明；
+相同逻辑`view_id`不构成同一物理观测，也不能绕过重复检测。
+
+`blade_foreground.enabled=false`仍是默认值。真实叶片上的mask
 容差、鳍片保持率、曲面质量和FoundationStereo运行时间尚未验收。默认
-`view_filter.workspace=null`仍会阻断机器人候选；连续扫掠网格证明、机器人—占用图扫掠证明、
-真机尺寸验收和人工逐段批准也仍是相互独立的生产运动前置条件。
+`view_filter.workspace=null`仍会阻断机器人候选；两类连续扫掠证明的真机验收、最终装配尺寸验收
+和人工逐段批准也仍是相互独立的生产运动前置条件。
 当前owner z-buffer由有限粗曲面点按`projection_radius_px`圆形splat得到，并非三角网格连续光栅化；
 因此真机还必须验收各工作距离下的最大投影采样孔隙，孔隙无法被保守覆盖时应失败关闭或改用
 三角面z-buffer，不能把离散owner直接表述为连续遮挡证明。

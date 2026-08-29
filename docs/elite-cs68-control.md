@@ -17,11 +17,11 @@ preserve upstream provenance; they must not be interpreted as a CS68 production 
   mount, and Pinocchio/FCL collision pairs form one hash-bound motion-model contract.
   Production model resolution requires the explicit, ready final ES68+D435i STL
   manifest and fails closed when it is absent or inconsistent.
-- Conservative linear-joint preflight evaluates bounded-step mesh and depth-derived
-  occupancy samples. In production mode it currently blocks at the missing continuous
-  swept-mesh proof before ServoJ generation; an independent continuous
-  robot-versus-voxel proof is also mandatory. A library-only diagnostic override may
-  generate a stream for inspection, but it is never approval-ready.
+- Conservative linear-joint preflight proves the full mesh/workcell interval using FCL
+  separation and serial-chain displacement bounds, and independently proves the full
+  robot-versus-voxel interval with displacement-expanded geometry spheres. Both
+  certificates are bound to the exact segment; inconclusive subdivision, numerical,
+  evidence or freshness states return `UNKNOWN` and block.
 - Unknown-blade occupancy is built from accepted FoundationStereo observations in
   `base`. A rendered ES68+D435i depth image retains a measured surface clearly in front
   of the robot, but masks matching or farther measurements so a dropout cannot clear
@@ -46,18 +46,21 @@ All of the following are mandatory:
    preflight start, confirms the occupancy identity and remaining freshness, and repeats
    both Pinocchio/FCL and occupancy path validation.
 
-There is intentionally no motion CLI yet. `bbf safety preflight-path` requires
-`--occupancy`, persists and re-verifies the mesh/occupancy contracts and available
-diagnostic evidence for an ordered view sequence, and does not connect to the robot. If a
-valid fresh map is supplied by a lower-level integration, current production motion
-evaluation stops at the missing continuous swept-mesh proof before a ServoJ stream exists.
-Existing robot-status, acquisition, planning, validation, occupancy, supervision, and
-preflight commands remain non-moving.
+`bbf safety preflight-path` requires `--occupancy`, persists and re-verifies the
+mesh/occupancy contracts for an ordered view sequence, and never connects to the robot.
+Robot-status, ordinary acquisition, planning, validation, occupancy replay, supervision
+and standalone preflight commands remain non-moving.
 
-No current CLI publishes a fresh `MAP_READY` occupancy asset. A default-off library-level
-coordinator can prepare and transactionally publish such an asset when assembled by an
-application, but no public composition root exposes that integration. The offline
-`build-replay` path below is deliberately not a substitute for a live accepted cycle.
+The only public physical-motion composition is the default-off, interactive
+`bbf scan run-unknown` runtime. It first requires `scan doctor --mode unknown`, opens one
+ES68 and one D435i, and accepts explicit operator-positioned `c` captures until a live
+`MAP_READY` generation exists. It then prepares one bounded segment at a time. The
+operator must paste the exact current preflight token; the one-shot permit is consumed
+before the private capability may perform any power/brake preparation. That preparation
+does not clear the stop latch or transmit a trajectory. Joint state, occupancy identity,
+freshness, both continuous proofs, stop generation and permit expiry are checked again
+before the compare-and-clear resume and ServoJ transport. Every successful segment ends
+with an acknowledged stop and one capture.
 
 `bbf occupancy build-replay` is an offline evidence-reconstruction command. Every map it
 writes is deliberately `STALE`, so supplying it to preflight remains blocked. Likewise,
@@ -66,27 +69,30 @@ writes is deliberately `STALE`, so supplying it to preflight remains blocked. Li
 motion-transmission interface. Its `--follow` mode only observes newly published files
 and is not a real-time control or dynamic-avoidance loop.
 
-The library coordinator now atomically binds settled capture, FoundationStereo inference,
-self-masking, fresh-map publication, optional fine-science staging, plan invalidation,
-preflight, and guarded execution state. This closes a software contract, not hardware
-enablement: it is default-off, lacks a public composition-root/motion CLI, and is not
-verified on the ES68/D435i system. Hardware release additionally requires the two
-continuous swept-volume proofs, final dimensions/attachments, measured timing thresholds,
-and controlled operator acceptance.
+The coordinator atomically binds settled capture, FoundationStereo inference,
+self-masking, fresh-map publication, coarse/fine scientific staging, plan invalidation,
+preflight, one-shot approval and guarded execution. This closes a software contract, not
+hardware acceptance: the committed configuration is off, and the complete path is not
+yet verified on the final ES68/D435i/blade workcell. Hardware release still requires
+final dimensions/attachments, measured timing and clearance thresholds, static-free
+workcell declarations, known-collision fixtures, controller stop tests and controlled
+operator acceptance.
 
 ## Known limitations
 
-- Mesh/FCL and robot-versus-voxel occupancy checks currently sample the joint path at
-  bounded discrete states; the latter approximates each collision mesh by the bounding
-  sphere of its transformed local AABB. Neither supplies its required continuous swept-
-  volume proof. These are independent release blockers, not interchangeable checks.
+- Both interval proofs are conservative and can reject safe motion. The occupancy proof
+  approximates each collision mesh with a sphere enclosing its transformed local AABB,
+  then further expands it by the interval motion bound. It must not be relaxed to point
+  sampling merely to obtain a feasible route.
 - Because robot pixels are correctly removed without ray-clearing, the robot's own
-  volume remains `UNKNOWN`; the current bounding-sphere query can therefore block the
-  capture pose itself. A conservative, model-hash-bound self-volume treatment with an
-  observed-free shell (or stronger equivalent) is required before physical release.
+  volume remains `UNKNOWN`. Only whole UNKNOWN voxels inside an immutable, physically
+  accepted static-free AABB may use the narrow external-object-free exception;
+  `OCCUPIED` always blocks. Such an AABB may not overlap the blade, fixture, support or
+  any other external-object envelope.
 - The map is stop-and-capture evidence for a static segment, not certified continuous
   dynamic-obstacle avoidance. Map changes invalidate existing preflights and permits.
 - Elite's copied public joint-limit profile has velocity limits but marks acceleration
   limits unavailable. Preflight therefore records `acceleration_limits_unavailable`.
 - Unit tests use SDK doubles and never connect to hardware, power on a controller,
-  release brakes, or transmit a motion command.
+  release brakes, or transmit a motion command. Continuous-proof regression tests are
+  software geometry tests, not physical ES68 safety certification.

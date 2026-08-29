@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -15,6 +17,8 @@ from biblade_fusion.devices.robot.base import RobotState
 
 _STATIONARY_ROBOT_MODES = {"IDLE"}
 _ACCEPTED_SAFETY_STATUSES = {"NORMAL", "REDUCED"}
+_BOOTSTRAP_SAFE_ROBOT_MODES = {"IDLE", "POWER_OFF", "3", "5"}
+_BOOTSTRAP_STOPPED_RUNTIME_STATES = {"STOPPED", "3"}
 
 
 class StationarityError(RuntimeError):
@@ -30,6 +34,14 @@ class RobotStateSource(Protocol):
     """Narrow read-only boundary required by the stationarity monitor."""
 
     def read_state(self) -> RobotState: ...
+
+
+@runtime_checkable
+class StopLatchedRobotStateSource(RobotStateSource, Protocol):
+    """Read-only state plus the driver's atomic software stop generation."""
+
+    @property
+    def stop_snapshot(self) -> tuple[int, bool]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +83,69 @@ class StationarityEvidence:
         )
         if not all(math.isfinite(float(value)) and float(value) >= 0.0 for value in values):
             raise ValueError("stationarity evidence metrics must be finite and non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class BootstrapSafeStateEvidence:
+    """Multi-channel evidence for the unpowered startup stop boundary."""
+
+    stationarity: StationarityEvidence
+    stop_generation: int
+    runtime_state: str
+    robot_mode: str
+    safety_status: str
+    max_actual_joint_velocity_rad_s: float
+    max_target_joint_velocity_rad_s: float
+    max_actual_tcp_linear_velocity_m_s: float
+    max_actual_tcp_angular_velocity_rad_s: float
+    max_target_tcp_linear_velocity_m_s: float
+    max_target_tcp_angular_velocity_rad_s: float
+    evidence_sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.stop_generation) is not int or self.stop_generation < 1:
+            raise ValueError("bootstrap stop generation must be a positive integer")
+        labels = (self.runtime_state, self.robot_mode, self.safety_status)
+        if any(not str(value).strip() for value in labels):
+            raise ValueError("bootstrap controller-state labels must be non-empty")
+        metrics = (
+            self.max_actual_joint_velocity_rad_s,
+            self.max_target_joint_velocity_rad_s,
+            self.max_actual_tcp_linear_velocity_m_s,
+            self.max_actual_tcp_angular_velocity_rad_s,
+            self.max_target_tcp_linear_velocity_m_s,
+            self.max_target_tcp_angular_velocity_rad_s,
+        )
+        if not all(math.isfinite(value) and value >= 0.0 for value in metrics):
+            raise ValueError("bootstrap stopped-velocity evidence must be finite and non-negative")
+        final = self.stationarity.final_state
+        payload = {
+            "schema": "biblade_fusion.bootstrap_safe_state_evidence.v1",
+            "stop_generation": self.stop_generation,
+            "runtime_state": self.runtime_state,
+            "robot_mode": self.robot_mode,
+            "safety_status": self.safety_status,
+            "sample_count": self.stationarity.sample_count,
+            "duration_s": self.stationarity.duration_s,
+            "controller_duration_s": self.stationarity.controller_duration_s,
+            "max_sample_gap_s": self.stationarity.max_sample_gap_s,
+            "max_joint_delta_rad": self.stationarity.max_joint_delta_rad,
+            "max_tcp_translation_delta_m": (
+                self.stationarity.max_tcp_translation_delta_m
+            ),
+            "max_tcp_rotation_delta_rad": self.stationarity.max_tcp_rotation_delta_rad,
+            "final_monotonic_time_ns": final.monotonic_time_ns,
+            "final_controller_time_s": final.controller_time_s,
+            "final_joint_positions_rad": final.joint_positions_rad.tolist(),
+            "stopped_velocity_maxima": list(metrics),
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        object.__setattr__(self, "evidence_sha256", hashlib.sha256(encoded).hexdigest())
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,19 +214,9 @@ def _state_deltas(
     current: RobotState,
 ) -> tuple[float, float, float]:
     return (
+        float(np.max(np.abs(current.joint_positions_rad - reference.joint_positions_rad))),
         float(
-            np.max(
-                np.abs(
-                    current.joint_positions_rad
-                    - reference.joint_positions_rad
-                )
-            )
-        ),
-        float(
-            np.linalg.norm(
-                current.base_t_tcp.translation_m
-                - reference.base_t_tcp.translation_m
-            )
+            np.linalg.norm(current.base_t_tcp.translation_m - reference.base_t_tcp.translation_m)
         ),
         _rotation_delta_rad(reference, current),
     )
@@ -166,10 +231,7 @@ def _maximum_trace_deltas(
     for current_index, current in enumerate(states):
         for reference in states[:current_index]:
             deltas = _state_deltas(reference, current)
-            maximum = tuple(
-                max(old, new)
-                for old, new in zip(maximum, deltas, strict=True)
-            )
+            maximum = tuple(max(old, new) for old, new in zip(maximum, deltas, strict=True))
     return maximum
 
 
@@ -273,9 +335,7 @@ def _read_state(source: RobotStateSource) -> RobotState:
     try:
         state = source.read_state()
     except Exception as exc:
-        raise StationarityError(
-            f"robot state read failed: {type(exc).__name__}: {exc}"
-        ) from exc
+        raise StationarityError(f"robot state read failed: {type(exc).__name__}: {exc}") from exc
     if not isinstance(state, RobotState):
         raise StationarityError("robot state source returned a non-RobotState value")
     _validate_state_contract(state)
@@ -284,14 +344,8 @@ def _read_state(source: RobotStateSource) -> RobotState:
 
 def _validate_state_contract(state: RobotState) -> None:
     timestamp = state.monotonic_time_ns
-    if (
-        isinstance(timestamp, bool)
-        or not isinstance(timestamp, (int, np.integer))
-        or timestamp < 0
-    ):
-        raise StationarityError(
-            "robot monotonic timestamp must be a non-negative integer"
-        )
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, np.integer)) or timestamp < 0:
+        raise StationarityError("robot monotonic timestamp must be a non-negative integer")
     if not math.isfinite(float(state.controller_time_s)):
         raise StationarityError("robot controller timestamp must be finite")
     if (state.base_t_tcp.parent_frame, state.base_t_tcp.child_frame) != (
@@ -301,13 +355,11 @@ def _validate_state_contract(state: RobotState) -> None:
         raise StationarityError("stationarity requires robot base_T_tcp state")
     if state.robot_mode.upper() not in _STATIONARY_ROBOT_MODES:
         raise StationarityError(
-            "stationarity requires controller robot_mode=IDLE, got "
-            f"{state.robot_mode!r}"
+            f"stationarity requires controller robot_mode=IDLE, got {state.robot_mode!r}"
         )
     if state.safety_status.upper() not in _ACCEPTED_SAFETY_STATUSES:
         raise StationarityError(
-            "stationarity requires NORMAL or REDUCED safety status, got "
-            f"{state.safety_status!r}"
+            f"stationarity requires NORMAL or REDUCED safety status, got {state.safety_status!r}"
         )
 
 
@@ -315,9 +367,7 @@ def _clock_value(clock: Callable[[], float]) -> float:
     try:
         value = float(clock())
     except Exception as exc:
-        raise StationarityError(
-            f"monotonic clock failed: {type(exc).__name__}: {exc}"
-        ) from exc
+        raise StationarityError(f"monotonic clock failed: {type(exc).__name__}: {exc}") from exc
     if not math.isfinite(value):
         raise StationarityError("monotonic clock returned a non-finite value")
     return value
@@ -345,6 +395,12 @@ def wait_until_settled(
     max_tcp_rotation_delta_rad: float,
     goal_tolerance_rad: float,
     maximum_robot_state_staleness_s: float = 0.25,
+    maximum_stopped_actual_joint_velocity_rad_s: float | None = None,
+    maximum_stopped_target_joint_velocity_rad_s: float | None = None,
+    maximum_stopped_actual_tcp_linear_velocity_m_s: float | None = None,
+    maximum_stopped_actual_tcp_angular_velocity_rad_s: float | None = None,
+    maximum_stopped_target_tcp_linear_velocity_m_s: float | None = None,
+    maximum_stopped_target_tcp_angular_velocity_rad_s: float | None = None,
     monotonic_clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> StationarityEvidence:
@@ -384,6 +440,50 @@ def wait_until_settled(
         max_tcp_translation_delta_m,
         max_tcp_rotation_delta_rad,
     )
+    optional_velocity_limits = (
+        maximum_stopped_actual_joint_velocity_rad_s,
+        maximum_stopped_target_joint_velocity_rad_s,
+        maximum_stopped_actual_tcp_linear_velocity_m_s,
+        maximum_stopped_actual_tcp_angular_velocity_rad_s,
+        maximum_stopped_target_tcp_linear_velocity_m_s,
+        maximum_stopped_target_tcp_angular_velocity_rad_s,
+    )
+    if any(value is not None for value in optional_velocity_limits) and not all(
+        value is not None for value in optional_velocity_limits
+    ):
+        raise ValueError("stopped-velocity limits must be configured as one complete set")
+    velocity_limits = (
+        None
+        if optional_velocity_limits[0] is None
+        else tuple(
+            _positive_finite(float(value), label="stopped velocity limit")
+            for value in optional_velocity_limits
+        )
+    )
+
+    def velocity_gate(state: RobotState) -> bool:
+        if velocity_limits is None:
+            return True
+        if any(
+            value is None
+            for value in (
+                state.actual_joint_velocity_rad_s,
+                state.target_joint_velocity_rad_s,
+                state.actual_tcp_velocity,
+                state.target_tcp_velocity,
+            )
+        ):
+            raise StationarityError(
+                "stopped-state proof lacks mandatory actual/target joint/TCP velocity channels"
+            )
+        return all(
+            observed <= limit
+            for observed, limit in zip(
+                _bootstrap_velocity_metrics(state),
+                velocity_limits,
+                strict=True,
+            )
+        )
 
     started_at = _clock_value(monotonic_clock)
     deadline = started_at + timeout
@@ -404,7 +504,7 @@ def wait_until_settled(
     maximum_deltas = (0.0, 0.0, 0.0)
     feedback_states = [previous_state]
     feedback_sample_times = [now]
-    if goal_error <= goal_tolerance:
+    if goal_error <= goal_tolerance and velocity_gate(previous_state):
         stable_states.append(previous_state)
         stable_sample_times.append(now)
         stable_started_at = now
@@ -413,12 +513,10 @@ def wait_until_settled(
         if stable_states and stable_started_at is not None:
             clock_duration = now - stable_started_at
             state_duration = (
-                stable_states[-1].monotonic_time_ns
-                - stable_states[0].monotonic_time_ns
+                stable_states[-1].monotonic_time_ns - stable_states[0].monotonic_time_ns
             ) / 1e9
             controller_duration = (
-                stable_states[-1].controller_time_s
-                - stable_states[0].controller_time_s
+                stable_states[-1].controller_time_s - stable_states[0].controller_time_s
             )
             if (
                 clock_duration >= settle_time
@@ -470,9 +568,7 @@ def wait_until_settled(
         if sampled_at < wake_time:
             raise StationarityError("monotonic clock moved backwards during state read")
         if sampled_at > deadline:
-            raise StationarityTimeoutError(
-                "stationarity timed out during robot-state sampling"
-            )
+            raise StationarityTimeoutError("stationarity timed out during robot-state sampling")
         _require_nondecreasing_state_time(previous_state, current_state)
         feedback_states.append(current_state)
         feedback_sample_times.append(sampled_at)
@@ -486,11 +582,16 @@ def wait_until_settled(
         if stable_states and stable_started_at is not None:
             candidate_states = (*stable_states, current_state)
             deltas = _maximum_trace_deltas(candidate_states)
-            if goal_error <= goal_tolerance and _within_thresholds(deltas, limits):
+            velocity_stopped = velocity_gate(current_state)
+            if (
+                goal_error <= goal_tolerance
+                and velocity_stopped
+                and _within_thresholds(deltas, limits)
+            ):
                 stable_states.append(current_state)
                 stable_sample_times.append(sampled_at)
                 maximum_deltas = deltas
-            elif goal_error <= goal_tolerance:
+            elif goal_error <= goal_tolerance and velocity_stopped:
                 stable_states = [current_state]
                 stable_sample_times = [sampled_at]
                 stable_started_at = sampled_at
@@ -500,7 +601,7 @@ def wait_until_settled(
                 stable_sample_times = []
                 stable_started_at = None
                 maximum_deltas = (0.0, 0.0, 0.0)
-        elif goal_error <= goal_tolerance:
+        elif goal_error <= goal_tolerance and velocity_gate(current_state):
             stable_states = [current_state]
             stable_sample_times = [sampled_at]
             stable_started_at = sampled_at
@@ -508,6 +609,289 @@ def wait_until_settled(
 
         previous_state = current_state
         now = sampled_at
+
+
+def _bootstrap_stop_snapshot(
+    source: StopLatchedRobotStateSource,
+    expected_generation: int,
+) -> None:
+    try:
+        snapshot = source.stop_snapshot
+    except Exception as exc:
+        raise StationarityError(
+            f"robot stop snapshot read failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    if (
+        not isinstance(snapshot, tuple)
+        or len(snapshot) != 2
+        or type(snapshot[0]) is not int
+        or type(snapshot[1]) is not bool
+    ):
+        raise StationarityError("robot stop snapshot must be an (integer, boolean) tuple")
+    if snapshot != (expected_generation, True):
+        raise StationarityError(
+            "bootstrap stop generation/latch changed while safe state was being proved"
+        )
+
+
+def _read_bootstrap_state(source: RobotStateSource) -> RobotState:
+    try:
+        state = source.read_state()
+    except Exception as exc:
+        raise StationarityError(f"robot state read failed: {type(exc).__name__}: {exc}") from exc
+    if not isinstance(state, RobotState):
+        raise StationarityError("robot state source returned a non-RobotState value")
+    timestamp = state.monotonic_time_ns
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, np.integer)) or timestamp < 0:
+        raise StationarityError("robot monotonic timestamp must be a non-negative integer")
+    if not math.isfinite(float(state.controller_time_s)):
+        raise StationarityError("robot controller timestamp must be finite")
+    if (state.base_t_tcp.parent_frame, state.base_t_tcp.child_frame) != ("base", "tcp"):
+        raise StationarityError("bootstrap stop requires robot base_T_tcp state")
+    safety = state.safety_status.strip().upper()
+    if safety not in {*_ACCEPTED_SAFETY_STATUSES, "1", "2"}:
+        raise StationarityError(
+            "bootstrap stop requires NORMAL or REDUCED safety status, "
+            f"got {state.safety_status!r}"
+        )
+    required = {
+        "actual_joint_velocity_rad_s": state.actual_joint_velocity_rad_s,
+        "target_joint_velocity_rad_s": state.target_joint_velocity_rad_s,
+        "actual_tcp_velocity": state.actual_tcp_velocity,
+        "target_tcp_velocity": state.target_tcp_velocity,
+    }
+    missing = tuple(name for name, value in required.items() if value is None)
+    if missing:
+        raise StationarityError(
+            "bootstrap stop lacks mandatory RTSI velocity channels: " + ", ".join(missing)
+        )
+    if state.runtime_state is None:
+        raise StationarityError("bootstrap stop lacks mandatory RTSI runtime_state")
+    return state
+
+
+def _bootstrap_velocity_metrics(
+    state: RobotState,
+) -> tuple[float, float, float, float, float, float]:
+    actual_joint = np.asarray(state.actual_joint_velocity_rad_s, dtype=np.float64)
+    target_joint = np.asarray(state.target_joint_velocity_rad_s, dtype=np.float64)
+    actual_tcp = np.asarray(state.actual_tcp_velocity, dtype=np.float64)
+    target_tcp = np.asarray(state.target_tcp_velocity, dtype=np.float64)
+    return (
+        float(np.max(np.abs(actual_joint))),
+        float(np.max(np.abs(target_joint))),
+        float(np.linalg.norm(actual_tcp[:3])),
+        float(np.linalg.norm(actual_tcp[3:])),
+        float(np.linalg.norm(target_tcp[:3])),
+        float(np.linalg.norm(target_tcp[3:])),
+    )
+
+
+def wait_until_bootstrap_safe_state(
+    state_source: StopLatchedRobotStateSource,
+    *,
+    expected_stop_generation: int,
+    settle_time_s: float,
+    timeout_s: float,
+    poll_period_s: float,
+    max_joint_delta_rad: float,
+    max_tcp_translation_delta_m: float,
+    max_tcp_rotation_delta_rad: float,
+    maximum_robot_state_staleness_s: float,
+    maximum_stopped_actual_joint_velocity_rad_s: float,
+    maximum_stopped_target_joint_velocity_rad_s: float,
+    maximum_stopped_actual_tcp_linear_velocity_m_s: float,
+    maximum_stopped_actual_tcp_angular_velocity_rad_s: float,
+    maximum_stopped_target_tcp_linear_velocity_m_s: float,
+    maximum_stopped_target_tcp_angular_velocity_rad_s: float,
+    monotonic_clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> BootstrapSafeStateEvidence:
+    """Prove the explicit Dashboard bootstrap stop from independent RTSI channels.
+
+    Velocity or controller-state observations that are still settling reset the
+    candidate window. Missing channels, unsafe safety modes, stale feedback, time
+    rollback, and a changed stop generation fail immediately.
+    """
+
+    if type(expected_stop_generation) is not int or expected_stop_generation < 1:
+        raise ValueError("expected_stop_generation must be a positive integer")
+    settle_time = _positive_finite(settle_time_s, label="settle_time_s")
+    timeout = _positive_finite(timeout_s, label="timeout_s")
+    poll_period = _positive_finite(poll_period_s, label="poll_period_s")
+    maximum_staleness = _positive_finite(
+        maximum_robot_state_staleness_s,
+        label="maximum_robot_state_staleness_s",
+    )
+    limits = _thresholds(
+        max_joint_delta_rad,
+        max_tcp_translation_delta_m,
+        max_tcp_rotation_delta_rad,
+    )
+    velocity_limits = tuple(
+        _positive_finite(value, label=label)
+        for value, label in (
+            (
+                maximum_stopped_actual_joint_velocity_rad_s,
+                "maximum_stopped_actual_joint_velocity_rad_s",
+            ),
+            (
+                maximum_stopped_target_joint_velocity_rad_s,
+                "maximum_stopped_target_joint_velocity_rad_s",
+            ),
+            (
+                maximum_stopped_actual_tcp_linear_velocity_m_s,
+                "maximum_stopped_actual_tcp_linear_velocity_m_s",
+            ),
+            (
+                maximum_stopped_actual_tcp_angular_velocity_rad_s,
+                "maximum_stopped_actual_tcp_angular_velocity_rad_s",
+            ),
+            (
+                maximum_stopped_target_tcp_linear_velocity_m_s,
+                "maximum_stopped_target_tcp_linear_velocity_m_s",
+            ),
+            (
+                maximum_stopped_target_tcp_angular_velocity_rad_s,
+                "maximum_stopped_target_tcp_angular_velocity_rad_s",
+            ),
+        )
+    )
+    started_at = _clock_value(monotonic_clock)
+    deadline = started_at + timeout
+    stable_states: list[RobotState] = []
+    stable_sample_times: list[float] = []
+    stable_velocity_maxima = (0.0,) * 6
+    maximum_deltas = (0.0, 0.0, 0.0)
+    all_states: list[RobotState] = []
+    all_sample_times: list[float] = []
+    previous_state: RobotState | None = None
+    last_conditions = "no sample"
+
+    while True:
+        _bootstrap_stop_snapshot(state_source, expected_stop_generation)
+        state = _read_bootstrap_state(state_source)
+        sampled_at = _clock_value(monotonic_clock)
+        if sampled_at < started_at or (all_sample_times and sampled_at < all_sample_times[-1]):
+            raise StationarityError("monotonic clock moved backwards during bootstrap stop proof")
+        if sampled_at > deadline:
+            raise StationarityTimeoutError(
+                "bootstrap safe-state proof timed out during robot-state sampling"
+            )
+        if previous_state is not None:
+            _require_nondecreasing_state_time(previous_state, state)
+        all_states.append(state)
+        all_sample_times.append(sampled_at)
+        _validate_feedback_freshness(
+            all_states,
+            maximum_staleness_s=maximum_staleness,
+            sample_times_s=all_sample_times,
+        )
+        _bootstrap_stop_snapshot(state_source, expected_stop_generation)
+
+        runtime = str(state.runtime_state).strip().upper()
+        mode = state.robot_mode.strip().upper()
+        velocities = _bootstrap_velocity_metrics(state)
+        controller_stopped = (
+            runtime in _BOOTSTRAP_STOPPED_RUNTIME_STATES
+            and mode in _BOOTSTRAP_SAFE_ROBOT_MODES
+        )
+        velocities_stopped = all(
+            observed <= limit
+            for observed, limit in zip(velocities, velocity_limits, strict=True)
+        )
+        candidate_ok = controller_stopped and velocities_stopped
+        last_conditions = (
+            f"runtime={runtime}, robot_mode={mode}, velocities={velocities!r}"
+        )
+        if candidate_ok:
+            candidate_states = (*stable_states, state)
+            deltas = _maximum_trace_deltas(candidate_states)
+            if stable_states and not _within_thresholds(deltas, limits):
+                stable_states = [state]
+                stable_sample_times = [sampled_at]
+                stable_velocity_maxima = velocities
+                maximum_deltas = (0.0, 0.0, 0.0)
+            else:
+                stable_states.append(state)
+                stable_sample_times.append(sampled_at)
+                maximum_deltas = deltas
+                stable_velocity_maxima = tuple(
+                    max(old, current)
+                    for old, current in zip(
+                        stable_velocity_maxima,
+                        velocities,
+                        strict=True,
+                    )
+                )
+        else:
+            stable_states = []
+            stable_sample_times = []
+            stable_velocity_maxima = (0.0,) * 6
+            maximum_deltas = (0.0, 0.0, 0.0)
+
+        if stable_states:
+            clock_duration = stable_sample_times[-1] - stable_sample_times[0]
+            host_duration = (
+                stable_states[-1].monotonic_time_ns
+                - stable_states[0].monotonic_time_ns
+            ) / 1e9
+            controller_duration = (
+                stable_states[-1].controller_time_s
+                - stable_states[0].controller_time_s
+            )
+            if min(clock_duration, host_duration, controller_duration) >= settle_time:
+                stationarity = StationarityEvidence(
+                    final_state=state,
+                    sample_count=len(stable_states),
+                    duration_s=min(clock_duration, host_duration),
+                    controller_duration_s=controller_duration,
+                    max_sample_gap_s=_validate_feedback_freshness(
+                        stable_states,
+                        maximum_staleness_s=maximum_staleness,
+                        sample_times_s=stable_sample_times,
+                    ),
+                    max_joint_delta_rad=maximum_deltas[0],
+                    max_tcp_translation_delta_m=maximum_deltas[1],
+                    max_tcp_rotation_delta_rad=maximum_deltas[2],
+                    goal_error_rad=0.0,
+                )
+                _bootstrap_stop_snapshot(state_source, expected_stop_generation)
+                return BootstrapSafeStateEvidence(
+                    stationarity=stationarity,
+                    stop_generation=expected_stop_generation,
+                    runtime_state=runtime,
+                    robot_mode=mode,
+                    safety_status=state.safety_status.strip().upper(),
+                    max_actual_joint_velocity_rad_s=stable_velocity_maxima[0],
+                    max_target_joint_velocity_rad_s=stable_velocity_maxima[1],
+                    max_actual_tcp_linear_velocity_m_s=stable_velocity_maxima[2],
+                    max_actual_tcp_angular_velocity_rad_s=stable_velocity_maxima[3],
+                    max_target_tcp_linear_velocity_m_s=stable_velocity_maxima[4],
+                    max_target_tcp_angular_velocity_rad_s=stable_velocity_maxima[5],
+                )
+
+        remaining = deadline - sampled_at
+        if remaining <= 0.0:
+            raise StationarityTimeoutError(
+                "bootstrap safe-state proof timed out before a full accepted window; "
+                + last_conditions
+            )
+        sleep_duration = min(poll_period, remaining)
+        try:
+            sleeper(sleep_duration)
+        except Exception as exc:
+            raise StationarityError(
+                f"bootstrap safe-state sleeper failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        wake_time = _clock_value(monotonic_clock)
+        if wake_time <= sampled_at:
+            raise StationarityError("monotonic clock did not advance during bootstrap stop proof")
+        if wake_time > deadline:
+            raise StationarityTimeoutError(
+                "bootstrap safe-state proof timed out before the next robot-state sample"
+            )
+        previous_state = state
 
 
 def validate_stationary_trace(
@@ -550,9 +934,7 @@ def validate_stationary_trace(
     maximum_deltas = (0.0, 0.0, 0.0)
     for index, current in enumerate(samples, start=1):
         if not isinstance(current, RobotState):
-            raise StationarityError(
-                f"stationary trace sample {index} is not a RobotState"
-        )
+            raise StationarityError(f"stationary trace sample {index} is not a RobotState")
         _validate_state_contract(current)
         _require_nondecreasing_state_time(previous, current)
         # Only pairs ending at ``current`` are new.  Updating the running maxima
@@ -562,12 +944,10 @@ def validate_stationary_trace(
         for earlier in accepted_states:
             pair = _state_deltas(earlier, current)
             current_deltas = tuple(
-                max(old, new)
-                for old, new in zip(current_deltas, pair, strict=True)
+                max(old, new) for old, new in zip(current_deltas, pair, strict=True)
             )
         maximum_deltas = tuple(
-            max(old, new)
-            for old, new in zip(maximum_deltas, current_deltas, strict=True)
+            max(old, new) for old, new in zip(maximum_deltas, current_deltas, strict=True)
         )
         if not _within_thresholds(maximum_deltas, limits):
             raise StationarityError(
@@ -585,12 +965,8 @@ def validate_stationary_trace(
     )
 
     final_state = samples[-1]
-    duration_s = (
-        final_state.monotonic_time_ns - reference.monotonic_time_ns
-    ) / 1e9
-    controller_duration_s = (
-        final_state.controller_time_s - reference.controller_time_s
-    )
+    duration_s = (final_state.monotonic_time_ns - reference.monotonic_time_ns) / 1e9
+    controller_duration_s = final_state.controller_time_s - reference.controller_time_s
     return StationarityEvidence(
         final_state=final_state,
         sample_count=len(samples) + 1,

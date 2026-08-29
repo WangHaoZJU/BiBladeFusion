@@ -7,6 +7,8 @@ FoundationStereo cycle engine decides whether that prepared successor is committ
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,10 +35,14 @@ from biblade_fusion.storage.reconstructed_view import (
     write_reconstructed_view,
 )
 from biblade_fusion.storage.surface_coverage import (
+    REACQUISITION_VIEW_ID_SCHEMA,
+    FineReacquisitionProvenance,
     StoredSurfaceCoverageGeneration,
+    reacquisition_view_id,
     read_surface_coverage_generation,
     write_surface_coverage_generation,
 )
+from biblade_fusion.workflows.blade_next_view import production_selection_policy_payload
 from biblade_fusion.workflows.occupancy_mapping import OccupancyFrameUpdate
 from biblade_fusion.workflows.reconstruction import (
     reconstruct_foundation_stereo_view,
@@ -80,6 +86,7 @@ class PreparedFineScienceAssets:
 
 def validate_fine_science_startup(
     settings: AppSettings,
+    hand_eye: HandEyeCalibration,
     *,
     reference_coarse_model: str | Path,
     accepted_coverage_path: str | Path | None = None,
@@ -89,12 +96,18 @@ def validate_fine_science_startup(
     if not settings.blade_foreground.enabled:
         raise FineSciencePreparationError("Fine-science foreground extraction is disabled")
     reference_root = _verified_reference(Path(reference_coarse_model).resolve())
+    policy_payload = production_selection_policy_payload(
+        settings,
+        hand_eye,
+        reference_coarse_model=reference_root,
+    )
     accepted_root = None
     if accepted_coverage_path is not None:
         accepted_root = _verified_accepted_coverage(
             Path(accepted_coverage_path).resolve(),
             reference_root=reference_root,
             settings=settings,
+            selection_policy_payload=policy_payload,
         ).root
     return reference_root, accepted_root
 
@@ -113,6 +126,7 @@ def _verified_accepted_coverage(
     *,
     reference_root: Path,
     settings: AppSettings,
+    selection_policy_payload: dict[str, object],
 ) -> StoredSurfaceCoverageGeneration:
     try:
         state = read_surface_coverage_generation(
@@ -131,25 +145,128 @@ def _verified_accepted_coverage(
         mode="json"
     ):
         raise FineSciencePreparationError("Accepted fine coverage uses a different quality policy")
+    expected_policy = _selection_policy_record(selection_policy_payload)
+    if state.metadata.get("reacquisition_policy") != expected_policy:
+        raise FineSciencePreparationError(
+            "Accepted fine coverage uses a different next-view/reacquisition policy"
+        )
     return state
 
 
-def _candidate_target_patch_id(
+def _selection_policy_record(payload: dict[str, object]) -> dict[str, object]:
+    canonical = json.loads(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    )
+    digest = hashlib.sha256(
+        json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "id_schema": REACQUISITION_VIEW_ID_SCHEMA,
+        "selection_policy_sha256": digest,
+        "selection_policy": canonical,
+    }
+
+
+def _candidate_target_authority(
     state: StoredSurfaceCoverageGeneration,
     view_id: str,
-) -> str:
+    *,
+    settings: AppSettings,
+    selection_policy_payload: dict[str, object],
+) -> tuple[str, FineReacquisitionProvenance | None]:
     matches = tuple(
-        candidate.patch.patch_id
+        candidate
         for candidate in state.view_plan.candidates
         if candidate.view_id == view_id
     )
-    if len(matches) != 1:
+    if len(matches) == 1:
+        if view_id in state.ledger.observation_ids:
+            raise FineSciencePreparationError(f"Fine candidate {view_id!r} was already committed")
+        return matches[0].patch.patch_id, None
+    if matches:
         raise FineSciencePreparationError(
             f"Capture {view_id!r} is not one unique fixed-reference candidate"
         )
     if view_id in state.ledger.observation_ids:
         raise FineSciencePreparationError(f"Fine candidate {view_id!r} was already committed")
-    return matches[0]
+    policy = _selection_policy_record(selection_policy_payload)
+    if state.metadata.get("reacquisition_policy") != policy:
+        raise FineSciencePreparationError("Fine retry policy differs from the accepted lineage")
+    policy_sha256 = str(policy["selection_policy_sha256"])
+    planning = settings.view_planning
+    try:
+        stored_planning = type(planning).model_validate(
+            state.reference.metadata["view_plan"]["configuration"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise FineSciencePreparationError(
+            f"Cannot replay coarse-reference retry bounds: {exc}"
+        ) from exc
+    lower = stored_planning.minimum_standoff_distance_m
+    upper = stored_planning.maximum_standoff_distance_m
+    if lower is None or upper is None:
+        raise FineSciencePreparationError("Fine retry requires bounded coarse standoff limits")
+    quality_by_id = {item.patch_id: item for item in state.quality.patches}
+    resolved: list[FineReacquisitionProvenance] = []
+    for nominal in state.view_plan.candidates:
+        for attempt, perturbation in enumerate(
+            settings.next_view_selection.reacquisition_perturbations,
+            start=1,
+        ):
+            expected_id = reacquisition_view_id(
+                nominal.view_id,
+                nominal.patch.patch_id,
+                attempt,
+                policy_sha256,
+            )
+            if expected_id != view_id:
+                continue
+            if nominal.view_id not in state.ledger.observation_ids:
+                raise FineSciencePreparationError(
+                    "Fine retry cannot precede its nominal patch capture"
+                )
+            quality = quality_by_id.get(nominal.patch.patch_id)
+            if quality is None or quality.complete:
+                raise FineSciencePreparationError(
+                    "Fine retry target is not an incomplete fixed-reference patch"
+                )
+            proposed = nominal.standoff_distance_m + perturbation.distance_offset_m
+            if not lower <= proposed <= upper:
+                raise FineSciencePreparationError(
+                    "Fine retry distance is outside the coarse planning interval"
+                )
+            resolved.append(
+                FineReacquisitionProvenance(
+                    view_id=expected_id,
+                    nominal_candidate_id=nominal.view_id,
+                    patch_id=nominal.patch.patch_id,
+                    attempt=attempt,
+                    distance_offset_m=perturbation.distance_offset_m,
+                    tilt_deg=perturbation.tilt_deg,
+                    azimuth_deg=perturbation.azimuth_deg,
+                    selection_policy_sha256=policy_sha256,
+                    reference_metadata_sha256=str(
+                        state.metadata["reference"]["metadata_sha256"]
+                    ),
+                )
+            )
+    if len(resolved) != 1:
+        raise FineSciencePreparationError(
+            f"Capture {view_id!r} is not one replayable bounded fine retry"
+        )
+    return resolved[0].patch_id, resolved[0]
 
 
 def _verify_prepared_candidate(
@@ -158,6 +275,7 @@ def _verify_prepared_candidate(
     captured: CapturedStopScanView,
     stereo_path: Path,
     previous: StoredSurfaceCoverageGeneration,
+    expected_reacquisition: FineReacquisitionProvenance | None,
 ) -> None:
     assert assets.blade_foreground_path is not None
     assert assets.reconstructed_view_path is not None
@@ -191,6 +309,7 @@ def _verify_prepared_candidate(
         or successor.current_reconstructed_view_path != assets.reconstructed_view_path
         or successor.ledger.observation_ids[-1] != captured.bundle.view_id
         or len(successor.ledger.observation_ids) != len(previous.ledger.observation_ids) + 1
+        or successor.current_reacquisition != expected_reacquisition
     ):
         raise FineSciencePreparationError(
             "Prepared reconstruction/coverage lineage is inconsistent"
@@ -217,6 +336,11 @@ def prepare_fine_science_assets(
     if not settings.blade_foreground.enabled:
         raise FineSciencePreparationError("Fine-science foreground extraction is disabled")
     reference_root = _verified_reference(Path(reference_coarse_model).resolve())
+    selection_policy_payload = production_selection_policy_payload(
+        settings,
+        hand_eye,
+        reference_coarse_model=reference_root,
+    )
     stereo_root = Path(stereo_path).resolve()
     occupancy_root = Path(occupancy_path).resolve()
     accepted = (
@@ -224,6 +348,7 @@ def prepare_fine_science_assets(
             Path(accepted_coverage_path).resolve(),
             reference_root=reference_root,
             settings=settings,
+            selection_policy_payload=selection_policy_payload,
         )
         if accepted_coverage_path is not None
         else None
@@ -244,11 +369,13 @@ def prepare_fine_science_assets(
             coverage_path,
             reference_coarse_model=reference_root,
             quality_config=settings.surface_quality,
+            selection_policy_payload=selection_policy_payload,
         )
         initial = _verified_accepted_coverage(
             coverage_path,
             reference_root=reference_root,
             settings=settings,
+            selection_policy_payload=selection_policy_payload,
         )
         if initial.ledger.observation_ids or initial.current_reconstructed_view_path is not None:
             raise FineSciencePreparationError("Initial fine coverage is not empty")
@@ -271,7 +398,12 @@ def prepare_fine_science_assets(
         raise FineSciencePreparationError(
             "A fine candidate requires a fresh MAP_READY occupancy result"
         )
-    target_patch_id = _candidate_target_patch_id(accepted, captured.bundle.view_id)
+    target_patch_id, reacquisition = _candidate_target_authority(
+        accepted,
+        captured.bundle.view_id,
+        settings=settings,
+        selection_policy_payload=selection_policy_payload,
+    )
     base_t_left_rectified = PoseSE3(
         "base",
         "left_rectified",
@@ -334,6 +466,8 @@ def prepare_fine_science_assets(
         previous_generation=accepted.root,
         current_reconstructed_view=reconstructed_path,
         observation_id=captured.bundle.view_id,
+        selection_policy_payload=selection_policy_payload,
+        current_reacquisition=reacquisition,
     )
     assets = PreparedFineScienceAssets(
         mask_path,
@@ -346,5 +480,6 @@ def prepare_fine_science_assets(
         captured=captured,
         stereo_path=stereo_root,
         previous=accepted,
+        expected_reacquisition=reacquisition,
     )
     return assets

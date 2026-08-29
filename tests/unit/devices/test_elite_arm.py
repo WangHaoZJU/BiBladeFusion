@@ -55,6 +55,10 @@ class FakeDashboard:
         self.calls.append(("playProgram", None))
         return True
 
+    def stopProgram(self) -> bool:
+        self.calls.append(("stopProgram", None))
+        return True
+
 
 class FakeRtsi:
     def __init__(
@@ -96,17 +100,28 @@ class FakeRtsi:
     def getActualJointPositions(self) -> list[float]:
         return [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
 
+    def getActualJointVelocity(self) -> list[float]:
+        return [0.0] * 6
+
+    def getTargetJointVelocity(self) -> list[float]:
+        return [0.0] * 6
+
     def getActualTCPPose(self) -> list[float]:
         return [0.4, 0.1, 0.5, 0.3, -0.4, 0.5]
+
+    def getActualTCPVelocity(self) -> list[float]:
+        return [0.0] * 6
+
+    def getTargetTCPVelocity(self) -> list[float]:
+        return [0.0] * 6
 
     def getTimestamp(self) -> float:
         self._enter_getter()
         try:
             if self.timestamp_getter_entered is not None:
                 self.timestamp_getter_entered.set()
-            if (
-                self.timestamp_getter_release is not None
-                and not self.timestamp_getter_release.wait(timeout=2.0)
+            if self.timestamp_getter_release is not None and not self.timestamp_getter_release.wait(
+                timeout=2.0
             ):
                 raise TimeoutError("test timestamp getter was not released")
             return 12.5
@@ -122,6 +137,9 @@ class FakeRtsi:
             return self.safety_status
         finally:
             self._leave_getter()
+
+    def getRuntimeState(self) -> int:
+        return 3
 
     def getActualSpeedScaling(self) -> float:
         return 0.3
@@ -187,9 +205,8 @@ class FakeDriver:
         self.calls.append(("writeServoj", (command, timeout_ms, flags)))
         if self.servoj_write_entered is not None:
             self.servoj_write_entered.set()
-        if (
-            self.servoj_write_release is not None
-            and not self.servoj_write_release.wait(timeout=2.0)
+        if self.servoj_write_release is not None and not self.servoj_write_release.wait(
+            timeout=2.0
         ):
             raise TimeoutError("test ServoJ write was not released")
         return self.servoj_result
@@ -295,6 +312,24 @@ def test_read_state_uses_holorobot_rpy_tcp_convention() -> None:
 
     np.testing.assert_allclose(state.base_t_tcp.rotation, rpy_xyz_to_matrix([0.3, -0.4, 0.5]))
     np.testing.assert_allclose(state.joint_positions_rad, np.arange(6) / 10)
+    np.testing.assert_allclose(state.actual_joint_velocity_rad_s, np.zeros(6))
+    np.testing.assert_allclose(state.target_joint_velocity_rad_s, np.zeros(6))
+    np.testing.assert_allclose(state.actual_tcp_velocity, np.zeros(6))
+    np.testing.assert_allclose(state.target_tcp_velocity, np.zeros(6))
+    assert state.runtime_state == "3"
+
+
+def test_bootstrap_controller_stop_is_dashboard_only_and_latches_generation() -> None:
+    sdk = FakeSdk()
+    arm = EliteArm(config(motion_enabled=True), sdk_module=sdk, sleep_fn=lambda _: None)
+    arm.connect(with_driver=False)
+
+    generation = arm.establish_bootstrap_controller_stop()
+
+    assert generation == 1
+    assert arm.stop_snapshot == (generation, True)
+    assert arm.has_motion_driver is False
+    assert ("stopProgram", None) in sdk.dashboard.calls
 
 
 def test_move_joints_executes_holorobot_single_point_trajectory() -> None:
@@ -387,6 +422,20 @@ def test_stop_rejects_false_write_idle_result() -> None:
         )
 
 
+def test_unpowered_bootstrap_stop_uses_dashboard_without_power_or_reverse_start() -> None:
+    arm, sdk = connected_arm()
+    sdk.driver.connected = False
+
+    arm.stop()
+
+    assert arm.stop_snapshot[1] is True
+    assert ("stopProgram", None) in sdk.dashboard.calls
+    assert not any(
+        name in {"powerOn", "brakeRelease", "playProgram"} for name, _ in sdk.dashboard.calls
+    )
+    assert not any(name == "writeIdle" for name, _ in sdk.driver.calls)
+
+
 def test_public_enable_cannot_clear_stop_latch() -> None:
     arm, _ = enabled_arm()
     arm.stop()
@@ -414,6 +463,58 @@ def test_guarded_servoj_recovery_requires_private_capability() -> None:
     assert not any(name == "writeServoj" for name, _ in sdk.driver.calls)
 
 
+def test_guarded_enable_requires_capability_and_preserves_stop_latch() -> None:
+    arm, sdk = connected_arm()
+    arm.stop()
+    generation = arm.stop_generation
+
+    with pytest.raises(PermissionError, match="guarded-executor capability"):
+        arm._guarded_enable_for_servoj_control(
+            expected_stop_generation=generation,
+            capability=object(),
+        )
+    assert arm.is_enabled is False
+
+    arm._guarded_enable_for_servoj_control(
+        expected_stop_generation=generation,
+        capability=_GUARDED_MOTION_CAPABILITY,
+    )
+
+    assert arm.is_enabled is True
+    assert arm.stop_generation == generation
+    with pytest.raises(RobotMotionInterruptedError, match="stopped"):
+        arm._guarded_prepare_servoj_stream(
+            dt_s=0.004,
+            expected_stop_generation=generation,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
+    assert [name for name, _ in sdk.driver.calls] == ["writeIdle"]
+
+
+def test_stop_between_power_on_and_brake_release_forces_power_off() -> None:
+    arm, sdk = connected_arm()
+    arm.stop()
+    approved_generation = arm.stop_generation
+    original_power_on = sdk.dashboard.powerOn
+
+    def power_on_then_stop() -> bool:
+        accepted = original_power_on()
+        arm.stop()
+        return accepted
+
+    sdk.dashboard.powerOn = power_on_then_stop
+
+    with pytest.raises(RobotMotionInterruptedError, match="after powerOn"):
+        arm._guarded_enable_for_servoj_control(
+            expected_stop_generation=approved_generation,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
+
+    assert arm.is_enabled is False
+    assert ("powerOff", None) in sdk.dashboard.calls
+    assert not any(name == "writeServoj" for name, _ in sdk.driver.calls)
+
+
 def test_guarded_servoj_recovery_clears_stop_without_sending_motion() -> None:
     arm, sdk = enabled_arm()
     arm.stop()
@@ -434,6 +535,7 @@ def test_guarded_servoj_recovery_clears_stop_without_sending_motion() -> None:
 
 def test_guarded_servoj_recovery_never_implicitly_enables_arm() -> None:
     arm, sdk = connected_arm()
+    arm.stop()
 
     with pytest.raises(RobotNotEnabledError, match="must be enabled"):
         arm._guarded_resume_servoj_control(
@@ -441,9 +543,7 @@ def test_guarded_servoj_recovery_never_implicitly_enables_arm() -> None:
             capability=_GUARDED_MOTION_CAPABILITY,
         )
 
-    assert not any(
-        name in {"powerOn", "brakeRelease"} for name, _ in sdk.dashboard.calls
-    )
+    assert not any(name in {"powerOn", "brakeRelease"} for name, _ in sdk.dashboard.calls)
 
 
 def test_guarded_servoj_recovery_keeps_stop_latched_on_unsafe_state() -> None:
@@ -506,7 +606,7 @@ def test_concurrent_stop_generation_wins_over_blocked_servoj_recovery() -> None:
     assert not recovery_thread.is_alive()
     assert len(recovery_errors) == 1
     assert isinstance(recovery_errors[0], RobotMotionInterruptedError)
-    assert "generation changed" in str(recovery_errors[0])
+    assert "stop latch changed" in str(recovery_errors[0])
     with pytest.raises(RobotMotionInterruptedError, match="stopped"):
         arm._guarded_prepare_servoj_stream(
             dt_s=0.004,
@@ -661,9 +761,7 @@ def test_stop_transport_gate_orders_idle_after_inflight_servoj() -> None:
     assert len(stream_results) == 1
     assert stream_results[0].ok is False
     assert stream_results[0].abort_reason == "operator_stop"
-    transport_names = [
-        name for name, _ in sdk.driver.calls if name in {"writeServoj", "writeIdle"}
-    ]
+    transport_names = [name for name, _ in sdk.driver.calls if name in {"writeServoj", "writeIdle"}]
     assert transport_names == ["writeServoj", "writeIdle"]
 
 
@@ -722,10 +820,33 @@ def test_stop_latched_before_prepare_gate_prevents_servoj_write() -> None:
     assert not prepare_thread.is_alive()
     assert not stop_thread.is_alive()
     assert any(isinstance(exc, RobotMotionInterruptedError) for exc in errors)
-    transport_names = [
-        name for name, _ in sdk.driver.calls if name in {"writeServoj", "writeIdle"}
-    ]
+    transport_names = [name for name, _ in sdk.driver.calls if name in {"writeServoj", "writeIdle"}]
     assert transport_names == ["writeIdle"]
+
+
+def test_deadline_stop_uses_dashboard_without_waiting_for_servoj_io_lock() -> None:
+    arm, sdk = enabled_arm()
+    errors: list[BaseException] = []
+    arm._command_io_lock.acquire()
+
+    def request_deadline_stop() -> None:
+        try:
+            arm._guarded_deadline_stop(capability=_GUARDED_MOTION_CAPABILITY)
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=request_deadline_stop)
+    worker.start()
+    worker.join(timeout=1.0)
+    completed_while_servoj_lock_held = not worker.is_alive()
+    arm._command_io_lock.release()
+    worker.join(timeout=1.0)
+
+    assert completed_while_servoj_lock_held
+    assert not worker.is_alive()
+    assert errors == []
+    assert arm.stop_snapshot[1] is True
+    assert ("stopProgram", None) in sdk.dashboard.calls
 
 
 def test_public_motion_methods_are_permanently_guarded() -> None:
@@ -837,6 +958,41 @@ def test_stream_servoj_writes_every_command_with_short_timeout() -> None:
     assert result.commands_sent == 3
     assert [value[1] for value in writes] == [500, 500, 500]
     assert result.timing_summary["planned_dt_s"] == 0.004
+
+
+def test_stream_servoj_checks_execution_deadline_inside_command_loop() -> None:
+    arm, sdk = enabled_arm()
+    stream = ServoJStream(
+        commands=(
+            (0.0, 0.1, 0.2, 0.3, 0.4, 0.5),
+            (0.01, 0.1, 0.2, 0.3, 0.4, 0.5),
+        ),
+        dt_s=0.004,
+    )
+    checks = 0
+
+    def deadline_exceeded() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 3
+
+    result = arm._guarded_stream_servoj(
+        stream,
+        capability=_GUARDED_MOTION_CAPABILITY,
+        expected_stop_generation=arm.stop_generation,
+        config=ServoJStreamConfig(
+            dt_s=0.004,
+            tracking_check_every_n_commands=99,
+        ),
+        deadline_exceeded=deadline_exceeded,
+    )
+
+    writes = [value for name, value in sdk.driver.calls if name == "writeServoj"]
+    assert result.ok is False
+    assert result.abort_reason == "execution_deadline_exceeded"
+    assert result.commands_sent == 1
+    assert len(writes) == 1
+    assert arm.stop_snapshot[1] is True
 
 
 def test_stream_servoj_aborts_on_tracking_error() -> None:

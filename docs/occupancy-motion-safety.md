@@ -50,10 +50,13 @@ a calibrated obstacle-existence probability.
     Mapping uses `base_T_flange(FK) · flange_T_left_ir`; controller TCP never becomes the
     camera-pose authority after passing the gate.
 12. Mesh swept-volume evidence and occupancy swept-volume evidence are independent
-    requirements. A continuous mesh/FCL result cannot substitute for a continuous
-    robot-versus-voxel result. The current occupancy checker samples joint states only,
-    explicitly reports `continuous_swept_volume_verified=false`, and therefore blocks
-    production preflight and guarded execution.
+    requirements. A mesh/FCL result cannot substitute for a robot-versus-voxel result.
+    The mesh checker proves each joint interval from the exact midpoint FCL separation
+    and a conservative serial-chain displacement bound. The occupancy checker queries
+    robot-envelope spheres enlarged by the same interval displacement bound. Both
+    proofs bisect an inconclusive interval and return `UNKNOWN` if a configured
+    subdivision or numerical limit is reached; clear point samples alone never produce
+    approval-ready evidence.
 13. A voxel becomes FREE only after the configured number of independent view votes
     (three by default), with at most one vote per frame. Each new supporting camera pose
     must differ from every existing supporting pose by at least 20 mm of camera-centre
@@ -77,14 +80,15 @@ OR invalid/stale/missing occupancy evidence.
 ## Read-only adapter
 
 `OccupancyRobotCollisionChecker` accepts a provider of immutable
-`mapping.OccupancySnapshot` objects. It does not expose mapping mutation. For every
-sampled joint state it:
+`mapping.OccupancySnapshot` objects. It does not expose mapping mutation. At checked
+configurations and for every adaptively certified interval it:
 
 1. validates map frame, lifecycle, rebuild-cycle age, source views, all three
    map/evidence hashes, the checker-bound robot-geometry hash, typed semantic attestation,
    and the freshness horizon;
 2. evaluates Pinocchio geometry placements;
-3. transforms each collision mesh's local-AABB sphere into `base`;
+3. transforms each collision mesh's local-AABB sphere into `base`, and for an interval
+   enlarges it by a conservative maximum geometry-displacement bound;
 4. invokes `query_sphere(..., unknown_is_occupied=True)`;
 5. validates state/count/blocking consistency returned by the mapping query;
 6. confirms that the provider still exposes the same sequence, content hash, mapping-
@@ -93,9 +97,15 @@ sampled joint state it:
 All adapter and provider exceptions become an `UNKNOWN` collision status with a blocking
 reason. They are never treated as free space.
 
-Occupancy artifact schema 6 stores snapshot format 4 and mapping-context schema 4. The
-integrity-only reader can replay it for permanently blocked visualization, but never
-returns a semantic attestation. The full motion reader additionally verifies raw-session
+Occupancy artifact schema 7 stores snapshot format 4 and mapping-context schema 4. Each
+frame carries both its operator-facing logical view label and an
+`occupancy_physical_source_id` derived from the exact session manifest, view metadata,
+sequence and camera frame. Voting, snapshot source lists, replay and duplicate rejection
+use the physical identity, so renaming one physical frame cannot add a vote while a new
+capture may safely reuse a logical label. Schema 6 has a separate explicit legacy reader
+for permanently blocked visualization and can never return a semantic attestation. The
+current integrity-only reader replays schema 7 without granting motion eligibility. The
+full motion reader additionally verifies raw-session
 array hashes, the bound user stereo-calibration asset, rectification reproduction, the
 official FoundationStereo source/checkpoint/model configuration, hand-eye calibration,
 and active ES68+D435i robot rendering. It re-runs the packaged ES68 FK from every joint
@@ -106,6 +116,14 @@ to detect a validation-time change.
 
 ## Preflight and permit binding
 
+Before either continuous proof may become approval-ready, an immutable motion-envelope
+acceptance must reproduce against the exact robot geometry, collision contract and ServoJ
+control contract. It records measured six-axis tracking deviation and stop drift,
+feedback/stop-ack bounds, and stopped actual/target joint and TCP linear/angular velocity
+thresholds. The interval envelopes are enlarged by the accepted joint uncertainty.
+Missing channels or an acceptance/configuration mismatch fail closed; the acceptance
+record does not itself issue a permit.
+
 Motion-preflight schema 5 binds the typed occupancy semantic attestation in addition to
 the independent continuous-occupancy-sweep contract and expanded evidence/permit
 identity. Schema 4 and earlier artifacts are rejected; they cannot be silently
@@ -113,10 +131,9 @@ reinterpreted or upgraded into approval evidence.
 
 `preflight_linear_joint_motion` requires both the mesh checker and occupancy checker by
 default. The generated `JointMotionPreflight` is ready for approval only when both path
-reports are clear, both mesh and occupancy reports independently carry continuous swept-
-volume proof, and the occupancy report contains valid evidence. The current discrete
-occupancy backend therefore returns `continuous_swept_occupancy_unavailable`. The
-diagnostic-only `require_occupancy=False` or
+reports are clear, both reports independently carry integrity-valid continuous swept-
+volume evidence bound to the exact joint segment, and the occupancy report contains
+valid semantic map evidence. The diagnostic-only `require_occupancy=False` or
 `require_continuous_occupancy_sweep=False` options can produce an offline ServoJ stream
 for inspection, but their reports are deliberately not approval-ready.
 
@@ -146,22 +163,26 @@ a separate freshness check against the current clock.
 
 - Bounding spheres are conservative and may reject feasible paths. Future mesh-to-voxel
   collision may reduce false positives, but must not under-approximate the STL geometry.
-- Robot pixels removed by self masking remain UNKNOWN. The current checker therefore
-  intentionally blocks physical motion when the robot envelope intersects that UNKNOWN
-  volume. Do not mark an AABB sphere free or add broad ignored-link exceptions. A future
-  release requires exact capture-pose mesh voxelization, hash-bound capture joints, and
-  an observed-free clearance shell before any self-volume exemption is permitted.
-- Continuous swept-mesh collision and continuous robot-versus-voxel occupancy collision
-  are both unimplemented. They are distinct proofs. Discrete joint samples are
-  diagnostic only: production preflight returns `continuous_swept_mesh_unavailable` or,
-  once that gate is satisfied, `continuous_swept_occupancy_unavailable`. The guarded
-  executor independently refuses either missing capability. These are intentional
-  physical-motion blockers, not an approval that sampling is sufficient.
+- Robot pixels removed by self masking remain UNKNOWN. Physical motion therefore blocks
+  when the swept robot envelope intersects that UNKNOWN volume unless every intersected
+  voxel is wholly contained in an immutable, workcell-specific static-free AABB accepted
+  by the operator. `OCCUPIED` always blocks, the acceptance is bound to the exact robot
+  geometry and mapping context, and an accepted AABB must never overlap the blade,
+  fixture, support, or any other external object.
+- The continuous proofs are conservative software certificates, not a replacement for
+  the controller safety system or a physical commissioning test. Mesh certification can
+  reject a safe interval when its displacement bound is loose; occupancy certification
+  can reject a safe interval because a complete mesh AABB sphere is deliberately larger
+  than the mesh. Reaching a subdivision, numerical, freshness, or evidence limit is
+  `UNKNOWN` and blocks rather than falling back to point sampling.
 - This is stop-and-capture static-map avoidance, not certified continuous dynamic obstacle
   avoidance. The mapping provider must be frozen during one motion segment.
 - The occupancy map is safety evidence, not the high-resolution blade reconstruction.
   Inflated safety voxels must not be fed back as blade geometry.
 - Software STOP remains distinct from the controller's physical emergency stop.
+- A controller stop acknowledgement is not physical stationarity. Startup and every
+  segment boundary require a fresh observation window in which runtime/mode/safety and
+  all configured actual/target joint/TCP velocity channels satisfy the accepted limits.
 
 ## Hardware acceptance gates
 
@@ -175,6 +196,15 @@ workcell configuration:
 - occupied/unknown near-miss fixtures and first-blocked-path reporting;
 - map-update invalidation between preflight, authorization and execution;
 - ES68-FK endpoint agreement against the controller MDH IK results;
-- continuous swept-mesh collision evidence for every trajectory segment;
-- continuous robot-versus-voxel occupancy sweep evidence for every trajectory segment;
+- controlled near-miss fixtures demonstrating that both interval proofs block a swept
+  collision located between endpoint/midpoint samples and remain bound to every emitted
+  ServoJ segment;
+- accepted static-free AABBs that cover only permanently empty self-mask volume and do
+  not overlap the blade, its fixture, support, or any reachable external object;
 - worst-case preflight latency, ServoJ duration, tracking error and stopping behavior.
+- Dashboard bootstrap-stop acknowledgement, runtime/mode enumeration, six stopped
+  velocity channels, feedback freshness, and segment-boundary stationarity behavior.
+- Independent Dashboard deadline-stop behavior while ServoJ transport is deliberately
+  blocked, including the SDK concurrency limit, worst-case return time, explicit
+  emergency-stop-unconfirmed evidence, and final RTSI stationarity. This software
+  watchdog is not a hard-real-time or safety-rated emergency stop.

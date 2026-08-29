@@ -29,11 +29,13 @@ from biblade_fusion.robotics import (
 )
 from biblade_fusion.storage.occupancy_mapping import (
     OCCUPANCY_MAPPING_SCHEMA_VERSION,
+    LegacyReplayOccupancyMapping,
     OccupancyMappingValidationDependencies,
     ReplayOccupancyMapping,
     VerifiedHandEyeSource,
     _read_occupancy_mapping_with_dependencies,
     _write_occupancy_mapping_with_dependencies,
+    read_legacy_occupancy_mapping_for_replay,
     read_occupancy_mapping,
     read_occupancy_mapping_for_replay,
     write_occupancy_mapping,
@@ -44,6 +46,7 @@ from biblade_fusion.workflows.occupancy_mapping import (
     OccupancyFrameUpdate,
     OccupancyMappingContext,
     occupancy_array_content_hash,
+    occupancy_physical_source_id,
 )
 
 _EMPTY_JSON_SHA256 = hashlib.sha256(b"{}\n").hexdigest()
@@ -191,6 +194,13 @@ def _updates() -> tuple[
     observed = datetime(2026, 8, 28, 8, 0, tzinfo=UTC)
     for index in range(3):
         source_id = f"view-{index}"
+        physical_source_id = occupancy_physical_source_id(
+            source_session_manifest_sha256=_EMPTY_JSON_SHA256,
+            source_session_view_metadata_sha256=_EMPTY_JSON_SHA256,
+            source_sequence_index=index,
+            frame_number=index,
+            source_view_id=source_id,
+        )
         joints_array = np.zeros(6, dtype=np.float64)
         joints_array[2] = 0.1 * index
         joints = tuple(float(value) for value in joints_array)
@@ -221,11 +231,12 @@ def _updates() -> tuple[
             intrinsics,
             pose,
             valid_mask=integration_mask,
-            source_view_id=source_id,
+            source_view_id=physical_source_id,
             observed_at_utc=observed + timedelta(milliseconds=index),
         )
         evidence = OccupancyFrameEvidence(
             source_view_id=source_id,
+            physical_source_id=physical_source_id,
             source_sequence_index=index,
             frame_number=index,
             captured_at_utc=mapping.created_at_utc.isoformat(),
@@ -380,15 +391,15 @@ class _FakeSessionReader:
             ),
         )
 
-    def load_bundle(self, selector: str):
-        if selector != self._bundle.view_id:
+    def load_bundle(self, selector: int | str):
+        if selector not in {self._bundle.view_id, self._bundle.sequence_index}:
             raise KeyError(selector)
         return self._bundle
 
-    def descriptor(self, selector: str):
-        if selector != self._bundle.view_id:
+    def descriptor(self, selector: int | str):
+        if selector not in {self._bundle.view_id, self._bundle.sequence_index}:
             raise KeyError(selector)
-        return SimpleNamespace(relative_path=f"views/{selector}")
+        return SimpleNamespace(relative_path=f"views/{self._bundle.view_id}")
 
 
 def _fake_stereo_source(
@@ -615,6 +626,97 @@ def _rewrite_context_metadata(
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
 
+def _snapshot_content_hash(raw: dict[str, object]) -> str:
+    payload = dict(raw)
+    payload.pop("content_hash", None)
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _write_snapshot_payload(path: Path, raw: dict[str, object]) -> str:
+    raw["content_hash"] = _snapshot_content_hash(raw)
+    payload = {
+        "format_version": 4,
+        "artifact_kind": "biblade_fusion.safety_occupancy",
+        "units": "m",
+        "snapshot": raw,
+    }
+    path.write_text(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return str(raw["content_hash"])
+
+
+def _downgrade_fixture_to_genuine_schema6(destination: Path) -> None:
+    metadata_path = destination / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["schema_version"] = 6
+    logical_ids: list[str] = []
+    previous_evidence_hash: str | None = None
+    final_result_payload: dict[str, object] | None = None
+    for frame in metadata["frames"]:
+        evidence = frame["evidence"]
+        logical_ids.append(str(evidence["source_view_id"]))
+        evidence.pop("physical_source_id")
+        evidence["mapping_source_view_ids"] = list(logical_ids)
+        evidence["previous_evidence_hash"] = previous_evidence_hash
+
+        mapping_record = frame["mapping_snapshot"]
+        mapping_path = destination / mapping_record["path"]
+        mapping_payload = json.loads(mapping_path.read_text(encoding="utf-8"))["snapshot"]
+        mapping_payload["source_view_ids"] = list(logical_ids)
+        mapping_payload["parent_evidence_hash"] = previous_evidence_hash
+        mapping_payload["quality_evidence_hash"] = None
+        mapping_payload["state_reason"] = (
+            f"integrated {logical_ids[-1]}; awaiting self-mask and depth quality gates"
+        )
+        mapping_hash = _write_snapshot_payload(mapping_path, mapping_payload)
+        mapping_record["sha256"] = _sha256(mapping_path)
+        mapping_record["content_hash"] = mapping_hash
+        evidence["mapping_snapshot_content_hash"] = mapping_hash
+
+        evidence_without_hash = dict(evidence)
+        evidence_without_hash.pop("quality_evidence_hash")
+        evidence_hash = hashlib.sha256(
+            json.dumps(
+                evidence_without_hash,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        evidence["quality_evidence_hash"] = evidence_hash
+
+        result_record = frame["result_snapshot"]
+        result_path = destination / result_record["path"]
+        result_payload = json.loads(result_path.read_text(encoding="utf-8"))["snapshot"]
+        result_payload["source_view_ids"] = list(logical_ids)
+        result_payload["parent_evidence_hash"] = previous_evidence_hash
+        result_payload["quality_evidence_hash"] = evidence_hash
+        result_payload["state_reason"] = mapping_payload["state_reason"]
+        result_hash = _write_snapshot_payload(result_path, result_payload)
+        result_record["sha256"] = _sha256(result_path)
+        result_record["content_hash"] = result_hash
+        previous_evidence_hash = evidence_hash
+        final_result_payload = result_payload
+
+    assert final_result_payload is not None
+    final_record = metadata["snapshot"]
+    final_path = destination / final_record["path"]
+    final_hash = _write_snapshot_payload(final_path, final_result_payload)
+    final_record["sha256"] = _sha256(final_path)
+    final_record["content_hash"] = final_hash
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+
 def test_occupancy_mapping_asset_round_trip_verifies_full_chain(tmp_path: Path) -> None:
     destination, _, dependencies = _write_asset(tmp_path)
     stored = _read_occupancy_mapping_with_dependencies(
@@ -623,7 +725,9 @@ def test_occupancy_mapping_asset_round_trip_verifies_full_chain(tmp_path: Path) 
     )
 
     assert stored.snapshot.map_state is OccupancyMapState.MAP_READY
-    assert stored.snapshot.source_view_ids == ("view-0", "view-1", "view-2")
+    assert stored.snapshot.source_view_ids == tuple(
+        evidence.physical_source_id for evidence in stored.frame_evidence
+    )
     assert len(stored.mapping_snapshots) == 3
     assert len(stored.result_snapshots) == 3
     assert stored.frame_evidence[1].previous_evidence_hash == (
@@ -631,7 +735,7 @@ def test_occupancy_mapping_asset_round_trip_verifies_full_chain(tmp_path: Path) 
     )
     assert stored.mapping_context.content_hash == stored.snapshot.mapping_context_hash
     assert stored.metadata["motion_authorized"] is False
-    assert stored.metadata["schema_version"] == OCCUPANCY_MAPPING_SCHEMA_VERSION == 6
+    assert stored.metadata["schema_version"] == OCCUPANCY_MAPPING_SCHEMA_VERSION == 7
     assert stored.motion_eligible is True
     assert stored.verification_status == "full_semantic_verified_for_motion_preflight"
     assert stored.semantic_attestation.snapshot_content_hash == stored.snapshot.content_hash
@@ -673,6 +777,36 @@ def test_replay_reader_is_explicitly_unverified_and_never_motion_eligible(
     assert replay.motion_eligible is False
     assert isinstance(replay.metadata, dict)
     assert not hasattr(replay, "semantic_attestation")
+
+
+def test_schema7_rejects_tampered_physical_source_identity(tmp_path: Path) -> None:
+    destination, _, _ = _write_asset(tmp_path)
+    metadata_path = destination / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["frames"][0]["evidence"]["physical_source_id"] = "f" * 64
+    metadata["frames"][0]["evidence"]["mapping_source_view_ids"][0] = "f" * 64
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="physical_source_id does not reproduce"):
+        read_occupancy_mapping_for_replay(destination)
+
+
+def test_schema6_requires_explicit_legacy_reader_and_is_never_motion_eligible(
+    tmp_path: Path,
+) -> None:
+    destination, _, _ = _write_asset(tmp_path)
+    _downgrade_fixture_to_genuine_schema6(destination)
+
+    with pytest.raises(ValueError, match="unsupported schema 6"):
+        read_occupancy_mapping_for_replay(destination)
+    with pytest.raises(ValueError, match="unsupported schema 6"):
+        read_occupancy_mapping(destination)
+    legacy = read_legacy_occupancy_mapping_for_replay(destination)
+
+    assert isinstance(legacy, LegacyReplayOccupancyMapping)
+    assert legacy.legacy_schema_version == 6
+    assert legacy.motion_eligible is False
+    assert legacy.verification_status == "legacy_integrity_only_unverified_for_motion"
 
 
 def test_full_reader_rejects_metadata_change_during_semantic_verification(

@@ -15,6 +15,10 @@ from biblade_fusion.robotics.occupancy_collision import (
     _issue_occupancy_semantic_attestation,
 )
 
+MOTION_ENVELOPE_ID = "6" * 64
+MOTION_ENVELOPE_METADATA_SHA256 = "7" * 64
+MOTION_ENVELOPE_RAD = (0.001,) * 6
+
 
 @dataclass(frozen=True)
 class FakeSphereQuery:
@@ -145,5 +149,8 @@ def occupancy_checker(
         lambda: occupancy_snapshot,
         maximum_map_age_s=30.0,
         semantic_attestation=attestation,
+        accepted_joint_uncertainty_rad=MOTION_ENVELOPE_RAD,
+        motion_envelope_acceptance_id=MOTION_ENVELOPE_ID,
+        motion_envelope_metadata_sha256=MOTION_ENVELOPE_METADATA_SHA256,
         utc_clock=lambda: datetime(2026, 8, 28, 0, 0, 1, tzinfo=UTC),
     )

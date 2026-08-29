@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -25,9 +27,14 @@ from biblade_fusion.robotics import (
     OccupancyRobotCollisionChecker,
     preflight_linear_joint_motion,
 )
+from biblade_fusion.robotics.guarded_execution import EmergencyStopUnconfirmedError
 from biblade_fusion.robotics.occupancy_collision import (
     _issue_occupancy_semantic_attestation,
 )
+
+_MOTION_ENVELOPE_ID = "6" * 64
+_MOTION_ENVELOPE_METADATA_SHA256 = "7" * 64
+_MOTION_ENVELOPE_RAD = (0.001,) * 6
 
 
 class _SyntheticSweptEs68Checker(Es68PinocchioCollisionChecker):
@@ -76,6 +83,9 @@ def _attested_occupancy_checker(
         checker,
         provider,
         semantic_attestation=attestation,
+        accepted_joint_uncertainty_rad=_MOTION_ENVELOPE_RAD,
+        motion_envelope_acceptance_id=_MOTION_ENVELOPE_ID,
+        motion_envelope_metadata_sha256=_MOTION_ENVELOPE_METADATA_SHA256,
         **kwargs,
     )
 
@@ -106,17 +116,29 @@ class FakeGuardedArm:
     resumed: bool = False
     prepared: bool = False
     streamed: bool = False
-    stopped: bool = False
+    stopped: bool = True
+    enabled: bool = True
+    guarded_enable_calls: int = 0
     _stop_generation: int = 0
     events: list[str] = field(default_factory=list)
     resume_exception: BaseException | None = None
     prepare_exception: BaseException | None = None
     stream_exception: BaseException | None = None
     stop_exception: BaseException | None = None
+    deadline_stop_exception: BaseException | None = None
+    deadline_stop_calls: int = 0
 
     @property
     def stop_generation(self) -> int:
         return self._stop_generation
+
+    @property
+    def stop_snapshot(self) -> tuple[int, bool]:
+        return self._stop_generation, self.stopped
+
+    @property
+    def is_enabled(self) -> bool:
+        return self.enabled
 
     def read_state(self) -> RobotState:
         self.events.append("read_state")
@@ -135,8 +157,10 @@ class FakeGuardedArm:
         *,
         expected_stop_generation: int,
         capability: object,
+        deadline_exceeded=None,
     ) -> None:
         assert capability is not None
+        assert deadline_exceeded is None or deadline_exceeded() is False
         self.events.append("resume")
         self.resumed = True
         if self.resume_exception is not None:
@@ -147,6 +171,21 @@ class FakeGuardedArm:
         if self.recovered_joint_positions_rad is not None:
             self.joint_positions_rad = self.recovered_joint_positions_rad
 
+    def _guarded_enable_for_servoj_control(
+        self,
+        *,
+        expected_stop_generation: int,
+        capability: object,
+        deadline_exceeded=None,
+    ) -> None:
+        assert capability is not None
+        assert deadline_exceeded is None or deadline_exceeded() is False
+        self.events.append("guarded_enable")
+        self.guarded_enable_calls += 1
+        if self._stop_generation != expected_stop_generation or not self.stopped:
+            raise RobotMotionInterruptedError("stop latch changed before guarded enable")
+        self.enabled = True
+
     def _guarded_prepare_servoj_stream(
         self,
         *,
@@ -154,8 +193,10 @@ class FakeGuardedArm:
         warmup_duration_s: float = 0.0,
         expected_stop_generation: int,
         capability: object,
+        deadline_exceeded=None,
     ) -> None:
         assert capability is not None
+        assert deadline_exceeded is None or deadline_exceeded() is False
         assert dt_s == 0.004
         assert warmup_duration_s == 0.0
         if self._stop_generation != expected_stop_generation or self.stopped:
@@ -173,8 +214,10 @@ class FakeGuardedArm:
         expected_stop_generation,
         capability,
         tracking_samples=None,
+        deadline_exceeded=None,
     ):
         assert capability is not None
+        assert deadline_exceeded is None or deadline_exceeded() is False
         assert config.dt_s == stream.dt_s
         assert tracking_samples is None
         if self._stop_generation != expected_stop_generation or self.stopped:
@@ -191,6 +234,15 @@ class FakeGuardedArm:
         self.stopped = True
         if self.stop_exception is not None:
             raise self.stop_exception
+
+    def _guarded_deadline_stop(self, *, capability: object) -> None:
+        assert capability is not None
+        self.events.append("deadline_stop")
+        self.deadline_stop_calls += 1
+        self._stop_generation += 1
+        self.stopped = True
+        if self.deadline_stop_exception is not None:
+            raise self.deadline_stop_exception
 
 
 @pytest.fixture(scope="module")
@@ -237,6 +289,53 @@ def test_authorization_requires_exact_preflight_bound_confirmation(
         confirmation=prompt,
     )
     assert permit.preflight_fingerprint.startswith(prompt.removeprefix("EXECUTE "))
+
+
+def test_authorization_requires_atomic_stopped_snapshot(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm(stopped=False)
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+
+    with pytest.raises(RobotCommandError, match="verified stop latch"):
+        executor.authorize(
+            clear_preflight,
+            operator_id="operator-a",
+            confirmation=executor.approval_prompt(clear_preflight),
+        )
+
+
+def test_guarded_enable_occurs_only_after_valid_permit_and_only_once(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm(enabled=False, stopped=True)
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    prompt = executor.approval_prompt(clear_preflight)
+
+    with pytest.raises(RobotCommandError, match="confirmation mismatch"):
+        executor.authorize(
+            clear_preflight,
+            operator_id="operator-a",
+            confirmation="yes",
+        )
+    assert arm.guarded_enable_calls == 0
+
+    first = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=prompt,
+    )
+    executor.execute(clear_preflight, first)
+    assert arm.guarded_enable_calls == 1
+    assert arm.events.index("guarded_enable") < arm.events.index("resume")
+
+    second = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=prompt,
+    )
+    executor.execute(clear_preflight, second)
+    assert arm.guarded_enable_calls == 1
 
 
 def test_execute_revalidates_and_consumes_one_shot_permit(
@@ -353,7 +452,7 @@ def test_execute_stops_arm_and_preserves_base_exception_from_driver_stream(
     assert arm.stopped is True
 
 
-def test_execute_preserves_original_base_exception_when_emergency_stop_raises(
+def test_execute_reports_unconfirmed_emergency_stop_without_losing_original_error(
     checker, occupancy_checker, clear_preflight
 ) -> None:
     original = KeyboardInterrupt("stream interrupted")
@@ -368,10 +467,12 @@ def test_execute_preserves_original_base_exception_when_emergency_stop_raises(
         confirmation=executor.approval_prompt(clear_preflight),
     )
 
-    with pytest.raises(KeyboardInterrupt) as raised:
+    with pytest.raises(EmergencyStopUnconfirmedError) as raised:
         executor.execute(clear_preflight, permit)
 
-    assert raised.value is original
+    assert raised.value.operation_error is original
+    assert isinstance(raised.value.stop_errors[0], SystemExit)
+    assert raised.value.error_code == "emergency_stop_unconfirmed"
     assert arm.stopped is True
 
 
@@ -442,6 +543,30 @@ def test_execute_never_reports_success_when_same_arm_stop_fails(
     assert arm.stopped is True
 
 
+def test_servoj_abort_and_stop_failure_are_reported_as_unconfirmed(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm(stop_exception=RuntimeError("writeIdle failed"))
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    def aborted_stream(*args, **kwargs):
+        del args, kwargs
+        return StreamServoJResult(ok=False, commands_sent=1, abort_reason="tracking_error")
+
+    arm._guarded_stream_servoj = aborted_stream  # type: ignore[method-assign]
+
+    with pytest.raises(EmergencyStopUnconfirmedError) as raised:
+        executor.execute(clear_preflight, permit)
+
+    assert "tracking_error" in str(raised.value.operation_error)
+    assert [str(error) for error in raised.value.stop_errors] == ["writeIdle failed"]
+
+
 def test_execute_rejects_stop_generation_newer_than_one_shot_permit(
     checker, occupancy_checker, clear_preflight
 ) -> None:
@@ -455,7 +580,7 @@ def test_execute_rejects_stop_generation_newer_than_one_shot_permit(
     assert permit.stop_generation == 0
     arm.stop()
 
-    with pytest.raises(RobotCommandError, match="stop generation changed"):
+    with pytest.raises(RobotCommandError, match="stop latch changed"):
         executor.execute(clear_preflight, permit)
 
     assert arm.events == ["stop", "read_state", "stop"]
@@ -683,7 +808,77 @@ def test_execute_rechecks_permit_expiry_after_servoj_prepare(
 
     assert arm.prepared is True
     assert arm.streamed is False
+
+
+def test_execution_budget_expires_during_control_recovery(
+    checker,
+    occupancy_checker,
+    clear_preflight,
+) -> None:
+    clock = SimpleNamespace(value=0.0)
+    arm = FakeGuardedArm()
+    executor = GuardedEliteExecutor(
+        arm,
+        checker,
+        occupancy_checker,
+        clock=lambda: clock.value,
+    )
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+    original_resume = arm._guarded_resume_servoj_control
+
+    def slow_resume(**kwargs):
+        original_resume(**kwargs)
+        clock.value = 1.000001
+
+    arm._guarded_resume_servoj_control = slow_resume  # type: ignore[method-assign]
+
+    with pytest.raises(RobotCommandError, match="during control recovery"):
+        executor.execute(clear_preflight, permit, maximum_duration_s=1.0)
+
     assert arm.stopped is True
+    assert arm.prepared is False
+    assert arm.streamed is False
+    assert arm.stopped is True
+
+
+def test_deadline_watchdog_and_boundary_stop_failures_are_typed(
+    checker,
+    occupancy_checker,
+    clear_preflight,
+) -> None:
+    arm = FakeGuardedArm(
+        deadline_stop_exception=RuntimeError("Dashboard stop failed"),
+        stop_exception=RuntimeError("writeIdle stop failed"),
+    )
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    def blocked_stream(*args, **kwargs):
+        del args, kwargs
+        deadline = time.monotonic() + 1.0
+        while arm.deadline_stop_calls == 0 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        return StreamServoJResult(ok=False, commands_sent=0, abort_reason="deadline")
+
+    arm._guarded_stream_servoj = blocked_stream  # type: ignore[method-assign]
+
+    with pytest.raises(EmergencyStopUnconfirmedError) as raised:
+        executor.execute(clear_preflight, permit, maximum_duration_s=0.01)
+
+    assert raised.value.error_code == "emergency_stop_unconfirmed"
+    assert arm.deadline_stop_calls == 1
+    assert [str(error) for error in raised.value.stop_errors] == [
+        "Dashboard stop failed",
+        "writeIdle stop failed",
+    ]
 
 
 def test_live_start_mismatch_blocks_before_driver_prepare(
@@ -738,9 +933,7 @@ def test_expired_permit_is_consumed_without_motion(
     assert arm.events == []
 
 
-def test_caller_cannot_extend_expired_permit(
-    checker, occupancy_checker, clear_preflight
-) -> None:
+def test_caller_cannot_extend_expired_permit(checker, occupancy_checker, clear_preflight) -> None:
     clock = {"now": 10.0}
     arm = FakeGuardedArm()
     executor = GuardedEliteExecutor(
@@ -802,9 +995,7 @@ def test_caller_cannot_mutate_authoritative_permit_through_returned_alias(
         ("live_start_tolerance_rad", float("nan")),
     ],
 )
-def test_executor_rejects_nonfinite_limits(
-    checker, occupancy_checker, keyword, value
-) -> None:
+def test_executor_rejects_nonfinite_limits(checker, occupancy_checker, keyword, value) -> None:
     with pytest.raises(ValueError, match="finite and positive"):
         GuardedEliteExecutor(
             FakeGuardedArm(),
@@ -814,9 +1005,7 @@ def test_executor_rejects_nonfinite_limits(
         )
 
 
-def test_executor_rejects_nonfinite_clock(
-    checker, occupancy_checker, clear_preflight
-) -> None:
+def test_executor_rejects_nonfinite_clock(checker, occupancy_checker, clear_preflight) -> None:
     executor = GuardedEliteExecutor(
         FakeGuardedArm(),
         checker,
@@ -855,9 +1044,7 @@ def test_authorization_rejects_tampered_servoj_detour(
         )
 
 
-def test_authorization_rejects_changed_occupancy_snapshot(
-    checker, occupancy_snapshot
-) -> None:
+def test_authorization_rejects_changed_occupancy_snapshot(checker, occupancy_snapshot) -> None:
     holder = {"snapshot": occupancy_snapshot}
     occupancy = _attested_occupancy_checker(
         checker,
@@ -916,9 +1103,7 @@ def test_authorization_rejects_mutable_snapshot_provider_result(
         )
 
 
-def test_execute_rejects_snapshot_change_after_permit(
-    checker, occupancy_snapshot
-) -> None:
+def test_execute_rejects_snapshot_change_after_permit(checker, occupancy_snapshot) -> None:
     holder = {"snapshot": occupancy_snapshot}
     occupancy = _attested_occupancy_checker(
         checker,
@@ -966,13 +1151,9 @@ def test_permit_carries_explicit_occupancy_binding(
     assert permit.occupancy_quality_evidence_hash == evidence.quality_evidence_hash
     assert permit.occupancy_metadata_sha256 == evidence.occupancy_metadata_sha256
     assert (
-        permit.occupancy_semantic_verifier_contract_hash
-        == evidence.semantic_verifier_contract_hash
+        permit.occupancy_semantic_verifier_contract_hash == evidence.semantic_verifier_contract_hash
     )
-    assert (
-        permit.occupancy_semantic_attestation_hash
-        == evidence.semantic_attestation_hash
-    )
+    assert permit.occupancy_semantic_attestation_hash == evidence.semantic_attestation_hash
     assert permit.continuous_occupancy_sweep_verified is True
     assert permit.stop_generation == 0
     assert permit.collision_model_id == checker.collision_model_id
@@ -980,10 +1161,7 @@ def test_permit_carries_explicit_occupancy_binding(
     assert permit.robot_geometry_hash == checker.robot_geometry_hash
     assert permit.motion_model_contract_hash == checker.motion_model_contract_hash
     assert len(permit.servoj_runtime_config_hash) == 64
-    assert (
-        permit.occupancy_policy_contract_hash
-        == occupancy_checker.policy_contract_hash
-    )
+    assert permit.occupancy_policy_contract_hash == occupancy_checker.policy_contract_hash
 
 
 def test_execute_rejects_runtime_guard_relaxation(
@@ -1074,9 +1252,7 @@ def test_authorization_requires_freshness_for_whole_planned_stream(
         )
 
 
-def test_execute_requires_freshness_for_whole_remaining_stream(
-    checker, occupancy_snapshot
-) -> None:
+def test_execute_requires_freshness_for_whole_remaining_stream(checker, occupancy_snapshot) -> None:
     clock = {"utc": datetime(2026, 8, 28, 0, 0, 0, 100000, tzinfo=UTC)}
     occupancy = _attested_occupancy_checker(
         checker,

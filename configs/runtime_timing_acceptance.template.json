@@ -1,0 +1,13 @@
+{
+  "workcell_id": "REPLACE_WITH_WORKCELL_ID",
+  "operator_id": "REPLACE_WITH_OPERATOR_ID",
+  "accepted_at_utc": "2026-01-01T00:00:00+00:00",
+  "checklist": {
+    "target_gpu_and_filesystem_used": false,
+    "target_robot_controller_used": false,
+    "all_four_intervals_measured_monotonically": false,
+    "cold_and_warm_trials_included": false,
+    "raw_timing_evidence_archived": false,
+    "independent_result_review_completed": false
+  }
+}

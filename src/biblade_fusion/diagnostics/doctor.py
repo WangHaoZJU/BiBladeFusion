@@ -24,6 +24,9 @@ from biblade_fusion.robotics.collision_template import (
     es68_d435i_collision_content_hash,
     es68_d435i_robot_geometry_hash,
 )
+from biblade_fusion.storage.runtime_timing_acceptance import (
+    read_runtime_timing_acceptance,
+)
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
@@ -391,8 +394,7 @@ def _check_final_collision_model(
         for value in (collision_hash_before, robot_hash_before)
     )
     hashes_are_stable = (
-        collision_hash_before == collision_hash_after
-        and robot_hash_before == robot_hash_after
+        collision_hash_before == collision_hash_after and robot_hash_before == robot_hash_after
     )
     details.update(
         {
@@ -422,24 +424,91 @@ def _check_final_collision_model(
 def _check_motion_readiness(settings: AppSettings) -> CheckResult:
     """Expose present release blockers without constructing a robot driver."""
 
-    # These values describe the current backends. Bounded-step samples are useful for
-    # diagnostics, but neither backend supplies the independent continuous proof required
-    # by production preflight and guarded execution.
+    # The code backends now implement conservative, hash-bound interval proofs.  This
+    # offline doctor still cannot establish that a particular physical workcell,
+    # occupancy generation, trajectory, or operator approval is safe.
     level = CheckLevel.FAIL if settings.robot.motion_enabled else CheckLevel.WARN
     return CheckResult(
         "motion_readiness",
         level,
-        "production motion is blocked: continuous swept-mesh and swept-occupancy "
-        "backends are unavailable",
+        "continuous proof backends are installed, but motion remains blocked until "
+        "a live segment has current map-bound proofs and hardware acceptance",
         {
             "motion_enabled": settings.robot.motion_enabled,
             "motion_ready": False,
-            "continuous_swept_mesh_supported": False,
-            "continuous_swept_occupancy_supported": False,
-            "available_path_checks": "bounded-step discrete diagnostics only",
+            "continuous_swept_mesh_supported": True,
+            "continuous_swept_occupancy_supported": True,
+            "available_path_checks": (
+                "conservative adaptive interval proofs; evaluated per live segment"
+            ),
+            "accepted_static_free_configured": bool(
+                settings.occupancy.accepted_static_free_aabbs
+                and settings.occupancy.accepted_static_free_acceptance_id
+            ),
             "doctor_authorizes_motion": False,
             "hardware_connection_attempted": False,
         },
+    )
+
+
+def _check_runtime_timing_acceptance(settings: AppSettings) -> CheckResult:
+    """Verify the immutable four-budget authority without touching hardware."""
+
+    timing = settings.stop_and_capture
+    limits = {
+        "maximum_perception_cycle_duration_s": timing.maximum_perception_cycle_duration_s,
+        "maximum_operator_reposition_interval_s": (
+            timing.maximum_operator_reposition_interval_s
+        ),
+        "maximum_segment_execution_duration_s": timing.maximum_segment_execution_duration_s,
+        "maximum_schema5_handoff_duration_s": timing.maximum_schema5_handoff_duration_s,
+    }
+    path = timing.runtime_timing_acceptance_path
+    acceptance_id = timing.runtime_timing_acceptance_id
+    required = settings.robot.motion_enabled or timing.enabled
+    missing = [name for name, value in limits.items() if value is None]
+    if path is None or acceptance_id is None:
+        missing.append("runtime_timing_acceptance_path/id")
+    details: dict[str, object] = {
+        "configured_limits_s": limits,
+        "acceptance_path": str(path) if path is not None else None,
+        "acceptance_id": acceptance_id,
+        "hardware_connection_attempted": False,
+        "motion_authorized": False,
+    }
+    if missing:
+        details["missing"] = missing
+        return CheckResult(
+            "runtime_timing_acceptance",
+            CheckLevel.FAIL if required else CheckLevel.WARN,
+            "runtime timing authority is incomplete",
+            details,
+        )
+    try:
+        assert path is not None and acceptance_id is not None
+        acceptance = read_runtime_timing_acceptance(path)
+        acceptance.assert_matches(settings=settings, acceptance_id=acceptance_id)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        details["error"] = str(exc)
+        return CheckResult(
+            "runtime_timing_acceptance",
+            CheckLevel.FAIL,
+            "runtime timing authority is invalid or differs from settings",
+            details,
+        )
+    details.update(
+        {
+            "verified": True,
+            "metadata_sha256": acceptance.metadata_sha256,
+            "trial_count": acceptance.trial_count,
+            "raw_evidence_count": acceptance.raw_evidence_count,
+        }
+    )
+    return CheckResult(
+        "runtime_timing_acceptance",
+        CheckLevel.PASS,
+        "runtime timing authority matches all four configured budgets",
+        details,
     )
 
 
@@ -458,5 +527,6 @@ def run_doctor(settings: AppSettings) -> list[CheckResult]:
         _check_collision_configuration(settings),
         _check_occupancy_configuration(settings),
         _check_final_collision_model(settings),
+        _check_runtime_timing_acceptance(settings),
         _check_motion_readiness(settings),
     ]

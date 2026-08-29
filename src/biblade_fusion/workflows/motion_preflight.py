@@ -108,6 +108,16 @@ def preflight_view_sequence_motion(
     occupancy_checker: OccupancyRobotCollisionChecker | None = None,
     execution_freshness_margin_s: float = 1.0,
     evaluated_at_utc: datetime | None = None,
+    accepted_joint_uncertainty_rad: tuple[float, float, float, float, float, float] = (
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ),
+    motion_envelope_acceptance_id: str | None = None,
+    motion_envelope_metadata_sha256: str | None = None,
 ) -> ViewSequenceMotionPreflight:
     """Preflight seed-to-view and view-to-view legs without authorizing motion."""
 
@@ -144,9 +154,7 @@ def preflight_view_sequence_motion(
             evaluation.status is not CandidateStatus.ENDPOINT_FEASIBLE
             or evaluation.joint_positions_rad is None
         ):
-            raise PathSequenceError(
-                f"View {view_id!r} has no endpoint-feasible joint solution"
-            )
+            raise PathSequenceError(f"View {view_id!r} has no endpoint-feasible joint solution")
         camera_pose = evaluation.candidate.base_t_left_ir
         canonical_camera_pose = type(camera_pose)(
             "base",
@@ -155,19 +163,13 @@ def preflight_view_sequence_motion(
         )
         base_t_flange = canonical_camera_pose.compose(flange_t_left_ir.inverse())
         base_t_tcp = base_t_flange.compose(flange_t_tcp)
-        goal_matrix = tuple(
-            tuple(float(value) for value in row) for row in base_t_tcp.matrix
-        )
+        goal_matrix = tuple(tuple(float(value) for value in row) for row in base_t_tcp.matrix)
         endpoint_consistency = evaluate_endpoint_pose_consistency(
             evaluation.joint_positions_rad,
             base_t_tcp.matrix,
             collision_checker,
-            maximum_translation_error_m=(
-                config.maximum_endpoint_translation_error_m
-            ),
-            maximum_rotation_error_deg=(
-                config.maximum_endpoint_rotation_error_deg
-            ),
+            maximum_translation_error_m=(config.maximum_endpoint_translation_error_m),
+            maximum_rotation_error_deg=(config.maximum_endpoint_rotation_error_deg),
         )
         preflight = preflight_linear_joint_motion(
             previous_joints,
@@ -180,6 +182,9 @@ def preflight_view_sequence_motion(
             speed_scaling=config.speed_scaling,
             velocity_margin=config.velocity_margin,
             execution_freshness_margin_s=execution_freshness_margin_s,
+            accepted_joint_uncertainty_rad=accepted_joint_uncertainty_rad,
+            motion_envelope_acceptance_id=motion_envelope_acceptance_id,
+            motion_envelope_metadata_sha256=motion_envelope_metadata_sha256,
         )
         preflight = _apply_endpoint_gate(preflight, endpoint_consistency)
         if evaluation_time is not None:
@@ -201,8 +206,7 @@ def preflight_view_sequence_motion(
         )
         if preflight.servoj_stream is not None:
             duration_s += (
-                max(0, len(preflight.servoj_stream.commands) - 1)
-                * preflight.servoj_stream.dt_s
+                max(0, len(preflight.servoj_stream.commands) - 1) * preflight.servoj_stream.dt_s
             )
         start_array = np.asarray(preflight.start_joint_positions_rad)
         goal_array = np.asarray(preflight.goal_joint_positions_rad)
@@ -256,9 +260,7 @@ def evaluate_endpoint_pose_consistency(
         )
     try:
         base_t_flange = np.asarray(
-            collision_checker.kinematic_model.forward_kinematics(
-                joint_positions_rad
-            ),
+            collision_checker.kinematic_model.forward_kinematics(joint_positions_rad),
             dtype=np.float64,
         )
         target_pose = PoseSE3("base", "tcp", target_base_t_tcp)
@@ -276,13 +278,9 @@ def evaluate_endpoint_pose_consistency(
             or not np.isfinite((base_t_flange, target, predicted)).all()
         ):
             raise ValueError("endpoint transforms must be finite 4x4 matrices")
-        translation_error = float(
-            np.linalg.norm(predicted[:3, 3] - target[:3, 3])
-        )
+        translation_error = float(np.linalg.norm(predicted[:3, 3] - target[:3, 3]))
         relative_rotation = predicted[:3, :3].T @ target[:3, :3]
-        cosine = float(
-            np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0)
-        )
+        cosine = float(np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0))
         rotation_error = float(np.degrees(np.arccos(cosine)))
         reasons = tuple(
             reason
@@ -299,11 +297,7 @@ def evaluate_endpoint_pose_consistency(
             if exceeded
         )
         return EndpointPoseConsistency(
-            (
-                CollisionCheckStatus.BLOCKED
-                if reasons
-                else CollisionCheckStatus.CLEAR
-            ),
+            (CollisionCheckStatus.BLOCKED if reasons else CollisionCheckStatus.CLEAR),
             translation_error,
             rotation_error,
             translation_limit,
@@ -320,7 +314,7 @@ def evaluate_endpoint_pose_consistency(
             rotation_limit,
             None,
             (f"endpoint_pose_consistency_error:{type(exc).__name__}",),
-    )
+        )
 
 
 def preflight_live_joint_segment(
@@ -335,6 +329,16 @@ def preflight_live_joint_segment(
     collision_checker_unavailable_reason: str = "checker_unavailable",
     execution_freshness_margin_s: float = 1.0,
     evaluated_at_utc: datetime | None = None,
+    accepted_joint_uncertainty_rad: tuple[float, float, float, float, float, float] = (
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ),
+    motion_envelope_acceptance_id: str | None = None,
+    motion_envelope_metadata_sha256: str | None = None,
 ) -> LiveJointSegmentPreflight:
     """Preflight exactly one receding-horizon segment from measured live joints.
 
@@ -364,6 +368,9 @@ def preflight_live_joint_segment(
         speed_scaling=config.speed_scaling,
         velocity_margin=config.velocity_margin,
         execution_freshness_margin_s=execution_freshness_margin_s,
+        accepted_joint_uncertainty_rad=accepted_joint_uncertainty_rad,
+        motion_envelope_acceptance_id=motion_envelope_acceptance_id,
+        motion_envelope_metadata_sha256=motion_envelope_metadata_sha256,
     )
     endpoint = None
     if final_target:
@@ -401,9 +408,7 @@ def _apply_endpoint_gate(
     }
     if endpoint.status is CollisionCheckStatus.CLEAR:
         return replace(preflight, diagnostics=diagnostics)
-    reasons = tuple(
-        dict.fromkeys((*preflight.blocking_reasons, *endpoint.blocking_reasons))
-    )
+    reasons = tuple(dict.fromkeys((*preflight.blocking_reasons, *endpoint.blocking_reasons)))
     return replace(
         preflight,
         status=(

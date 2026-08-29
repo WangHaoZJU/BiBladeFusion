@@ -21,13 +21,20 @@ import numpy as np
 from numpy.typing import NDArray
 
 from biblade_fusion.core.pose import PoseSE3
-from biblade_fusion.core.settings import SurfacePartitionConfig, SurfaceQualityConfig
+from biblade_fusion.core.settings import (
+    NextViewSelectionConfig,
+    ReacquisitionPerturbationConfig,
+    SurfacePartitionConfig,
+    SurfaceQualityConfig,
+    ViewPlanningConfig,
+)
 from biblade_fusion.perception.features import FinComponent
 from biblade_fusion.perception.surface import (
     CurvedBladeSurface,
     CurvedSurfacePatch,
     CurvedViewPlan,
     SurfaceRegion,
+    generate_reacquisition_view,
 )
 from biblade_fusion.planning.surface_coverage import (
     SurfaceCoverageLedger,
@@ -48,10 +55,14 @@ from biblade_fusion.storage.reconstructed_view import (
     StoredReconstructedBladeView,
     read_reconstructed_view,
 )
+from biblade_fusion.storage.stereo_inference import read_stereo_inference
 from biblade_fusion.workflows.coarse_model import registered_cloud_view
 
-SURFACE_COVERAGE_SCHEMA_VERSION = 1
+SURFACE_COVERAGE_SCHEMA_VERSION = 2
+LEGACY_SURFACE_COVERAGE_SCHEMA_VERSION = 1
 SURFACE_COVERAGE_COARSE_SCHEMA_VERSION = 5
+REACQUISITION_VIEW_ID_SCHEMA = "fine_patch_reacquisition_v2"
+PhysicalSourceIdentity = tuple[str, str, int, int]
 _METADATA_NAME = "coverage.json"
 _ARRAY_NAMES = (
     "minimum_distances_m",
@@ -78,6 +89,8 @@ class StoredSurfaceCoverageGeneration:
     previous_generation_path: Path | None
     current_reconstructed_view_path: Path | None
     metadata: dict[str, Any]
+    current_reacquisition: FineReacquisitionProvenance | None = None
+    physical_source_identities: tuple[PhysicalSourceIdentity, ...] = ()
 
     @property
     def motion_authorized(self) -> bool:
@@ -91,6 +104,112 @@ class _ReferenceGeometry:
     surface: CurvedBladeSurface
     view_plan: CurvedViewPlan
     partition_config: SurfacePartitionConfig
+
+
+@dataclass(frozen=True, slots=True)
+class FineReacquisitionProvenance:
+    """Typed authority for one bounded retry of a fixed nominal patch view."""
+
+    view_id: str
+    nominal_candidate_id: str
+    patch_id: str
+    attempt: int
+    distance_offset_m: float
+    tilt_deg: float
+    azimuth_deg: float
+    selection_policy_sha256: str
+    reference_metadata_sha256: str
+
+    def __post_init__(self) -> None:
+        for name in ("view_id", "nominal_candidate_id", "patch_id"):
+            raw = getattr(self, name)
+            if type(raw) is not str:
+                raise TypeError(f"Fine reacquisition {name} must be a string")
+            value = raw.strip()
+            if not value:
+                raise ValueError(f"Fine reacquisition {name} must be non-empty")
+            object.__setattr__(self, name, value)
+        if isinstance(self.attempt, bool) or not isinstance(self.attempt, int) or self.attempt < 1:
+            raise ValueError("Fine reacquisition attempt must be a positive integer")
+        perturbations = (
+            ("distance_offset_m", self.distance_offset_m),
+            ("tilt_deg", self.tilt_deg),
+            ("azimuth_deg", self.azimuth_deg),
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for _, value in perturbations
+        ):
+            raise TypeError("Fine reacquisition perturbations must be numeric")
+        values = np.asarray(tuple(value for _, value in perturbations), dtype=np.float64)
+        if not np.isfinite(values).all():
+            raise ValueError("Fine reacquisition perturbation must be finite")
+        for (name, _), value in zip(perturbations, values, strict=True):
+            object.__setattr__(self, name, float(value))
+        for name in ("selection_policy_sha256", "reference_metadata_sha256"):
+            value = getattr(self, name)
+            if type(value) is not str:
+                raise TypeError(f"Fine reacquisition {name} must be a string")
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError(f"Fine reacquisition {name} must be a SHA-256 digest")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "kind": "bounded_reacquisition",
+            "id_schema": REACQUISITION_VIEW_ID_SCHEMA,
+            "view_id": self.view_id,
+            "nominal_candidate_id": self.nominal_candidate_id,
+            "patch_id": self.patch_id,
+            "attempt": self.attempt,
+            "distance_offset_m": self.distance_offset_m,
+            "tilt_deg": self.tilt_deg,
+            "azimuth_deg": self.azimuth_deg,
+            "selection_policy_sha256": self.selection_policy_sha256,
+            "reference_metadata_sha256": self.reference_metadata_sha256,
+        }
+
+
+def reacquisition_view_id(
+    nominal_candidate_id: str,
+    patch_id: str,
+    attempt: int,
+    selection_policy_sha256: str,
+) -> str:
+    """Derive the immutable capture ID that carries retry policy provenance."""
+
+    if type(nominal_candidate_id) is not str or type(patch_id) is not str:
+        raise TypeError("Reacquisition candidate and patch IDs must be strings")
+    nominal = nominal_candidate_id.strip()
+    patch = patch_id.strip()
+    if (
+        not nominal
+        or not patch
+        or isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt < 1
+    ):
+        raise ValueError("Reacquisition ID inputs are invalid")
+    if type(selection_policy_sha256) is not str:
+        raise TypeError("Reacquisition ID selection policy must be a string")
+    policy = selection_policy_sha256
+    if len(policy) != 64 or any(
+        character not in "0123456789abcdef" for character in policy
+    ):
+        raise ValueError("Reacquisition ID selection policy must be a SHA-256")
+    source = json.dumps(
+        {
+            "schema": REACQUISITION_VIEW_ID_SCHEMA,
+            "nominal_candidate_id": nominal,
+            "patch_id": patch,
+            "attempt": int(attempt),
+            "selection_policy_sha256": policy,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"fine_reacq_a{attempt:02d}_{hashlib.sha256(source).hexdigest()}"
 
 
 def _sha256(path: Path) -> str:
@@ -489,11 +608,338 @@ def _required_regions(surface: CurvedBladeSurface) -> tuple[SurfaceRegion, ...]:
     return tuple(dict.fromkeys(patch.region for patch in surface.patches))
 
 
+def _canonical_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _selection_policy_record(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise TypeError("Fine selection policy payload must be an object")
+    canonical = json.loads(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    )
+    return {
+        "id_schema": REACQUISITION_VIEW_ID_SCHEMA,
+        "selection_policy_sha256": _canonical_sha256(canonical),
+        "selection_policy": canonical,
+    }
+
+
+def _validated_selection_policy(
+    record: object,
+    *,
+    reference: _ReferenceGeometry,
+    quality_config: SurfaceQualityConfig,
+) -> tuple[NextViewSelectionConfig, dict[str, Any]] | None:
+    if record is None:
+        return None
+    if not isinstance(record, dict) or set(record) != {
+        "id_schema",
+        "selection_policy_sha256",
+        "selection_policy",
+    }:
+        raise ValueError("Fine reacquisition policy record is malformed")
+    if record["id_schema"] != REACQUISITION_VIEW_ID_SCHEMA:
+        raise ValueError("Fine reacquisition ID schema changed")
+    payload = record["selection_policy"]
+    if not isinstance(payload, dict) or set(payload) != {
+        "algorithm",
+        "selection",
+        "surface_quality",
+        "view_filter",
+        "kinematics",
+        "motion_endpoint_gate",
+        "expected_reference",
+        "terminal_reconstruction",
+        "flange_T_left_ir",
+        "fk_implementation",
+    }:
+        raise ValueError("Fine selection-policy payload is incomplete")
+    policy_sha256 = str(record["selection_policy_sha256"])
+    if _canonical_sha256(payload) != policy_sha256:
+        raise ValueError("Fine selection-policy SHA-256 does not match its payload")
+    if payload["algorithm"] != "bilateral_single_fin_coverage_priority_v2":
+        raise ValueError("Fine selection-policy algorithm changed")
+    selection = NextViewSelectionConfig.model_validate(payload["selection"])
+    if selection.model_dump(mode="json") != payload["selection"]:
+        raise ValueError("Fine reacquisition configuration is not canonical")
+    stored_quality = SurfaceQualityConfig.model_validate(payload["surface_quality"])
+    if stored_quality.model_dump(mode="json") != quality_config.model_dump(mode="json"):
+        raise ValueError("Fine selection and coverage quality policies disagree")
+    expected_reference = payload["expected_reference"]
+    if not isinstance(expected_reference, dict) or set(expected_reference) != {
+        "root",
+        "metadata_sha256",
+    }:
+        raise ValueError("Fine selection-policy reference binding is malformed")
+    if (
+        Path(str(expected_reference["root"])).resolve() != reference.summary.root
+        or str(expected_reference["metadata_sha256"]) != reference.metadata_sha256
+    ):
+        raise ValueError("Fine selection policy is bound to another coarse reference")
+    endpoint = payload["motion_endpoint_gate"]
+    if not isinstance(endpoint, dict) or set(endpoint) != {
+        "maximum_translation_error_m",
+        "maximum_rotation_error_deg",
+    }:
+        raise ValueError("Fine selection-policy endpoint gate is malformed")
+    endpoint_values = np.asarray(tuple(float(value) for value in endpoint.values()))
+    if not np.isfinite(endpoint_values).all() or np.any(endpoint_values <= 0.0):
+        raise ValueError("Fine selection-policy endpoint tolerances are invalid")
+    PoseSE3("flange", "left_ir", payload["flange_T_left_ir"])
+    if not str(payload["fk_implementation"]).strip():
+        raise ValueError("Fine selection-policy FK implementation is missing")
+    return selection, payload
+
+
+def _provenance_from_payload(payload: object) -> FineReacquisitionProvenance:
+    if not isinstance(payload, dict) or set(payload) != {
+        "kind",
+        "id_schema",
+        "view_id",
+        "nominal_candidate_id",
+        "patch_id",
+        "attempt",
+        "distance_offset_m",
+        "tilt_deg",
+        "azimuth_deg",
+        "selection_policy_sha256",
+        "reference_metadata_sha256",
+    }:
+        raise ValueError("Fine reacquisition provenance is malformed")
+    if payload["kind"] != "bounded_reacquisition":
+        raise ValueError("Fine reacquisition provenance kind changed")
+    if payload["id_schema"] != REACQUISITION_VIEW_ID_SCHEMA:
+        raise ValueError("Fine reacquisition provenance ID schema changed")
+    return FineReacquisitionProvenance(
+        view_id=payload["view_id"],
+        nominal_candidate_id=payload["nominal_candidate_id"],
+        patch_id=payload["patch_id"],
+        attempt=payload["attempt"],
+        distance_offset_m=payload["distance_offset_m"],
+        tilt_deg=payload["tilt_deg"],
+        azimuth_deg=payload["azimuth_deg"],
+        selection_policy_sha256=payload["selection_policy_sha256"],
+        reference_metadata_sha256=payload["reference_metadata_sha256"],
+    )
+
+
+def _rotation_error_deg(expected: PoseSE3, actual: PoseSE3) -> float:
+    relative = expected.rotation.T @ actual.rotation
+    cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def _validate_reacquisition_provenance(
+    provenance: FineReacquisitionProvenance,
+    current: StoredReconstructedBladeView,
+    reference: _ReferenceGeometry,
+    policy_record: dict[str, Any] | None,
+    quality_config: SurfaceQualityConfig,
+) -> None:
+    validated = _validated_selection_policy(
+        policy_record,
+        reference=reference,
+        quality_config=quality_config,
+    )
+    if validated is None:
+        raise ValueError("A fine retry requires a pinned selection-policy payload")
+    selection, policy_payload = validated
+    policy_sha256 = str(policy_record["selection_policy_sha256"])
+    if (
+        provenance.view_id != current.view.source_view_id
+        or provenance.selection_policy_sha256 != policy_sha256
+        or provenance.reference_metadata_sha256 != reference.metadata_sha256
+    ):
+        raise ValueError("Fine retry identity, policy, or reference binding changed")
+    hand_eye = current.metadata.get("hand_eye")
+    if not isinstance(hand_eye, dict) or "flange_T_left_ir" not in hand_eye:
+        raise ValueError("Fine retry reconstructed view lacks hand-eye provenance")
+    expected_flange_t_left_ir = PoseSE3(
+        "flange",
+        "left_ir",
+        policy_payload["flange_T_left_ir"],
+    )
+    actual_flange_t_left_ir = PoseSE3(
+        "flange",
+        "left_ir",
+        hand_eye["flange_T_left_ir"],
+    )
+    if not np.allclose(
+        actual_flange_t_left_ir.matrix,
+        expected_flange_t_left_ir.matrix,
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError("Fine retry hand-eye differs from its pinned selection policy")
+    matches = tuple(
+        (candidate, projection)
+        for candidate, projection in zip(
+            reference.view_plan.candidates,
+            reference.view_plan.candidate_base_t_left_rectified,
+            strict=True,
+        )
+        if candidate.view_id == provenance.nominal_candidate_id
+    )
+    if len(matches) != 1:
+        raise ValueError("Fine retry nominal candidate is not unique in the reference")
+    nominal, nominal_projection = matches[0]
+    if nominal.patch.patch_id != provenance.patch_id:
+        raise ValueError("Fine retry patch differs from its nominal candidate")
+    if provenance.attempt > selection.maximum_reacquisition_attempts_per_patch:
+        raise ValueError("Fine retry attempt exceeds the pinned bounded budget")
+    perturbation = selection.reacquisition_perturbations[provenance.attempt - 1]
+    expected_values = (
+        perturbation.distance_offset_m,
+        perturbation.tilt_deg,
+        perturbation.azimuth_deg,
+    )
+    actual_values = (
+        provenance.distance_offset_m,
+        provenance.tilt_deg,
+        provenance.azimuth_deg,
+    )
+    if actual_values != expected_values:
+        raise ValueError("Fine retry perturbation differs from the pinned attempt")
+    expected_id = reacquisition_view_id(
+        nominal.view_id,
+        nominal.patch.patch_id,
+        provenance.attempt,
+        policy_sha256,
+    )
+    if provenance.view_id != expected_id:
+        raise ValueError("Fine retry view ID does not replay from its provenance")
+    planning = ViewPlanningConfig.model_validate(
+        reference.summary.metadata["view_plan"]["configuration"]
+    )
+    lower = planning.minimum_standoff_distance_m
+    upper = planning.maximum_standoff_distance_m
+    if lower is None or upper is None:
+        raise ValueError("Fine retry reference has no bounded standoff interval")
+    expected_candidate, expected_projection = generate_reacquisition_view(
+        nominal,
+        nominal_projection,
+        reference.view_plan.left_rectified_t_left_ir,
+        ReacquisitionPerturbationConfig.model_validate(perturbation),
+        view_id=expected_id,
+        minimum_standoff_distance_m=lower,
+        maximum_standoff_distance_m=upper,
+    )
+    if expected_candidate.patch.patch_id != provenance.patch_id:
+        raise ValueError("Fine retry replay changed its target patch")
+    actual_projection = current.view.base_t_projection_camera
+    translation_error = float(
+        np.linalg.norm(actual_projection.translation_m - expected_projection.translation_m)
+    )
+    rotation_error = _rotation_error_deg(expected_projection, actual_projection)
+    endpoint = policy_payload["motion_endpoint_gate"]
+    if (
+        translation_error > float(endpoint["maximum_translation_error_m"])
+        or rotation_error > float(endpoint["maximum_rotation_error_deg"])
+    ):
+        raise ValueError("Fine retry capture is outside its pinned endpoint tolerance")
+
+
+def _physical_source_identity(
+    current: StoredReconstructedBladeView,
+) -> PhysicalSourceIdentity | None:
+    if int(current.metadata["schema_version"]) != SCIENCE_RECONSTRUCTED_VIEW_SCHEMA_VERSION:
+        # Schema-2 views remain readable for offline/legacy coverage.  They have no
+        # foreground asset that strictly replays the raw stereo source, so they
+        # cannot contribute a physical-frame identity to a production lineage.
+        return None
+    # The schema-3 reconstructed-view reader has already replayed its foreground
+    # asset, which strictly verifies the raw session behind this stereo artifact.
+    # Re-read the checksummed stereo metadata here to derive a path-independent ID.
+    source = current.metadata["source"]
+    stereo_value = source.get("stereo_inference")
+    if stereo_value is None:
+        raise ValueError("Science coverage observation has no stereo-inference source")
+    stereo = read_stereo_inference(Path(str(stereo_value)).resolve())
+    observation = stereo.observation
+    if (
+        observation.source_view_id != current.view.source_view_id
+        or observation.source_sequence_index != current.view.source_sequence_index
+        or observation.rectified.source_frame_number != current.view.source_frame_number
+    ):
+        raise ValueError("Science coverage stereo physical identity changed")
+    integrity = stereo.metadata["source"].get("raw_session_integrity")
+    if not isinstance(integrity, dict) or set(integrity) != {
+        "session_manifest_sha256",
+        "view_metadata_sha256",
+        "left_ir_npy_sha256",
+        "right_ir_npy_sha256",
+        "raw_calibration_content_hash",
+    }:
+        raise ValueError("Science coverage stereo lacks complete raw-session integrity")
+    for label, key in (
+        ("session manifest", "session_manifest_sha256"),
+        ("view metadata", "view_metadata_sha256"),
+        ("left IR array", "left_ir_npy_sha256"),
+        ("right IR array", "right_ir_npy_sha256"),
+        ("raw calibration", "raw_calibration_content_hash"),
+    ):
+        digest = integrity[key]
+        if type(digest) is not str:
+            raise TypeError(f"Science coverage {label} identity must be a string")
+        if len(digest) != 64 or any(value not in "0123456789abcdef" for value in digest):
+            raise ValueError(f"Science coverage {label} identity is not a SHA-256")
+    manifest_sha256 = integrity["session_manifest_sha256"]
+    view_metadata_sha256 = integrity["view_metadata_sha256"]
+    return (
+        manifest_sha256,
+        view_metadata_sha256,
+        int(current.view.source_sequence_index),
+        int(current.view.source_frame_number),
+    )
+
+
+def _validate_reacquisition_lineage(
+    provenance: FineReacquisitionProvenance,
+    previous: StoredSurfaceCoverageGeneration,
+    reference: _ReferenceGeometry,
+    policy_record: dict[str, Any] | None,
+) -> None:
+    validated = _validated_selection_policy(
+        policy_record,
+        reference=reference,
+        quality_config=previous.quality_config,
+    )
+    if validated is None:
+        raise ValueError("A fine retry lineage requires a pinned selection policy")
+    if provenance.nominal_candidate_id not in previous.ledger.observation_ids:
+        raise ValueError("Fine retry cannot precede its nominal candidate observation")
+    quality = next(
+        (item for item in previous.quality.patches if item.patch_id == provenance.patch_id),
+        None,
+    )
+    if quality is None or quality.complete:
+        raise ValueError("Fine retry requires an incomplete target patch")
+
+
 def _validate_fine_reconstructed_view(
     current: StoredReconstructedBladeView,
     reference: _ReferenceGeometry,
     *,
     require_foreground_bound_science: bool,
+    quality_config: SurfaceQualityConfig,
+    policy_record: dict[str, Any] | None,
+    reacquisition: FineReacquisitionProvenance | None,
 ) -> None:
     schema_version = int(current.metadata["schema_version"])
     if (
@@ -518,8 +964,23 @@ def _validate_fine_reconstructed_view(
     if current.view.depth_source != "foundation_stereo":
         raise ValueError("Fine coverage requires a FoundationStereo reconstructed view")
     candidate_ids = {candidate.view_id for candidate in reference.view_plan.candidates}
-    if current.view.source_view_id not in candidate_ids:
-        raise ValueError("Fine reconstructed source view ID is not a reference candidate ID")
+    if reacquisition is None:
+        if current.view.source_view_id not in candidate_ids:
+            raise ValueError("Fine reconstructed source view ID is not a reference candidate ID")
+    else:
+        if schema_version != SCIENCE_RECONSTRUCTED_VIEW_SCHEMA_VERSION:
+            raise ValueError(
+                "A fine retry requires a foreground-bound schema-3 reconstructed view"
+            )
+        if current.view.source_view_id in candidate_ids:
+            raise ValueError("A nominal fine candidate cannot cite retry provenance")
+        _validate_reacquisition_provenance(
+            reacquisition,
+            current,
+            reference,
+            policy_record,
+            quality_config,
+        )
     expected_base_t_left_rectified = current.view.base_t_left_ir.compose(
         reference.view_plan.left_rectified_t_left_ir.inverse()
     )
@@ -719,6 +1180,8 @@ def write_surface_coverage_generation(
     current_reconstructed_view: str | Path | None = None,
     observation_id: str | None = None,
     ledger: SurfaceCoverageLedger | None = None,
+    selection_policy_payload: dict[str, Any] | None = None,
+    current_reacquisition: FineReacquisitionProvenance | None = None,
 ) -> Path:
     """Write an initial empty ledger or append exactly one fine observation.
 
@@ -738,11 +1201,23 @@ def write_surface_coverage_generation(
         "kind": "coarse_model_schema_5",
         **_source_record(reference.summary.root, "metadata.json"),
     }
+    requested_policy = _selection_policy_record(selection_policy_payload)
+    if requested_policy is not None:
+        _validated_selection_policy(
+            requested_policy,
+            reference=reference,
+            quality_config=config,
+        )
 
     previous_record: dict[str, Any] | None = None
     current_record: dict[str, Any] | None = None
+    policy_record = requested_policy
     if previous_generation is None:
-        if current_reconstructed_view is not None or observation_id is not None:
+        if (
+            current_reconstructed_view is not None
+            or observation_id is not None
+            or current_reacquisition is not None
+        ):
             raise ValueError(
                 "Initial fine coverage generation cannot contain a reconstructed observation"
             )
@@ -765,15 +1240,42 @@ def write_surface_coverage_generation(
             or previous.required_regions != required_regions
         ):
             raise ValueError("Required surface identities cannot drift between generations")
+        inherited_policy = previous.metadata.get("reacquisition_policy")
+        if requested_policy is not None and requested_policy != inherited_policy:
+            raise ValueError("Fine selection policy cannot drift between generations")
+        policy_record = inherited_policy
+        _validated_selection_policy(
+            policy_record,
+            reference=reference,
+            quality_config=config,
+        )
         current_path = Path(current_reconstructed_view).resolve()
         current = read_reconstructed_view(current_path)
         _validate_fine_reconstructed_view(
             current,
             reference,
             require_foreground_bound_science=False,
+            quality_config=config,
+            policy_record=policy_record,
+            reacquisition=current_reacquisition,
         )
+        if current_reacquisition is not None:
+            _validate_reacquisition_lineage(
+                current_reacquisition,
+                previous,
+                reference,
+                policy_record,
+            )
         if observation_id != current.view.source_view_id:
             raise ValueError("Fine observation ID must equal the reconstructed source view ID")
+        if observation_id in previous.ledger.observation_ids:
+            raise ValueError("Fine observation ID was already committed")
+        physical_identity = _physical_source_identity(current)
+        if (
+            physical_identity is not None
+            and physical_identity in previous.physical_source_identities
+        ):
+            raise ValueError("Fine coverage cannot reuse one physical camera frame")
         expected = update_surface_coverage(
             previous.ledger,
             reference.surface,
@@ -791,6 +1293,19 @@ def write_surface_coverage_generation(
             "source_view_id": current.view.source_view_id,
             "source_sequence_index": current.view.source_sequence_index,
             "source_frame_number": current.view.source_frame_number,
+            "view_authority": (
+                {
+                    "kind": "nominal_candidate",
+                    "view_id": current.view.source_view_id,
+                    "patch_id": next(
+                        candidate.patch.patch_id
+                        for candidate in reference.view_plan.candidates
+                        if candidate.view_id == current.view.source_view_id
+                    ),
+                }
+                if current_reacquisition is None
+                else current_reacquisition.to_payload()
+            ),
         }
     if ledger is not None:
         _validate_ledger(ledger, reference.surface)
@@ -824,6 +1339,7 @@ def write_surface_coverage_generation(
             "created_at_utc": datetime.now(UTC).isoformat(),
             "motion_authorized": False,
             "reference": reference_record,
+            "reacquisition_policy": policy_record,
             "previous_generation": previous_record,
             "current_observation": current_record,
             "files": {name: _record(temporary / f"{name}.npy") for name in arrays},
@@ -860,7 +1376,11 @@ def _read_generation(
     try:
         metadata_path = resolved / _METADATA_NAME
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if int(payload["schema_version"]) != SURFACE_COVERAGE_SCHEMA_VERSION:
+        schema_version = int(payload["schema_version"])
+        if schema_version not in {
+            LEGACY_SURFACE_COVERAGE_SCHEMA_VERSION,
+            SURFACE_COVERAGE_SCHEMA_VERSION,
+        }:
             raise ValueError(f"unsupported schema {payload['schema_version']}")
         if payload.get("motion_authorized") is not False:
             raise ValueError("Surface-coverage generations must explicitly forbid motion")
@@ -879,6 +1399,16 @@ def _read_generation(
         config = SurfaceQualityConfig.model_validate(payload["quality_configuration"])
         if config.model_dump(mode="json") != payload["quality_configuration"]:
             raise ValueError("Surface quality configuration is not canonical")
+        policy_record = (
+            payload.get("reacquisition_policy")
+            if schema_version == SURFACE_COVERAGE_SCHEMA_VERSION
+            else None
+        )
+        _validated_selection_policy(
+            policy_record,
+            reference=reference,
+            quality_config=config,
+        )
         required_patch_ids = tuple(str(value) for value in payload["required_patch_ids"])
         expected_patch_ids = tuple(patch.patch_id for patch in reference.surface.patches)
         if required_patch_ids != expected_patch_ids:
@@ -890,6 +1420,8 @@ def _read_generation(
 
         previous_path: Path | None = None
         current_path: Path | None = None
+        current_reacquisition: FineReacquisitionProvenance | None = None
+        physical_source_identities: tuple[PhysicalSourceIdentity, ...] = ()
         previous_record = payload["previous_generation"]
         current_record = payload["current_observation"]
         if previous_record is None:
@@ -921,6 +1453,8 @@ def _read_generation(
                 raise ValueError("Surface-coverage coarse reference drifted across lineage")
             if previous.quality_config.model_dump(mode="json") != config.model_dump(mode="json"):
                 raise ValueError("Surface quality configuration drifted across lineage")
+            if previous.metadata.get("reacquisition_policy") != policy_record:
+                raise ValueError("Fine reacquisition policy drifted across lineage")
             if (
                 previous.required_patch_ids != required_patch_ids
                 or previous.required_regions != required_regions
@@ -930,11 +1464,44 @@ def _read_generation(
                 current_record, "metadata.json", label="current reconstructed view"
             )
             current = read_reconstructed_view(current_path)
+            if schema_version == SURFACE_COVERAGE_SCHEMA_VERSION:
+                authority = current_record.get("view_authority")
+                if not isinstance(authority, dict):
+                    raise ValueError("Current fine observation lacks typed view authority")
+                kind = authority.get("kind")
+                if kind == "nominal_candidate":
+                    if set(authority) != {"kind", "view_id", "patch_id"}:
+                        raise ValueError("Nominal fine-view authority is malformed")
+                    matches = tuple(
+                        candidate
+                        for candidate in reference.view_plan.candidates
+                        if candidate.view_id == str(authority["view_id"])
+                    )
+                    if (
+                        len(matches) != 1
+                        or matches[0].patch.patch_id != str(authority["patch_id"])
+                        or str(authority["view_id"]) != current.view.source_view_id
+                    ):
+                        raise ValueError("Nominal fine-view authority changed")
+                elif kind == "bounded_reacquisition":
+                    current_reacquisition = _provenance_from_payload(authority)
+                else:
+                    raise ValueError("Current fine-view authority kind is unsupported")
             _validate_fine_reconstructed_view(
                 current,
                 reference,
                 require_foreground_bound_science=require_foreground_bound_science,
+                quality_config=config,
+                policy_record=policy_record,
+                reacquisition=current_reacquisition,
             )
+            if current_reacquisition is not None:
+                _validate_reacquisition_lineage(
+                    current_reacquisition,
+                    previous,
+                    reference,
+                    policy_record,
+                )
             if (
                 str(current_record["source_view_id"]) != current.view.source_view_id
                 or int(current_record["source_sequence_index"])
@@ -949,6 +1516,15 @@ def _read_generation(
                 )
             if ledger.observation_ids != (*previous.ledger.observation_ids, observation_id):
                 raise ValueError("Successor must append exactly its one current observation")
+            physical_identity = _physical_source_identity(current)
+            if (
+                physical_identity is not None
+                and physical_identity in previous.physical_source_identities
+            ):
+                raise ValueError("Fine coverage lineage reuses one physical camera frame")
+            physical_source_identities = previous.physical_source_identities
+            if physical_identity is not None:
+                physical_source_identities = (*physical_source_identities, physical_identity)
             expected = update_surface_coverage(
                 previous.ledger,
                 reference.surface,
@@ -981,6 +1557,8 @@ def _read_generation(
             previous_path,
             current_path,
             payload,
+            current_reacquisition,
+            physical_source_identities,
         )
     finally:
         active.remove(resolved)

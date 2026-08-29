@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 from collections.abc import Callable
@@ -11,6 +12,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Protocol
+from uuid import uuid4
 
 import numpy as np
 
@@ -27,6 +30,7 @@ from biblade_fusion.perception.stereo import FoundationStereoBackend
 from biblade_fusion.robotics.stationarity import validate_stationary_trace
 from biblade_fusion.storage.blade_foreground import read_blade_foreground_mask
 from biblade_fusion.storage.inference_stationarity import (
+    read_inference_stationarity,
     write_inference_stationarity,
 )
 from biblade_fusion.storage.occupancy_mapping import (
@@ -34,6 +38,7 @@ from biblade_fusion.storage.occupancy_mapping import (
     write_occupancy_mapping,
 )
 from biblade_fusion.storage.reconstructed_view import read_reconstructed_view
+from biblade_fusion.storage.science_authority import ScienceAcceptanceAuthority
 from biblade_fusion.storage.session import SessionWriter
 from biblade_fusion.storage.stereo_inference import (
     read_stereo_inference,
@@ -58,12 +63,26 @@ from biblade_fusion.workflows.stereo_inference import (
 from biblade_fusion.workflows.stop_scan_coordinator import (
     CapturedStopScanView,
     CapturePurpose,
+    OccupancyBinding,
     PerceptionCycleResult,
 )
 
 
 class FoundationStereoCycleError(RuntimeError):
     """A stopped FoundationStereo asset transaction could not be committed."""
+
+
+class CoarseSciencePreparer(Protocol):
+    """Prepare one coarse wrapper inside the current stopped transaction."""
+
+    def __call__(
+        self,
+        captured: CapturedStopScanView,
+        stereo: StereoInferenceObservation,
+        stereo_path: Path,
+        occupancy_update: OccupancyFrameUpdate,
+        occupancy_path: Path,
+    ) -> str | Path: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +101,15 @@ class _PendingPerceptionCommit:
 
     key: tuple[str, int]
     cycle_root: Path
+    raw_session_path: Path
+    raw_session_manifest_sha256: str
+    raw_session_view_metadata_sha256: str
+    stereo_inference_path: Path
+    stereo_metadata_sha256: str
     occupancy_mapping_path: Path
+    occupancy_metadata_sha256: str
+    occupancy_binding: tuple[object, ...]
+    inference_stationarity_path: Path
     inference_stationarity_sha256: str
     sources: tuple[_VerifiedSource, ...]
     blade_foreground_path: Path | None
@@ -90,6 +117,8 @@ class _PendingPerceptionCommit:
     coverage_path: Path | None
     coverage_metadata_sha256: str | None
     accepted_coverage_path_after_commit: Path | None
+    coarse_scan_view_path: Path | None = None
+    coarse_scan_metadata_sha256: str | None = None
 
 
 class FoundationStereoOccupancyCycleEngine:
@@ -112,6 +141,9 @@ class FoundationStereoOccupancyCycleEngine:
         output_root: str | Path,
         reference_coarse_model: str | Path | None = None,
         accepted_coverage_path: str | Path | None = None,
+        coarse_science_preparer: CoarseSciencePreparer | None = None,
+        science_authority: ScienceAcceptanceAuthority | None = None,
+        science_authority_settings: AppSettings | None = None,
         utc_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if settings.stop_and_capture.depth_backend != "foundation_stereo":
@@ -138,6 +170,16 @@ class FoundationStereoOccupancyCycleEngine:
         if not hand_eye.source_path.resolve().is_file():
             raise ValueError("A persisted flange-primary hand-eye asset is required")
         hand_eye.require_flange_primary()
+        if settings.science_acceptance.path is not None and science_authority is None:
+            raise ValueError(
+                "A configured science acceptance requires its preloaded runtime authority"
+            )
+        if (science_authority is None) != (science_authority_settings is None):
+            raise ValueError(
+                "Science authority and its authoritative AppSettings must be supplied together"
+            )
+        if science_authority is not None and science_authority_settings is not None:
+            science_authority.assert_current(science_authority_settings)
         reference = (
             Path(reference_coarse_model).resolve() if reference_coarse_model is not None else None
         )
@@ -151,9 +193,12 @@ class FoundationStereoOccupancyCycleEngine:
             )
         if accepted_coverage is not None and reference is None:
             raise ValueError("An accepted fine-coverage generation requires fine science")
+        if reference is not None and coarse_science_preparer is not None:
+            raise ValueError("A cycle cannot prepare coarse and fine science together")
         if reference is not None:
             reference, accepted_coverage = validate_fine_science_startup(
                 settings,
+                hand_eye,
                 reference_coarse_model=reference,
                 accepted_coverage_path=accepted_coverage,
             )
@@ -166,11 +211,22 @@ class FoundationStereoOccupancyCycleEngine:
         self._output_root = Path(output_root).resolve()
         self._reference_coarse_model = reference
         self._accepted_coverage_path = accepted_coverage
+        self._coarse_science_preparer = coarse_science_preparer
+        self._science_authority = science_authority
+        self._science_authority_settings = (
+            science_authority_settings.model_copy(deep=True)
+            if science_authority_settings is not None
+            else None
+        )
         self._utc_clock = utc_clock
         self._sources: list[_VerifiedSource] = []
+        # A logical (view_id, sequence) becomes occupied only at successful commit.
+        # Every physical attempt is written below its own UUID root and is retained
+        # even when capture/inference is cancelled or fails.
         self._capture_roots: dict[tuple[str, int], Path] = {}
         self._pending_lock = threading.Lock()
         self._pending_key: tuple[str, int] | None = None
+        self._pending_attempt_root: Path | None = None
         self._pending_sampler: _RobotStateSampler | None = None
         self._pending_commit: _PendingPerceptionCommit | None = None
         self._poisoned_reason: str | None = None
@@ -198,6 +254,112 @@ class FoundationStereoOccupancyCycleEngine:
         with self._pending_lock:
             return self._accepted_coverage_path
 
+    def _require_science_authority_settings(self) -> AppSettings:
+        settings = self._science_authority_settings
+        if settings is None:
+            raise FoundationStereoCycleError(
+                "Science authority lost its authoritative runtime settings"
+            )
+        return settings
+
+    def fork_for_fine_science(
+        self,
+        *,
+        settings: AppSettings,
+        reference_coarse_model: str | Path,
+        output_root: str | Path,
+    ) -> FoundationStereoOccupancyCycleEngine:
+        """Create a fine-science engine from this engine's committed source window.
+
+        This is a perception-source fork, not a coordinator-state migration.  It
+        deliberately carries only independently verified, already committed raw and
+        stereo sources.  It does *not* carry an occupancy publication, prepared
+        segment, motion permit, stop latch, run event, or fine-coverage generation.
+        The new coordinator must start normally and publish a fresh MAP_READY
+        generation before it can preflight any motion.
+
+        The supplied settings may differ only in ``blade_foreground``.  This keeps
+        every acquisition, calibration, occupancy, stationarity and safety policy
+        identical while allowing the coarse engine's disabled reference mask to be
+        replaced by the schema-5-guided fine mask.
+        """
+
+        if not settings.blade_foreground.enabled:
+            raise FoundationStereoCycleError(
+                "Fine source-window fork requires blade_foreground.enabled=true"
+            )
+        comparable = settings.model_copy(
+            update={"blade_foreground": self._settings.blade_foreground}
+        )
+        if comparable != self._settings:
+            raise FoundationStereoCycleError(
+                "Fine source-window fork changed a non-foreground runtime policy"
+            )
+        with self._pending_lock:
+            if (
+                self._pending_key is not None
+                or self._pending_attempt_root is not None
+                or self._pending_sampler is not None
+                or self._pending_commit is not None
+            ):
+                raise FoundationStereoCycleError(
+                    "Cannot fork a perception engine with a pending transaction"
+                )
+            sources = tuple(self._sources)
+        if not sources:
+            raise FoundationStereoCycleError(
+                "Cannot fork fine science before a committed coarse source exists"
+            )
+        now = self._aware_utc_now()
+        oldest = now - timedelta(seconds=self._settings.occupancy.maximum_map_age_s)
+        fresh_sources: list[_VerifiedSource] = []
+        for source in sources:
+            if (
+                _sha256(source.stereo_path / "metadata.json") != source.stereo_metadata_sha256
+                or _sha256(source.captured.raw_session_path / "manifest.json")
+                != source.session_manifest_sha256
+                or _single_view_metadata_hash(
+                    source.captured.raw_session_path,
+                    source.captured.bundle,
+                )
+                != source.session_view_metadata_sha256
+            ):
+                raise FoundationStereoCycleError(
+                    "Committed coarse source evidence changed before fine handoff"
+                )
+            stored = read_stereo_inference(source.stereo_path)
+            verify_stereo_inference_source(
+                stored,
+                expected_session=source.captured.raw_session_path,
+            )
+            if oldest <= source.captured.captured_at_utc <= now:
+                fresh_sources.append(source)
+
+        forked = type(self)(
+            settings=settings,
+            acquirer=self._acquirer,
+            state_source=self._state_source,
+            backend=self._backend,
+            hand_eye=self._hand_eye,
+            renderer=self._renderer,
+            output_root=output_root,
+            reference_coarse_model=reference_coarse_model,
+            accepted_coverage_path=None,
+            science_authority=self._science_authority,
+            science_authority_settings=self._science_authority_settings,
+            utc_clock=self._utc_clock,
+        )
+        # The source records are immutable value/evidence bindings.  Copying the
+        # list prevents either engine from mutating the other's source window.
+        # An expensive schema-5 build may legitimately outlive the occupancy
+        # freshness horizon.  Immutable coarse sources are still reverified above,
+        # but expired frames are not migrated into the fine safety map.  The fine
+        # coordinator starts in BOOTSTRAP_MAP_REQUIRED and gathers new explicitly
+        # stopped sources until MAP_READY instead of turning elapsed compute time
+        # into an unrecoverable handoff failure.
+        forked._sources = fresh_sources
+        return forked
+
     def capture(
         self,
         view_id: str,
@@ -211,7 +373,10 @@ class FoundationStereoOccupancyCycleEngine:
             raise ValueError("Capture purpose must be assigned by the coordinator")
 
         safe_view = _safe_name(view_id)
-        cycle_root = self._output_root / "cycles" / (f"{sequence_index:06d}_{safe_view}")
+        logical_root = self._output_root / "cycles" / (f"{sequence_index:06d}_{safe_view}")
+        commit_marker = logical_root / "committed.json"
+        attempt_id = uuid4().hex
+        cycle_root = (logical_root / f"attempt_{attempt_id}").resolve()
         key = (view_id, sequence_index)
         sampler = _RobotStateSampler(
             self._state_source,
@@ -223,20 +388,23 @@ class FoundationStereoOccupancyCycleEngine:
                     "Perception engine is fail-closed after sampler cleanup failure: "
                     f"{self._poisoned_reason}"
                 )
+            if key in self._capture_roots or commit_marker.exists():
+                raise FoundationStereoCycleError("Capture identity was already committed")
             if self._pending_sampler is not None or self._pending_commit is not None:
                 raise FoundationStereoCycleError(
                     "A prior capture transaction is still awaiting inference or commit"
                 )
             self._pending_key = key
+            self._pending_attempt_root = cycle_root
             self._pending_sampler = sampler
         writer: SessionWriter | None = None
         try:
-            cycle_root.parent.mkdir(parents=True, exist_ok=True)
+            logical_root.mkdir(parents=True, exist_ok=True)
             cycle_root.mkdir()
             writer = SessionWriter.create(
                 cycle_root / "raw",
                 self._settings,
-                label=f"cycle_{sequence_index:06d}_{safe_view}",
+                label=f"cycle_{sequence_index:06d}_{safe_view}_attempt_{attempt_id}",
             )
             # Sampling starts before camera exposure and remains active across raw
             # persistence, FoundationStereo, map rebuild, and evidence persistence.
@@ -259,11 +427,6 @@ class FoundationStereoOccupancyCycleEngine:
         # exposure keeps that timestamp conservative, while reading it back prevents
         # an independently sampled clock value from diverging by microseconds.
         captured_at = _session_created_at_utc(writer.path)
-        if key in self._capture_roots:
-            with suppress(BaseException):
-                self._cancel_pending_sampler_instance(sampler)
-            raise FoundationStereoCycleError("Capture identity was already committed")
-        self._capture_roots[key] = cycle_root
         return CapturedStopScanView(
             bundle=bundle,
             raw_session_path=writer.path,
@@ -307,16 +470,35 @@ class FoundationStereoOccupancyCycleEngine:
         """Infer FoundationStereo and stage a reverified map candidate."""
 
         key = (captured.bundle.view_id, captured.bundle.sequence_index)
-        if self._capture_roots.get(key) != captured.cycle_root:
-            raise FoundationStereoCycleError("Captured view is not owned by this engine")
+        with self._pending_lock:
+            if (
+                self._pending_key != key
+                or self._pending_attempt_root != captured.cycle_root
+                or self._pending_sampler is None
+            ):
+                raise FoundationStereoCycleError(
+                    "Captured attempt is not the engine's active logical transaction"
+                )
         sampler = self._require_pending_sampler(key)
         sampler_finished = False
         try:
+            if self._science_authority is not None:
+                # This check is intentionally adjacent to the actual backend call.
+                # Constructor/readiness validation cannot close a source/checkpoint/
+                # calibration TOCTOU window during a long-running experiment.
+                self._science_authority.assert_current(
+                    self._require_science_authority_settings()
+                )
             observation = infer_rectified_stereo(
                 captured.bundle,
                 self._backend,
                 self._settings.stereo_rectification,
             )
+            if self._science_authority is not None:
+                self._science_authority.assert_current(
+                    self._require_science_authority_settings()
+                )
+                self._science_authority.assert_inference_observation(observation)
             stereo_path = captured.cycle_root / "stereo_inference"
             write_stereo_inference(
                 stereo_path,
@@ -331,6 +513,11 @@ class FoundationStereoOccupancyCycleEngine:
                 stored_stereo,
                 expected_session=captured.raw_session_path,
             )
+            if self._science_authority is not None:
+                self._science_authority.assert_stereo_artifact(stored_stereo)
+                self._science_authority.assert_current(
+                    self._require_science_authority_settings()
+                )
             source = _VerifiedSource(
                 captured=captured,
                 stereo=stored_stereo.observation,
@@ -356,6 +543,13 @@ class FoundationStereoOccupancyCycleEngine:
             )
             stored_mapping = read_occupancy_mapping(occupancy_path)
             science = self._prepare_science_assets(
+                captured,
+                stored_stereo.observation,
+                stereo_path,
+                updates[-1],
+                occupancy_path,
+            )
+            coarse_scan_view_path = self._prepare_coarse_science_asset(
                 captured,
                 stored_stereo.observation,
                 stereo_path,
@@ -429,6 +623,7 @@ class FoundationStereoOccupancyCycleEngine:
             blade_foreground_path=science.blade_foreground_path,
             reconstructed_view_path=science.reconstructed_view_path,
             coverage_path=science.coverage_path,
+            coarse_scan_view_path=coarse_scan_view_path,
         )
         # Preparing a valid asset does not make it a source for a later map.  Only
         # the coordinator can accept it after independent readback and stop-latch
@@ -439,7 +634,15 @@ class FoundationStereoOccupancyCycleEngine:
             _PendingPerceptionCommit(
                 key=key,
                 cycle_root=captured.cycle_root,
+                raw_session_path=captured.raw_session_path,
+                raw_session_manifest_sha256=source.session_manifest_sha256,
+                raw_session_view_metadata_sha256=(source.session_view_metadata_sha256),
+                stereo_inference_path=result.stereo_inference_path,
+                stereo_metadata_sha256=source.stereo_metadata_sha256,
                 occupancy_mapping_path=result.occupancy_mapping_path,
+                occupancy_metadata_sha256=_sha256(result.occupancy_mapping_path / "metadata.json"),
+                occupancy_binding=OccupancyBinding.from_mapping(stored_mapping).tuple,
+                inference_stationarity_path=result.inference_stationarity_path,
                 inference_stationarity_sha256=(result.inference_stationarity_sha256),
                 sources=candidates,
                 blade_foreground_path=result.blade_foreground_path,
@@ -455,6 +658,12 @@ class FoundationStereoOccupancyCycleEngine:
                     if science.advances_coverage
                     else self._accepted_coverage_path
                 ),
+                coarse_scan_view_path=result.coarse_scan_view_path,
+                coarse_scan_metadata_sha256=(
+                    _sha256(result.coarse_scan_view_path / "metadata.json")
+                    if result.coarse_scan_view_path is not None
+                    else None
+                ),
             ),
         )
         return result
@@ -463,21 +672,29 @@ class FoundationStereoOccupancyCycleEngine:
         self,
         captured: CapturedStopScanView,
         result: PerceptionCycleResult,
+        *,
+        before_commit: Callable[[str], None] = lambda _stage: None,
     ) -> None:
         """Commit exactly one coordinator-accepted perception transaction."""
 
         key = (captured.bundle.view_id, captured.bundle.sequence_index)
         with self._pending_lock:
+            before_commit("before_pending_authority_validation")
             pending = self._pending_commit
             if (
                 pending is None
                 or pending.key != key
                 or pending.cycle_root != captured.cycle_root
+                or pending.raw_session_path != captured.raw_session_path
+                or pending.raw_session_path != result.raw_session_path
+                or pending.stereo_inference_path != result.stereo_inference_path
                 or pending.occupancy_mapping_path != result.occupancy_mapping_path
+                or pending.inference_stationarity_path != result.inference_stationarity_path
                 or pending.inference_stationarity_sha256 != result.inference_stationarity_sha256
                 or pending.blade_foreground_path != result.blade_foreground_path
                 or pending.reconstructed_view_path != result.reconstructed_view_path
                 or pending.coverage_path != result.coverage_path
+                or pending.coarse_scan_view_path != result.coarse_scan_view_path
             ):
                 raise FoundationStereoCycleError(
                     "Perception commit does not match the prepared asset transaction"
@@ -490,6 +707,14 @@ class FoundationStereoOccupancyCycleEngine:
                 raise FoundationStereoCycleError(
                     "Prepared fine-coverage metadata changed before commit"
                 )
+            if pending.coarse_scan_view_path is not None and (
+                pending.coarse_scan_metadata_sha256 is None
+                or _sha256(pending.coarse_scan_view_path / "metadata.json")
+                != pending.coarse_scan_metadata_sha256
+            ):
+                raise FoundationStereoCycleError(
+                    "Prepared coarse-scan metadata changed before commit"
+                )
             try:
                 if pending.blade_foreground_path is not None:
                     read_blade_foreground_mask(pending.blade_foreground_path)
@@ -500,13 +725,183 @@ class FoundationStereoOccupancyCycleEngine:
                         pending.coverage_path,
                         require_foreground_bound_science=True,
                     )
+                if pending.coarse_scan_view_path is not None:
+                    from biblade_fusion.storage.coarse_scan import (
+                        read_coarse_scan_view,
+                    )
+
+                    read_coarse_scan_view(pending.coarse_scan_view_path)
             except (OSError, TypeError, ValueError) as exc:
                 raise FoundationStereoCycleError(
-                    f"Prepared fine-science asset changed before commit: {exc}"
+                    f"Prepared science asset changed before commit: {exc}"
                 ) from exc
+            self._reverify_pending_authority(captured, result, pending)
+            before_commit("after_pending_authority_validation")
+            if key in self._capture_roots:
+                self._poisoned_reason = "logical capture identity committed twice"
+                raise FoundationStereoCycleError(self._poisoned_reason)
+            self._write_logical_commit_marker(
+                pending,
+                before_commit=before_commit,
+            )
             self._sources = list(pending.sources)
             self._accepted_coverage_path = pending.accepted_coverage_path_after_commit
+            self._capture_roots[key] = pending.cycle_root
             self._pending_commit = None
+
+    @staticmethod
+    def _write_logical_commit_marker(
+        pending: _PendingPerceptionCommit,
+        *,
+        before_commit: Callable[[str], None] = lambda _stage: None,
+    ) -> None:
+        logical_root = pending.cycle_root.parent
+        marker = logical_root / "committed.json"
+        payload = {
+            "schema_version": 1,
+            "artifact_kind": "biblade_fusion.foundation_stereo_logical_commit",
+            "logical_identity": {
+                "view_id": pending.key[0],
+                "sequence_index": pending.key[1],
+            },
+            "accepted_attempt": {
+                "attempt_id": pending.cycle_root.name,
+                "root": str(pending.cycle_root),
+            },
+            "authority": {
+                "raw_session_manifest_sha256": pending.raw_session_manifest_sha256,
+                "raw_session_view_metadata_sha256": (pending.raw_session_view_metadata_sha256),
+                "stereo_metadata_sha256": pending.stereo_metadata_sha256,
+                "inference_stationarity_sha256": (pending.inference_stationarity_sha256),
+                "occupancy_metadata_sha256": pending.occupancy_metadata_sha256,
+                "occupancy_binding": list(pending.occupancy_binding),
+            },
+        }
+        temporary = logical_root / f".committed.{uuid4().hex}.partial"
+        encoded = (
+            json.dumps(
+                payload,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+        )
+        try:
+            before_commit("before_logical_commit_temporary_write")
+            with temporary.open("x", encoding="utf-8") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # This is the final fallible deadline gate before the immutable logical
+            # identity becomes visible.  A raised timeout leaves only the temporary
+            # file, which the ``finally`` block removes without advancing sources.
+            before_commit("before_logical_commit_marker_link")
+            os.link(temporary, marker)
+            descriptor = os.open(logical_root, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except FileExistsError as exc:
+            raise FoundationStereoCycleError(
+                "Logical capture identity already has an immutable commit marker"
+            ) from exc
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _reverify_pending_authority(
+        captured: CapturedStopScanView,
+        result: PerceptionCycleResult,
+        pending: _PendingPerceptionCommit,
+    ) -> None:
+        """Re-read the full disk authority at the commit linearization point."""
+
+        manifest_path = pending.raw_session_path / "manifest.json"
+        stereo_metadata_path = pending.stereo_inference_path / "metadata.json"
+        occupancy_metadata_path = pending.occupancy_mapping_path / "metadata.json"
+        try:
+            hashes = {
+                "raw session manifest": (
+                    _sha256(manifest_path),
+                    pending.raw_session_manifest_sha256,
+                ),
+                "raw session view metadata": (
+                    _single_view_metadata_hash(pending.raw_session_path, captured.bundle),
+                    pending.raw_session_view_metadata_sha256,
+                ),
+                "stereo inference metadata": (
+                    _sha256(stereo_metadata_path),
+                    pending.stereo_metadata_sha256,
+                ),
+                "inference stationarity": (
+                    _sha256(pending.inference_stationarity_path),
+                    pending.inference_stationarity_sha256,
+                ),
+                "occupancy metadata": (
+                    _sha256(occupancy_metadata_path),
+                    pending.occupancy_metadata_sha256,
+                ),
+            }
+        except (OSError, TypeError, ValueError) as exc:
+            raise FoundationStereoCycleError(
+                f"Prepared disk authority is missing or unreadable: {exc}"
+            ) from exc
+        changed = tuple(label for label, values in hashes.items() if values[0] != values[1])
+        if changed:
+            raise FoundationStereoCycleError(
+                "Prepared disk authority changed before commit: " + ", ".join(changed)
+            )
+
+        try:
+            stored_stereo = read_stereo_inference(pending.stereo_inference_path)
+            verify_stereo_inference_source(
+                stored_stereo,
+                expected_session=pending.raw_session_path,
+            )
+            observation = stored_stereo.observation
+            stored_stationarity = read_inference_stationarity(pending.inference_stationarity_path)
+            authoritative_mapping = read_occupancy_mapping(pending.occupancy_mapping_path)
+            authoritative_binding = OccupancyBinding.from_mapping(authoritative_mapping).tuple
+            returned_binding = OccupancyBinding.from_mapping(result.stored_occupancy).tuple
+        except (OSError, TypeError, ValueError) as exc:
+            raise FoundationStereoCycleError(
+                f"Prepared disk authority failed semantic readback: {exc}"
+            ) from exc
+
+        bundle = captured.bundle
+        if (
+            observation.source_view_id != bundle.view_id
+            or observation.source_sequence_index != bundle.sequence_index
+            or observation.rectified.source_frame_number != bundle.stereo.frame_number
+            or stored_stationarity.view_id != bundle.view_id
+            or stored_stationarity.sequence_index != bundle.sequence_index
+            or stored_stationarity.source_session_manifest_path != manifest_path.resolve()
+            or stored_stationarity.source_session_manifest_sha256
+            != pending.raw_session_manifest_sha256
+            or authoritative_binding != pending.occupancy_binding
+            or returned_binding != pending.occupancy_binding
+            or not authoritative_mapping.frame_evidence
+        ):
+            raise FoundationStereoCycleError(
+                "Prepared disk authority identity or binding changed before commit"
+            )
+        current_evidence = authoritative_mapping.frame_evidence[-1]
+        if (
+            current_evidence.source_view_id != bundle.view_id
+            or current_evidence.source_sequence_index != bundle.sequence_index
+            or current_evidence.frame_number != bundle.stereo.frame_number
+            or current_evidence.source_stereo_metadata_sha256 != pending.stereo_metadata_sha256
+            or current_evidence.source_session_manifest_sha256
+            != pending.raw_session_manifest_sha256
+            or current_evidence.source_session_view_metadata_sha256
+            != pending.raw_session_view_metadata_sha256
+        ):
+            raise FoundationStereoCycleError(
+                "Occupancy authority is not bound to the committing physical attempt"
+            )
 
     def _prepare_science_assets(
         self,
@@ -517,7 +912,10 @@ class FoundationStereoOccupancyCycleEngine:
         occupancy_path: Path,
     ) -> PreparedFineScienceAssets:
         if self._reference_coarse_model is None:
-            if captured.purpose is CapturePurpose.CANDIDATE:
+            if (
+                captured.purpose is CapturePurpose.CANDIDATE
+                and self._coarse_science_preparer is None
+            ):
                 raise FoundationStereoCycleError(
                     "Candidate capture requires the configured fine-science pipeline"
                 )
@@ -534,6 +932,38 @@ class FoundationStereoOccupancyCycleEngine:
             reference_coarse_model=self._reference_coarse_model,
             accepted_coverage_path=self._accepted_coverage_path,
         )
+
+    def _prepare_coarse_science_asset(
+        self,
+        captured: CapturedStopScanView,
+        stereo: StereoInferenceObservation,
+        stereo_path: Path,
+        occupancy_update: OccupancyFrameUpdate,
+        occupancy_path: Path,
+    ) -> Path | None:
+        preparer = self._coarse_science_preparer
+        if preparer is None or captured.purpose not in {
+            CapturePurpose.BOOTSTRAP,
+            CapturePurpose.CANDIDATE,
+        }:
+            return None
+        path = Path(
+            preparer(
+                captured,
+                stereo,
+                stereo_path,
+                occupancy_update,
+                occupancy_path,
+            )
+        ).resolve()
+        if path.parent != captured.cycle_root.resolve() or not path.is_dir():
+            raise FoundationStereoCycleError(
+                "Coarse-science preparer must write one direct child of the cycle root"
+            )
+        from biblade_fusion.storage.coarse_scan import read_coarse_scan_view
+
+        read_coarse_scan_view(path)
+        return path
 
     def _require_pending_sampler(
         self,
@@ -554,6 +984,7 @@ class FoundationStereoOccupancyCycleEngine:
                     raise FoundationStereoCycleError(self._poisoned_reason)
                 self._pending_sampler = None
                 self._pending_key = None
+                self._pending_attempt_root = None
 
     def _stage_pending_commit(
         self,
@@ -566,6 +997,7 @@ class FoundationStereoOccupancyCycleEngine:
             if (
                 self._pending_sampler is not sampler
                 or self._pending_key != pending.key
+                or self._pending_attempt_root != pending.cycle_root
                 or self._pending_commit is not None
             ):
                 self._poisoned_reason = "perception transaction ownership changed"
@@ -577,6 +1009,7 @@ class FoundationStereoOccupancyCycleEngine:
                 raise FoundationStereoCycleError(self._poisoned_reason)
             self._pending_sampler = None
             self._pending_key = None
+            self._pending_attempt_root = None
             self._pending_commit = pending
 
     def _cancel_pending_sampler_instance(
@@ -595,16 +1028,39 @@ class FoundationStereoOccupancyCycleEngine:
     def _fresh_rebuild_sources(self, current: _VerifiedSource) -> tuple[_VerifiedSource, ...]:
         now = self._aware_utc_now()
         oldest = now - timedelta(seconds=self._settings.occupancy.maximum_map_age_s)
-        sources = tuple(
+        age_eligible = tuple(
             item
             for item in (*self._sources, current)
             if oldest <= item.captured.captured_at_utc <= now
         )
-        if not sources or sources[-1] is not current:
+        if not age_eligible or age_eligible[-1] is not current:
             raise FoundationStereoCycleError(
                 "Current FoundationStereo frame expired before map rebuild"
             )
-        return sources
+        maximum_gap_s = (
+            self._settings.stop_and_capture.maximum_operator_reposition_interval_s
+        )
+        if maximum_gap_s is None:
+            return age_eligible
+        suffix_start = 0
+        previous_monotonic_ns = (
+            age_eligible[0].captured.bundle.stereo.monotonic_time_ns
+        )
+        maximum_gap_ns = maximum_gap_s * 1e9
+        for index, source in enumerate(age_eligible[1:], start=1):
+            captured_monotonic_ns = source.captured.bundle.stereo.monotonic_time_ns
+            gap_ns = captured_monotonic_ns - previous_monotonic_ns
+            if gap_ns <= 0:
+                raise FoundationStereoCycleError(
+                    "Committed source monotonic capture timestamps did not advance"
+                )
+            if gap_ns > maximum_gap_ns:
+                # The earlier safety window is no longer accepted evidence.  Rebuild
+                # only from the continuous tail, which returns the map to MAPPING
+                # until the configured independent-view count is reacquired.
+                suffix_start = index
+            previous_monotonic_ns = captured_monotonic_ns
+        return age_eligible[suffix_start:]
 
     def _rebuild_updates(
         self,

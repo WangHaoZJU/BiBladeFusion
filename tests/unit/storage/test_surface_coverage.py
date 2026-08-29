@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import biblade_fusion.storage.surface_coverage as coverage_storage
 from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
@@ -15,6 +18,7 @@ from biblade_fusion.core.settings import (
     PointCloudConfig,
     SurfacePartitionConfig,
     SurfaceQualityConfig,
+    ViewPlanningConfig,
     load_settings,
 )
 from biblade_fusion.devices.depth_camera import CameraIntrinsics
@@ -26,6 +30,7 @@ from biblade_fusion.perception.surface import (
     CurvedSurfacePatch,
     CurvedViewPlan,
     SurfaceRegion,
+    generate_reacquisition_view,
 )
 from biblade_fusion.perception.tsdf import (
     BilateralTSDFResult,
@@ -40,12 +45,18 @@ from biblade_fusion.planning.surface_coverage import (
 from biblade_fusion.planning.views import BladeSide, CandidateView, SurfacePatch
 from biblade_fusion.robotics import Es68KinematicModel, load_es68_flange_t_tcp
 from biblade_fusion.storage import (
+    read_reconstructed_view,
     read_surface_coverage_generation,
     write_coarse_model,
     write_reconstructed_view,
     write_surface_coverage_generation,
 )
+from biblade_fusion.storage.surface_coverage import FineReacquisitionProvenance
 from biblade_fusion.workflows import AuthoritativeRobotPose, ReconstructedBladeView
+from biblade_fusion.workflows import fine_science as fine_science_workflow
+from biblade_fusion.workflows.blade_next_view import (
+    _reacquisition_view_id as selector_reacquisition_view_id,
+)
 from biblade_fusion.workflows.coarse_model import CoarseModelResult
 
 
@@ -332,6 +343,11 @@ def _write_coarse_reference(
         update={
             "surface_partition": partition,
             "surface_quality": quality_config,
+            "view_planning": ViewPlanningConfig(
+                standoff_distance_m=0.25,
+                minimum_standoff_distance_m=0.15,
+                maximum_standoff_distance_m=0.35,
+            ),
         }
     )
     source = tmp_path / f"{name}_source"
@@ -352,11 +368,17 @@ def _write_front_view(
     plan: CurvedViewPlan,
     *,
     depth_source: str = "foundation_stereo",
+    view_id: str | None = None,
+    sequence_index: int = 1,
+    frame_number: int = 11,
+    camera_pose: PoseSE3 | None = None,
+    projection_pose: PoseSE3 | None = None,
+    point_indices: tuple[int, ...] | None = None,
 ) -> Path:
     tmp_path.mkdir(parents=True, exist_ok=True)
     patch = surface.patches[0]
-    camera_pose = plan.candidates[0].base_t_left_ir
-    projection_pose = (
+    camera_pose = camera_pose or plan.candidates[0].base_t_left_ir
+    projection_pose = projection_pose or (
         plan.candidate_base_t_left_rectified[0]
         if depth_source == "foundation_stereo"
         else PoseSE3("base", "depth", camera_pose.matrix)
@@ -406,12 +428,14 @@ def _write_front_view(
         0.3,
         (0.0,) * 6,
     )
-    pixels = np.column_stack(np.meshgrid(np.arange(3), np.arange(3))).reshape(-1, 2)
-    cloud = PointCloud("base", patch.points_m, pixels, (3, 3))
+    indices = np.arange(len(patch.points_m)) if point_indices is None else np.asarray(point_indices)
+    points = patch.points_m[indices]
+    pixels = np.column_stack((np.arange(len(points)) % 3, np.arange(len(points)) // 3))
+    cloud = PointCloud("base", points, pixels, (3, 3))
     view = ReconstructedBladeView(
-        patch.patch_id,
-        1,
-        11,
+        view_id or patch.patch_id,
+        sequence_index,
+        frame_number,
         CameraIntrinsics(3, 3, 100.0, 100.0, 1.0, 1.0, "none", ()),
         np.zeros(6),
         camera_pose,
@@ -444,6 +468,362 @@ def _fine_quality() -> SurfaceQualityConfig:
         minimum_normal_consistency=0.8,
         minimum_observed_points=3,
     )
+
+
+def _selection_policy_payload(
+    coarse: Path,
+    quality: SurfaceQualityConfig,
+) -> dict[str, object]:
+    settings = load_settings("configs/default.yaml")
+    metadata_sha256 = hashlib.sha256((coarse / "metadata.json").read_bytes()).hexdigest()
+    return {
+        "algorithm": "bilateral_single_fin_coverage_priority_v2",
+        "selection": settings.next_view_selection.model_dump(mode="json"),
+        "surface_quality": quality.model_dump(mode="json"),
+        "view_filter": settings.view_filter.model_dump(mode="json"),
+        "kinematics": settings.kinematics.model_dump(mode="json"),
+        "motion_endpoint_gate": {
+            "maximum_translation_error_m": (
+                settings.motion_preflight.maximum_endpoint_translation_error_m
+            ),
+            "maximum_rotation_error_deg": (
+                settings.motion_preflight.maximum_endpoint_rotation_error_deg
+            ),
+        },
+        "expected_reference": {
+            "root": str(coarse.resolve()),
+            "metadata_sha256": metadata_sha256,
+        },
+        "terminal_reconstruction": {
+            "fusion": settings.multi_view_fusion.model_dump(mode="json"),
+            "tsdf": settings.tsdf.model_dump(mode="json"),
+            "finalization": settings.fine_finalization.model_dump(mode="json"),
+        },
+        "flange_T_left_ir": np.eye(4).tolist(),
+        "fk_implementation": (
+            f"{Es68KinematicModel.__module__}.{Es68KinematicModel.__qualname__}"
+        ),
+    }
+
+
+def _stereo_identity_fixture(
+    *,
+    view_id: str,
+    sequence_index: int,
+    frame_number: int,
+    manifest_sha256: str,
+    view_metadata_sha256: str,
+):
+    return type(
+        "StoredStereoFixture",
+        (),
+        {
+            "observation": type(
+                "StereoObservationFixture",
+                (),
+                {
+                    "source_view_id": view_id,
+                    "source_sequence_index": sequence_index,
+                    "rectified": type(
+                        "RectifiedFixture",
+                        (),
+                        {"source_frame_number": frame_number},
+                    )(),
+                },
+            )(),
+            "metadata": {
+                "source": {
+                    "raw_session_integrity": {
+                        "session_manifest_sha256": manifest_sha256,
+                        "view_metadata_sha256": view_metadata_sha256,
+                        "left_ir_npy_sha256": "3" * 64,
+                        "right_ir_npy_sha256": "4" * 64,
+                        "raw_calibration_content_hash": "5" * 64,
+                    }
+                }
+            },
+        },
+    )()
+
+
+def _science_identity_view(
+    *,
+    session: Path,
+    stereo: Path,
+    view_id: str,
+    sequence_index: int,
+    frame_number: int,
+):
+    return type(
+        "StoredViewFixture",
+        (),
+        {
+            "metadata": {
+                "schema_version": 3,
+                "source": {
+                    "session": str(session.resolve()),
+                    "stereo_inference": str(stereo.resolve()),
+                },
+            },
+            "view": type(
+                "ViewFixture",
+                (),
+                {
+                    "source_view_id": view_id,
+                    "source_sequence_index": sequence_index,
+                    "source_frame_number": frame_number,
+                },
+            )(),
+        },
+    )()
+
+
+def test_physical_source_identity_uses_content_hashes_not_session_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_stereo = tmp_path / "first" / "stereo"
+    copied_stereo = tmp_path / "copied" / "stereo"
+    stored = _stereo_identity_fixture(
+        view_id="retry",
+        sequence_index=4,
+        frame_number=17,
+        manifest_sha256="1" * 64,
+        view_metadata_sha256="2" * 64,
+    )
+    monkeypatch.setattr(coverage_storage, "read_stereo_inference", lambda _path: stored)
+
+    first = coverage_storage._physical_source_identity(
+        _science_identity_view(
+            session=tmp_path / "first" / "session",
+            stereo=first_stereo,
+            view_id="retry",
+            sequence_index=4,
+            frame_number=17,
+        )
+    )
+    copied = coverage_storage._physical_source_identity(
+        _science_identity_view(
+            session=tmp_path / "copied" / "session",
+            stereo=copied_stereo,
+            view_id="retry",
+            sequence_index=4,
+            frame_number=17,
+        )
+    )
+
+    assert first == copied == ("1" * 64, "2" * 64, 4, 17)
+    assert copied in (first,)
+
+
+def test_physical_source_identity_distinguishes_true_manifest_or_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stereo_by_name = {
+        "first": _stereo_identity_fixture(
+            view_id="retry",
+            sequence_index=4,
+            frame_number=17,
+            manifest_sha256="1" * 64,
+            view_metadata_sha256="2" * 64,
+        ),
+        "different_manifest": _stereo_identity_fixture(
+            view_id="retry",
+            sequence_index=4,
+            frame_number=17,
+            manifest_sha256="6" * 64,
+            view_metadata_sha256="7" * 64,
+        ),
+        "different_frame": _stereo_identity_fixture(
+            view_id="retry",
+            sequence_index=5,
+            frame_number=18,
+            manifest_sha256="1" * 64,
+            view_metadata_sha256="8" * 64,
+        ),
+    }
+    monkeypatch.setattr(
+        coverage_storage,
+        "read_stereo_inference",
+        lambda path: stereo_by_name[Path(path).parent.name],
+    )
+
+    identities = tuple(
+        coverage_storage._physical_source_identity(
+            _science_identity_view(
+                session=tmp_path / name / "session",
+                stereo=tmp_path / name / "stereo",
+                view_id="retry",
+                sequence_index=sequence,
+                frame_number=frame,
+            )
+        )
+        for name, sequence, frame in (
+            ("first", 4, 17),
+            ("different_manifest", 4, 17),
+            ("different_frame", 5, 18),
+        )
+    )
+
+    assert len(set(identities)) == 3
+
+
+def _write_retry_coverage_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, FineReacquisitionProvenance]:
+    coarse, surface, plan = _write_coarse_reference(tmp_path)
+    quality = _fine_quality().model_copy(update={"completed_fraction": 0.99})
+    settings = load_settings("configs/default.yaml")
+    policy_payload = _selection_policy_payload(coarse, quality)
+    initial = write_surface_coverage_generation(
+        tmp_path / "generation_000",
+        reference_coarse_model=coarse,
+        quality_config=quality,
+        selection_policy_payload=policy_payload,
+    )
+    nominal = plan.candidates[0]
+    nominal_path = _write_front_view(
+        tmp_path / "nominal",
+        surface,
+        plan,
+        point_indices=tuple(range(7)),
+    )
+    nominal_generation = write_surface_coverage_generation(
+        tmp_path / "generation_001",
+        reference_coarse_model=coarse,
+        quality_config=quality,
+        previous_generation=initial,
+        current_reconstructed_view=nominal_path,
+        observation_id=nominal.view_id,
+    )
+    previous = read_surface_coverage_generation(nominal_generation)
+    policy_sha256 = str(
+        previous.metadata["reacquisition_policy"]["selection_policy_sha256"]
+    )
+    retry_id = selector_reacquisition_view_id(nominal, 2, policy_sha256)
+    retry, retry_projection = generate_reacquisition_view(
+        nominal,
+        plan.candidate_base_t_left_rectified[0],
+        plan.left_rectified_t_left_ir,
+        settings.next_view_selection.reacquisition_perturbations[1],
+        view_id=retry_id,
+        minimum_standoff_distance_m=0.15,
+        maximum_standoff_distance_m=0.35,
+    )
+    retry_path = _write_front_view(
+        tmp_path / "retry",
+        surface,
+        plan,
+        view_id=retry_id,
+        sequence_index=2,
+        frame_number=22,
+        camera_pose=retry.base_t_left_ir,
+        projection_pose=retry_projection,
+        point_indices=tuple(range(7)),
+    )
+    legacy_retry = read_reconstructed_view(retry_path)
+    stereo_path = (tmp_path / "retry_stereo").resolve()
+    science_retry = replace(
+        legacy_retry,
+        metadata={
+            **legacy_retry.metadata,
+            "schema_version": 3,
+            "hand_eye": {
+                **legacy_retry.metadata["hand_eye"],
+                "flange_T_left_ir": np.eye(4).tolist(),
+            },
+            "source": {
+                **legacy_retry.metadata["source"],
+                "stereo_inference": str(stereo_path),
+            },
+        },
+    )
+    real_reconstructed_reader = coverage_storage.read_reconstructed_view
+
+    def read_reconstruction(path: str | Path):
+        if Path(path).resolve() == retry_path.resolve():
+            return science_retry
+        return real_reconstructed_reader(path)
+
+    monkeypatch.setattr(coverage_storage, "read_reconstructed_view", read_reconstruction)
+    monkeypatch.setattr(
+        coverage_storage,
+        "read_stereo_inference",
+        lambda path: _stereo_identity_fixture(
+            view_id=retry_id,
+            sequence_index=2,
+            frame_number=22,
+            manifest_sha256="9" * 64,
+            view_metadata_sha256="a" * 64,
+        )
+        if Path(path).resolve() == stereo_path
+        else pytest.fail(f"unexpected stereo source: {path}"),
+    )
+    target_patch_id, provenance = fine_science_workflow._candidate_target_authority(
+        previous,
+        retry_id,
+        settings=settings,
+        selection_policy_payload=policy_payload,
+    )
+    assert target_patch_id == nominal.patch.patch_id
+    assert provenance is not None
+    successor = write_surface_coverage_generation(
+        tmp_path / "generation_002",
+        reference_coarse_model=coarse,
+        quality_config=quality,
+        previous_generation=nominal_generation,
+        current_reconstructed_view=retry_path,
+        observation_id=retry_id,
+        current_reacquisition=provenance,
+    )
+    return successor, provenance
+
+
+def test_selector_retry_id_flows_through_transaction_and_coverage_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    successor, provenance = _write_retry_coverage_chain(tmp_path, monkeypatch)
+
+    stored = read_surface_coverage_generation(successor)
+
+    assert stored.current_reacquisition == provenance
+    assert stored.ledger.observation_ids[-1] == provenance.view_id
+    assert provenance.attempt == 2
+    assert provenance.nominal_candidate_id in stored.ledger.observation_ids
+    assert stored.physical_source_identities == (("9" * 64, "a" * 64, 2, 22),)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("view_id", "fine_reacq_forged"),
+        ("nominal_candidate_id", "back_surface"),
+        ("patch_id", "back_surface"),
+        ("attempt", 1),
+        ("distance_offset_m", 0.123),
+        ("tilt_deg", 12.3),
+        ("azimuth_deg", -45.0),
+        ("selection_policy_sha256", "f" * 64),
+        ("reference_metadata_sha256", "e" * 64),
+    ],
+)
+def test_retry_coverage_rejects_tampered_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    replacement: object,
+) -> None:
+    successor, _ = _write_retry_coverage_chain(tmp_path, monkeypatch)
+    metadata_path = successor / "coverage.json"
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    payload["current_observation"]["view_authority"][field] = replacement
+    metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Fine retry"):
+        read_surface_coverage_generation(successor)
 
 
 def test_initial_generation_starts_empty_and_restores_typed_reference(

@@ -23,7 +23,10 @@ from biblade_fusion.perception.blade_foreground import (
     BladeForegroundMaskResult,
     reference_guided_blade_mask,
 )
-from biblade_fusion.workflows.occupancy_mapping import occupancy_array_content_hash
+from biblade_fusion.workflows.occupancy_mapping import (
+    occupancy_array_content_hash,
+    occupancy_physical_source_id,
+)
 
 BLADE_FOREGROUND_SCHEMA_VERSION = 1
 
@@ -426,11 +429,11 @@ def _validate_source_chain(
 
     occupancy = _read_json(occupancy_root / "metadata.json")
     if (
-        int(occupancy["schema_version"]) != 6
+        int(occupancy["schema_version"]) != 7
         or occupancy.get("artifact_kind") != "biblade_fusion.occupancy_mapping"
         or occupancy.get("motion_authorized") is not False
     ):
-        raise ValueError("blade-foreground requires a schema-6 occupancy mapping")
+        raise ValueError("blade-foreground requires a schema-7 occupancy mapping")
     matching_frames = []
     for frame in occupancy["frames"]:
         evidence = _mapping(frame, "evidence")
@@ -450,6 +453,15 @@ def _validate_source_chain(
         raise ValueError("occupancy evidence does not bind the raw session manifest")
     if _sha256(view_metadata_path) != str(evidence["source_session_view_metadata_sha256"]):
         raise ValueError("occupancy evidence does not bind the raw view metadata")
+    physical_source_id = occupancy_physical_source_id(
+        source_session_manifest_sha256=_sha256(session_root / "manifest.json"),
+        source_session_view_metadata_sha256=_sha256(view_metadata_path),
+        source_sequence_index=sequence_index,
+        frame_number=frame_number,
+        source_view_id=view_id,
+    )
+    if str(evidence["physical_source_id"]) != physical_source_id:
+        raise ValueError("occupancy evidence physical source identity changed")
     frame_sources = _mapping(frame, "sources")
     if (
         _occupancy_source_root(_mapping(frame_sources, "stereo_inference"), "metadata.json")

@@ -3,26 +3,27 @@
 **BiBladeFusion** is a robot-guided bilateral 3D-geometry reconstruction system for
 thin-walled blades, with a planned thermal-reconstruction extension.
 
-The current development stage provides a Python 3.12 application, read-only Elite ES68
-diagnostics plus a fail-closed guarded-control library, synchronized raw stereo acquisition
+The current development stage provides a Python 3.12 application, Elite ES68 diagnostics
+plus a fail-closed supervised-control stack, synchronized raw stereo acquisition
 from an Intel RealSense D435i, reproducible session storage, a calibrated
 FoundationStereo inference path, paired native/stereo depth evaluation, a conservative
 single-view blade proxy, paper-derived true curved-surface partitioning, thin-wall-aware
 multi-view TSDF/mesh reconstruction, real-surface quality feedback, and offline Elite KDL
 endpoint IK. A fixed-reference fine-coverage ledger, deterministic bilateral-fin
 next-view selector, and transactional fine-scan foreground/reconstruction/coverage
-branch are implemented at library level. It also contains a fail-closed,
-FoundationStereo-derived three-state safety
-occupancy layer and a read-only supervisory replay console. The curved reconstruction
+branch are implemented. It also contains a fail-closed FoundationStereo-derived
+three-state safety occupancy layer, conservative continuous mesh and occupancy sweep
+certificates, an operator-guided unknown-blade coarse loop, a one-way schema-5 handoff,
+an append-only experiment checkpoint/completion chain, resumable fail-closed execution,
+and a read-only live/replay supervisory console. The curved reconstruction
 chain is currently regression-verified on deterministic synthetic bilateral-blade data;
 real-blade accuracy and hardware thresholds still require recorded experiments. Thermal
-capture/fusion is not implemented beyond a disabled interface placeholder. Every public
-Elite-arm motion method and every public CLI motion path is sealed; the guarded executor
-can reach the private driver capability only after its complete evidence contract passes.
-The two required continuous swept-volume backends are not implemented, so that contract
-currently blocks before driver preparation. The online library components remain disabled
-by default, have no public composition-root or motion CLI, and have not been validated on
-the physical blade/ES68/D435i system.
+capture/fusion is not implemented beyond a disabled interface placeholder. Every ordinary
+Elite-arm motion method remains sealed; the supervised path can reach the private driver
+capability only after a fresh map, both continuous proofs, an exact one-segment preflight
+and the operator's segment-specific confirmation. It remains disabled by default and has
+not been validated on the physical blade/ES68/D435i system. Software completion must not
+be interpreted as physical acceptance.
 
 ## Bootstrap
 
@@ -45,6 +46,19 @@ FoundationStereo inference machine:
 git submodule update --init --recursive
 uv sync --extra foundation-stereo
 ```
+
+For a fresh GPU workstation, the strict bootstrap also checks CUDA, installs the local
+Elite SDK wheel, and runs the non-moving stereo doctor. Pass the wheel explicitly when
+the laboratory path is not present on that machine:
+
+```bash
+./scripts/bootstrap-gpu.sh \
+  /absolute/path/to/elite_cs_sdk-1.0.0-cp312-cp312-linux_x86_64.whl \
+  configs/local.yaml
+```
+
+This is an environment check, not a FoundationStereo accuracy/latency acceptance or a
+robot-motion release. A saved-session inference smoke test is still required.
 
 ## Verify
 
@@ -243,8 +257,11 @@ view is checked for optical alignment, incidence, coverage, standoff, camera cle
 workspace bounds, forbidden volumes, duplicate poses, and—when configured—offline ES68
 IK. A `geometry_only` view has not passed IK/workspace validation. An
 `endpoint_feasible` view still has **not** passed robot-body collision or trajectory
-validation. Every exported plan contains `motion_authorized: false`; no current command
-executes a planned pose.
+validation. Every exported plan contains `motion_authorized: false`; the commands in this
+offline plan/coverage workflow never execute an exported pose. The separate production
+entry point, `bbf scan run-unknown`, can command the robot only after the complete runtime
+authority chain, live stop/stationarity checks, collision revalidation, and an exact
+single-segment operator approval have all succeeded.
 
 The coverage ledger uses pose-registered base-frame blade points to fill independent
 front/back per-patch occupancy grids. See [coverage and replanning](docs/coverage.md) for
@@ -274,10 +291,12 @@ can now stage a reference-projected foreground mask, a FoundationStereo reconstr
 and exactly one fine-coverage successor as one library-level transaction. Its schema-3
 scientific view is replayed from the bound stereo depth, occupancy-derived eligible mask,
 foreground mask, point-cloud configuration and raw/rectified camera chain; an online
-recovery rejects legacy schema-2 observations anywhere in the accepted lineage. This branch
-is disabled by default, requires an explicitly pinned schema-5 coarse model and optional
-recovery generation at construction, and is not exposed by a composition-root or motion
-CLI. It is software-tested only; no real-blade accuracy or motion-release claim follows.
+recovery rejects legacy schema-2 observations anywhere in the accepted lineage. The branch
+is disabled in the coarse engine and requires an explicitly pinned schema-5 coarse model
+and optional recovery generation at construction. The supervised `scan run-unknown`
+composition enables it only after a verified one-way schema-5 handoff; it never transfers
+an old permit, prepared segment, map publication, or coverage state. It is software-tested
+only; no real-blade accuracy or motion-release claim follows.
 Install
 `uv sync --extra tsdf-open3d` to enable the optional calibrated Open3D backend; the
 locked NumPy fallback remains available without it.
@@ -345,11 +364,10 @@ algorithm verification and audit only, and can never become live motion evidence
 production renderer also fails closed when the ready, final ES68+D435i STL manifest is
 absent or mismatched. Follow the [final ES68+D435i collision-model activation
 checklist](src/biblade_fusion/robotics/resources/elite_cs/collision_models/es68_d435i/README.md)
-when installing those meshes. A library-level coordinator now atomically combines stopped
+when installing those meshes. The supervised coordinator atomically combines stopped
 robot state, FoundationStereo inference, fresh-map publication, scientific-asset staging,
-planning invalidation, and execution freshness. It remains default-off, has no public
-composition-root or robot-motion CLI, and has not been hardware-verified. The missing
-continuous swept-mesh and robot-versus-voxel proofs still block production execution.
+planning invalidation, two conservative continuous sweep proofs, one-segment approval and
+execution freshness. It remains default-off and has not been hardware-verified.
 
 The current HoloRobot-derived ES68 and D435i-only collision assembly can be checked in a
 fully offline Qt3D viewer. The command exposes no robot IP and never opens a robot or
@@ -381,17 +399,124 @@ The GUI visualizes only evidence it can bind: occupancy and implicit unknown wor
 the historical robot chain and camera pose, current/fused blade point clouds, sensor
 quality, copied source manifests and blocking events. Exact ES68+D435i meshes appear only
 when the active final collision model reproduces the mapping geometry hash; planned TCP
-endpoints appear only from a canonically re-derived preflight. A continuous actual TCP
-trace is not yet persisted. The GUI is strictly an observer: replay snapshots remain
+paths appear only from a canonically derived preflight. Actual-path samples currently mean
+stopped perception stations, not high-rate ServoJ tracking. The GUI is strictly an observer: replay snapshots remain
 `REPLAY/BLOCKED`, and it contains no approval or robot-command path. `--follow` only
 polls atomically published replay snapshots; it does not provide online avoidance or a
 deterministic control loop.
 
-After an ordered sequence has endpoint-feasible IK solutions, the production preflight
-interface is the following read-only command. It requires a fresh `MAP_READY` occupancy
-asset, but no current CLI publishes one; the path below denotes future native-coordinator
-output and cannot be replaced by `build-replay`. Consequently this is presently a
-contract-level interface, not a complete CLI-only workflow.
+## Supervised unknown-blade runtime
+
+The production composition is exposed as one deliberately interactive command. First
+copy the default configuration to a Git-ignored local file and complete the measured
+workspace, occupancy, stop-and-capture, collision, standoff, calibration and
+static-free, motion-envelope and geometry-science acceptance fields, including measured
+timing budgets. Audit the complete coarse-to-fine chain without opening
+the robot or camera:
+
+```bash
+uv run bbf scan doctor --mode unknown --config configs/local.yaml
+```
+
+Only after that audit passes, create a new non-overwriting experiment root:
+
+```bash
+uv run bbf scan run-unknown \
+  --config configs/local.yaml \
+  --output data/experiments/unknown_blade_001 \
+  --operator-id vale
+```
+
+The first stage never chooses a path through unknown space. The operator manually places
+the stopped arm at at least three independently safe views and presses exactly `c` once
+per capture. After a fresh `MAP_READY` generation exists, the program prepares only one
+bounded segment, prints its exact approval token, and moves only if the same token is
+pasted back. A successful segment is followed by an explicit stop and one automatic
+capture. Coarse completion produces a verified schema-5 model; the fine coordinator then
+starts with a new map publication and no inherited permit, approval, prepared segment or
+coverage state. The top-level write-once chain is
+`INIT -> COARSE_CHECKPOINT+ -> PREPARED -> FINE_START_CANDIDATE+ -> FINE_STARTED -> FINE_CHECKPOINT* -> FINE_COMPLETED`.
+It binds each accepted checkpoint to its exact run-event boundary and science generation,
+binds the schema-5/reference handoff separately, makes only the latest durable candidate
+eligible for atomic fine-start publication, and seals the terminal fine coverage plus
+strictly replayed final reconstruction. A candidate left by a crash is non-authoritative;
+resume creates a new fine run and candidate. StopScan append and fine-start publication
+share one canonical-root thread/process lock, so no fine event can cross the publication
+linearization point unnoticed. A failed write or replay leaves the runtime
+blocked and never transfers or completes active-runner authority. If fine safety refresh
+has no expected source ID, `c` performs one explicitly stopped replenishment capture; it
+does not start automatic continuous acquisition.
+
+Resume only the explicitly named immutable experiment root:
+
+```bash
+uv run bbf scan run-unknown \
+  --resume \
+  --config configs/local.yaml \
+  --output data/experiments/unknown_blade_001 \
+  --operator-id vale
+```
+
+Resume derives its phase solely from the verified top-level chain and rejects missing,
+spliced, renumbered or source-mutated evidence. It never restores an old permit, approval,
+prepared segment, motion freshness or controller authority. A sealed `FINE_COMPLETED`
+experiment is reported read-only without connecting the robot or camera.
+
+Every FoundationStereo logical cycle stores each retry in a fresh immutable
+`attempt_<uuid>` directory. Failed or cancelled attempts remain diagnostic assets, while
+only an atomically created `committed.json` selects the accepted attempt. Occupancy schema
+7 deduplicates by a physical source identity derived from the session manifest, exact
+view metadata, sequence and camera frame number—not by a reusable logical view label.
+Schema-6 occupancy data is replay-only and can never become motion evidence.
+Retries remain finite under the configured policy, and an accepted attempt is proven
+against its raw session manifest, exact view metadata, physical frame identity,
+stationarity evidence and derived science/safety authorities. Reusing a logical label is
+not source proof.
+
+Before `scan doctor --mode unknown` can pass, record physical geometry-science acceptance
+from a completed declaration and copy its emitted path/ID pair into
+`science_acceptance.path` and `science_acceptance.acceptance_id`:
+
+```bash
+uv run bbf safety record-science-acceptance \
+  --declaration configs/science_acceptance.completed.json \
+  --config configs/local.yaml \
+  --output data/acceptance/geometry_science_001
+```
+
+The record must cover the configured working-distance and incidence-angle envelope and
+binds the exact calibration, FoundationStereo source/checkpoint/model configuration,
+foreground, coarse/fine reconstruction and selection policies. It authorizes no motion.
+Doctor also requires one immutable runtime-timing acceptance whose path/ID matches all four
+configured bounds: complete perception cycle, operator reposition interval, segment
+execution, and stop/checkpoint/schema-5/fine handoff. Those measurements participate in
+map-age readiness and are enforced again at their runtime boundaries; missing, stale, or
+mismatched timing/science evidence remains blocking. The exact cold/warm trace workflow and
+non-overwriting commands are defined in
+[the supervised experiment protocol](docs/supervised-blade-experiment.md#7-科学验收与schema-5时序预算).
+
+The command prints a second-terminal observer command. It normally resolves to:
+
+```bash
+uv run bbf supervise replay \
+  --snapshot data/experiments/unknown_blade_001/live_timeline \
+  --follow
+```
+
+This observer retains coarse and fine point-cloud history across the handoff but has no
+robot, approval or stop capability. Its ES68+D435i triangles are reloaded from the exact
+active collision manifest and STL files, and every displayed point-cloud source is
+recorded in a disk-backed append-only hash chain. Source or mesh mutation therefore
+blocks publication rather than silently changing the screen. `q`, `Ctrl-C`, a stale map,
+changed evidence, a failed continuous proof, or any unsupported runtime state
+stops/blocks the run. Passing the
+software doctor still does not constitute the hardware acceptance listed in
+[the supervised experiment protocol](docs/supervised-blade-experiment.md).
+
+After an ordered sequence has endpoint-feasible IK solutions, the offline preflight
+interface below remains useful for audit. It requires a fresh `MAP_READY` occupancy asset
+from the live FoundationStereo stop-and-capture coordinator and cannot be supplied by
+`build-replay`.
 
 ```bash
 uv run bbf safety preflight-path \
@@ -411,13 +536,12 @@ rectification, official FoundationStereo source/checkpoint/configuration, hand-e
 chain and active robot-depth rendering before issuing a process-local semantic
 attestation. That attestation is bound through collision evidence, preflight, permit and
 guarded execution; replay-only assets never receive one. The artifact re-derives every
-leg when read and always stores
-`motion_authorized: false`. The production path currently stops at
-`continuous_swept_mesh_unavailable` before creating a ServoJ stream, so a zero reported
-duration is a blocked diagnostic, not an executable trajectory. Even after that backend
-exists, the independent continuous robot-versus-voxel proof must also pass. This command
-does not connect to the robot. Passing an offline `build-replay` occupancy asset is
-intentionally blocked because that asset is `STALE`.
+leg when read and always stores `motion_authorized: false`. Approval eligibility also
+requires both the mesh/FCL interval certificate and the independent robot-versus-voxel
+interval certificate. Failure to prove an interval is reported as `UNKNOWN` and blocks;
+a finite set of clear samples is never promoted to a continuous result. This command does
+not connect to the robot. Passing an offline `build-replay` occupancy asset is intentionally
+blocked because that asset is `STALE`.
 
 Exactly one ordering source is accepted: repeated manual `--view-id` options or one
 `--coverage-plan`. In the latter mode, preflight verifies the coverage artifact's source
@@ -427,8 +551,7 @@ proposal; it is not mesh, occupancy, or trajectory clearance.
 
 The current implementation must not be interpreted as physical motion clearance. Robot
 pixels removed by self-masking remain `UNKNOWN`, so the robot's own volume can block its
-occupancy query. Both continuous swept-mesh/FCL collision evidence and continuous
-robot-versus-voxel occupancy evidence are independently unimplemented; bounded-step
-discrete samples and transformed mesh-AABB bounding spheres are diagnostic only. These
-limitations, the absent live coordinator, and final-model hardware acceptance must be
-resolved before exposing a motion CLI.
+occupancy query. A narrowly scoped exception exists only for complete voxels inside an
+immutable, physically accepted static-free AABB; `OCCUPIED` always wins, and these AABBs
+must never overlap the blade, fixture, support or their possible envelope. Final model,
+workcell, timing, sensing and guarded-motion acceptance remain mandatory.

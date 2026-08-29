@@ -63,7 +63,22 @@ def _reference(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
         "read_coarse_model_summary",
         lambda path: SimpleNamespace(root=Path(path).resolve(), metadata={"schema_version": 5}),
     )
+    monkeypatch.setattr(
+        module,
+        "production_selection_policy_payload",
+        lambda _settings, _hand_eye, *, reference_coarse_model: {
+            "test_reference": str(Path(reference_coarse_model).resolve())
+        },
+    )
     root.mkdir()
+
+
+def _policy_metadata(root: Path) -> dict[str, object]:
+    return {
+        "reacquisition_policy": module._selection_policy_record(
+            {"test_reference": str(root.resolve())}
+        )
+    }
 
 
 def test_startup_rejects_accepted_lineage_without_schema_3_science_binding(
@@ -92,6 +107,7 @@ def test_startup_rejects_accepted_lineage_without_schema_3_science_binding(
     ):
         module.validate_fine_science_startup(
             _settings(),
+            SimpleNamespace(),
             reference_coarse_model=reference,
             accepted_coverage_path=accepted,
         )
@@ -151,6 +167,7 @@ def test_first_map_ready_bootstrap_stages_local_empty_generation(
         quality_config=settings.surface_quality,
         ledger=SimpleNamespace(observation_ids=()),
         current_reconstructed_view_path=None,
+        metadata=_policy_metadata(reference),
     )
     monkeypatch.setattr(module, "write_surface_coverage_generation", write_coverage)
     monkeypatch.setattr(
@@ -188,6 +205,7 @@ def test_transit_carries_exact_accepted_generation_without_science(
         root=accepted,
         reference=SimpleNamespace(root=reference.resolve()),
         quality_config=_settings().surface_quality,
+        metadata=_policy_metadata(reference),
     )
     monkeypatch.setattr(
         module,
@@ -237,6 +255,7 @@ def test_bootstrap_or_safety_refresh_carries_existing_generation_without_advanci
         root=accepted,
         reference=SimpleNamespace(root=reference.resolve()),
         quality_config=settings.surface_quality,
+        metadata=_policy_metadata(reference),
     )
     monkeypatch.setattr(
         module,
@@ -334,6 +353,7 @@ def test_first_map_ready_safety_cycle_stages_generation_zero(
         quality_config=settings.surface_quality,
         ledger=SimpleNamespace(observation_ids=()),
         current_reconstructed_view_path=None,
+        metadata=_policy_metadata(reference),
     )
     monkeypatch.setattr(module, "write_surface_coverage_generation", write_coverage)
     monkeypatch.setattr(
@@ -390,6 +410,7 @@ def test_candidate_stages_mask_reconstruction_and_one_exact_successor(
         view_plan=SimpleNamespace(candidates=(candidate,)),
         ledger=SimpleNamespace(observation_ids=()),
         surface=SimpleNamespace(),
+        metadata=_policy_metadata(reference),
     )
     mask_array = np.ones((3, 4), dtype=np.bool_)
     mask_result = SimpleNamespace(mask=mask_array)
@@ -404,6 +425,7 @@ def test_candidate_stages_mask_reconstruction_and_one_exact_successor(
         previous_generation_path=accepted,
         current_reconstructed_view_path=reconstructed_path.resolve(),
         ledger=SimpleNamespace(observation_ids=(captured.bundle.view_id,)),
+        current_reacquisition=None,
     )
     read_calls = 0
 

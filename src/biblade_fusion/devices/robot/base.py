@@ -22,6 +22,11 @@ class RobotState:
     robot_mode: str
     safety_status: str
     speed_scaling: float
+    runtime_state: str | None = None
+    actual_joint_velocity_rad_s: NDArray[np.float64] | None = None
+    target_joint_velocity_rad_s: NDArray[np.float64] | None = None
+    actual_tcp_velocity: NDArray[np.float64] | None = None
+    target_tcp_velocity: NDArray[np.float64] | None = None
 
     def __post_init__(self) -> None:
         joints = np.array(self.joint_positions_rad, dtype=np.float64, copy=True)
@@ -35,6 +40,25 @@ class RobotState:
             raise ValueError("Robot speed scaling must be in [0, 1]")
         joints.setflags(write=False)
         object.__setattr__(self, "joint_positions_rad", joints)
+        for name in (
+            "actual_joint_velocity_rad_s",
+            "target_joint_velocity_rad_s",
+            "actual_tcp_velocity",
+            "target_tcp_velocity",
+        ):
+            raw = getattr(self, name)
+            if raw is None:
+                continue
+            vector = np.array(raw, dtype=np.float64, copy=True)
+            if vector.shape != (6,) or not np.isfinite(vector).all():
+                raise ValueError(f"{name} must be a finite six-vector")
+            vector.setflags(write=False)
+            object.__setattr__(self, name, vector)
+        if self.runtime_state is not None:
+            runtime_state = str(self.runtime_state).strip()
+            if not runtime_state:
+                raise ValueError("runtime_state must be non-empty when present")
+            object.__setattr__(self, "runtime_state", runtime_state)
 
 
 @runtime_checkable

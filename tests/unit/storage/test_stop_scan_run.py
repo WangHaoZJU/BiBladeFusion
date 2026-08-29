@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+import biblade_fusion.storage.stop_scan_run as stop_scan_module
 from biblade_fusion.storage.stop_scan_run import (
     StopScanRunFormatError,
     StopScanRunWriter,
@@ -103,6 +105,47 @@ def test_two_resumed_writers_cannot_overwrite_same_event(tmp_path: Path) -> None
     stored = read_stop_scan_run(writer.root)
     assert stored.latest_event == committed
     assert len(stored.events) == 2
+
+
+def test_append_acquires_run_authority_before_writer_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = StopScanRunWriter.create(tmp_path / "run", run_id="run-001")
+    order: list[str] = []
+
+    @contextmanager
+    def authority(_root: Path):
+        order.append("authority-enter")
+        try:
+            yield
+        finally:
+            order.append("authority-exit")
+
+    class ProbeLock:
+        def __enter__(self):
+            order.append("writer-enter")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            order.append("writer-exit")
+
+    monkeypatch.setattr(stop_scan_module, "exclusive_stop_scan_run_authority", authority)
+    writer._append_lock = ProbeLock()  # type: ignore[assignment]
+
+    writer.append_event(
+        phase="stopped",
+        cycle_index=0,
+        event_type="run_started",
+        payload={},
+    )
+
+    assert order == [
+        "authority-enter",
+        "writer-enter",
+        "writer-exit",
+        "authority-exit",
+    ]
 
 
 @pytest.mark.parametrize(

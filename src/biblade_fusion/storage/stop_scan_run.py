@@ -7,12 +7,16 @@ directly and verify the complete chain without trusting the index.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
 import os
 import re
-from collections.abc import Mapping
+import stat
+import threading
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +24,7 @@ from typing import Any
 from uuid import uuid4
 
 STOP_SCAN_RUN_INDEX_SCHEMA_VERSION = 1
+STOP_SCAN_RUN_AUTHORITY_LOCK_FILENAME = ".stop_scan_authority.lock"
 _EVENT_FILENAME_DIGITS = 8
 _EVENT_KEYS = frozenset(
     {
@@ -38,10 +43,85 @@ _RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _TOKEN_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _EVENT_FILENAME_PATTERN = re.compile(r"([0-9]{8})\.json")
+_AUTHORITY_LOCKS_GUARD = threading.Lock()
+_AUTHORITY_LOCKS: dict[Path, threading.RLock] = {}
+_AUTHORITY_LOCK_STATE = threading.local()
 
 
 class StopScanRunFormatError(ValueError):
     """A stop-and-scan event chain is malformed, incomplete, or corrupted."""
+
+
+def _authority_process_lock(root: Path) -> threading.RLock:
+    with _AUTHORITY_LOCKS_GUARD:
+        return _AUTHORITY_LOCKS.setdefault(root, threading.RLock())
+
+
+def _open_authority_lock(root: Path) -> int:
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(
+        root / STOP_SCAN_RUN_AUTHORITY_LOCK_FILENAME,
+        flags,
+        0o600,
+    )
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(descriptor)
+        raise ValueError("stop-and-scan authority lock must be one regular file")
+    return descriptor
+
+
+def _initialise_authority_lock(root: Path) -> None:
+    descriptor = _open_authority_lock(root)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(root)
+
+
+@contextmanager
+def exclusive_stop_scan_run_authority(path: str | Path) -> Iterator[None]:
+    """Hold the run's append/publication authority across threads and processes.
+
+    Every :class:`StopScanRunWriter` append and every external authority commit
+    that relies on an exact StopScan prefix must use this canonical-root lock.
+    The per-process ``RLock`` supplies deterministic thread exclusion; ``flock``
+    extends the same exclusion to cooperating processes.  A thread-local depth
+    makes nested use by the same thread safe without reacquiring a second flock.
+    """
+
+    root = Path(path).resolve()
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("stop-and-scan authority root must be a real directory")
+    process_lock = _authority_process_lock(root)
+    with process_lock:
+        held = getattr(_AUTHORITY_LOCK_STATE, "held", None)
+        if held is None:
+            held = {}
+            _AUTHORITY_LOCK_STATE.held = held
+        current = held.get(root)
+        if current is not None:
+            descriptor, depth = current
+            held[root] = (descriptor, depth + 1)
+            try:
+                yield
+            finally:
+                held[root] = (descriptor, depth)
+            return
+        descriptor = _open_authority_lock(root)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            held[root] = (descriptor, 1)
+            try:
+                yield
+            finally:
+                held.pop(root, None)
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _validate_run_id(value: object) -> str:
@@ -54,6 +134,12 @@ def _validate_run_id(value: object) -> str:
             "and must start with a letter or digit"
         )
     return run_id
+
+
+def validate_stop_scan_run_id(value: object) -> str:
+    """Validate a run identity before allocating output or opening hardware."""
+
+    return _validate_run_id(value)
 
 
 def _validate_token(value: object, *, label: str) -> str:
@@ -196,17 +282,17 @@ class StopScanRunEvent:
         payload = _normalise_payload(self.payload)
         previous = self.previous_event_sha256
         if previous is not None and (
-            not isinstance(previous, str)
-            or _SHA256_PATTERN.fullmatch(previous) is None
+            not isinstance(previous, str) or _SHA256_PATTERN.fullmatch(previous) is None
         ):
             raise ValueError("previous_event_sha256 must be null or a SHA-256 digest")
         if sequence == 0 and previous is not None:
             raise ValueError("the first event must not have a predecessor")
         if sequence > 0 and previous is None:
             raise ValueError("every event after sequence zero requires a predecessor")
-        if not isinstance(self.event_sha256, str) or _SHA256_PATTERN.fullmatch(
-            self.event_sha256
-        ) is None:
+        if (
+            not isinstance(self.event_sha256, str)
+            or _SHA256_PATTERN.fullmatch(self.event_sha256) is None
+        ):
             raise ValueError("event_sha256 must be a lowercase SHA-256 digest")
         expected_hash = _compute_event_sha256(
             run_id=run_id,
@@ -337,9 +423,7 @@ def _write_new_json(path: Path, payload: Mapping[str, Any]) -> None:
         try:
             os.link(temporary, path)
         except FileExistsError as exc:
-            raise FileExistsError(
-                f"Refusing to overwrite stop-and-scan event: {path}"
-            ) from exc
+            raise FileExistsError(f"Refusing to overwrite stop-and-scan event: {path}") from exc
         _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
@@ -378,6 +462,7 @@ class StopScanRunWriter:
         self.root = root
         self.run_id = _validate_run_id(run_id)
         self._events = list(events)
+        self._append_lock = threading.RLock()
 
     @classmethod
     def create(cls, output_dir: str | Path, *, run_id: str) -> StopScanRunWriter:
@@ -386,6 +471,7 @@ class StopScanRunWriter:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.mkdir()
         (output / "events").mkdir()
+        _initialise_authority_lock(output)
         writer = cls(output, run, ())
         writer._update_navigation_index()
         return writer
@@ -397,7 +483,8 @@ class StopScanRunWriter:
 
     @property
     def events(self) -> tuple[StopScanRunEvent, ...]:
-        return tuple(self._events)
+        with self._append_lock:
+            return tuple(self._events)
 
     def append_event(
         self,
@@ -408,33 +495,37 @@ class StopScanRunWriter:
         payload: dict[str, Any],
         created_at_utc: datetime | str | None = None,
     ) -> StopScanRunEvent:
-        sequence = len(self._events)
-        previous = self._events[-1].event_sha256 if self._events else None
-        event = StopScanRunEvent.build(
-            run_id=self.run_id,
-            sequence=sequence,
-            phase=phase,
-            cycle_index=cycle_index,
-            event_type=event_type,
-            payload=payload,
-            previous_event_sha256=previous,
-            created_at_utc=created_at_utc,
-        )
-        if self._events:
-            previous_created = datetime.fromisoformat(
-                self._events[-1].created_at_utc
+        # Global order is authority -> writer. Fine-start publication already
+        # holds authority while its final callback may re-enter this writer;
+        # the reverse order would permit an ABBA deadlock with another thread.
+        with exclusive_stop_scan_run_authority(self.root), self._append_lock:
+            sequence = len(self._events)
+            previous = self._events[-1].event_sha256 if self._events else None
+            event = StopScanRunEvent.build(
+                run_id=self.run_id,
+                sequence=sequence,
+                phase=phase,
+                cycle_index=cycle_index,
+                event_type=event_type,
+                payload=payload,
+                previous_event_sha256=previous,
+                created_at_utc=created_at_utc,
             )
-            current_created = datetime.fromisoformat(event.created_at_utc)
-            if current_created < previous_created:
-                raise ValueError(
-                    "Refusing to append a stop-and-scan event whose UTC timestamp "
-                    "precedes the previous event"
+            if self._events:
+                previous_created = datetime.fromisoformat(
+                    self._events[-1].created_at_utc
                 )
-        destination = self.root / "events" / _event_filename(sequence)
-        _write_new_json(destination, event.to_payload())
-        self._events.append(event)
-        self._update_navigation_index()
-        return event
+                current_created = datetime.fromisoformat(event.created_at_utc)
+                if current_created < previous_created:
+                    raise ValueError(
+                        "Refusing to append a stop-and-scan event whose UTC timestamp "
+                        "precedes the previous event"
+                    )
+            destination = self.root / "events" / _event_filename(sequence)
+            _write_new_json(destination, event.to_payload())
+            self._events.append(event)
+            self._update_navigation_index()
+            return event
 
     def _update_navigation_index(self) -> None:
         latest = self._events[-1] if self._events else None

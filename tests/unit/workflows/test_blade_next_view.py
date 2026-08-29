@@ -17,6 +17,7 @@ from biblade_fusion.core.settings import (
     NextViewSelectionConfig,
     SurfaceQualityConfig,
     ViewFilterConfig,
+    ViewPlanningConfig,
 )
 from biblade_fusion.devices.robot.base import RobotState
 from biblade_fusion.perception.features import FinComponent
@@ -25,6 +26,7 @@ from biblade_fusion.perception.surface import (
     CurvedSurfacePatch,
     CurvedViewPlan,
     SurfaceRegion,
+    generate_reacquisition_view,
 )
 from biblade_fusion.planning import ReachabilityResult, ReachabilityState
 from biblade_fusion.planning.surface_coverage import (
@@ -35,12 +37,29 @@ from biblade_fusion.planning.surface_coverage import (
 from biblade_fusion.planning.views import BladeSide, CandidateView, SurfacePatch
 from biblade_fusion.robotics import load_es68_flange_t_tcp
 from biblade_fusion.storage.coarse_model import StoredCoarseModelSummary
-from biblade_fusion.storage.surface_coverage import StoredSurfaceCoverageGeneration
-from biblade_fusion.workflows.blade_next_view import BladeCoverageNextViewSelector
+from biblade_fusion.storage.surface_coverage import (
+    REACQUISITION_VIEW_ID_SCHEMA,
+    StoredSurfaceCoverageGeneration,
+)
+from biblade_fusion.workflows.blade_next_view import (
+    BladeCoverageNextViewSelector,
+    _reacquisition_view_id,
+)
+from biblade_fusion.workflows.fine_completion import FinalFineCompletionEvidence
 from biblade_fusion.workflows.stop_scan_coordinator import (
     BladePlanningAssetError,
     NextViewUnavailable,
 )
+
+
+def test_production_selector_factory_requires_science_authority(tmp_path: Path) -> None:
+    with pytest.raises(BladePlanningAssetError, match="requires a science acceptance"):
+        BladeCoverageNextViewSelector.from_settings(
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            reference_coarse_model=tmp_path / "not-read",
+            science_authority=None,  # type: ignore[arg-type]
+        )
 
 
 def _camera_rotation(outward_normal: np.ndarray) -> np.ndarray:
@@ -265,7 +284,18 @@ def _stored_generation(
         root,
         "a" * 64,
         "c" * 64,
-        StoredCoarseModelSummary(reference_root, {}),
+        StoredCoarseModelSummary(
+            reference_root,
+            {
+                "view_plan": {
+                    "configuration": ViewPlanningConfig(
+                        standoff_distance_m=0.25,
+                        minimum_standoff_distance_m=0.15,
+                        maximum_standoff_distance_m=0.35,
+                    ).model_dump(mode="json")
+                }
+            },
+        ),
         surface,
         plan,
         ledger,
@@ -469,8 +499,11 @@ def _selector(
     fk_model: Any,
     view_filter: ViewFilterConfig | None = None,
     coverage_reader: Any | None = None,
+    fine_finalizer: Any | None = None,
 ) -> BladeCoverageNextViewSelector:
-    return BladeCoverageNextViewSelector(
+    final_root = tmp_path / "final_reconstruction"
+    final_root.mkdir(exist_ok=True)
+    selector = BladeCoverageNextViewSelector(
         hand_eye=_hand_eye(tmp_path),
         selection_config=selection_config,
         surface_quality_config=state.quality_config,
@@ -484,6 +517,57 @@ def _selector(
         reachability_factory=factory,
         fk_model=fk_model,
         coverage_reader=coverage_reader or (lambda _path: state),
+        fine_finalizer=fine_finalizer
+        or (
+            lambda _state: FinalFineCompletionEvidence(
+                final_root,
+                "d" * 64,
+                "e" * 64,
+            )
+        ),
+    )
+    state.metadata["reacquisition_policy"] = {
+        "id_schema": REACQUISITION_VIEW_ID_SCHEMA,
+        "selection_policy_sha256": selector.selection_policy_sha256,
+        "selection_policy": selector.selection_policy_payload,
+    }
+    return selector
+
+
+def _policy_sha(
+    tmp_path: Path,
+    state: StoredSurfaceCoverageGeneration,
+    selection_config: NextViewSelectionConfig,
+    *,
+    fk_model: Any,
+) -> str:
+    return _selector(
+        tmp_path,
+        state,
+        selection_config,
+        factory=_UnreachableFactory(),
+        fk_model=fk_model,
+    ).selection_policy_sha256
+
+
+def _with_patch_observations(
+    state: StoredSurfaceCoverageGeneration,
+    *,
+    patch_id: str,
+    observation_ids: tuple[str, ...],
+    root: Path,
+) -> StoredSurfaceCoverageGeneration:
+    evidence = tuple(
+        replace(
+            item,
+            observation_ids=(observation_ids if item.patch_id == patch_id else ()),
+        )
+        for item in state.ledger.evidence
+    )
+    return replace(
+        state,
+        ledger=SurfaceCoverageLedger(evidence, observation_ids),
+        current_reconstructed_view_path=(root / "prior_reconstruction").resolve(),
     )
 
 
@@ -579,6 +663,52 @@ def test_only_complete_coverage_returns_a_targetless_decision(tmp_path: Path) ->
     assert decision.coverage_complete is True
     assert decision.target is None
     assert decision.incomplete_patch_count == 0
+    assert decision.final_reconstruction_path == (
+        tmp_path / "final_reconstruction"
+    ).resolve()
+    assert decision.final_reconstruction_id == "d" * 64
+    assert decision.final_reconstruction_metadata_sha256 == "e" * 64
+
+
+def test_complete_coverage_blocks_when_terminal_reconstruction_fails(
+    tmp_path: Path,
+) -> None:
+    patches = (
+        _patch(
+            "front_surface",
+            BladeSide.FRONT,
+            SurfaceRegion.SURFACE,
+            center=(0.0, 0.0, 0.01),
+            normal=(0.0, 0.0, 1.0),
+        ),
+        _patch(
+            "back_surface",
+            BladeSide.BACK,
+            SurfaceRegion.SURFACE,
+            center=(0.0, 0.0, -0.01),
+            normal=(0.0, 0.0, -1.0),
+        ),
+    )
+    state = _stored_generation(
+        tmp_path,
+        patches,
+        complete_patch_ids=frozenset(patch.patch_id for patch in patches),
+    )
+
+    def fail_finalization(_state: StoredSurfaceCoverageGeneration):
+        raise ValueError("mesh contains a boundary loop")
+
+    selector = _selector(
+        tmp_path,
+        state,
+        _selection_config(SurfaceRegion.SURFACE),
+        factory=lambda _seed: pytest.fail("terminal failure must not initialize IK"),
+        fk_model=_WrongFk(),
+        fine_finalizer=fail_finalization,
+    )
+
+    with pytest.raises(BladePlanningAssetError, match="terminal reconstruction failed"):
+        selector.select_next(_observation(state), object())
 
 
 def test_current_stationary_joint_trace_is_the_dynamic_ik_seed(tmp_path: Path) -> None:
@@ -649,6 +779,411 @@ def test_incomplete_but_unreachable_raises_typed_planning_block(
 
     with pytest.raises(NextViewUnavailable, match="no unused candidate passed"):
         selector.select_next(_observation(state), object())
+
+
+def test_incomplete_captured_patch_gets_one_unique_bounded_reacquisition_view(
+    tmp_path: Path,
+) -> None:
+    front = _patch(
+        "front_surface",
+        BladeSide.FRONT,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, 0.01),
+        normal=(0.0, 0.0, 1.0),
+    )
+    back = _patch(
+        "back_surface",
+        BladeSide.BACK,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, -0.01),
+        normal=(0.0, 0.0, -1.0),
+    )
+    initial = _stored_generation(
+        tmp_path,
+        (front, back),
+        complete_patch_ids=frozenset({back.patch_id}),
+    )
+    nominal = initial.view_plan.candidates[0]
+    config = _selection_config(SurfaceRegion.SURFACE)
+    state = _with_patch_observations(
+        initial,
+        patch_id=front.patch_id,
+        observation_ids=(nominal.view_id, "unrelated_science_view"),
+        root=tmp_path,
+    )
+    probe_factory = _ReachabilityFactory(())
+    policy_sha256 = _policy_sha(
+        tmp_path,
+        state,
+        config,
+        fk_model=_MappedFk((), probe_factory),
+    )
+    retry_id = _reacquisition_view_id(nominal, 1, policy_sha256)
+    retry, _ = generate_reacquisition_view(
+        nominal,
+        initial.view_plan.candidate_base_t_left_rectified[0],
+        initial.view_plan.left_rectified_t_left_ir,
+        config.reacquisition_perturbations[0],
+        view_id=retry_id,
+        minimum_standoff_distance_m=0.15,
+        maximum_standoff_distance_m=0.35,
+    )
+    factory = _ReachabilityFactory((retry,))
+    selector = _selector(
+        tmp_path,
+        state,
+        config,
+        factory=factory,
+        fk_model=_MappedFk((retry,), factory),
+    )
+
+    decision = selector.select_next(_observation(state), object())
+
+    assert decision.target is not None
+    assert decision.target.view_id == retry_id
+    assert decision.target.view_id not in state.ledger.observation_ids
+    assert retry.standoff_distance_m == pytest.approx(
+        nominal.standoff_distance_m
+        + config.reacquisition_perturbations[0].distance_offset_m
+    )
+    assert "reacquisition_attempt=1" in decision.diagnostics
+    assert decision.diagnostics[-1] == (
+        "occupancy is reserved exclusively for downstream segment safety"
+    )
+    assert len(factory.seen_poses) == config.maximum_reacquisition_attempts_per_patch
+    assert any(
+        np.allclose(pose, retry.base_t_left_ir.matrix, rtol=0.0, atol=1e-12)
+        for pose in factory.seen_poses
+    )
+
+
+def test_reacquisition_evaluates_later_slot_when_first_slot_has_no_ik(
+    tmp_path: Path,
+) -> None:
+    front = _patch(
+        "front_surface",
+        BladeSide.FRONT,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, 0.01),
+        normal=(0.0, 0.0, 1.0),
+    )
+    back = _patch(
+        "back_surface",
+        BladeSide.BACK,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, -0.01),
+        normal=(0.0, 0.0, -1.0),
+    )
+    initial = _stored_generation(
+        tmp_path,
+        (front, back),
+        complete_patch_ids=frozenset({back.patch_id}),
+    )
+    nominal = initial.view_plan.candidates[0]
+    state = _with_patch_observations(
+        initial,
+        patch_id=front.patch_id,
+        observation_ids=(nominal.view_id,),
+        root=tmp_path,
+    )
+    config = _selection_config(SurfaceRegion.SURFACE)
+    probe_factory = _ReachabilityFactory(())
+    policy_sha256 = _policy_sha(
+        tmp_path,
+        state,
+        config,
+        fk_model=_MappedFk((), probe_factory),
+    )
+    retries = tuple(
+        generate_reacquisition_view(
+            nominal,
+            initial.view_plan.candidate_base_t_left_rectified[0],
+            initial.view_plan.left_rectified_t_left_ir,
+            perturbation,
+            view_id=_reacquisition_view_id(nominal, attempt, policy_sha256),
+            minimum_standoff_distance_m=0.15,
+            maximum_standoff_distance_m=0.35,
+        )[0]
+        for attempt, perturbation in enumerate(
+            config.reacquisition_perturbations,
+            start=1,
+        )
+    )
+    factory = _ReachabilityFactory((retries[1],))
+    selector = _selector(
+        tmp_path,
+        state,
+        config,
+        factory=factory,
+        fk_model=_MappedFk((retries[1],), factory),
+    )
+
+    decision = selector.select_next(_observation(state), object())
+
+    assert decision.target is not None
+    assert decision.target.view_id == retries[1].view_id
+    assert "reacquisition_attempt=2" in decision.diagnostics
+    assert any(
+        np.allclose(pose, retries[0].base_t_left_ir.matrix, rtol=0.0, atol=1e-12)
+        for pose in factory.seen_poses
+    )
+    assert retries[0].view_id not in state.ledger.observation_ids
+
+
+def test_reacquisition_id_is_bound_to_selection_policy(tmp_path: Path) -> None:
+    state = _stored_generation(
+        tmp_path,
+        (
+            _patch(
+                "front_surface",
+                BladeSide.FRONT,
+                SurfaceRegion.SURFACE,
+                center=(0.0, 0.0, 0.01),
+                normal=(0.0, 0.0, 1.0),
+            ),
+            _patch(
+                "back_surface",
+                BladeSide.BACK,
+                SurfaceRegion.SURFACE,
+                center=(0.0, 0.0, -0.01),
+                normal=(0.0, 0.0, -1.0),
+            ),
+        ),
+    )
+    nominal = state.view_plan.candidates[0]
+
+    first = _reacquisition_view_id(nominal, 1, "a" * 64)
+    second = _reacquisition_view_id(nominal, 1, "b" * 64)
+
+    assert first != second
+    assert first == _reacquisition_view_id(nominal, 1, "a" * 64)
+
+
+def test_reacquisition_attempt_budget_exhaustion_is_finite_and_explicit(
+    tmp_path: Path,
+) -> None:
+    front = _patch(
+        "front_surface",
+        BladeSide.FRONT,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, 0.01),
+        normal=(0.0, 0.0, 1.0),
+    )
+    back = _patch(
+        "back_surface",
+        BladeSide.BACK,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, -0.01),
+        normal=(0.0, 0.0, -1.0),
+    )
+    initial = _stored_generation(
+        tmp_path,
+        (front, back),
+        complete_patch_ids=frozenset({back.patch_id}),
+    )
+    nominal = initial.view_plan.candidates[0]
+    config = _selection_config(SurfaceRegion.SURFACE)
+    policy_sha256 = _policy_sha(
+        tmp_path,
+        initial,
+        config,
+        fk_model=_WrongFk(),
+    )
+    consumed = (
+        nominal.view_id,
+        *(
+            _reacquisition_view_id(nominal, attempt, policy_sha256)
+            for attempt in range(
+                1,
+                config.maximum_reacquisition_attempts_per_patch + 1,
+            )
+        ),
+    )
+    state = _with_patch_observations(
+        initial,
+        patch_id=front.patch_id,
+        observation_ids=consumed,
+        root=tmp_path,
+    )
+
+    selector = _selector(
+        tmp_path,
+        state,
+        config,
+        factory=lambda _seed: pytest.fail("exhausted retries must not initialize IK"),
+        fk_model=_WrongFk(),
+    )
+
+    with pytest.raises(NextViewUnavailable, match=r"attempt budget \(3 per patch\)"):
+        selector.select_next(_observation(state), object())
+
+
+def test_reacquisition_skips_a_distance_outside_the_coarse_planning_interval(
+    tmp_path: Path,
+) -> None:
+    front = _patch(
+        "front_surface",
+        BladeSide.FRONT,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, 0.01),
+        normal=(0.0, 0.0, 1.0),
+    )
+    back = _patch(
+        "back_surface",
+        BladeSide.BACK,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, -0.01),
+        normal=(0.0, 0.0, -1.0),
+    )
+    initial = _stored_generation(
+        tmp_path,
+        (front, back),
+        complete_patch_ids=frozenset({back.patch_id}),
+    )
+    nominal = initial.view_plan.candidates[0]
+    config = _selection_config(SurfaceRegion.SURFACE)
+    initial = replace(
+        initial,
+        reference=StoredCoarseModelSummary(
+            initial.reference.root,
+            {
+                "view_plan": {
+                    "configuration": ViewPlanningConfig(
+                        standoff_distance_m=0.25,
+                        minimum_standoff_distance_m=0.15,
+                        maximum_standoff_distance_m=0.25,
+                    ).model_dump(mode="json")
+                }
+            },
+        ),
+    )
+    probe_factory = _ReachabilityFactory(())
+    policy_sha256 = _policy_sha(
+        tmp_path,
+        initial,
+        config,
+        fk_model=_MappedFk((), probe_factory),
+    )
+    state = _with_patch_observations(
+        initial,
+        patch_id=front.patch_id,
+        observation_ids=(
+            nominal.view_id,
+            _reacquisition_view_id(nominal, 1, policy_sha256),
+        ),
+        root=tmp_path,
+    )
+    retry_id = _reacquisition_view_id(nominal, 3, policy_sha256)
+    retry, _ = generate_reacquisition_view(
+        nominal,
+        initial.view_plan.candidate_base_t_left_rectified[0],
+        initial.view_plan.left_rectified_t_left_ir,
+        config.reacquisition_perturbations[2],
+        view_id=retry_id,
+        minimum_standoff_distance_m=0.15,
+        maximum_standoff_distance_m=0.25,
+    )
+    factory = _ReachabilityFactory((retry,))
+    selector = _selector(
+        tmp_path,
+        state,
+        config,
+        factory=factory,
+        fk_model=_MappedFk((retry,), factory),
+    )
+
+    decision = selector.select_next(_observation(state), object())
+
+    assert decision.target is not None
+    assert decision.target.view_id == retry_id
+    assert "reacquisition_attempt=3" in decision.diagnostics
+    assert retry.standoff_distance_m == pytest.approx(0.23)
+
+
+def test_reacquisition_candidate_still_requires_endpoint_ik(tmp_path: Path) -> None:
+    front = _patch(
+        "front_surface",
+        BladeSide.FRONT,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, 0.01),
+        normal=(0.0, 0.0, 1.0),
+    )
+    back = _patch(
+        "back_surface",
+        BladeSide.BACK,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, -0.01),
+        normal=(0.0, 0.0, -1.0),
+    )
+    initial = _stored_generation(
+        tmp_path,
+        (front, back),
+        complete_patch_ids=frozenset({back.patch_id}),
+    )
+    nominal = initial.view_plan.candidates[0]
+    state = _with_patch_observations(
+        initial,
+        patch_id=front.patch_id,
+        observation_ids=(nominal.view_id,),
+        root=tmp_path,
+    )
+    selector = _selector(
+        tmp_path,
+        state,
+        _selection_config(SurfaceRegion.SURFACE),
+        factory=_UnreachableFactory(),
+        fk_model=_WrongFk(),
+    )
+
+    with pytest.raises(NextViewUnavailable, match="no unused candidate passed"):
+        selector.select_next(_observation(state), object())
+
+
+def test_reacquisition_capture_without_coverage_successor_fails_closed(
+    tmp_path: Path,
+) -> None:
+    front = _patch(
+        "front_surface",
+        BladeSide.FRONT,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, 0.01),
+        normal=(0.0, 0.0, 1.0),
+    )
+    back = _patch(
+        "back_surface",
+        BladeSide.BACK,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, -0.01),
+        normal=(0.0, 0.0, -1.0),
+    )
+    initial = _stored_generation(tmp_path, (front, back))
+    nominal = initial.view_plan.candidates[0]
+    state = _with_patch_observations(
+        initial,
+        patch_id=front.patch_id,
+        observation_ids=(nominal.view_id,),
+        root=tmp_path,
+    )
+    policy_sha256 = _policy_sha(
+        tmp_path,
+        state,
+        _selection_config(SurfaceRegion.SURFACE),
+        fk_model=_WrongFk(),
+    )
+    retry_id = _reacquisition_view_id(nominal, 1, policy_sha256)
+    selector = _selector(
+        tmp_path,
+        state,
+        _selection_config(SurfaceRegion.SURFACE),
+        factory=lambda _seed: pytest.fail("missing science must fail before IK"),
+        fk_model=_WrongFk(),
+    )
+
+    with pytest.raises(BladePlanningAssetError, match="planned fine candidate"):
+        selector.select_next(
+            _observation(state, view_id=retry_id, sequence_index=2),
+            object(),
+        )
 
 
 def test_ik_pseudo_solution_is_rejected_by_authoritative_fk(tmp_path: Path) -> None:

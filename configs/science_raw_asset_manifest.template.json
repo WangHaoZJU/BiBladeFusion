@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "report_type": "biblade_fusion.raw_science_acceptance_asset_manifest",
+  "generator": {
+    "name": "REPLACE_WITH_GENERATOR_NAME",
+    "version": "REPLACE_WITH_GENERATOR_VERSION"
+  },
+  "created_at_utc": "REPLACE_WITH_CANONICAL_UTC_ISO8601",
+  "assets": [
+    {
+      "asset_id": "annotation-001",
+      "role": "annotation",
+      "archive_path": "annotations/REPLACE_WITH_ARCHIVED_ASSET",
+      "sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+      "size_bytes": 1
+    },
+    {
+      "asset_id": "depth-reference-001",
+      "role": "depth_reference",
+      "archive_path": "depth/REPLACE_WITH_ARCHIVED_ASSET",
+      "sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+      "size_bytes": 1
+    },
+    {
+      "asset_id": "specimen-001",
+      "role": "specimen",
+      "archive_path": "specimens/REPLACE_WITH_ARCHIVED_ASSET",
+      "sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+      "size_bytes": 1
+    }
+  ]
+}

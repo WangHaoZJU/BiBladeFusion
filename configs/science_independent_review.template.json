@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "report_type": "biblade_fusion.geometry_science_independent_review_report",
+  "reviewed_at_utc": "REPLACE_WITH_CANONICAL_UTC_ISO8601",
+  "reviewer_id": "REPLACE_WITH_INDEPENDENT_REVIEWER_ID",
+  "operator_id": "REPLACE_WITH_ACQUISITION_OPERATOR_ID",
+  "decision": "accepted",
+  "notes": "REPLACE_WITH_NONEMPTY_INDEPENDENT_REVIEW_NOTES",
+  "science_runtime_contract_sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+  "geometry_evaluation_report_sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+  "raw_acceptance_asset_manifest_sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+  "checklist": {
+    "traceable_depth_reference_verified": false,
+    "distance_and_incidence_envelope_verified": false,
+    "front_back_and_both_fins_annotated": false,
+    "bootstrap_and_reference_masks_reviewed": false,
+    "final_mesh_holes_and_thickness_reviewed": false,
+    "raw_acceptance_assets_archived": false,
+    "independent_result_review_completed": false
+  }
+}

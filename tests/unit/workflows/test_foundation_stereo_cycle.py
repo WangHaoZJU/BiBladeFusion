@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
-from datetime import datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +33,7 @@ from biblade_fusion.workflows.foundation_stereo_cycle import (
     FoundationStereoCycleError,
     FoundationStereoOccupancyCycleEngine,
     _PendingPerceptionCommit,
+    _VerifiedSource,
 )
 from biblade_fusion.workflows.stop_scan_coordinator import CapturePurpose
 
@@ -54,9 +56,7 @@ def _bundle(view_id: str, sequence_index: int) -> SynchronizedFrameBundle:
     calibration = StereoCalibrationSnapshot(
         intrinsics,
         intrinsics,
-        PoseSE3.from_rotation_translation(
-            "right_ir", "left_ir", np.eye(3), (-0.05, 0.0, 0.0)
-        ),
+        PoseSE3.from_rotation_translation("right_ir", "left_ir", np.eye(3), (-0.05, 0.0, 0.0)),
         None,
     )
     image = np.zeros((3, 4), dtype=np.uint8)
@@ -100,8 +100,7 @@ class FakeAcquirer:
     def capture(self, view_id: str, sequence_index: int) -> SynchronizedFrameBundle:
         self.calls += 1
         self.sampler_active_during_capture = any(
-            thread.name == "bbf-foundation-stereo-stationarity"
-            and thread.is_alive()
+            thread.name == "bbf-foundation-stereo-stationarity" and thread.is_alive()
             for thread in threading.enumerate()
         )
         return _bundle(view_id, sequence_index)
@@ -129,8 +128,298 @@ class UnusedRenderer:
         raise AssertionError
 
 
+def _capture_engine(
+    tmp_path: Path,
+    *,
+    acquirer_type=FakeAcquirer,
+) -> tuple[FoundationStereoOccupancyCycleEngine, FakeAcquirer]:
+    stereo_calibration = tmp_path / "stereo.yaml"
+    hand_eye_path = tmp_path / "hand-eye.yaml"
+    stereo_calibration.write_text("calibration: test\n", encoding="utf-8")
+    hand_eye_path.write_text("hand_eye: test\n", encoding="utf-8")
+    settings = load_settings("configs/default.yaml")
+    settings = settings.model_copy(
+        update={
+            "realsense": settings.realsense.model_copy(
+                update={"stereo_calibration_path": stereo_calibration}
+            ),
+            "occupancy": OccupancyConfig(
+                enabled=True,
+                workspace_bounds_min_m=(-0.2, -0.2, -0.2),
+                workspace_bounds_max_m=(0.2, 0.2, 0.2),
+            ),
+        }
+    )
+    source = FakeStateSource()
+    acquirer = acquirer_type(source)
+    tcp_t_left_ir = PoseSE3.identity("tcp", "left_ir")
+    engine = FoundationStereoOccupancyCycleEngine(
+        settings=settings,
+        acquirer=acquirer,
+        state_source=source,
+        backend=FoundationStereoBackend(settings.foundation_stereo),
+        hand_eye=HandEyeCalibration(
+            tcp_t_left_ir,
+            "synthetic",
+            20,
+            0.001,
+            0.1,
+            hand_eye_path,
+            flange_t_left_ir=load_es68_flange_t_tcp().compose(tcp_t_left_ir),
+        ),
+        renderer=UnusedRenderer(),
+        output_root=tmp_path / "run",
+    )
+    return engine, acquirer
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _window_source(
+    tmp_path: Path,
+    *,
+    sequence_index: int,
+    monotonic_time_ns: int,
+    captured_at_utc: datetime,
+) -> _VerifiedSource:
+    bundle = _bundle(f"view-{sequence_index}", sequence_index)
+    bundle = replace(
+        bundle,
+        stereo=replace(bundle.stereo, monotonic_time_ns=monotonic_time_ns),
+    )
+    captured = SimpleNamespace(bundle=bundle, captured_at_utc=captured_at_utc)
+    return _VerifiedSource(
+        captured=captured,
+        stereo=SimpleNamespace(),
+        stereo_path=tmp_path / f"stereo-{sequence_index}",
+        stereo_metadata_sha256="1" * 64,
+        session_manifest_sha256="2" * 64,
+        session_view_metadata_sha256="3" * 64,
+    )
+
+
+def test_source_window_uses_monotonic_capture_gap_not_wall_clock(tmp_path: Path) -> None:
+    engine, _ = _capture_engine(tmp_path)
+    stop = engine._settings.stop_and_capture.model_copy(  # noqa: SLF001
+        update={"maximum_operator_reposition_interval_s": 2.0}
+    )
+    engine._settings = engine._settings.model_copy(  # noqa: SLF001
+        update={"stop_and_capture": stop}
+    )
+    now = datetime(2026, 8, 29, tzinfo=UTC)
+    engine._utc_clock = lambda: now  # noqa: SLF001
+    first = _window_source(
+        tmp_path,
+        sequence_index=0,
+        monotonic_time_ns=1_000_000_000,
+        captured_at_utc=now - timedelta(seconds=1),
+    )
+    # Deliberately jump the wall clock backwards while the capture clock advances.
+    second = _window_source(
+        tmp_path,
+        sequence_index=1,
+        monotonic_time_ns=2_000_000_000,
+        captured_at_utc=now - timedelta(seconds=2),
+    )
+    engine._sources = [first]  # noqa: SLF001
+
+    assert engine._fresh_rebuild_sources(second) == (first, second)  # noqa: SLF001
+
+
+def test_source_window_discards_prefix_after_monotonic_gap(tmp_path: Path) -> None:
+    engine, _ = _capture_engine(tmp_path)
+    stop = engine._settings.stop_and_capture.model_copy(  # noqa: SLF001
+        update={"maximum_operator_reposition_interval_s": 2.0}
+    )
+    engine._settings = engine._settings.model_copy(  # noqa: SLF001
+        update={"stop_and_capture": stop}
+    )
+    now = datetime(2026, 8, 29, tzinfo=UTC)
+    engine._utc_clock = lambda: now  # noqa: SLF001
+    first = _window_source(
+        tmp_path,
+        sequence_index=0,
+        monotonic_time_ns=1_000_000_000,
+        captured_at_utc=now - timedelta(seconds=3),
+    )
+    second = _window_source(
+        tmp_path,
+        sequence_index=1,
+        monotonic_time_ns=4_000_000_001,
+        captured_at_utc=now - timedelta(seconds=2),
+    )
+    third = _window_source(
+        tmp_path,
+        sequence_index=2,
+        monotonic_time_ns=5_000_000_001,
+        captured_at_utc=now - timedelta(seconds=1),
+    )
+    engine._sources = [first, second]  # noqa: SLF001
+
+    assert engine._fresh_rebuild_sources(third) == (second, third)  # noqa: SLF001
+
+
+def test_source_window_rejects_nonadvancing_monotonic_capture_clock(
+    tmp_path: Path,
+) -> None:
+    engine, _ = _capture_engine(tmp_path)
+    stop = engine._settings.stop_and_capture.model_copy(  # noqa: SLF001
+        update={"maximum_operator_reposition_interval_s": 2.0}
+    )
+    engine._settings = engine._settings.model_copy(  # noqa: SLF001
+        update={"stop_and_capture": stop}
+    )
+    now = datetime(2026, 8, 29, tzinfo=UTC)
+    engine._utc_clock = lambda: now  # noqa: SLF001
+    first = _window_source(
+        tmp_path,
+        sequence_index=0,
+        monotonic_time_ns=1_000_000_000,
+        captured_at_utc=now - timedelta(seconds=2),
+    )
+    second = _window_source(
+        tmp_path,
+        sequence_index=1,
+        monotonic_time_ns=1_000_000_000,
+        captured_at_utc=now - timedelta(seconds=1),
+    )
+    engine._sources = [first]  # noqa: SLF001
+
+    with pytest.raises(FoundationStereoCycleError, match="did not advance"):
+        engine._fresh_rebuild_sources(second)  # noqa: SLF001
+
+
+def test_failed_physical_attempt_is_retained_and_same_logical_key_retries(
+    tmp_path: Path,
+) -> None:
+    class FailOnceAcquirer(FakeAcquirer):
+        def capture(self, view_id: str, sequence_index: int) -> SynchronizedFrameBundle:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("synthetic camera failure")
+            return _bundle(view_id, sequence_index)
+
+    engine, acquirer = _capture_engine(tmp_path, acquirer_type=FailOnceAcquirer)
+
+    with pytest.raises(RuntimeError, match="camera failure"):
+        engine.capture("same-logical-view", 0, purpose=CapturePurpose.BOOTSTRAP)
+
+    failed_attempts = sorted((tmp_path / "run" / "cycles" / "000000_same-logical-view").iterdir())
+    assert len(failed_attempts) == 1
+    assert failed_attempts[0].name.startswith("attempt_")
+    failed_manifests = tuple((failed_attempts[0] / "raw").glob("*/manifest.json"))
+    assert len(failed_manifests) == 1
+    failed_manifest = json.loads(failed_manifests[0].read_text(encoding="utf-8"))
+    assert failed_manifest["status"] == "failed"
+
+    captured = engine.capture(
+        "same-logical-view",
+        0,
+        purpose=CapturePurpose.BOOTSTRAP,
+    )
+
+    attempts = sorted(captured.cycle_root.parent.iterdir())
+    assert len(attempts) == 2
+    assert attempts[0] != attempts[1]
+    assert captured.cycle_root != failed_attempts[0]
+    assert acquirer.calls == 2
+    engine.cancel_pending_capture(captured)
+
+
+def test_concurrent_capture_cannot_duplicate_one_physical_attempt(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingAcquirer(FakeAcquirer):
+        def capture(self, view_id: str, sequence_index: int) -> SynchronizedFrameBundle:
+            self.calls += 1
+            entered.set()
+            assert release.wait(timeout=2.0)
+            return _bundle(view_id, sequence_index)
+
+    engine, acquirer = _capture_engine(tmp_path, acquirer_type=BlockingAcquirer)
+    captured: list[object] = []
+    failures: list[BaseException] = []
+
+    def first_capture() -> None:
+        try:
+            captured.append(engine.capture("concurrent", 0, purpose=CapturePurpose.BOOTSTRAP))
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=first_capture)
+    worker.start()
+    assert entered.wait(timeout=2.0)
+    with pytest.raises(FoundationStereoCycleError, match="still awaiting"):
+        engine.capture("concurrent", 0, purpose=CapturePurpose.BOOTSTRAP)
+    release.set()
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert len(captured) == 1
+    assert acquirer.calls == 1
+    engine.cancel_pending_capture(captured[0])
+
+
+class _DriftingScienceAuthority:
+    def __init__(self, *, fail_on_current_call: int) -> None:
+        self.fail_on_current_call = fail_on_current_call
+        self.current_calls = 0
+
+    def assert_current(self, _settings) -> None:
+        self.current_calls += 1
+        if self.current_calls == self.fail_on_current_call:
+            raise ValueError("synthetic science runtime drift")
+
+    def assert_inference_observation(self, _observation) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("fail_on_current_call", "expected_backend_calls"),
+    [(1, 0), (2, 1)],
+)
+def test_science_authority_is_rechecked_immediately_before_and_after_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_on_current_call: int,
+    expected_backend_calls: int,
+) -> None:
+    engine, _ = _capture_engine(tmp_path)
+    captured = engine.capture("authority-window", 0, purpose=CapturePurpose.BOOTSTRAP)
+    authority = _DriftingScienceAuthority(
+        fail_on_current_call=fail_on_current_call,
+    )
+    engine._science_authority = authority
+    engine._science_authority_settings = engine._settings.model_copy(deep=True)
+    backend_calls: list[str] = []
+    monkeypatch.setattr(
+        cycle_module,
+        "infer_rectified_stereo",
+        lambda *_args, **_kwargs: backend_calls.append("infer") or SimpleNamespace(),
+    )
+
+    with pytest.raises(ValueError, match="science runtime drift"):
+        engine.infer_and_update(captured)
+
+    assert backend_calls == ["infer"] * expected_backend_calls
+    assert authority.current_calls == fail_on_current_call
+
+
+def test_committed_logical_key_rejects_before_camera_attempt(tmp_path: Path) -> None:
+    engine, acquirer = _capture_engine(tmp_path)
+    logical_root = tmp_path / "run" / "cycles" / "000005_committed"
+    logical_root.mkdir(parents=True)
+    (logical_root / "committed.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(FoundationStereoCycleError, match="already committed"):
+        engine.capture("committed", 5, purpose=CapturePurpose.BOOTSTRAP)
+
+    assert acquirer.calls == 0
+    assert tuple(logical_root.iterdir()) == (logical_root / "committed.json",)
 
 
 def test_each_capture_is_a_separate_closed_single_view_session(tmp_path: Path) -> None:
@@ -193,9 +482,7 @@ def test_each_capture_is_a_separate_closed_single_view_session(tmp_path: Path) -
     first_manifest = first.raw_session_path / "manifest.json"
     first_hash = _sha256(first_manifest)
     first_payload = json.loads(first_manifest.read_text(encoding="utf-8"))
-    assert first.captured_at_utc == datetime.fromisoformat(
-        first_payload["created_at_utc"]
-    )
+    assert first.captured_at_utc == datetime.fromisoformat(first_payload["created_at_utc"])
     engine.cancel_pending_capture(first)
     second = engine.capture(
         "bootstrap-right",
@@ -219,7 +506,7 @@ def test_each_capture_is_a_separate_closed_single_view_session(tmp_path: Path) -
     engine.cancel_pending_capture(second)
 
 
-def test_duplicate_cycle_identity_fails_before_recapture(tmp_path: Path) -> None:
+def test_pending_identity_blocks_but_cancelled_identity_can_retry(tmp_path: Path) -> None:
     stereo_calibration = tmp_path / "stereo.yaml"
     hand_eye_path = tmp_path / "hand-eye.yaml"
     stereo_calibration.write_text("calibration: test\n", encoding="utf-8")
@@ -260,6 +547,9 @@ def test_duplicate_cycle_identity_fails_before_recapture(tmp_path: Path) -> None
     with pytest.raises(FoundationStereoCycleError, match="still awaiting inference"):
         engine.capture("same", 0, purpose=CapturePurpose.BOOTSTRAP)
     engine.cancel_pending_capture(captured)
+    retried = engine.capture("same", 0, purpose=CapturePurpose.BOOTSTRAP)
+    assert retried.cycle_root != captured.cycle_root
+    engine.cancel_pending_capture(retried)
 
 
 def _engine_with_pending_transaction(
@@ -269,6 +559,8 @@ def _engine_with_pending_transaction(
     reconstructed_view_path: Path | None = None,
     coverage_path: Path | None = None,
     coverage_metadata_sha256: str | None = None,
+    coarse_scan_view_path: Path | None = None,
+    coarse_scan_metadata_sha256: str | None = None,
 ) -> tuple[
     FoundationStereoOccupancyCycleEngine,
     SimpleNamespace,
@@ -279,8 +571,10 @@ def _engine_with_pending_transaction(
     engine = object.__new__(FoundationStereoOccupancyCycleEngine)
     engine._pending_lock = threading.Lock()
     engine._pending_key = None
+    engine._pending_attempt_root = None
     engine._pending_sampler = None
     engine._poisoned_reason = None
+    engine._capture_roots = {}
     engine._sources = ["accepted-source"]
     accepted = (tmp_path / "accepted-coverage").resolve()
     proposed = (tmp_path / "proposed-coverage").resolve()
@@ -288,23 +582,44 @@ def _engine_with_pending_transaction(
     cycle_root = (tmp_path / "cycle").resolve()
     cycle_root.mkdir(exist_ok=True)
     key = ("candidate-001", 7)
-    captured = SimpleNamespace(
-        bundle=SimpleNamespace(view_id=key[0], sequence_index=key[1]),
-        cycle_root=cycle_root,
-    )
     occupancy_path = cycle_root / "occupancy"
+    raw_session_path = cycle_root / "raw"
+    stereo_path = cycle_root / "stereo"
+    stationarity_path = cycle_root / "inference_stationarity.json"
+    captured = SimpleNamespace(
+        bundle=SimpleNamespace(
+            view_id=key[0],
+            sequence_index=key[1],
+            stereo=SimpleNamespace(frame_number=19),
+        ),
+        cycle_root=cycle_root,
+        raw_session_path=raw_session_path,
+    )
     stationarity_sha256 = "a" * 64
     result = SimpleNamespace(
+        raw_session_path=raw_session_path,
+        stereo_inference_path=stereo_path,
         occupancy_mapping_path=occupancy_path,
+        inference_stationarity_path=stationarity_path,
         inference_stationarity_sha256=stationarity_sha256,
+        stored_occupancy=SimpleNamespace(),
         blade_foreground_path=blade_foreground_path,
         reconstructed_view_path=reconstructed_view_path,
         coverage_path=coverage_path,
+        coarse_scan_view_path=coarse_scan_view_path,
     )
     engine._pending_commit = _PendingPerceptionCommit(
         key=key,
         cycle_root=cycle_root,
+        raw_session_path=raw_session_path,
+        raw_session_manifest_sha256="1" * 64,
+        raw_session_view_metadata_sha256="2" * 64,
+        stereo_inference_path=stereo_path,
+        stereo_metadata_sha256="3" * 64,
         occupancy_mapping_path=occupancy_path,
+        occupancy_metadata_sha256="4" * 64,
+        occupancy_binding=("synthetic",),
+        inference_stationarity_path=stationarity_path,
         inference_stationarity_sha256=stationarity_sha256,
         sources=("proposed-source",),
         blade_foreground_path=blade_foreground_path,
@@ -312,8 +627,156 @@ def _engine_with_pending_transaction(
         coverage_path=coverage_path,
         coverage_metadata_sha256=coverage_metadata_sha256,
         accepted_coverage_path_after_commit=proposed,
+        coarse_scan_view_path=coarse_scan_view_path,
+        coarse_scan_metadata_sha256=coarse_scan_metadata_sha256,
     )
     return engine, captured, result
+
+
+def _materialize_pinned_core_authority(
+    engine: FoundationStereoOccupancyCycleEngine,
+    captured: SimpleNamespace,
+) -> dict[str, Path]:
+    pending = engine._pending_commit
+    assert pending is not None
+    view_root = pending.raw_session_path / "views" / "0000_candidate"
+    view_root.mkdir(parents=True)
+    view_metadata = view_root / "metadata.json"
+    view_metadata.write_text('{"raw":"view"}\n', encoding="utf-8")
+    manifest = pending.raw_session_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "views": [
+                    {
+                        "view_id": captured.bundle.view_id,
+                        "sequence_index": captured.bundle.sequence_index,
+                        "path": "views/0000_candidate",
+                    }
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pending.stereo_inference_path.mkdir()
+    stereo_metadata = pending.stereo_inference_path / "metadata.json"
+    stereo_metadata.write_text('{"stereo":"authority"}\n', encoding="utf-8")
+    pending.occupancy_mapping_path.mkdir()
+    occupancy_metadata = pending.occupancy_mapping_path / "metadata.json"
+    occupancy_metadata.write_text('{"occupancy":"authority"}\n', encoding="utf-8")
+    pending.inference_stationarity_path.write_text(
+        '{"stationarity":"authority"}\n',
+        encoding="utf-8",
+    )
+    engine._pending_commit = replace(
+        pending,
+        raw_session_manifest_sha256=_sha256(manifest),
+        raw_session_view_metadata_sha256=_sha256(view_metadata),
+        stereo_metadata_sha256=_sha256(stereo_metadata),
+        occupancy_metadata_sha256=_sha256(occupancy_metadata),
+        inference_stationarity_sha256=_sha256(pending.inference_stationarity_path),
+    )
+    return {
+        "raw": manifest,
+        "view": view_metadata,
+        "stereo": stereo_metadata,
+        "stationarity": pending.inference_stationarity_path,
+        "occupancy": occupancy_metadata,
+    }
+
+
+@pytest.mark.parametrize(
+    "authority_name",
+    ["raw", "view", "stereo", "stationarity", "occupancy"],
+)
+def test_each_core_disk_authority_is_rechecked_at_commit(
+    tmp_path: Path,
+    authority_name: str,
+) -> None:
+    engine, captured, result = _engine_with_pending_transaction(tmp_path)
+    files = _materialize_pinned_core_authority(engine, captured)
+    files[authority_name].write_text(
+        files[authority_name].read_text(encoding="utf-8") + " ",
+        encoding="utf-8",
+    )
+    result.inference_stationarity_sha256 = engine._pending_commit.inference_stationarity_sha256
+
+    with pytest.raises(FoundationStereoCycleError, match="disk authority"):
+        engine.commit_perception_cycle(captured, result)
+
+    assert engine._pending_commit is not None
+    assert engine._capture_roots == {}
+
+
+def test_semantic_identity_is_rechecked_after_hashes_at_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, captured, result = _engine_with_pending_transaction(tmp_path)
+    _materialize_pinned_core_authority(engine, captured)
+    pending = engine._pending_commit
+    assert pending is not None
+    result.inference_stationarity_sha256 = pending.inference_stationarity_sha256
+    calls: list[str] = []
+    observation = SimpleNamespace(
+        source_view_id="wrong-view",
+        source_sequence_index=captured.bundle.sequence_index,
+        rectified=SimpleNamespace(
+            source_frame_number=captured.bundle.stereo.frame_number,
+        ),
+    )
+    monkeypatch.setattr(
+        cycle_module,
+        "read_stereo_inference",
+        lambda path: calls.append("stereo") or SimpleNamespace(observation=observation),
+    )
+    monkeypatch.setattr(
+        cycle_module,
+        "verify_stereo_inference_source",
+        lambda stored, *, expected_session: calls.append("raw-source"),
+    )
+    monkeypatch.setattr(
+        cycle_module,
+        "read_inference_stationarity",
+        lambda path: (
+            calls.append("stationarity")
+            or SimpleNamespace(
+                view_id=captured.bundle.view_id,
+                sequence_index=captured.bundle.sequence_index,
+                source_session_manifest_path=(pending.raw_session_path / "manifest.json").resolve(),
+                source_session_manifest_sha256=pending.raw_session_manifest_sha256,
+            )
+        ),
+    )
+    mapping = SimpleNamespace(
+        frame_evidence=(
+            SimpleNamespace(
+                source_view_id=captured.bundle.view_id,
+                source_sequence_index=captured.bundle.sequence_index,
+                frame_number=captured.bundle.stereo.frame_number,
+                source_stereo_metadata_sha256=pending.stereo_metadata_sha256,
+                source_session_manifest_sha256=pending.raw_session_manifest_sha256,
+                source_session_view_metadata_sha256=(pending.raw_session_view_metadata_sha256),
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        cycle_module,
+        "read_occupancy_mapping",
+        lambda path: calls.append("occupancy") or mapping,
+    )
+    monkeypatch.setattr(
+        cycle_module.OccupancyBinding,
+        "from_mapping",
+        classmethod(lambda cls, value: SimpleNamespace(tuple=pending.occupancy_binding)),
+    )
+
+    with pytest.raises(FoundationStereoCycleError, match="identity or binding"):
+        engine.commit_perception_cycle(captured, result)
+
+    assert calls == ["stereo", "raw-source", "stationarity", "occupancy"]
+    assert engine._capture_roots == {}
 
 
 def test_cancel_pending_science_transaction_does_not_advance_coverage_or_sources(
@@ -333,6 +796,68 @@ def test_cancel_pending_science_transaction_does_not_advance_coverage_or_sources
     assert engine._pending_commit is None
     assert engine.accepted_coverage_path == accepted_before
     assert engine._sources == sources_before
+
+
+def test_only_successful_commit_occupies_the_logical_capture_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, captured, result = _engine_with_pending_transaction(tmp_path)
+    key = (captured.bundle.view_id, captured.bundle.sequence_index)
+    assert key not in engine._capture_roots
+    monkeypatch.setattr(
+        engine,
+        "_reverify_pending_authority",
+        lambda captured, result, pending: None,
+    )
+
+    engine.commit_perception_cycle(captured, result)
+
+    assert engine._pending_commit is None
+    assert engine._capture_roots == {key: captured.cycle_root}
+    marker = captured.cycle_root.parent / "committed.json"
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["logical_identity"] == {
+        "view_id": key[0],
+        "sequence_index": key[1],
+    }
+    assert payload["accepted_attempt"]["root"] == str(captured.cycle_root)
+
+
+def test_deadline_at_marker_boundary_leaves_no_commit_or_source_advance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, captured, result = _engine_with_pending_transaction(tmp_path)
+    sources_before = list(engine._sources)
+    capture_roots_before = dict(engine._capture_roots)
+    monkeypatch.setattr(
+        engine,
+        "_reverify_pending_authority",
+        lambda captured, result, pending: None,
+    )
+    stages: list[str] = []
+
+    def deadline_gate(stage: str) -> None:
+        stages.append(stage)
+        if stage == "before_logical_commit_marker_link":
+            raise TimeoutError("synthetic perception deadline")
+
+    with pytest.raises(TimeoutError, match="perception deadline"):
+        engine.commit_perception_cycle(
+            captured,
+            result,
+            before_commit=deadline_gate,
+        )
+
+    logical_root = captured.cycle_root.parent
+    assert "before_logical_commit_temporary_write" in stages
+    assert "before_logical_commit_marker_link" in stages
+    assert not (logical_root / "committed.json").exists()
+    assert list(logical_root.glob(".committed.*.partial")) == []
+    assert engine._sources == sources_before
+    assert engine._capture_roots == capture_roots_before
+    assert engine._pending_commit is not None
 
 
 def test_tampered_pending_coverage_fails_without_advancing_engine_state(
@@ -383,4 +908,79 @@ def test_failed_pending_science_readback_does_not_advance_engine_state(
 
     assert engine.accepted_coverage_path == accepted_before
     assert engine._sources == sources_before
+    assert engine._pending_commit is not None
+
+
+def test_coarse_science_hook_is_stopped_transaction_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import biblade_fusion.storage.coarse_scan as coarse_storage
+
+    cycle_root = (tmp_path / "cycle").resolve()
+    coarse_path = cycle_root / "coarse_scan_view"
+    coarse_path.mkdir(parents=True)
+    calls = []
+    monkeypatch.setattr(
+        coarse_storage,
+        "read_coarse_scan_view",
+        lambda path: calls.append(Path(path).resolve()),
+    )
+    engine = object.__new__(FoundationStereoOccupancyCycleEngine)
+    engine._coarse_science_preparer = lambda *args: coarse_path
+    captured = SimpleNamespace(
+        purpose=CapturePurpose.CANDIDATE,
+        cycle_root=cycle_root,
+    )
+
+    result = engine._prepare_coarse_science_asset(
+        captured,
+        SimpleNamespace(),
+        cycle_root / "stereo",
+        SimpleNamespace(),
+        cycle_root / "occupancy",
+    )
+
+    assert result == coarse_path
+    assert calls == [coarse_path]
+
+
+def test_coarse_science_hook_cannot_escape_cycle_root(tmp_path: Path) -> None:
+    cycle_root = (tmp_path / "cycle").resolve()
+    cycle_root.mkdir()
+    escaped = (tmp_path / "escaped").resolve()
+    escaped.mkdir()
+    engine = object.__new__(FoundationStereoOccupancyCycleEngine)
+    engine._coarse_science_preparer = lambda *args: escaped
+    captured = SimpleNamespace(
+        purpose=CapturePurpose.BOOTSTRAP,
+        cycle_root=cycle_root,
+    )
+
+    with pytest.raises(FoundationStereoCycleError, match="direct child"):
+        engine._prepare_coarse_science_asset(
+            captured,
+            SimpleNamespace(),
+            cycle_root / "stereo",
+            SimpleNamespace(),
+            cycle_root / "occupancy",
+        )
+
+
+def test_tampered_pending_coarse_asset_does_not_commit(tmp_path: Path) -> None:
+    coarse = (tmp_path / "cycle" / "coarse_scan_view").resolve()
+    coarse.mkdir(parents=True)
+    metadata = coarse / "metadata.json"
+    metadata.write_text('{"generation":"original"}\n', encoding="utf-8")
+    engine, captured, result = _engine_with_pending_transaction(
+        tmp_path,
+        coarse_scan_view_path=coarse,
+        coarse_scan_metadata_sha256=_sha256(metadata),
+    )
+    metadata.write_text('{"generation":"tampered"}\n', encoding="utf-8")
+
+    with pytest.raises(FoundationStereoCycleError, match="coarse-scan metadata"):
+        engine.commit_perception_cycle(captured, result)
+
+    assert engine._sources == ["accepted-source"]
     assert engine._pending_commit is not None

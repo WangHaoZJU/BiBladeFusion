@@ -1,0 +1,22 @@
+{
+  "workcell_id": "REPLACE_WITH_PHYSICAL_WORKCELL_ID",
+  "operator_id": "REPLACE_WITH_OPERATOR_ID",
+  "accepted_at_utc": "2026-08-29T00:00:00+00:00",
+  "workspace_bounds_m": {
+    "minimum": [-0.8, -0.8, 0.0],
+    "maximum": [0.8, 0.8, 1.6]
+  },
+  "accepted_static_free_aabbs": [
+    {
+      "name": "REPLACE_WITH_MEASURED_ROBOT_STAGING_VOLUME",
+      "minimum_m": [-0.4, -0.4, 0.0],
+      "maximum_m": [0.4, 0.4, 0.8]
+    }
+  ],
+  "checklist": {
+    "final_collision_assembly_verified": false,
+    "workcell_cleared_verified": false,
+    "emergency_stop_verified": false,
+    "low_speed_known_safe_path_verified": false
+  }
+}

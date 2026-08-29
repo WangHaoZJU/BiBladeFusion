@@ -9,6 +9,7 @@ import pytest
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     MultiViewFusionConfig,
+    ReacquisitionPerturbationConfig,
     SurfacePartitionConfig,
     SurfaceQualityConfig,
     TSDFConfig,
@@ -22,6 +23,7 @@ from biblade_fusion.perception.surface import (
     SurfaceRegion,
     derive_usable_footprint,
     generate_curved_view_plan,
+    generate_reacquisition_view,
     partition_curved_blade,
 )
 from biblade_fusion.perception.tsdf import integrate_bilateral_tsdf
@@ -215,6 +217,58 @@ def test_paper_partition_has_real_normals_obb_edges_and_adaptive_patches() -> No
         assert candidate.projection_fraction == pytest.approx(1.0)
         assert candidate.visibility_fraction >= 0.90
         assert candidate.distance_policy.startswith("adaptive_")
+
+
+def test_reacquisition_view_is_a_calibrated_bounded_target_centred_orbit() -> None:
+    calibration = _non_identity_rectification()
+    surface = partition_curved_blade(
+        fuse_registered_views(_blade_views(), _fusion_config()),
+        _partition_config(),
+    )
+    plan = generate_curved_view_plan(
+        surface,
+        _intrinsics(),
+        _planning_config(),
+        _partition_config(),
+        left_rectified_t_left_ir=calibration,
+    )
+    nominal = plan.candidates[0]
+    nominal_rectified = plan.candidate_base_t_left_rectified[0]
+    perturbation = ReacquisitionPerturbationConfig(
+        distance_offset_m=-0.02,
+        tilt_deg=10.0,
+        azimuth_deg=45.0,
+    )
+
+    retry, retry_rectified = generate_reacquisition_view(
+        nominal,
+        nominal_rectified,
+        calibration,
+        perturbation,
+        view_id="fine_reacq_unit_01",
+        minimum_standoff_distance_m=0.10,
+        maximum_standoff_distance_m=0.40,
+    )
+
+    target_to_camera = retry_rectified.translation_m - retry.patch.target_m
+    direction = target_to_camera / np.linalg.norm(target_to_camera)
+    assert retry.view_id == "fine_reacq_unit_01"
+    assert retry.patch is nominal.patch
+    assert retry.standoff_distance_m == pytest.approx(
+        nominal.standoff_distance_m - 0.02
+    )
+    assert np.linalg.norm(target_to_camera) == pytest.approx(retry.standoff_distance_m)
+    assert direction @ retry.patch.outward_normal == pytest.approx(cos(radians(10.0)))
+    assert np.linalg.det(retry_rectified.rotation) == pytest.approx(1.0)
+    np.testing.assert_allclose(
+        retry.base_t_left_ir.matrix,
+        retry_rectified.compose(calibration).matrix,
+        rtol=0.0,
+        atol=1e-12,
+    )
+    assert retry.projection_fraction <= nominal.projection_fraction
+    assert retry.visibility_fraction <= nominal.visibility_fraction
+    assert retry.distance_policy.endswith("bounded_reacquisition_v1")
 
 
 def test_non_identity_rectification_converts_rectified_look_at_pose_to_raw() -> None:

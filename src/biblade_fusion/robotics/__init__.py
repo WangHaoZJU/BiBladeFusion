@@ -33,6 +33,7 @@ from biblade_fusion.robotics.motion_preflight import (
 )
 from biblade_fusion.robotics.occupancy_collision import (
     OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH,
+    AcceptedStaticFreeAabb,
     JointPathOccupancyCollisionReport,
     OccupancyCollisionCheckResult,
     OccupancyEvidenceError,
@@ -41,6 +42,7 @@ from biblade_fusion.robotics.occupancy_collision import (
     OccupancyRobotCollisionChecker,
     OccupancySemanticAttestation,
     RobotEnvelopeSphere,
+    SweptOccupancyProofEvidence,
     occupancy_evidence_from_snapshot,
 )
 from biblade_fusion.robotics.pinocchio_collision import (
@@ -49,13 +51,16 @@ from biblade_fusion.robotics.pinocchio_collision import (
     Cs68PinocchioCollisionChecker,
     Es68PinocchioCollisionChecker,
     JointPathMeshCollisionReport,
+    SweptMeshProofEvidence,
 )
 from biblade_fusion.robotics.provenance import HOLOROBOT_SOURCE_COMMIT
 from biblade_fusion.robotics.stationarity import (
+    BootstrapSafeStateEvidence,
     StationarityError,
     StationarityEvidence,
     StationarityTimeoutError,
     validate_stationary_trace,
+    wait_until_bootstrap_safe_state,
     wait_until_settled,
 )
 
@@ -81,6 +86,7 @@ __all__ = [
     "MotionPreflightStatus",
     "MotionExecutionPermit",
     "JointPathOccupancyCollisionReport",
+    "AcceptedStaticFreeAabb",
     "OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH",
     "OccupancyCollisionCheckResult",
     "OccupancyEvidenceError",
@@ -89,6 +95,9 @@ __all__ = [
     "OccupancyRobotCollisionChecker",
     "OccupancySemanticAttestation",
     "RobotEnvelopeSphere",
+    "SweptMeshProofEvidence",
+    "SweptOccupancyProofEvidence",
+    "BootstrapSafeStateEvidence",
     "StationarityError",
     "StationarityEvidence",
     "StationarityTimeoutError",
@@ -100,6 +109,7 @@ __all__ = [
     "es68_d435i_robot_geometry_hash",
     "load_es68_flange_t_tcp",
     "validate_stationary_trace",
+    "wait_until_bootstrap_safe_state",
     "wait_until_settled",
     "write_es68_d435i_collision_urdf",
 ]

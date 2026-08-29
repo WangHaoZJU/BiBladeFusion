@@ -44,6 +44,7 @@ from biblade_fusion.supervision.snapshot import (
     TransformSnapshot,
 )
 from biblade_fusion.supervision.storage import AtomicSupervisorySnapshotWriter
+from biblade_fusion.workflows.occupancy_mapping import occupancy_physical_source_id
 
 
 def _sha256(path: Path) -> str:
@@ -111,8 +112,7 @@ def _coverage(
     selected = [
         item
         for item in patches
-        if str(item.get("side")) == side
-        and str(item.get("region", "")).startswith("fin_") is fin
+        if str(item.get("side")) == side and str(item.get("region", "")).startswith("fin_") is fin
     ]
     weights = np.asarray(
         [max(0, int(item.get("reference_point_count", 0))) for item in selected],
@@ -139,9 +139,7 @@ def _registration_rmse(refinements: list[dict[str, Any]]) -> float | None:
     ]
     if not accepted:
         return None
-    weights = np.asarray(
-        [int(item["correspondence_count"]) for item in accepted], dtype=np.float64
-    )
+    weights = np.asarray([int(item["correspondence_count"]) for item in accepted], dtype=np.float64)
     values = np.asarray([float(item["rmse_after_m"]) for item in accepted])
     if not np.all(np.isfinite(values)) or np.any(values < 0.0):
         raise ValueError("Coarse-model accepted registration RMSE is invalid")
@@ -185,12 +183,12 @@ class _OccupancySourceBinding:
 
 def _occupancy_source_bindings(
     stored_occupancy: Any,
-) -> dict[tuple[str, int, int], _OccupancySourceBinding]:
+) -> dict[str, _OccupancySourceBinding]:
     records = stored_occupancy.metadata["frames"]
     evidence_items = stored_occupancy.frame_evidence
     if len(records) != len(evidence_items):
         raise ValueError("Occupancy frame records and evidence have different lengths")
-    bindings: dict[tuple[str, int, int], _OccupancySourceBinding] = {}
+    bindings: dict[str, _OccupancySourceBinding] = {}
     for index, (record, evidence) in enumerate(zip(records, evidence_items, strict=True)):
         session_root = _source_root(
             record["sources"]["session"], label=f"occupancy session {index}"
@@ -199,11 +197,7 @@ def _occupancy_source_bindings(
             record["sources"]["stereo_inference"],
             label=f"occupancy stereo inference {index}",
         )
-        key = (
-            evidence.source_view_id,
-            evidence.source_sequence_index,
-            evidence.frame_number,
-        )
+        key = evidence.physical_source_id
         if key in bindings:
             raise ValueError(f"Ambiguous occupancy source identity: {key}")
         bindings[key] = _OccupancySourceBinding(evidence, session_root, stereo_root)
@@ -264,8 +258,7 @@ def _validate_reconstructed_view_binding(
         stereo.source_view_id != evidence.source_view_id
         or stereo.source_sequence_index != evidence.source_sequence_index
         or stereo.rectified.source_frame_number != evidence.frame_number
-        or Path(str(stored_stereo.metadata["source"]["session"])).resolve()
-        != binding.session_root
+        or Path(str(stored_stereo.metadata["source"]["session"])).resolve() != binding.session_root
     ):
         raise ValueError("bound stereo artifact disagrees with occupancy evidence")
     if view.planning_intrinsics != stereo.rectified.calibration.left:
@@ -301,9 +294,7 @@ def _validate_reconstructed_view_binding(
     ):
         raise ValueError("occupancy mapping context lacks pose-chain evidence")
     flange_t_tcp = _matrix(robot_context["flange_T_tcp"], label="flange_T_tcp")
-    flange_t_left_ir = _matrix(
-        hand_eye_context["flange_T_left_ir"], label="flange_T_left_ir"
-    )
+    flange_t_left_ir = _matrix(hand_eye_context["flange_T_left_ir"], label="flange_T_left_ir")
     left_rectified_t_left_ir = _matrix(
         rectified_context["left_rectified_T_left_ir"],
         label="left_rectified_T_left_ir",
@@ -316,9 +307,7 @@ def _validate_reconstructed_view_binding(
         hand_eye.get("flange_T_left_ir"),
         label="reconstructed flange_T_left_ir",
     )
-    stored_flange_t_tcp = _matrix(
-        hand_eye.get("flange_T_tcp"), label="reconstructed flange_T_tcp"
-    )
+    stored_flange_t_tcp = _matrix(hand_eye.get("flange_T_tcp"), label="reconstructed flange_T_tcp")
     if not np.allclose(
         stored_flange_t_left_ir,
         flange_t_left_ir,
@@ -334,9 +323,7 @@ def _validate_reconstructed_view_binding(
     authority = view.pose_authority
     if authority is None:
         raise ValueError("reconstructed view lacks authoritative joints-to-FK pose evidence")
-    expected_offsets = tuple(
-        float(value) for value in robot_context["joint_zero_offsets_rad"]
-    )
+    expected_offsets = tuple(float(value) for value in robot_context["joint_zero_offsets_rad"])
     if authority.joint_zero_offsets_rad != expected_offsets:
         raise ValueError("reconstructed view and occupancy use different joint offsets")
     authority_pairs = (
@@ -358,9 +345,7 @@ def _validate_reconstructed_view_binding(
     )
     for reconstructed, mapped, label in authority_pairs:
         if not np.allclose(reconstructed, mapped, atol=1e-9, rtol=0.0):
-            raise ValueError(
-                f"reconstructed {label} differs from occupancy pose evidence"
-            )
+            raise ValueError(f"reconstructed {label} differs from occupancy pose evidence")
     if not np.allclose(
         (
             authority.fk_tcp_translation_error_m,
@@ -390,15 +375,10 @@ def _validate_reconstructed_view_binding(
         raise ValueError("reconstructed and occupancy FK/TCP gates differ")
 
     expected_base_t_left_ir = (
-        _matrix(evidence.base_t_flange_matrix, label="base_T_flange")
-        @ flange_t_left_ir
+        _matrix(evidence.base_t_flange_matrix, label="base_T_flange") @ flange_t_left_ir
     )
-    expected_base_t_camera = expected_base_t_left_ir @ np.linalg.inv(
-        left_rectified_t_left_ir
-    )
-    if not np.allclose(
-        view.base_t_left_ir.matrix, expected_base_t_left_ir, atol=1e-9, rtol=0.0
-    ):
+    expected_base_t_camera = expected_base_t_left_ir @ np.linalg.inv(left_rectified_t_left_ir)
+    if not np.allclose(view.base_t_left_ir.matrix, expected_base_t_left_ir, atol=1e-9, rtol=0.0):
         raise ValueError("reconstructed base_T_left_ir differs from occupancy pose chain")
     if not np.allclose(
         view.base_t_projection_camera.matrix,
@@ -413,9 +393,7 @@ def _validate_reconstructed_view_binding(
         atol=1e-8,
         rtol=0.0,
     ):
-        raise ValueError(
-            "reconstructed base_T_camera differs from the mapped camera pose"
-        )
+        raise ValueError("reconstructed base_T_camera differs from the mapped camera pose")
 
     expected_mapping_camera = (
         _matrix(evidence.base_t_flange_matrix, label="base_T_flange")
@@ -433,7 +411,7 @@ def _validate_reconstructed_view_binding(
 
 def _coarse_model_provenance(
     metadata: Mapping[str, Any],
-    bindings: Mapping[tuple[str, int, int], _OccupancySourceBinding],
+    bindings: Mapping[str, _OccupancySourceBinding],
     *,
     mapping_context: Mapping[str, Any],
 ) -> tuple[Literal["CURRENT_RUN_VERIFIED", "INDEPENDENT_REFERENCE"], tuple[str, ...]]:
@@ -447,10 +425,19 @@ def _coarse_model_provenance(
                 raise ValueError("source record is not a mapping")
             stored_view = read_reconstructed_view(Path(str(source["path"])).resolve())
             view = stored_view.view
-            key = (
-                view.source_view_id,
-                view.source_sequence_index,
-                view.source_frame_number,
+            reconstructed_source = stored_view.metadata["source"]
+            session_root = Path(str(reconstructed_source["session"])).resolve()
+            session_reader = SessionReader(session_root)
+            descriptor = session_reader.descriptor(view.source_sequence_index)
+            view_metadata = (
+                session_root / descriptor.relative_path / "metadata.json"
+            ).resolve()
+            key = occupancy_physical_source_id(
+                source_session_manifest_sha256=_sha256(session_root / "manifest.json"),
+                source_session_view_metadata_sha256=_sha256(view_metadata),
+                source_sequence_index=view.source_sequence_index,
+                frame_number=view.source_frame_number,
+                source_view_id=view.source_view_id,
             )
             binding = bindings.get(key)
             if binding is None:
@@ -474,9 +461,7 @@ def _robot_scene_geometry(
     """Use the exact active renderer when its complete geometry hash matches evidence."""
 
     try:
-        renderer = Es68D435iRobotDepthRenderer.from_active_resources(
-            joint_zero_offsets_rad=offsets
-        )
+        renderer = Es68D435iRobotDepthRenderer.from_active_resources(joint_zero_offsets_rad=offsets)
         if renderer.model_content_hash != evidence.robot_model_hash:
             raise ValueError("robot_geometry_hash_mismatch")
         import pinocchio as pin
@@ -532,9 +517,7 @@ def _robot_scene_geometry(
             joint_zero_offsets_rad=offsets,
         )
         transforms = fallback.link_transforms(evidence.joint_positions_rad)
-        link_origins = np.stack(
-            [transforms[name][:3, 3] for name in CS68_COLLISION_LINK_NAMES]
-        )
+        link_origins = np.stack([transforms[name][:3, 3] for name in CS68_COLLISION_LINK_NAMES])
         reason = (
             "robot_visualization_geometry_hash_mismatch"
             if isinstance(exc, ValueError) and str(exc) == "robot_geometry_hash_mismatch"
@@ -566,9 +549,7 @@ def _historical_preflight(
         occupancy_record = sources.get("occupancy")
         if occupancy_record is None:
             raise ValueError("motion preflight has no bound occupancy source")
-        bound_occupancy = _source_root(
-            occupancy_record, label="motion-preflight occupancy"
-        )
+        bound_occupancy = _source_root(occupancy_record, label="motion-preflight occupancy")
         if bound_occupancy != occupancy_root.resolve():
             raise ValueError("motion preflight belongs to a different occupancy artifact")
         report = stored.report
@@ -636,8 +617,7 @@ def build_supervisory_replay_snapshot(
     stored_occupancy = read_occupancy_mapping_for_replay(occupancy_root)
     if (
         stored_occupancy.motion_eligible
-        or stored_occupancy.verification_status
-        != "integrity_only_unverified_for_motion"
+        or stored_occupancy.verification_status != "integrity_only_unverified_for_motion"
     ):
         raise ValueError("Supervisory replay requires permanently motion-ineligible occupancy")
     map_data = stored_occupancy.snapshot
@@ -653,19 +633,15 @@ def build_supervisory_replay_snapshot(
     bindings = _occupancy_source_bindings(stored_occupancy)
     frame_record = stored_occupancy.metadata["frames"][-1]
     evidence = stored_occupancy.frame_evidence[-1]
-    latest_key = (
-        evidence.source_view_id,
-        evidence.source_sequence_index,
-        evidence.frame_number,
-    )
+    latest_key = evidence.physical_source_id
     latest_binding = bindings.get(latest_key)
-    if latest_binding is None or evidence.source_view_id != map_data.source_view_ids[-1]:
+    if latest_binding is None or evidence.physical_source_id != map_data.source_view_ids[-1]:
         raise ValueError("Latest occupancy evidence does not match map source-view order")
 
     session_root = latest_binding.session_root
     latest_stereo_root = latest_binding.stereo_root
     session_reader = SessionReader(session_root)
-    bundle = session_reader.load_bundle(evidence.source_view_id)
+    bundle = session_reader.load_bundle(evidence.source_sequence_index)
     if (
         bundle.sequence_index != evidence.source_sequence_index
         or bundle.stereo.frame_number != evidence.frame_number
@@ -703,8 +679,7 @@ def build_supervisory_replay_snapshot(
         stereo.source_view_id != evidence.source_view_id
         or stereo.source_sequence_index != evidence.source_sequence_index
         or stereo.rectified.source_frame_number != evidence.frame_number
-        or Path(str(stored_stereo.metadata["source"]["session"])).resolve()
-        != session_root
+        or Path(str(stored_stereo.metadata["source"]["session"])).resolve() != session_root
     ):
         raise ValueError("Stereo artifact and occupancy evidence identify different sources")
     self_mask = _verified_array(
@@ -719,9 +694,7 @@ def build_supervisory_replay_snapshot(
     robot_context = mapping_context.get("robot")
     if not isinstance(robot_context, Mapping):
         raise ValueError("Occupancy mapping context has no robot contract")
-    offsets_array = np.asarray(
-        robot_context.get("joint_zero_offsets_rad"), dtype=np.float64
-    )
+    offsets_array = np.asarray(robot_context.get("joint_zero_offsets_rad"), dtype=np.float64)
     if offsets_array.shape != (6,) or not np.isfinite(offsets_array).all():
         raise ValueError("Occupancy mapping context has invalid ES68 joint-zero offsets")
     offsets = tuple(float(value) for value in offsets_array)
@@ -851,9 +824,7 @@ def build_supervisory_replay_snapshot(
 
     coarse_metadata: dict[str, Any] | None = None
     coarse_root: Path | None = None
-    coarse_provenance: Literal[
-        "CURRENT_RUN_VERIFIED", "INDEPENDENT_REFERENCE"
-    ] | None = None
+    coarse_provenance: Literal["CURRENT_RUN_VERIFIED", "INDEPENDENT_REFERENCE"] | None = None
     coarse_provenance_reasons: tuple[str, ...] = ()
     if source_coarse_model is not None:
         stored_coarse = read_coarse_model_summary(source_coarse_model)
@@ -940,9 +911,7 @@ def build_supervisory_replay_snapshot(
             mesh_vertices_reference = writer.write_array(
                 "robot_collision_mesh_vertices_base_m",
                 mesh_vertices,
-                semantic=(
-                    "verified active ES68-D435i collision-mesh vertices in base, metres"
-                ),
+                semantic=("verified active ES68-D435i collision-mesh vertices in base, metres"),
             )
             mesh_triangles_reference = writer.write_array(
                 "robot_collision_mesh_triangles",
@@ -1045,9 +1014,7 @@ def build_supervisory_replay_snapshot(
             )
             coarse_sha = _sha256(coarse_root / "metadata.json")
             model_prefix = (
-                "coarse"
-                if coarse_provenance == "CURRENT_RUN_VERIFIED"
-                else "reference-unbound"
+                "coarse" if coarse_provenance == "CURRENT_RUN_VERIFIED" else "reference-unbound"
             )
             model_version = f"{model_prefix}:{coarse_sha[:16]}"
             patches = list(coarse_metadata.get("quality", {}).get("patches", ()))
@@ -1081,9 +1048,7 @@ def build_supervisory_replay_snapshot(
             depth_m=depth_reference,
             confidence=confidence_reference,
             robot_self_mask=mask_reference,
-            captured_at_utc=_utc(
-                evidence.captured_at_utc, label="occupancy capture timestamp"
-            ),
+            captured_at_utc=_utc(evidence.captured_at_utc, label="occupancy capture timestamp"),
             occupancy_quality_evidence_sha256=evidence.quality_evidence_hash,
             valid_depth_fraction=evidence.valid_depth_fraction,
             stereo_valid_fraction=evidence.stereo_valid_fraction,
@@ -1181,9 +1146,7 @@ def build_supervisory_replay_snapshot(
             snapshot_id=f"replay:{hashlib.sha256(identity_seed).hexdigest()[:20]}",
             sequence=map_data.sequence,
             created_at_utc=created,
-            source_session_id=str(
-                session_reader.manifest.get("session_id") or session_root.name
-            ),
+            source_session_id=str(session_reader.manifest.get("session_id") or session_root.name),
             safety=safety,
             robot=robot,
             occupancy=occupancy,

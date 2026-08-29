@@ -23,7 +23,10 @@ from biblade_fusion.storage.blade_foreground import (
     read_blade_foreground_mask,
     write_blade_foreground_mask,
 )
-from biblade_fusion.workflows.occupancy_mapping import occupancy_array_content_hash
+from biblade_fusion.workflows.occupancy_mapping import (
+    occupancy_array_content_hash,
+    occupancy_physical_source_id,
+)
 
 _REAL_REPLAY_SOURCE_RESULT = blade_foreground_storage._replay_source_result
 
@@ -155,13 +158,22 @@ def _sources(tmp_path: Path, result: BladeForegroundMaskResult) -> dict[str, Pat
     _write_json(
         occupancy / "metadata.json",
         {
-            "schema_version": 6,
+            "schema_version": 7,
             "artifact_kind": "biblade_fusion.occupancy_mapping",
             "motion_authorized": False,
             "frames": [
                 {
                     "evidence": {
                         "source_view_id": "candidate",
+                        "physical_source_id": occupancy_physical_source_id(
+                            source_session_manifest_sha256=_sha256(
+                                session / "manifest.json"
+                            ),
+                            source_session_view_metadata_sha256=_sha256(view_metadata),
+                            source_sequence_index=0,
+                            frame_number=7,
+                            source_view_id="candidate",
+                        ),
                         "source_sequence_index": 0,
                         "frame_number": 7,
                         "base_t_camera_matrix": np.eye(4).tolist(),

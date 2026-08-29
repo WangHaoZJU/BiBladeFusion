@@ -103,6 +103,7 @@ class OccupancyMappingContext:
 @dataclass(frozen=True, slots=True)
 class OccupancyFrameEvidence:
     source_view_id: str
+    physical_source_id: str
     source_sequence_index: int
     frame_number: int
     captured_at_utc: str
@@ -141,6 +142,9 @@ class OccupancyFrameEvidence:
         source_view_id = str(self.source_view_id).strip()
         if not source_view_id:
             raise ValueError("Occupancy evidence source_view_id must be non-empty")
+        physical_source_id = str(self.physical_source_id).strip()
+        if _SHA256_PATTERN.fullmatch(physical_source_id) is None:
+            raise ValueError("Occupancy evidence physical_source_id must be a SHA-256 digest")
         if (
             isinstance(self.source_sequence_index, bool)
             or not isinstance(self.source_sequence_index, (int, np.integer))
@@ -239,9 +243,18 @@ class OccupancyFrameEvidence:
         if (
             not source_views
             or len(set(source_views)) != len(source_views)
-            or source_views[-1] != source_view_id
+            or source_views[-1] != physical_source_id
         ):
             raise ValueError("Occupancy evidence mapping_source_view_ids are invalid")
+        expected_physical_source_id = occupancy_physical_source_id(
+            source_session_manifest_sha256=self.source_session_manifest_sha256,
+            source_session_view_metadata_sha256=self.source_session_view_metadata_sha256,
+            source_sequence_index=int(self.source_sequence_index),
+            frame_number=int(self.frame_number),
+            source_view_id=source_view_id,
+        )
+        if physical_source_id != expected_physical_source_id:
+            raise ValueError("Occupancy evidence physical_source_id does not reproduce")
         if len(source_views) == 1 and self.previous_evidence_hash is not None:
             raise ValueError("First occupancy evidence must not have a parent")
         if len(source_views) > 1 and self.previous_evidence_hash is None:
@@ -254,6 +267,7 @@ class OccupancyFrameEvidence:
             raise ValueError("Occupancy evidence mapping snapshot sequence must be positive")
 
         object.__setattr__(self, "source_view_id", source_view_id)
+        object.__setattr__(self, "physical_source_id", physical_source_id)
         object.__setattr__(self, "source_sequence_index", int(self.source_sequence_index))
         object.__setattr__(self, "frame_number", int(self.frame_number))
         object.__setattr__(self, "captured_at_utc", captured_text)
@@ -324,16 +338,14 @@ class OccupancyFrameUpdate:
             raise ValueError("Occupancy frame depth, confidence and masks must share one HxW shape")
         if np.isfinite(depth[~stereo_valid]).any():
             raise ValueError("Stereo-invalid occupancy depth pixels must be non-finite")
-        if not np.isfinite(depth[stereo_valid]).all() or np.any(
-            depth[stereo_valid] <= 0.0
-        ):
+        if not np.isfinite(depth[stereo_valid]).all() or np.any(depth[stereo_valid] <= 0.0):
             raise ValueError("Stereo-valid occupancy depth pixels must be positive")
-        if not np.isfinite(confidence).all() or np.any(
-            (confidence < 0.0) | (confidence > 1.0)
-        ):
+        if not np.isfinite(confidence).all() or np.any((confidence < 0.0) | (confidence > 1.0)):
             raise ValueError("Occupancy stereo confidence must be finite in [0, 1]")
-        if np.any(np.isnan(predicted)) or np.any(np.isneginf(predicted)) or np.any(
-            np.isfinite(predicted) & (predicted <= 0.0)
+        if (
+            np.any(np.isnan(predicted))
+            or np.any(np.isneginf(predicted))
+            or np.any(np.isfinite(predicted) & (predicted <= 0.0))
         ):
             raise ValueError("Predicted robot depth must contain positive metres or +inf")
         if np.any(robot_mask & integration_mask):
@@ -360,9 +372,7 @@ class OccupancyFrameUpdate:
             or float(threshold) > occupancy_contract.maximum_lr_consistency_error_px
         ):
             raise ValueError("Occupancy update has an invalid FoundationStereo quality contract")
-        accepted = stereo_valid & (
-            confidence >= occupancy_contract.minimum_stereo_confidence
-        )
+        accepted = stereo_valid & (confidence >= occupancy_contract.minimum_stereo_confidence)
         range_valid = (
             accepted
             & np.isfinite(depth)
@@ -472,8 +482,7 @@ class OccupancyFrameUpdate:
             != self.mapping_snapshot.source_camera_centres_base_m
             or self.snapshot.source_camera_axes_base
             != self.mapping_snapshot.source_camera_axes_base
-            or self.snapshot.rebuild_started_at_utc
-            != self.mapping_snapshot.rebuild_started_at_utc
+            or self.snapshot.rebuild_started_at_utc != self.mapping_snapshot.rebuild_started_at_utc
             or self.snapshot.parent_evidence_hash != self.mapping_snapshot.parent_evidence_hash
             or self.snapshot.created_at_utc != self.mapping_snapshot.created_at_utc
         ):
@@ -488,6 +497,7 @@ def occupancy_frame_evidence_payload(evidence: OccupancyFrameEvidence) -> dict[s
 
     return {
         "source_view_id": evidence.source_view_id,
+        "physical_source_id": evidence.physical_source_id,
         "source_sequence_index": evidence.source_sequence_index,
         "frame_number": evidence.frame_number,
         "captured_at_utc": evidence.captured_at_utc,
@@ -495,16 +505,10 @@ def occupancy_frame_evidence_payload(evidence: OccupancyFrameEvidence) -> dict[s
         "hand_eye_hash": evidence.hand_eye_hash,
         "source_stereo_metadata_sha256": evidence.source_stereo_metadata_sha256,
         "source_session_manifest_sha256": evidence.source_session_manifest_sha256,
-        "source_session_view_metadata_sha256": (
-            evidence.source_session_view_metadata_sha256
-        ),
+        "source_session_view_metadata_sha256": (evidence.source_session_view_metadata_sha256),
         "base_t_flange_matrix": [list(row) for row in evidence.base_t_flange_matrix],
-        "predicted_base_t_tcp_matrix": [
-            list(row) for row in evidence.predicted_base_t_tcp_matrix
-        ],
-        "observed_base_t_tcp_matrix": [
-            list(row) for row in evidence.observed_base_t_tcp_matrix
-        ],
+        "predicted_base_t_tcp_matrix": [list(row) for row in evidence.predicted_base_t_tcp_matrix],
+        "observed_base_t_tcp_matrix": [list(row) for row in evidence.observed_base_t_tcp_matrix],
         "base_t_camera_matrix": [list(row) for row in evidence.base_t_camera_matrix],
         "joint_positions_rad": list(evidence.joint_positions_rad),
         "fk_tcp_translation_error_m": evidence.fk_tcp_translation_error_m,
@@ -523,13 +527,9 @@ def occupancy_frame_evidence_payload(evidence: OccupancyFrameEvidence) -> dict[s
         "source_depth_content_hash": evidence.source_depth_content_hash,
         "stereo_valid_mask_content_hash": evidence.stereo_valid_mask_content_hash,
         "stereo_confidence_content_hash": evidence.stereo_confidence_content_hash,
-        "predicted_robot_depth_content_hash": (
-            evidence.predicted_robot_depth_content_hash
-        ),
+        "predicted_robot_depth_content_hash": (evidence.predicted_robot_depth_content_hash),
         "robot_mask_content_hash": evidence.robot_mask_content_hash,
-        "integration_valid_mask_content_hash": (
-            evidence.integration_valid_mask_content_hash
-        ),
+        "integration_valid_mask_content_hash": (evidence.integration_valid_mask_content_hash),
     }
 
 
@@ -537,6 +537,42 @@ def compute_occupancy_evidence_hash(evidence: OccupancyFrameEvidence) -> str:
     return hashlib.sha256(
         _canonical_json(occupancy_frame_evidence_payload(evidence)).encode("utf-8")
     ).hexdigest()
+
+
+def occupancy_physical_source_id(
+    *,
+    source_session_manifest_sha256: str,
+    source_session_view_metadata_sha256: str,
+    source_sequence_index: int,
+    frame_number: int,
+    source_view_id: str,
+) -> str:
+    """Identify one immutable raw observation independently of its UI label."""
+
+    logical_id = str(source_view_id).strip()
+    if not logical_id:
+        raise ValueError("Occupancy physical source logical view ID must be non-empty")
+    for name, digest in (
+        ("source_session_manifest_sha256", source_session_manifest_sha256),
+        ("source_session_view_metadata_sha256", source_session_view_metadata_sha256),
+    ):
+        if _SHA256_PATTERN.fullmatch(str(digest)) is None:
+            raise ValueError(f"Occupancy physical source {name} must be a SHA-256 digest")
+    for name, value in (
+        ("source_sequence_index", source_sequence_index),
+        ("frame_number", frame_number),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 0:
+            raise ValueError(f"Occupancy physical source {name} must be non-negative")
+    payload = {
+        "schema_version": 1,
+        "source_session_manifest_sha256": str(source_session_manifest_sha256),
+        "source_session_view_metadata_sha256": str(source_session_view_metadata_sha256),
+        "source_sequence_index": int(source_sequence_index),
+        "frame_number": int(frame_number),
+        "source_view_id": logical_id,
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
 def occupancy_array_content_hash(array: NDArray[np.generic]) -> str:
@@ -587,12 +623,9 @@ def integrate_foundation_stereo_occupancy(
     bounds_max = occupancy_config.workspace_bounds_max_m
     if bounds_min is None or bounds_max is None:
         raise OccupancyMappingError("Measured occupancy workspace bounds are missing")
-    extents = np.asarray(bounds_max, dtype=np.float64) - np.asarray(
-        bounds_min, dtype=np.float64
-    )
+    extents = np.asarray(bounds_max, dtype=np.float64) - np.asarray(bounds_min, dtype=np.float64)
     shape = tuple(
-        int(value)
-        for value in np.ceil(extents / occupancy_config.voxel_size_m).astype(np.int64)
+        int(value) for value in np.ceil(extents / occupancy_config.voxel_size_m).astype(np.int64)
     )
     grid = OccupancyGridSpec(
         frame_id=occupancy_config.frame_id,
@@ -601,9 +634,7 @@ def integrate_foundation_stereo_occupancy(
         grid_shape=shape,
     )
     rectified_calibration = stereo.rectified.calibration
-    joints = tuple(
-        float(value) for value in bundle.selected_robot_state.joint_positions_rad
-    )
+    joints = tuple(float(value) for value in bundle.selected_robot_state.joint_positions_rad)
     es68_resources = Es68ModelResources.packaged()
     flange_t_tcp = load_es68_flange_t_tcp(es68_resources)
     if hand_eye.flange_t_left_ir is None:
@@ -618,19 +649,14 @@ def integrate_foundation_stereo_occupancy(
     predicted_base_t_tcp = predicted_base_t_flange.compose(flange_t_tcp)
     observed_base_t_tcp = bundle.selected_robot_state.base_t_tcp
     fk_tcp_translation_error_m = float(
-        np.linalg.norm(
-            predicted_base_t_tcp.translation_m - observed_base_t_tcp.translation_m
-        )
+        np.linalg.norm(predicted_base_t_tcp.translation_m - observed_base_t_tcp.translation_m)
     )
     fk_tcp_rotation_error_deg = _rotation_error_deg(
         predicted_base_t_tcp.rotation,
         observed_base_t_tcp.rotation,
     )
     pose_violations = []
-    if (
-        fk_tcp_translation_error_m
-        > occupancy_config.maximum_fk_tcp_translation_error_m
-    ):
+    if fk_tcp_translation_error_m > occupancy_config.maximum_fk_tcp_translation_error_m:
         pose_violations.append("translation")
     if fk_tcp_rotation_error_deg > occupancy_config.maximum_fk_tcp_rotation_error_deg:
         pose_violations.append("rotation")
@@ -642,9 +668,7 @@ def integrate_foundation_stereo_occupancy(
             f"rotation={fk_tcp_rotation_error_deg:.6f} deg)"
         )
     base_t_left_ir = predicted_base_t_flange.compose(hand_eye.flange_t_left_ir)
-    base_t_camera = base_t_left_ir.compose(
-        rectified_calibration.left_rectified_t_left_ir.inverse()
-    )
+    base_t_camera = base_t_left_ir.compose(rectified_calibration.left_rectified_t_left_ir.inverse())
     hand_eye_hash = _file_sha256(hand_eye.source_path)
     context = _build_mapping_context(
         grid,
@@ -701,17 +725,18 @@ def integrate_foundation_stereo_occupancy(
             pixel_stride=occupancy_config.integration_stride,
             minimum_valid_rays=1,
             free_space_margin_m=occupancy_config.free_space_margin_m,
-            minimum_free_observations=(
-                occupancy_config.minimum_free_observations
-            ),
-            minimum_free_view_translation_m=(
-                occupancy_config.minimum_free_view_translation_m
-            ),
-            minimum_free_view_direction_deg=(
-                occupancy_config.minimum_free_view_direction_deg
-            ),
+            minimum_free_observations=(occupancy_config.minimum_free_observations),
+            minimum_free_view_translation_m=(occupancy_config.minimum_free_view_translation_m),
+            minimum_free_view_direction_deg=(occupancy_config.minimum_free_view_direction_deg),
         ),
         mapping_context_hash=context.content_hash,
+    )
+    physical_source_id = occupancy_physical_source_id(
+        source_session_manifest_sha256=source_session_manifest_sha256,
+        source_session_view_metadata_sha256=source_session_view_metadata_sha256,
+        source_sequence_index=bundle.sequence_index,
+        frame_number=stereo.rectified.source_frame_number,
+        source_view_id=bundle.view_id,
     )
     mapping_snapshot = integrator.integrate(
         previous_snapshot,
@@ -719,7 +744,7 @@ def integrate_foundation_stereo_occupancy(
         rectified_calibration.left,
         base_t_camera,
         valid_mask=self_mask.integration_valid_mask,
-        source_view_id=bundle.view_id,
+        source_view_id=physical_source_id,
         observed_at_utc=captured,
     )
     inherited_evidence_hash = mapping_snapshot.parent_evidence_hash
@@ -732,6 +757,7 @@ def integrate_foundation_stereo_occupancy(
             )
     evidence = OccupancyFrameEvidence(
         source_view_id=bundle.view_id,
+        physical_source_id=physical_source_id,
         source_sequence_index=bundle.sequence_index,
         frame_number=stereo.rectified.source_frame_number,
         captured_at_utc=captured.isoformat(),
@@ -741,16 +767,13 @@ def integrate_foundation_stereo_occupancy(
         source_session_manifest_sha256=source_session_manifest_sha256,
         source_session_view_metadata_sha256=source_session_view_metadata_sha256,
         base_t_flange_matrix=tuple(
-            tuple(float(value) for value in row)
-            for row in predicted_base_t_flange.matrix
+            tuple(float(value) for value in row) for row in predicted_base_t_flange.matrix
         ),
         predicted_base_t_tcp_matrix=tuple(
-            tuple(float(value) for value in row)
-            for row in predicted_base_t_tcp.matrix
+            tuple(float(value) for value in row) for row in predicted_base_t_tcp.matrix
         ),
         observed_base_t_tcp_matrix=tuple(
-            tuple(float(value) for value in row)
-            for row in observed_base_t_tcp.matrix
+            tuple(float(value) for value in row) for row in observed_base_t_tcp.matrix
         ),
         base_t_camera_matrix=tuple(
             tuple(float(value) for value in row) for row in base_t_camera.matrix
@@ -812,9 +835,8 @@ def mark_snapshot_stale_if_expired(
 ) -> OccupancySnapshot:
     """Materialise expiry as a new immutable snapshot version for storage/UI."""
 
-    if (
-        snapshot.map_state is OccupancyMapState.MAP_READY
-        and snapshot.is_stale(_utc(now_utc), occupancy_config.maximum_map_age_s)
+    if snapshot.map_state is OccupancyMapState.MAP_READY and snapshot.is_stale(
+        _utc(now_utc), occupancy_config.maximum_map_age_s
     ):
         return snapshot.mark_stale("capture age exceeded maximum_map_age_s")
     return snapshot
@@ -895,9 +917,7 @@ def _validated_stereo_quality_mask(
     pixel_count = int(stereo_valid.size)
     stereo_fraction = float(np.count_nonzero(stereo_valid) / pixel_count)
     accepted_fraction = float(np.count_nonzero(accepted) / pixel_count)
-    mean_confidence = (
-        float(np.mean(confidence_array[accepted])) if np.any(accepted) else 0.0
-    )
+    mean_confidence = float(np.mean(confidence_array[accepted])) if np.any(accepted) else 0.0
     return accepted, stereo_fraction, accepted_fraction, mean_confidence, threshold
 
 
@@ -964,12 +984,8 @@ def _build_mapping_context(
             "right_rectified_T_left_rectified": (
                 calibration.right_rectified_t_left_rectified.matrix.tolist()
             ),
-            "left_rectified_T_left_ir": (
-                calibration.left_rectified_t_left_ir.matrix.tolist()
-            ),
-            "right_rectified_T_right_ir": (
-                calibration.right_rectified_t_right_ir.matrix.tolist()
-            ),
+            "left_rectified_T_left_ir": (calibration.left_rectified_t_left_ir.matrix.tolist()),
+            "right_rectified_T_right_ir": (calibration.right_rectified_t_right_ir.matrix.tolist()),
             "disparity_to_depth_q": calibration.disparity_to_depth_q.tolist(),
             "left_valid_roi": list(calibration.left_valid_roi),
             "right_valid_roi": list(calibration.right_valid_roi),

@@ -92,25 +92,29 @@ ordinary collision-checked leg.
 
 For each ordered leg, this preflight derives the target as
 `base_T_left_ir · inverse(flange_T_left_ir) · flange_T_tcp`, records that calibrated
-`base_T_tcp` goal, and evaluates bounded-step discrete joint samples. It also rejects a
+`base_T_tcp` goal, and constructs a velocity-limited ServoJ stream. It rejects a
 joint endpoint unless HoloRobot ES68 FK composed with the packaged
 `flange_T_tcp` reaches the requested TCP pose within the configured translation and
 rotation thresholds. The controller MDH used by IK and the packaged ES68 chain are
 different representations; this endpoint gate checks their result, not an invalid
 assumption that their source-file hashes should match.
 
-The current production-mode call then stops at `continuous_swept_mesh_unavailable`
-before velocity-limited ServoJ stream generation. The stored schema-5 report therefore
-records the blocked leg and diagnostic joint-travel evidence; zero estimated ServoJ
-duration is not evidence of a valid or executable trajectory. Library-only options can
-disable a continuous-proof requirement for offline stream inspection, but such output is
-explicitly diagnostic and cannot become approval evidence. The artifact binds its view
-plan, optional coverage-order proposal, initialization, occupancy, and motion-model
-inputs by SHA-256 and fully re-derives the blocked report when read.
+The mesh checker certifies the complete linear joint interval by combining exact
+midpoint FCL separation with conservative serial-chain displacement bounds for both
+geometries. Inconclusive intervals are bisected; a collision witness returns `BLOCKED`,
+whereas a numerical or subdivision limit returns `UNKNOWN`. The independent occupancy
+checker encloses each robot collision mesh in a midpoint sphere and enlarges it by its
+maximum interval displacement before querying the immutable voxel snapshot. A schema-5
+preflight becomes approval-eligible only when both integrity-bound proofs are clear for
+the exact segment and all occupancy semantic/freshness gates pass. Its artifact binds the
+view plan, optional coverage-order proposal, initialization, occupancy, proof evidence,
+and motion-model inputs by SHA-256 and fully re-derives the report when read.
 
 The original `validate-path` artifact remains for compatibility and for comparing the
-conservative capsule model with the mesh model. Neither command connects to hardware or
-authorizes execution.
+conservative capsule model with the mesh model. Both standalone safety commands remain
+non-moving and never authorize execution. The separate supervised unknown-blade runtime
+can consume a clear preflight only after an exact, process-local one-shot operator permit;
+it does not reinterpret either offline command as permission.
 
 The production ES68 path never falls back to the packaged legacy-labelled checker. Its
 `robot_geometry_hash` covers the generated ES68 URDF, ES68 kinematics and joint-limit
@@ -121,10 +125,10 @@ set, and Pinocchio/hpp-fcl versions. Preflight evidence,
 operator permits, live collision revalidation, and occupancy self-mask evidence must
 agree on these identities or motion remains blocked.
 
-The current mesh path remains discretely sampled and does not provide continuous swept
-volume evidence. The occupancy path is independently discretely sampled and likewise
-lacks continuous robot-versus-voxel swept-volume evidence; one proof cannot substitute
-for the other. Consequently both are diagnostics, and production preflight plus guarded
-execution remain blocked until both continuous backends are implemented and validated.
-Same-side snake ordering reduces unnecessary side changes, but supplies no collision
-evidence and does not weaken either continuous-proof requirement.
+Mesh and occupancy proofs remain independent: one proof cannot substitute for the other,
+and neither relies on same-side snake ordering as collision evidence. Both are deliberately
+conservative interval certificates. If either checker cannot prove the entire interval,
+the preflight and guarded executor fail closed even when all evaluated configurations are
+clear. Hardware commissioning must still validate STL scale/origins, self masking,
+static-free declarations, clearance, timing and controller stop behaviour before a real
+blade scan is accepted.

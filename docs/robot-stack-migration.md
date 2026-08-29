@@ -1,7 +1,7 @@
 # HoloRobot robot-stack migration
 
-Status: offline safety layers implemented; continuous swept-motion proofs, live
-coordination, and hardware acceptance pending
+Status: software safety and supervised coordination implemented; hardware acceptance
+and real-system validation pending
 
 ## Decision
 
@@ -85,28 +85,29 @@ license and attribution.
    clearance-expanded AABB workcell obstacles. A separate FoundationStereo safety map
    represents the unknown blade/environment as `FREE`, `OCCUPIED`, or `UNKNOWN`; unknown
    and out-of-grid queries block.
-5. **Artifact contract implemented; production path blocked:** ordered endpoint-feasible
-   view sequences produce immutable, source-bound, re-derived tool goals and discrete
-   mesh/occupancy diagnostics. Production mode stops at the missing continuous swept-mesh
-   proof before generating a ServoJ trajectory; continuous robot-versus-voxel evidence is
-   a separate unresolved requirement. Library-only diagnostic overrides are not approval
-   evidence.
-6. **Library layer complete:** guarded execution is behind default-off configuration,
-   exact hash confirmation, expiring one-shot permits, and live revalidation. No motion
-   CLI is exposed before supervised hardware acceptance is complete.
-7. **Offline replay skeleton complete:** immutable supervisory snapshots visualize the
+5. **Software proof backends complete:** an adaptive interval proof uses FCL midpoint
+   separation and conservative serial-chain displacement bounds for continuous
+   ES68+D435i mesh clearance. A separate interval enclosure proves the complete robot
+   sweep against the three-state voxel map. Either backend returns `UNKNOWN`, rather
+   than passing, when its subdivision or numerical proof limit is reached. Both proofs
+   bind the exact joint path, geometry, policy and map evidence.
+6. **Guarded execution complete at software-contract level:** execution remains behind
+   default-off configuration, exact per-segment hash confirmation, expiring one-shot
+   permits, live-start revalidation, a frozen occupancy generation and asynchronous stop
+   generations. Software completion is not physical clearance.
+7. **Read-only replay and live observation complete:** immutable supervisory snapshots visualize the
    verified data actually present in their source chain. Exact robot/camera collision
    meshes appear only when the active final model reproduces the mapping geometry hash;
-   planned TCP endpoints appear only from a canonically re-derived preflight, and no
-   actual continuous TCP trace is currently persisted. The GUI is read-only, remains
-   `REPLAY/BLOCKED`, and cannot approve or transmit motion. `--follow` is only filesystem
-   polling, not online obstacle avoidance.
-8. **Implemented at library level; production integration pending:** the stop-and-capture
-   coordinator now binds settled capture, FoundationStereo inference, fresh occupancy,
-   optional fine-science assets, planning invalidation and guarded short-segment state.
-   It is disabled by default, has no public composition-root or motion CLI, and has not
-   been hardware-verified. `bbf occupancy build-replay` still deliberately seals every
-   result `STALE`, so it can never supply live motion evidence.
+   planned TCP paths appear only from a canonically derived preflight. Stopped perception
+   samples provide the recorded actual path; they are explicitly not described as
+   high-rate ServoJ tracking. The GUI cannot approve or transmit motion. `--follow` is
+   atomic filesystem observation, not an avoidance controller.
+8. **Supervised runtime implemented, default off:** the stop-and-capture composition binds
+   settled capture, FoundationStereo, fresh occupancy, unknown-blade coarse science,
+   schema-5 handoff, fixed-reference fine science, next-view planning and one guarded
+   short segment at a time. The first map views remain operator-guided because unknown
+   space blocks motion. Every later segment still needs its own exact approval. No part
+   of this status claims that the physical ES68/D435i/workcell has passed acceptance.
 9. Remove superseded MDH/capsule code only after artifact compatibility and regression
    tests cover existing offline workflows.
 
@@ -119,10 +120,14 @@ license and attribution.
 - FoundationStereo mapping retains surfaces clearly in front of rendered robot geometry,
   but masks matching or farther measurements and leaves those rays `UNKNOWN`; it never
   clears through the robot or its occluded background.
-- The present occupancy checker uses transformed local-AABB bounding spheres at discrete
-  joint samples. The resulting self-`UNKNOWN` intersection, missing continuous
-  mesh/FCL swept-volume proof, and independently missing continuous robot-versus-voxel
-  swept-volume proof are physical motion-release blockers, even if other checks pass.
+- Continuous mesh and occupancy proofs are conservative interval certificates, not dense
+  sampling. Failure to establish a strictly positive bound is blocking. Self-masked
+  robot voxels remain `UNKNOWN`; they can be exempted only inside an immutable,
+  operator-recorded static-free AABB acceptance whose robot geometry, workspace and exact
+  regions match the runtime. `OCCUPIED` always blocks, including inside such a region.
+- An accepted static-free region must remain free of every external object throughout the
+  experiment and must not overlap the possible blade, fixture or support envelope. The
+  acceptance asset itself never authorizes a segment.
 - A BiBladeFusion view plan never directly calls the Elite SDK.
 - Hardware execution must pass HoloRobot planning/preflight and an explicit operator
   approval gate in the same run.

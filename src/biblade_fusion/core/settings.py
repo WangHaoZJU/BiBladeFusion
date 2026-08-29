@@ -205,13 +205,57 @@ class BladeForegroundConfig(BaseModel):
     @model_validator(mode="after")
     def validate_reference_mask_policy(self) -> Self:
         if self.maximum_projection_depth_m <= self.minimum_projection_depth_m:
-            raise ValueError(
-                "Blade-foreground maximum projection depth must exceed minimum"
-            )
+            raise ValueError("Blade-foreground maximum projection depth must exceed minimum")
         if self.maximum_mask_fraction <= self.minimum_mask_fraction:
-            raise ValueError(
-                "Blade-foreground maximum mask fraction must exceed minimum"
-            )
+            raise ValueError("Blade-foreground maximum mask fraction must exceed minimum")
+        return self
+
+
+class BootstrapForegroundSettings(BaseModel):
+    """Unknown-blade foreground policy before a coarse reference exists.
+
+    The algorithm keeps this policy separate from the later schema-5
+    reference-projected foreground gate.  It rejects depth components touching
+    the valid-domain boundary and refuses ambiguous automatic selections; a
+    recorded rectangle or polygon can be supplied as an explicit fallback.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    minimum_depth_m: float = Field(default=0.15, gt=0.0)
+    maximum_depth_m: float = Field(default=2.0, gt=0.0)
+    maximum_neighbour_depth_jump_m: float = Field(default=0.030, ge=0.0)
+    maximum_neighbour_relative_depth_jump: float = Field(
+        default=0.035,
+        ge=0.0,
+        le=1.0,
+    )
+    connectivity: Literal[4, 8] = 8
+    boundary_margin_px: int = Field(default=2, ge=1, le=100)
+    minimum_valid_pixels: int = Field(default=1_000, ge=1)
+    minimum_component_pixels: int = Field(default=100, ge=1)
+    minimum_mask_pixels: int = Field(default=500, ge=1)
+    minimum_mask_fraction: float = Field(default=0.001, ge=0.0, le=1.0)
+    maximum_mask_fraction: float = Field(default=0.70, ge=0.0, le=1.0)
+    maximum_unseeded_ambiguity_ratio: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+    )
+    minimum_seed_valid_pixels: int = Field(default=25, ge=1)
+    minimum_seed_valid_fraction: float = Field(default=0.10, ge=0.0, le=1.0)
+    minimum_component_hint_selection_fraction: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=1.0,
+    )
+
+    @model_validator(mode="after")
+    def validate_bootstrap_foreground_policy(self) -> Self:
+        if self.maximum_depth_m <= self.minimum_depth_m:
+            raise ValueError("Bootstrap-foreground maximum depth must exceed minimum")
+        if self.maximum_mask_fraction < self.minimum_mask_fraction:
+            raise ValueError("Bootstrap-foreground maximum mask fraction is below minimum")
         return self
 
 
@@ -469,6 +513,25 @@ class SurfaceQualityConfig(BaseModel):
     minimum_observed_points: int = Field(default=30, ge=3)
 
 
+class FineFinalizationConfig(BaseModel):
+    """Terminal gates for the immutable fine multi-view reconstruction.
+
+    Coverage of the schema-5 reference is necessary but is deliberately not a
+    completion condition.  These gates are evaluated against a newly fused fine
+    cloud and its bilateral TSDF mesh before a fine run may report completion.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_source_views_per_side: int = Field(default=1, ge=1, le=1000)
+    minimum_mesh_triangles_per_side: int = Field(default=1, ge=1)
+    maximum_mesh_boundary_edges: int = Field(default=0, ge=0)
+    maximum_mesh_boundary_loops: int = Field(default=0, ge=0)
+    require_watertight_mesh: Literal[True] = True
+    require_two_face_fin_per_side: Literal[True] = True
+    require_fin_regions_complete: Literal[True] = True
+
+
 SurfaceRegionName = Literal[
     "surface",
     "leading_edge",
@@ -479,6 +542,24 @@ SurfaceRegionName = Literal[
     "fin_root",
     "fin_free_edge",
 ]
+
+
+class ReacquisitionPerturbationConfig(BaseModel):
+    """One deterministic retry orbit relative to a patch's nominal view."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    distance_offset_m: float = Field(ge=-0.08, le=0.08)
+    tilt_deg: float = Field(ge=0.0, le=20.0)
+    azimuth_deg: float = Field(ge=-180.0, le=180.0)
+
+    @model_validator(mode="after")
+    def validate_nonzero_perturbation(self) -> Self:
+        if self.distance_offset_m == 0.0 and self.tilt_deg == 0.0:
+            raise ValueError(
+                "A reacquisition perturbation must change distance or tilt"
+            )
+        return self
 
 
 class NextViewSelectionConfig(BaseModel):
@@ -510,6 +591,24 @@ class NextViewSelectionConfig(BaseModel):
     require_two_observed_fin_faces_per_side: bool = True
     exclude_already_captured_candidate_ids: bool = True
     use_joint_travel_only_as_tiebreak: bool = True
+    maximum_reacquisition_attempts_per_patch: int = Field(default=3, ge=0, le=8)
+    reacquisition_perturbations: tuple[ReacquisitionPerturbationConfig, ...] = (
+        ReacquisitionPerturbationConfig(
+            distance_offset_m=0.0,
+            tilt_deg=6.0,
+            azimuth_deg=0.0,
+        ),
+        ReacquisitionPerturbationConfig(
+            distance_offset_m=0.02,
+            tilt_deg=8.0,
+            azimuth_deg=120.0,
+        ),
+        ReacquisitionPerturbationConfig(
+            distance_offset_m=-0.02,
+            tilt_deg=10.0,
+            azimuth_deg=-120.0,
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_region_contract(self) -> Self:
@@ -520,8 +619,16 @@ class NextViewSelectionConfig(BaseModel):
         if len(set(self.region_priority)) != len(self.region_priority):
             raise ValueError("Next-view region priority must contain unique values")
         if set(self.region_priority) != set(self.required_regions):
+            raise ValueError("Next-view region priority must contain exactly the required regions")
+        if not self.exclude_already_captured_candidate_ids:
             raise ValueError(
-                "Next-view region priority must contain exactly the required regions"
+                "Captured candidate IDs must remain excluded so every acquisition ID is unique"
+            )
+        if len(self.reacquisition_perturbations) != (
+            self.maximum_reacquisition_attempts_per_patch
+        ):
+            raise ValueError(
+                "Reacquisition perturbations must exactly match the per-patch attempt budget"
             )
         return self
 
@@ -691,6 +798,65 @@ class MotionPreflightConfig(BaseModel):
     velocity_margin: float = Field(default=0.8, gt=0.0, le=1.0)
     maximum_endpoint_translation_error_m: float = Field(default=0.002, gt=0.0)
     maximum_endpoint_rotation_error_deg: float = Field(default=0.3, gt=0.0, le=180.0)
+    motion_envelope_acceptance_path: Path | None = None
+    motion_envelope_acceptance_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_motion_envelope_binding(self) -> Self:
+        if (self.motion_envelope_acceptance_path is None) != (
+            self.motion_envelope_acceptance_id is None
+        ):
+            raise ValueError(
+                "Motion-envelope acceptance path and identity must be configured together"
+            )
+        return self
+
+
+class ScienceAcceptanceConfig(BaseModel):
+    """Immutable physical acceptance asset for the geometry-science pipeline."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: Path | None = None
+    acceptance_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_acceptance_binding(self) -> Self:
+        if (self.path is None) != (self.acceptance_id is None):
+            raise ValueError(
+                "Science acceptance path and identity must be configured together"
+            )
+        return self
+
+
+class CoarseScienceConfig(BaseModel):
+    """Completion and conservative fin-discovery policy for unknown blades."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    discovery_tilt_deg: float = Field(default=15.0, gt=0.0, lt=45.0)
+    minimum_total_views: int = Field(default=6, ge=4)
+    minimum_views_per_side: int = Field(default=3, ge=2)
+    maximum_attempts_per_candidate: int = Field(default=2, ge=1)
+    require_complete_proxy_coverage: bool = True
+    maximum_discovery_translation_error_m: float = Field(default=0.020, gt=0.0)
+    maximum_discovery_rotation_error_deg: float = Field(
+        default=5.0,
+        gt=0.0,
+        le=30.0,
+    )
+
+    @model_validator(mode="after")
+    def validate_bilateral_view_gate(self) -> Self:
+        if self.minimum_total_views < 2 * self.minimum_views_per_side:
+            raise ValueError("Total coarse-view gate is below the per-side requirement")
+        return self
 
 
 class StopAndCaptureConfig(BaseModel):
@@ -720,11 +886,41 @@ class StopAndCaptureConfig(BaseModel):
     )
     maximum_goal_joint_error_rad: float = Field(default=0.01, gt=0.0, le=0.2)
     execution_freshness_margin_s: float = Field(default=1.0, ge=0.0, le=60.0)
+    # These budgets are hardware measurements, not guessed software defaults.
+    # The unknown-blade production entry remains offline-blocked until all four
+    # have been measured for the deployed GPU/controller/workcell.
+    maximum_perception_cycle_duration_s: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=3600.0,
+    )
+    maximum_operator_reposition_interval_s: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=3600.0,
+    )
+    maximum_segment_execution_duration_s: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=300.0,
+    )
+    maximum_schema5_handoff_duration_s: float | None = Field(default=None, gt=0.0)
+    runtime_timing_acceptance_path: Path | None = None
+    runtime_timing_acceptance_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     require_operator_approval: Literal[True] = True
     require_capture_after_every_segment: Literal[True] = True
 
     @model_validator(mode="after")
     def validate_enabled_contract(self) -> Self:
+        if (self.runtime_timing_acceptance_path is None) != (
+            self.runtime_timing_acceptance_id is None
+        ):
+            raise ValueError(
+                "Runtime-timing acceptance path and identity must be configured together"
+            )
         if self.enabled and self.maximum_segment_joint_delta_rad is None:
             raise ValueError(
                 "Enabled stop-and-capture coordination requires a measured "
@@ -734,8 +930,7 @@ class StopAndCaptureConfig(BaseModel):
             raise ValueError("settle_poll_period_s must not exceed settle_timeout_s")
         if self.maximum_robot_state_staleness_s < self.settle_poll_period_s:
             raise ValueError(
-                "maximum_robot_state_staleness_s must be at least "
-                "settle_poll_period_s"
+                "maximum_robot_state_staleness_s must be at least settle_poll_period_s"
             )
         return self
 
@@ -759,6 +954,16 @@ class OccupancyConfig(BaseModel):
     maximum_map_age_s: float = Field(default=5.0, gt=0.0, le=300.0)
     unknown_policy: Literal["block"] = "block"
     require_robot_self_mask: bool = True
+    # Optional hardware-accepted static free volumes solve the otherwise
+    # unobservable robot-base/self-volume bootstrap without weakening UNKNOWN
+    # elsewhere.  The acceptance ID is the SHA-256 identity of the separately
+    # archived workcell acceptance record; empty-by-default keeps this feature off.
+    accepted_static_free_aabbs: tuple[AxisAlignedBoxConfig, ...] = ()
+    accepted_static_free_acceptance_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    accepted_static_free_acceptance_path: Path | None = None
     self_mask_front_tolerance_m: float = Field(default=0.01, ge=0.0, le=0.10)
     self_mask_back_tolerance_m: float = Field(default=0.02, ge=0.0, le=0.20)
     self_mask_dilation_px: int = Field(default=1, ge=0, le=20)
@@ -800,6 +1005,41 @@ class OccupancyConfig(BaseModel):
             raise ValueError("Enabled occupancy mapping requires measured workspace bounds")
         if self.enabled and not self.require_robot_self_mask:
             raise ValueError("Physical occupancy mapping requires robot self masking")
+        accepted = self.accepted_static_free_aabbs
+        acceptance_fields_present = (
+            self.accepted_static_free_acceptance_id is not None
+            and self.accepted_static_free_acceptance_path is not None
+        )
+        if bool(accepted) != acceptance_fields_present or (
+            (self.accepted_static_free_acceptance_id is None)
+            != (self.accepted_static_free_acceptance_path is None)
+        ):
+            raise ValueError(
+                "Accepted static-free AABBs, acceptance ID, and immutable acceptance "
+                "asset path must be configured together"
+            )
+        names = tuple(item.name for item in accepted)
+        if len(names) != len(set(names)):
+            raise ValueError("Accepted static-free AABB names must be unique")
+        if accepted and bounds[0] is None:
+            raise ValueError(
+                "Accepted static-free AABBs require configured occupancy workspace bounds"
+            )
+        if accepted and bounds[0] is not None and bounds[1] is not None:
+            for volume in accepted:
+                if any(
+                    lower < workspace_lower or upper > workspace_upper
+                    for lower, upper, workspace_lower, workspace_upper in zip(
+                        volume.minimum_m,
+                        volume.maximum_m,
+                        bounds[0],
+                        bounds[1],
+                        strict=True,
+                    )
+                ):
+                    raise ValueError(
+                        "Accepted static-free AABBs must lie inside the occupancy workspace"
+                    )
         return self
 
 
@@ -819,6 +1059,9 @@ class AppSettings(BaseModel):
     )
     proxy_model: ProxyModelConfig = Field(default_factory=ProxyModelConfig)
     point_cloud: PointCloudConfig = Field(default_factory=PointCloudConfig)
+    bootstrap_foreground: BootstrapForegroundSettings = Field(
+        default_factory=BootstrapForegroundSettings
+    )
     blade_foreground: BladeForegroundConfig = Field(default_factory=BladeForegroundConfig)
     hand_eye: HandEyeConfig = Field(default_factory=HandEyeConfig)
     view_planning: ViewPlanningConfig = Field(default_factory=ViewPlanningConfig)
@@ -828,9 +1071,10 @@ class AppSettings(BaseModel):
     surface_partition: SurfacePartitionConfig = Field(default_factory=SurfacePartitionConfig)
     tsdf: TSDFConfig = Field(default_factory=TSDFConfig)
     surface_quality: SurfaceQualityConfig = Field(default_factory=SurfaceQualityConfig)
-    next_view_selection: NextViewSelectionConfig = Field(
-        default_factory=NextViewSelectionConfig
+    fine_finalization: FineFinalizationConfig = Field(
+        default_factory=FineFinalizationConfig
     )
+    next_view_selection: NextViewSelectionConfig = Field(default_factory=NextViewSelectionConfig)
     depth_comparison: DepthComparisonConfig = Field(default_factory=DepthComparisonConfig)
     native_overlap_validation: NativeOverlapValidationConfig = Field(
         default_factory=NativeOverlapValidationConfig
@@ -838,19 +1082,19 @@ class AppSettings(BaseModel):
     kinematics: KinematicsConfig = Field(default_factory=KinematicsConfig)
     collision: CollisionConfig = Field(default_factory=CollisionConfig)
     motion_preflight: MotionPreflightConfig = Field(default_factory=MotionPreflightConfig)
+    science_acceptance: ScienceAcceptanceConfig = Field(
+        default_factory=ScienceAcceptanceConfig
+    )
+    coarse_science: CoarseScienceConfig = Field(default_factory=CoarseScienceConfig)
     stop_and_capture: StopAndCaptureConfig = Field(default_factory=StopAndCaptureConfig)
     occupancy: OccupancyConfig = Field(default_factory=OccupancyConfig)
 
     @model_validator(mode="after")
     def validate_stop_and_capture_dependencies(self) -> Self:
         if self.stop_and_capture.enabled and not self.occupancy.enabled:
-            raise ValueError(
-                "Enabled stop-and-capture coordination requires occupancy mapping"
-            )
+            raise ValueError("Enabled stop-and-capture coordination requires occupancy mapping")
         if self.stop_and_capture.enabled and self.robot.model != "es68":
-            raise ValueError(
-                "Enabled stop-and-capture coordination requires robot.model='es68'"
-            )
+            raise ValueError("Enabled stop-and-capture coordination requires robot.model='es68'")
         if self.stop_and_capture.enabled and not self.robot.motion_enabled:
             raise ValueError(
                 "Enabled stop-and-capture coordination requires "
@@ -858,17 +1102,14 @@ class AppSettings(BaseModel):
             )
         if self.stop_and_capture.enabled and self.robot.settle_time_s <= 0.0:
             raise ValueError(
-                "Enabled stop-and-capture coordination requires robot.settle_time_s "
-                "to be positive"
+                "Enabled stop-and-capture coordination requires robot.settle_time_s to be positive"
             )
         minimum_settle_timeout_s = (
-            self.robot.settle_time_s
-            + self.stop_and_capture.settle_poll_period_s
+            self.robot.settle_time_s + self.stop_and_capture.settle_poll_period_s
         )
         if (
             self.stop_and_capture.enabled
-            and self.stop_and_capture.settle_timeout_s
-            < minimum_settle_timeout_s
+            and self.stop_and_capture.settle_timeout_s < minimum_settle_timeout_s
         ):
             raise ValueError(
                 "Enabled stop-and-capture settle_timeout_s must be at least "
@@ -884,12 +1125,9 @@ class AppSettings(BaseModel):
                 "Enabled stop-and-capture requires robot.servoj_time_s to equal "
                 "motion_preflight.servoj_dt_s"
             )
-        lr_threshold = (
-            self.foundation_stereo.left_right_consistency_threshold_px
-        )
+        lr_threshold = self.foundation_stereo.left_right_consistency_threshold_px
         if self.stop_and_capture.enabled and (
-            lr_threshold is None
-            or lr_threshold > self.occupancy.maximum_lr_consistency_error_px
+            lr_threshold is None or lr_threshold > self.occupancy.maximum_lr_consistency_error_px
         ):
             raise ValueError(
                 "Enabled stop-and-capture requires a FoundationStereo left-right "

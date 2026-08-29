@@ -91,10 +91,34 @@ point_cloud:
   pixel_stride: 1
   minimum_valid_points: 100
 
+# Before a schema-5 coarse blade surface exists, select a single interior depth
+# component from the first FoundationStereo observation. Components reaching the
+# valid-depth boundary and ambiguous unseeded scenes fail closed. A persisted
+# rectangle/polygon may be used as a hard ROI or component hint. No erosion is used,
+# because the specimen's thin fin and edge support must survive initialization.
+# These thresholds are software starting values and remain hardware-acceptance items.
+bootstrap_foreground:
+  minimum_depth_m: 0.15
+  maximum_depth_m: 2.0
+  maximum_neighbour_depth_jump_m: 0.030
+  maximum_neighbour_relative_depth_jump: 0.035
+  connectivity: 8
+  boundary_margin_px: 2
+  minimum_valid_pixels: 1000
+  minimum_component_pixels: 100
+  minimum_mask_pixels: 500
+  minimum_mask_fraction: 0.001
+  maximum_mask_fraction: 0.70
+  maximum_unseeded_ambiguity_ratio: 0.35
+  minimum_seed_valid_pixels: 25
+  minimum_seed_valid_fraction: 0.10
+  minimum_component_hint_selection_fraction: 0.10
+
 # Fine-scan science reconstruction projects one explicitly pinned immutable schema-5
 # coarse surface into left_rectified. Enabling this block is insufficient by itself:
-# the library composition root must also pass that exact reference (and, for recovery,
-# an exact accepted coverage generation) to the cycle engine. No public CLI does so yet.
+# the supervised composition root must also pass that exact reference (and, for recovery,
+# an exact accepted coverage generation) to the cycle engine. The unknown-blade runtime
+# enables this only after its coarse generation is promoted to an immutable schema-5 asset.
 # The eligible mask comes from the same FoundationStereo quality/range/robot-self-mask
 # gate used for occupancy, but science then keeps only depth consistent with the blade
 # reference. Safety occupancy still consumes every eligible scene depth, including
@@ -299,6 +323,15 @@ next_view_selection:
   require_two_observed_fin_faces_per_side: true
   exclude_already_captured_candidate_ids: true
   use_joint_travel_only_as_tiebreak: true
+  # If a nominal patch view is accepted scientifically but still fails the patch
+  # quality gates, try only these three deterministic target-centred orbits.  Every
+  # retry receives a new immutable view ID and still passes workspace/IK/FK here and
+  # swept occupancy/collision preflight downstream.
+  maximum_reacquisition_attempts_per_patch: 3
+  reacquisition_perturbations:
+    - {distance_offset_m: 0.000, tilt_deg: 6.0, azimuth_deg: 0.0}
+    - {distance_offset_m: 0.020, tilt_deg: 8.0, azimuth_deg: 120.0}
+    - {distance_offset_m: -0.020, tilt_deg: 10.0, azimuth_deg: -120.0}
 
 depth_comparison:
   minimum_overlap_points: 100
@@ -361,9 +394,9 @@ collision:
   minimum_clearance_m: 0.01
   maximum_joint_step_rad: 0.02
 
-# HoloRobot-derived motion-preflight contract. Production mode currently fails closed at
-# the missing continuous swept-mesh proof before ServoJ generation, and later also requires
-# an independent continuous robot-versus-voxel proof. Discrete streams are diagnostic only.
+# HoloRobot-derived motion-preflight contract. Production eligibility requires independent
+# conservative continuous mesh/FCL and robot-versus-voxel interval certificates. Failure to
+# prove a complete interval is UNKNOWN and blocks; discrete samples are diagnostic only.
 motion_preflight:
   maximum_joint_step_rad: 0.02
   servoj_dt_s: 0.004
@@ -373,6 +406,39 @@ motion_preflight:
   # ES68 FK and packaged flange_T_tcp before any future approval-eligible stream exists.
   maximum_endpoint_translation_error_m: 0.002
   maximum_endpoint_rotation_error_deg: 0.3
+  # Immutable physical measurements for following error + stop drift. Both values
+  # remain null until the final ES68/D435i assembly is accepted on the target workcell.
+  motion_envelope_acceptance_path: null
+  motion_envelope_acceptance_id: null
+
+# Immutable physical release evidence for the exact geometry-science contract.
+# Both fields remain null until the target workcell has passed acceptance.
+science_acceptance:
+  path: null
+  acceptance_id: null
+
+# Deterministic coarse-scan completion and bilateral fin-discovery policy. These
+# defaults exactly mirror CoarseSciencePolicy; production code must consume this
+# configuration rather than instantiate an independent implicit policy.
+coarse_science:
+  discovery_tilt_deg: 15.0
+  minimum_total_views: 6
+  minimum_views_per_side: 3
+  maximum_attempts_per_candidate: 2
+  require_complete_proxy_coverage: true
+  maximum_discovery_translation_error_m: 0.020
+  maximum_discovery_rotation_error_deg: 5.0
+
+# Terminal fine-reconstruction gates. These are software defaults, not measured
+# accuracy claims; the science acceptance asset must bind the deployed experiment.
+fine_finalization:
+  minimum_source_views_per_side: 1
+  minimum_mesh_triangles_per_side: 1
+  maximum_mesh_boundary_edges: 0
+  maximum_mesh_boundary_loops: 0
+  require_watertight_mesh: true
+  require_two_face_fin_per_side: true
+  require_fin_regions_complete: true
 
 # Receding-horizon coordinator: stop/settle, capture, FoundationStereo, publish one
 # immutable occupancy generation, preflight exactly one short segment, approve, move,
@@ -387,6 +453,15 @@ stop_and_capture:
   maximum_robot_state_staleness_s: 0.25
   maximum_goal_joint_error_rad: 0.01
   execution_freshness_margin_s: 1.0
+  # These four bounds must come from measurements on the deployed GPU,
+  # controller and workcell. Null keeps the production entry fail-closed.
+  maximum_perception_cycle_duration_s: null
+  maximum_operator_reposition_interval_s: null
+  maximum_segment_execution_duration_s: null
+  # Measured upper bound for stop-coarse/checkpoint/schema-5 promotion/fine handoff.
+  maximum_schema5_handoff_duration_s: null
+  runtime_timing_acceptance_path: null
+  runtime_timing_acceptance_id: null
   require_operator_approval: true
   require_capture_after_every_segment: true
 
@@ -409,6 +484,14 @@ occupancy:
   maximum_map_age_s: 5.0
   unknown_policy: block
   require_robot_self_mask: true
+  # Optional hardware-accepted base-frame regions known to contain no external
+  # object. They are not generic UNKNOWN exemptions: only a complete voxel cell
+  # inside one accepted AABB may be treated as accepted-static-free, while an
+  # OCCUPIED vote always wins. Keep empty until a separately archived acceptance
+  # record has been completed; its SHA-256 becomes the acceptance ID.
+  accepted_static_free_aabbs: []
+  accepted_static_free_acceptance_id: null
+  accepted_static_free_acceptance_path: null
   self_mask_front_tolerance_m: 0.01
   self_mask_back_tolerance_m: 0.02
   self_mask_dilation_px: 1

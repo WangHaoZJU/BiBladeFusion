@@ -44,9 +44,7 @@ def _load_display_arrays(stored: StoredSupervisorySnapshot) -> _DisplayArrays:
         robot_mesh_vertices=load_snapshot_array(
             stored, snapshot.robot.collision_mesh_vertices_base_m
         ),
-        robot_mesh_triangles=load_snapshot_array(
-            stored, snapshot.robot.collision_mesh_triangles
-        ),
+        robot_mesh_triangles=load_snapshot_array(stored, snapshot.robot.collision_mesh_triangles),
         planned_path=load_snapshot_array(stored, snapshot.robot.planned_tcp_path_base_m),
         actual_path=load_snapshot_array(stored, snapshot.robot.actual_tcp_path_base_m),
         occupied=load_snapshot_array(stored, snapshot.occupancy.occupied_centres_m),
@@ -79,9 +77,7 @@ def launch_supervisory_console(
     if follow_poll_interval_ms < 500:
         raise ValueError("follow_poll_interval_ms must be at least 500")
     source_path = Path(source).resolve()
-    if follow and (
-        not source_path.is_dir() or (source_path / "snapshot.json").is_file()
-    ):
+    if follow and (not source_path.is_dir() or (source_path / "snapshot.json").is_file()):
         raise ValueError(
             "Follow mode requires a timeline root whose child directories contain snapshots"
         )
@@ -166,10 +162,13 @@ def launch_supervisory_console(
             centre = np.mean(points, axis=0)
             rotated = (points - centre) @ self._rotation()
             span = np.maximum(np.ptp(rotated[:, :2], axis=0), 1e-3)
-            scale = min(
-                max(self.width() - 70, 1) / float(span[0]),
-                max(self.height() - 80, 1) / float(span[1]),
-            ) * self._zoom
+            scale = (
+                min(
+                    max(self.width() - 70, 1) / float(span[0]),
+                    max(self.height() - 80, 1) / float(span[1]),
+                )
+                * self._zoom
+            )
 
             def project(values: np.ndarray) -> np.ndarray:
                 transformed = (values - centre) @ self._rotation()
@@ -210,9 +209,7 @@ def launch_supervisory_console(
                 & (screen[:, 1] >= 0)
                 & (screen[:, 1] < self.height())
             )
-            polygon = QPolygonF(
-                [QPointF(float(x), float(y)) for x, y in screen[inside, :2]]
-            )
+            polygon = QPolygonF([QPointF(float(x), float(y)) for x, y in screen[inside, :2]])
             painter.setPen(QPen(color, width))
             painter.drawPoints(polygon)
 
@@ -340,9 +337,7 @@ def launch_supervisory_console(
             self._draw_cloud(
                 painter, project, arrays.unknown, QColor(119, 130, 144, 75), maximum=5_000
             )
-            self._draw_cloud(
-                painter, project, arrays.free, QColor(76, 110, 132, 55), maximum=6_000
-            )
+            self._draw_cloud(painter, project, arrays.free, QColor(76, 110, 132, 55), maximum=6_000)
             self._draw_cloud(
                 painter, project, arrays.inflated, QColor(255, 169, 69, 115), maximum=12_000
             )
@@ -360,15 +355,10 @@ def launch_supervisory_console(
             if arrays.robot_mesh_vertices is not None and arrays.robot_mesh_triangles is not None:
                 vertices = project(arrays.robot_mesh_vertices)
                 triangles = arrays.robot_mesh_triangles.astype(np.int64, copy=False)
-                valid = (
-                    np.all(triangles >= 0, axis=1)
-                    & np.all(triangles < len(vertices), axis=1)
-                )
+                valid = np.all(triangles >= 0, axis=1) & np.all(triangles < len(vertices), axis=1)
                 triangles = triangles[valid]
                 if len(triangles) > 2_500:
-                    triangle_indices = np.linspace(
-                        0, len(triangles) - 1, 2_500, dtype=np.int64
-                    )
+                    triangle_indices = np.linspace(0, len(triangles) - 1, 2_500, dtype=np.int64)
                     triangles = triangles[triangle_indices]
                 depth_order = np.argsort(np.mean(vertices[triangles, 2], axis=1))
                 painter.setPen(QPen(QColor(196, 211, 223, 105), 0.8))
@@ -443,7 +433,7 @@ def launch_supervisory_console(
             if arrays.planned_path is not None:
                 legend_items.append("历史目标端点折线=蓝虚线")
             if arrays.actual_path is not None:
-                legend_items.append("实际轨迹=绿")
+                legend_items.append("已记录TCP轨迹=绿（语义见数字资产）")
             if camera_pose is not None:
                 legend_items.append("黄色视锥=姿态示意（非内参尺寸）")
             painter.setPen(QColor("#cbd5df"))
@@ -451,9 +441,7 @@ def launch_supervisory_console(
             if len(legend_items) > 3:
                 painter.drawText(14, 65, "  ".join(legend_items[3:]))
             clearance = snapshot.plan.minimum_clearance_m
-            clearance_text = (
-                f"{clearance:.3f} m" if clearance is not None else "未知"
-            )
+            clearance_text = f"{clearance:.3f} m" if clearance is not None else "未知"
             painter.drawText(
                 14,
                 86,
@@ -717,25 +705,17 @@ def launch_supervisory_console(
 
         def _refresh_follow(self) -> None:
             nonlocal timeline
-            previous_hashes = tuple(
-                item.content_sha256 for item in timeline.snapshots
-            )
+            previous_hashes = tuple(item.content_sha256 for item in timeline.snapshots)
             try:
                 discovered = discover_supervisory_snapshots(source_path)
             except ValueError as exc:
-                self.timeline_label.setToolTip(
-                    f"目录跟随保留上一完整时间线；本轮发现失败：{exc}"
-                )
+                self.timeline_label.setToolTip(f"目录跟随保留上一完整时间线；本轮发现失败：{exc}")
                 return
-            discovered_hashes = tuple(
-                item.content_sha256 for item in discovered.snapshots
-            )
+            discovered_hashes = tuple(item.content_sha256 for item in discovered.snapshots)
             if discovered_hashes == previous_hashes:
                 return
             if discovered_hashes[: len(previous_hashes)] != previous_hashes:
-                self.timeline_label.setToolTip(
-                    "目录跟随拒绝已发布快照被修改、删除或重新排序"
-                )
+                self.timeline_label.setToolTip("目录跟随拒绝已发布快照被修改、删除或重新排序")
                 return
             was_at_end = self._index == len(timeline.snapshots) - 1
             timeline = discovered
@@ -745,9 +725,7 @@ def launch_supervisory_console(
             self.play_button.setEnabled(enabled)
             self.next_button.setEnabled(enabled)
             self.position_slider.setEnabled(enabled)
-            self.timeline_label.setToolTip(
-                "只读发现原子发布的回放快照；不构成在线感知或实时避障"
-            )
+            self.timeline_label.setToolTip("只读发现原子发布的回放快照；不构成在线感知或实时避障")
             self._show_index(len(timeline.snapshots) - 1 if was_at_end else self._index)
 
         def _toggle_replay(self) -> None:
@@ -817,7 +795,7 @@ def launch_supervisory_console(
                 f"<b>计划 {snapshot.plan.state}</b><br>{snapshot.plan.plan_id}<br>"
                 f"进度 {plan_position} · 下一视点 {snapshot.plan.next_view_id or '-'} · "
                 + (
-                    "历史目标端点折线"
+                    "快照绑定的计划TCP轨迹"
                     if arrays.planned_path is not None
                     else "无已验证轨迹资产"
                 )
@@ -910,9 +888,7 @@ def launch_supervisory_console(
                 if snapshot.safety.feedback_age_ms is not None
                 else "未知"
             )
-            reconstruction_reasons = (
-                "；".join(snapshot.reconstruction.provenance_reasons) or "无"
-            )
+            reconstruction_reasons = "；".join(snapshot.reconstruction.provenance_reasons) or "无"
             self.diagnostic_label.setText(
                 "<b>不可绕过的显示事实</b><br>"
                 f"未知体素策略：{snapshot.safety.unknown_occupancy_policy}；"

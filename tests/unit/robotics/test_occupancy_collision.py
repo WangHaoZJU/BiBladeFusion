@@ -7,11 +7,13 @@ import pytest
 
 from biblade_fusion.mapping import OccupancyMapState, OccupancySnapshot
 from biblade_fusion.robotics import (
+    AcceptedStaticFreeAabb,
     CollisionCheckStatus,
     Cs68PinocchioCollisionChecker,
     OccupancyEvidenceError,
     OccupancyQueryState,
     OccupancyRobotCollisionChecker,
+    RobotEnvelopeSphere,
     occupancy_evidence_from_snapshot,
 )
 from biblade_fusion.robotics.occupancy_collision import (
@@ -174,12 +176,307 @@ def test_path_report_binds_one_exact_snapshot(checker, occupancy_snapshot) -> No
         None,
         None,
     )
-    assert result.sample_count == 3
-    assert result.continuous_swept_volume_verified is False
-    assert (
-        result.result.diagnostics["path_semantic"]
-        == "discrete_joint_samples_only"
+    assert result.sample_count >= 3
+    assert result.continuous_swept_volume_verified is True
+    assert result.continuous_swept_volume_evidence_valid is True
+    assert result.proof_evidence is not None
+    assert result.proof_evidence.matches_path(
+        (0.0,) * 6,
+        (0.03, 0.0, 0.0, 0.0, 0.0, 0.0),
     )
+    assert result.result.diagnostics["path_semantic"] == (
+        "adaptive_midpoint_expanded_tracking_envelope_sphere_sweep"
+    )
+
+
+def test_swept_occupancy_proof_tampering_invalidates_certificate(
+    checker, occupancy_snapshot
+) -> None:
+    result = _checker(checker, occupancy_snapshot).check_path(
+        (0.0,) * 6,
+        (0.03, 0.0, 0.0, 0.0, 0.0, 0.0),
+        maximum_joint_step_rad=0.02,
+    )
+    assert result.proof_evidence is not None
+
+    tampered = replace(
+        result,
+        proof_evidence=replace(
+            result.proof_evidence,
+            certified_interval_count=result.proof_evidence.certified_interval_count
+            + 1,
+        ),
+    )
+
+    assert tampered.continuous_swept_volume_verified is True
+    assert tampered.continuous_swept_volume_evidence_valid is False
+
+
+def test_swept_occupancy_map_binding_tampering_invalidates_certificate(
+    checker, occupancy_snapshot
+) -> None:
+    result = _checker(checker, occupancy_snapshot).check_path(
+        (0.0,) * 6,
+        (0.03, 0.0, 0.0, 0.0, 0.0, 0.0),
+        maximum_joint_step_rad=0.02,
+    )
+    assert result.evidence is not None
+
+    changed_result = replace(
+        result.result,
+        evidence=replace(result.evidence, sequence=result.evidence.sequence + 1),
+    )
+    tampered = replace(result, result=changed_result)
+
+    assert tampered.continuous_swept_volume_evidence_valid is False
+
+
+def test_swept_occupancy_limit_returns_unknown_when_expansion_reaches_unknown(
+    checker,
+) -> None:
+    class SingleEnvelopeChecker(OccupancyRobotCollisionChecker):
+        def _robot_envelope_spheres(self, joint_positions_rad):
+            del joint_positions_rad
+            return (
+                RobotEnvelopeSphere(
+                    geometry_name="upperarm_link_0",
+                    center_base_m=(0.0, 0.0, 0.0),
+                    radius_m=0.04,
+                    geometry_index=2,
+                ),
+            )
+
+    shape = (16, 16, 16)
+    free = frozenset(
+        (x, y, z)
+        for x in range(shape[0])
+        for y in range(shape[1])
+        for z in range(shape[2])
+    )
+    snapshot = OccupancySnapshot(
+        frame_id="base",
+        voxel_size_m=0.01,
+        origin_m=(-0.08, -0.08, -0.08),
+        grid_shape=shape,
+        free_indices=free,
+        free_observation_counts=tuple((index, 3) for index in sorted(free)),
+        minimum_free_observations=3,
+        minimum_free_view_translation_m=0.02,
+        minimum_free_view_direction_deg=5.0,
+        occupied_indices=frozenset(),
+        sequence=3,
+        created_at_utc=datetime(2026, 8, 28, 0, 0, tzinfo=UTC),
+        source_view_ids=("v1", "v2", "v3"),
+        source_camera_centres_base_m=(
+            (0.0, 0.0, 0.0),
+            (0.03, 0.0, 0.0),
+            (0.06, 0.0, 0.0),
+        ),
+        source_camera_axes_base=((0.0, 0.0, 1.0),) * 3,
+        rebuild_started_at_utc=datetime(2026, 8, 28, 0, 0, tzinfo=UTC),
+        map_state=OccupancyMapState.MAP_READY,
+        mapping_context_hash="d" * 64,
+        parent_evidence_hash="b" * 64,
+        quality_evidence_hash="c" * 64,
+        state_reason="narrow synthetic known-free cube",
+    )
+    occupancy = SingleEnvelopeChecker(
+        checker,
+        lambda: snapshot,
+        verified_robot_geometry_hash="9" * 64,
+        utc_clock=lambda: datetime(2026, 8, 28, 0, 0, 1, tzinfo=UTC),
+    )
+
+    result = occupancy.check_path(
+        (0.0,) * 6,
+        (0.2, 0.0, 0.0, 0.0, 0.0, 0.0),
+        maximum_joint_step_rad=0.2,
+        maximum_subdivision_depth=0,
+    )
+
+    assert result.status is CollisionCheckStatus.UNKNOWN
+    assert result.proof_evidence is not None
+    assert result.proof_evidence.termination_reason == "subdivision_limit"
+    assert result.continuous_swept_volume_verified is False
+    assert "unproven:subdivision_limit" in result.result.blocking_reasons[0]
+
+
+def test_swept_occupancy_finds_midpath_collision_with_clear_endpoints(checker) -> None:
+    shape = (30, 30, 30)
+    origin = (-1.5, -1.5, -1.5)
+    voxel_size = 0.1
+    occupied = (7, 12, 15)
+    all_indices = {
+        (x, y, z)
+        for x in range(shape[0])
+        for y in range(shape[1])
+        for z in range(shape[2])
+    }
+    free = frozenset(all_indices - {occupied})
+    snapshot = OccupancySnapshot(
+        frame_id="base",
+        voxel_size_m=voxel_size,
+        origin_m=origin,
+        grid_shape=shape,
+        free_indices=free,
+        free_observation_counts=tuple((index, 3) for index in sorted(free)),
+        minimum_free_observations=3,
+        minimum_free_view_translation_m=0.02,
+        minimum_free_view_direction_deg=5.0,
+        occupied_indices=frozenset({occupied}),
+        sequence=3,
+        created_at_utc=datetime(2026, 8, 28, 0, 0, tzinfo=UTC),
+        source_view_ids=("v1", "v2", "v3"),
+        source_camera_centres_base_m=(
+            (0.0, 0.0, 0.0),
+            (0.03, 0.0, 0.0),
+            (0.06, 0.0, 0.0),
+        ),
+        source_camera_axes_base=((0.0, 0.0, 1.0),) * 3,
+        rebuild_started_at_utc=datetime(2026, 8, 28, 0, 0, tzinfo=UTC),
+        map_state=OccupancyMapState.MAP_READY,
+        mapping_context_hash="d" * 64,
+        parent_evidence_hash="b" * 64,
+        quality_evidence_hash="c" * 64,
+        state_reason="synthetic camera midpath obstacle",
+    )
+    camera_name = str(checker.geometry_model.geometryObjects[-1].name)
+    ignored = tuple(
+        str(geometry.name)
+        for geometry in checker.geometry_model.geometryObjects
+        if str(geometry.name) != camera_name
+    )
+    occupancy = OccupancyRobotCollisionChecker(
+        checker,
+        lambda: snapshot,
+        verified_robot_geometry_hash="9" * 64,
+        ignored_geometry_names=ignored,
+        utc_clock=lambda: datetime(2026, 8, 28, 0, 0, 1, tzinfo=UTC),
+    )
+    start = (-1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    goal = (1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    assert occupancy.check(start).status is CollisionCheckStatus.CLEAR
+    assert occupancy.check(goal).status is CollisionCheckStatus.CLEAR
+
+    result = occupancy.check_path(
+        start,
+        goal,
+        maximum_joint_step_rad=2.0,
+    )
+
+    assert result.status is CollisionCheckStatus.BLOCKED
+    assert result.blocked_path_fraction == 0.5
+    assert result.proof_evidence is not None
+    assert result.proof_evidence.termination_reason == "occupied_voxel_witness"
+
+
+def _single_unknown_voxel_snapshot(occupancy_snapshot, *, occupied: bool = False):
+    index = (10, 10, 10)
+    free = frozenset(set(occupancy_snapshot.free_indices) - {index})
+    return replace(
+        occupancy_snapshot,
+        free_indices=free,
+        free_observation_counts=tuple(
+            item
+            for item in occupancy_snapshot.free_observation_counts
+            if item[0] != index
+        ),
+        occupied_indices=frozenset({index}) if occupied else frozenset(),
+        sequence=occupancy_snapshot.sequence + 1,
+        content_hash="",
+    )
+
+
+class _SingleStaticAcceptanceEnvelopeChecker(OccupancyRobotCollisionChecker):
+    def _robot_envelope_spheres(self, joint_positions_rad):
+        del joint_positions_rad
+        return (
+            RobotEnvelopeSphere(
+                geometry_name="upperarm_link_0",
+                center_base_m=(0.25, 0.25, 0.25),
+                radius_m=0.01,
+                geometry_index=2,
+            ),
+        )
+
+
+def _static_acceptance_checker(checker, snapshot, *, maximum_m=(0.5, 0.5, 0.5)):
+    return _SingleStaticAcceptanceEnvelopeChecker(
+        checker,
+        lambda: snapshot,
+        verified_robot_geometry_hash="9" * 64,
+        accepted_static_free_aabbs=(
+            AcceptedStaticFreeAabb(
+                name="accepted_startup_cell",
+                minimum_m=(0.0, 0.0, 0.0),
+                maximum_m=maximum_m,
+            ),
+        ),
+        accepted_static_free_acceptance_id="a" * 64,
+        accepted_static_free_mapping_context_hash=snapshot.mapping_context_hash,
+        utc_clock=lambda: datetime(2026, 8, 28, 0, 0, 1, tzinfo=UTC),
+    )
+
+
+def test_accepted_static_free_requires_whole_unknown_voxel_containment(
+    checker, occupancy_snapshot
+) -> None:
+    snapshot = _single_unknown_voxel_snapshot(occupancy_snapshot)
+
+    accepted_checker = _static_acceptance_checker(checker, snapshot)
+    accepted = accepted_checker.check((0.0,) * 6)
+    partial = _static_acceptance_checker(
+        checker,
+        snapshot,
+        maximum_m=(0.49, 0.5, 0.5),
+    ).check((0.0,) * 6)
+
+    assert accepted.status is CollisionCheckStatus.CLEAR
+    assert accepted.diagnostics["queries"][0]["accepted_unknown_count"] == 1
+    assert partial.status is CollisionCheckStatus.BLOCKED
+    assert "environment_occupancy_unknown" in partial.blocking_reasons[0]
+
+    swept = accepted_checker.check_path(
+        (0.0,) * 6,
+        (0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+        maximum_joint_step_rad=0.01,
+    )
+    assert swept.status is CollisionCheckStatus.CLEAR
+    assert swept.continuous_swept_volume_evidence_valid is True
+    assert swept.proof_evidence is not None
+    assert swept.proof_evidence.accepted_unknown_voxel_query_count > 0
+
+
+def test_accepted_static_free_never_downgrades_occupied(
+    checker, occupancy_snapshot
+) -> None:
+    snapshot = _single_unknown_voxel_snapshot(occupancy_snapshot, occupied=True)
+
+    result = _static_acceptance_checker(checker, snapshot).check((0.0,) * 6)
+
+    assert result.status is CollisionCheckStatus.BLOCKED
+    assert "environment_occupancy_occupied" in result.blocking_reasons[0]
+
+
+def test_accepted_static_free_is_bound_to_mapping_context_and_acceptance_id(
+    checker, occupancy_snapshot
+) -> None:
+    snapshot = _single_unknown_voxel_snapshot(occupancy_snapshot)
+    valid = _static_acceptance_checker(checker, snapshot)
+    mismatched_context = replace(
+        valid,
+        accepted_static_free_mapping_context_hash="e" * 64,
+    )
+    different_acceptance = replace(
+        valid,
+        accepted_static_free_acceptance_id="b" * 64,
+    )
+
+    result = mismatched_context.check((0.0,) * 6)
+
+    assert result.status is CollisionCheckStatus.UNKNOWN
+    assert "mapping_context_does_not_match" in result.blocking_reasons[0]
+    assert valid.policy_contract_hash != different_acceptance.policy_contract_hash
 
 
 def test_adapter_accepts_real_immutable_mapping_snapshot(checker) -> None:

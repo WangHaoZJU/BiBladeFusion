@@ -8,10 +8,12 @@ import pytest
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.devices.robot.base import RobotState
 from biblade_fusion.robotics.stationarity import (
+    BootstrapSafeStateEvidence,
     RobotStateSource,
     StationarityError,
     StationarityTimeoutError,
     validate_stationary_trace,
+    wait_until_bootstrap_safe_state,
     wait_until_settled,
 )
 
@@ -68,6 +70,57 @@ class StateSource:
         return self._states[index]
 
 
+class BootstrapStateSource(StateSource):
+    def __init__(self, states: list[RobotState]) -> None:
+        super().__init__(states)
+        self.stop_snapshot = (1, True)
+
+
+def _bootstrap_state(
+    time_s: float,
+    *,
+    actual_joint_velocity_rad_s: float = 0.0,
+    target_joint_velocity_rad_s: float = 0.0,
+    actual_tcp_linear_velocity_m_s: float = 0.0,
+    runtime_state: str = "STOPPED",
+) -> RobotState:
+    return replace(
+        _state(time_s),
+        runtime_state=runtime_state,
+        actual_joint_velocity_rad_s=np.full(6, actual_joint_velocity_rad_s),
+        target_joint_velocity_rad_s=np.full(6, target_joint_velocity_rad_s),
+        actual_tcp_velocity=np.array(
+            [actual_tcp_linear_velocity_m_s, 0.0, 0.0, 0.0, 0.0, 0.0]
+        ),
+        target_tcp_velocity=np.zeros(6),
+    )
+
+
+def _wait_bootstrap(
+    source: BootstrapStateSource,
+    fake_time: FakeTime,
+) -> BootstrapSafeStateEvidence:
+    return wait_until_bootstrap_safe_state(
+        source,
+        expected_stop_generation=1,
+        settle_time_s=0.5,
+        timeout_s=1.5,
+        poll_period_s=0.25,
+        max_joint_delta_rad=0.001,
+        max_tcp_translation_delta_m=0.001,
+        max_tcp_rotation_delta_rad=0.001,
+        maximum_robot_state_staleness_s=0.25,
+        maximum_stopped_actual_joint_velocity_rad_s=0.002,
+        maximum_stopped_target_joint_velocity_rad_s=0.002,
+        maximum_stopped_actual_tcp_linear_velocity_m_s=0.001,
+        maximum_stopped_actual_tcp_angular_velocity_rad_s=0.002,
+        maximum_stopped_target_tcp_linear_velocity_m_s=0.001,
+        maximum_stopped_target_tcp_angular_velocity_rad_s=0.002,
+        monotonic_clock=fake_time.monotonic,
+        sleeper=fake_time.sleep,
+    )
+
+
 @dataclass
 class FakeTime:
     now_s: float = 0.0
@@ -110,6 +163,47 @@ def test_narrow_robot_state_source_requires_only_read_state() -> None:
     source = StateSource([_state(0.0)])
 
     assert isinstance(source, RobotStateSource)
+
+
+def test_bootstrap_stop_requires_full_stopped_controller_and_velocity_window() -> None:
+    source = BootstrapStateSource(
+        [
+            _bootstrap_state(0.0, actual_joint_velocity_rad_s=0.01),
+            _bootstrap_state(0.25),
+            _bootstrap_state(0.50),
+            _bootstrap_state(0.75),
+        ]
+    )
+    fake_time = FakeTime()
+
+    evidence = _wait_bootstrap(source, fake_time)
+
+    assert evidence.stationarity.sample_count == 3
+    assert evidence.stationarity.duration_s == pytest.approx(0.5)
+    assert evidence.stop_generation == 1
+    assert evidence.runtime_state == "STOPPED"
+    assert len(evidence.evidence_sha256) == 64
+
+
+def test_bootstrap_stop_fails_closed_when_velocity_channels_are_missing() -> None:
+    source = BootstrapStateSource([_state(0.0)])
+
+    with pytest.raises(StationarityError, match="mandatory RTSI velocity"):
+        _wait_bootstrap(source, FakeTime())
+
+
+def test_bootstrap_stop_fails_when_stop_generation_changes() -> None:
+    source = BootstrapStateSource([_bootstrap_state(0.0)])
+
+    def change_generation(duration_s: float) -> None:
+        fake_time.now_s += duration_s
+        source.stop_snapshot = (2, True)
+
+    fake_time = FakeTime()
+    fake_time.sleep = change_generation  # type: ignore[method-assign]
+
+    with pytest.raises(StationarityError, match="generation/latch changed"):
+        _wait_bootstrap(source, fake_time)
 
 
 def test_wait_until_settled_covers_the_full_sampled_window() -> None:

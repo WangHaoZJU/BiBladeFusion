@@ -52,8 +52,9 @@ class _FakeEs68Checker:
         end_joint_positions_rad,
         *,
         maximum_joint_step_rad: float,
+        **proof_contract,
     ) -> JointPathMeshCollisionReport:
-        del start_joint_positions_rad, end_joint_positions_rad
+        del start_joint_positions_rad, end_joint_positions_rad, proof_contract
         result = CollisionCheckResult(
             CollisionCheckStatus.CLEAR,
             diagnostics={

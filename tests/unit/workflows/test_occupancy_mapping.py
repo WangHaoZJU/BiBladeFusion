@@ -29,6 +29,7 @@ from biblade_fusion.workflows import (
     integrate_foundation_stereo_occupancy,
     mark_snapshot_stale_if_expired,
 )
+from biblade_fusion.workflows.occupancy_mapping import occupancy_physical_source_id
 
 FOUNDATION_METADATA = {
     "backend": "foundation_stereo",
@@ -213,7 +214,8 @@ def test_one_view_is_evidence_bound_but_not_ready(tmp_path: Path) -> None:
     update = _integrate_views(tmp_path, 1)[0]
 
     assert update.snapshot.map_state is OccupancyMapState.MAPPING
-    assert update.snapshot.source_view_ids == ("view-007",)
+    assert update.snapshot.source_view_ids == (update.evidence.physical_source_id,)
+    assert update.evidence.source_view_id == "view-007"
     assert update.snapshot.quality_evidence_hash == update.evidence.quality_evidence_hash
     assert update.snapshot.state_at_point((0.0125, 0.0125, 0.5)) is OccupancyState.OCCUPIED
     assert update.evidence.robot_model_hash == "a" * 64
@@ -245,6 +247,147 @@ def test_one_view_is_evidence_bound_but_not_ready(tmp_path: Path) -> None:
     ] * 6
 
 
+def test_same_logical_view_can_be_retried_with_a_distinct_physical_capture(
+    tmp_path: Path,
+) -> None:
+    settings = _config()
+    hand_eye = _hand_eye(tmp_path)
+    start = datetime(2026, 8, 28, 6, 0, tzinfo=UTC)
+    first_bundle = _bundle(
+        view_id="front-retry",
+        sequence_index=7,
+        camera_offset_m=0.0,
+    )
+    first = integrate_foundation_stereo_occupancy(
+        None,
+        first_bundle,
+        _stereo(first_bundle),
+        hand_eye,
+        settings,
+        AcquisitionConfig(),
+        EmptyRobotRenderer(),
+        captured_at_utc=start,
+        source_stereo_metadata_sha256=SOURCE_SHA256,
+        source_session_manifest_sha256=SOURCE_SHA256,
+        source_session_view_metadata_sha256=SOURCE_SHA256,
+    )
+    second_bundle = _bundle(
+        view_id="front-retry",
+        sequence_index=7,
+        camera_offset_m=0.03,
+    )
+    second = integrate_foundation_stereo_occupancy(
+        first.snapshot,
+        second_bundle,
+        _stereo(second_bundle),
+        hand_eye,
+        settings,
+        AcquisitionConfig(),
+        EmptyRobotRenderer(),
+        captured_at_utc=start + timedelta(milliseconds=1),
+        source_stereo_metadata_sha256="e" * 64,
+        source_session_manifest_sha256="e" * 64,
+        source_session_view_metadata_sha256="e" * 64,
+        previous_evidence_hash=first.evidence.quality_evidence_hash,
+    )
+
+    assert first.evidence.source_view_id == second.evidence.source_view_id == "front-retry"
+    assert first.evidence.physical_source_id != second.evidence.physical_source_id
+    assert second.snapshot.source_view_ids == (
+        first.evidence.physical_source_id,
+        second.evidence.physical_source_id,
+    )
+
+
+def test_same_physical_observation_is_rejected_even_if_reintegrated(
+    tmp_path: Path,
+) -> None:
+    bundle = _bundle(view_id="front", sequence_index=7, camera_offset_m=0.0)
+    settings = _config()
+    hand_eye = _hand_eye(tmp_path)
+    captured = datetime(2026, 8, 28, 6, 0, tzinfo=UTC)
+    first = integrate_foundation_stereo_occupancy(
+        None,
+        bundle,
+        _stereo(bundle),
+        hand_eye,
+        settings,
+        AcquisitionConfig(),
+        EmptyRobotRenderer(),
+        captured_at_utc=captured,
+        source_stereo_metadata_sha256=SOURCE_SHA256,
+        source_session_manifest_sha256=SOURCE_SHA256,
+        source_session_view_metadata_sha256=SOURCE_SHA256,
+    )
+
+    with pytest.raises(ValueError, match="already integrated"):
+        integrate_foundation_stereo_occupancy(
+            first.snapshot,
+            bundle,
+            _stereo(bundle),
+            hand_eye,
+            settings,
+            AcquisitionConfig(),
+            EmptyRobotRenderer(),
+            captured_at_utc=captured + timedelta(milliseconds=1),
+            source_stereo_metadata_sha256=SOURCE_SHA256,
+            source_session_manifest_sha256=SOURCE_SHA256,
+            source_session_view_metadata_sha256=SOURCE_SHA256,
+            previous_evidence_hash=first.evidence.quality_evidence_hash,
+        )
+
+
+def test_physical_source_identity_binds_all_raw_identity_fields() -> None:
+    baseline = occupancy_physical_source_id(
+        source_session_manifest_sha256="a" * 64,
+        source_session_view_metadata_sha256="b" * 64,
+        source_sequence_index=2,
+        frame_number=3,
+        source_view_id="front",
+    )
+    variants = (
+        occupancy_physical_source_id(
+            source_session_manifest_sha256="c" * 64,
+            source_session_view_metadata_sha256="b" * 64,
+            source_sequence_index=2,
+            frame_number=3,
+            source_view_id="front",
+        ),
+        occupancy_physical_source_id(
+            source_session_manifest_sha256="a" * 64,
+            source_session_view_metadata_sha256="c" * 64,
+            source_sequence_index=2,
+            frame_number=3,
+            source_view_id="front",
+        ),
+        occupancy_physical_source_id(
+            source_session_manifest_sha256="a" * 64,
+            source_session_view_metadata_sha256="b" * 64,
+            source_sequence_index=4,
+            frame_number=3,
+            source_view_id="front",
+        ),
+        occupancy_physical_source_id(
+            source_session_manifest_sha256="a" * 64,
+            source_session_view_metadata_sha256="b" * 64,
+            source_sequence_index=2,
+            frame_number=4,
+            source_view_id="front",
+        ),
+        occupancy_physical_source_id(
+            source_session_manifest_sha256="a" * 64,
+            source_session_view_metadata_sha256="b" * 64,
+            source_sequence_index=2,
+            frame_number=3,
+            source_view_id="back",
+        ),
+    )
+
+    assert len(baseline) == 64
+    assert baseline not in variants
+    assert len(set(variants)) == len(variants)
+
+
 def test_three_views_are_required_before_map_ready(tmp_path: Path) -> None:
     updates = _integrate_views(tmp_path, 3)
 
@@ -253,10 +396,8 @@ def test_three_views_are_required_before_map_ready(tmp_path: Path) -> None:
         OccupancyMapState.MAPPING,
         OccupancyMapState.MAP_READY,
     ]
-    assert updates[-1].snapshot.source_view_ids == (
-        "view-007",
-        "view-008",
-        "view-009",
+    assert updates[-1].snapshot.source_view_ids == tuple(
+        update.evidence.physical_source_id for update in updates
     )
     assert updates[1].evidence.previous_evidence_hash == updates[0].evidence.quality_evidence_hash
     assert updates[2].evidence.previous_evidence_hash == updates[1].evidence.quality_evidence_hash

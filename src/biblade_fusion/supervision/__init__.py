@@ -3,6 +3,12 @@
 This package deliberately has no dependency on robot command or execution ports.
 """
 
+from biblade_fusion.supervision.experiment import (
+    ExperimentDisposition,
+    ExperimentEventBatch,
+    ExperimentStatusSnapshot,
+    read_experiment_events,
+)
 from biblade_fusion.supervision.snapshot import (
     ArrayReference,
     StoredSupervisorySnapshot,
@@ -25,4 +31,8 @@ __all__ = [
     "load_snapshot_array",
     "read_supervisory_snapshot",
     "snapshot_array_references",
+    "ExperimentDisposition",
+    "ExperimentEventBatch",
+    "ExperimentStatusSnapshot",
+    "read_experiment_events",
 ]

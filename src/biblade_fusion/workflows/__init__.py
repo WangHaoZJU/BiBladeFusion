@@ -56,6 +56,7 @@ from biblade_fusion.workflows.occupancy_mapping import (
     OccupancyMappingError,
     integrate_foundation_stereo_occupancy,
     mark_snapshot_stale_if_expired,
+    occupancy_physical_source_id,
 )
 from biblade_fusion.workflows.path_validation import (
     PathSequenceError,
@@ -109,6 +110,7 @@ __all__ = [
     "OccupancyFrameEvidence",
     "OccupancyFrameUpdate",
     "OccupancyMappingError",
+    "occupancy_physical_source_id",
     "PathSequenceError",
     "PreflightedMotionLeg",
     "AuthoritativeRobotPose",

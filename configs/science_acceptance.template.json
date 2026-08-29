@@ -1,0 +1,58 @@
+{
+  "schema_version": 2,
+  "declaration_type": "biblade_fusion.geometry_science_acceptance_declaration",
+  "workcell_id": "REPLACE_WITH_WORKCELL_ID",
+  "operator_id": "REPLACE_WITH_OPERATOR_ID",
+  "accepted_at_utc": "REPLACE_WITH_UTC_ISO8601",
+  "limits": {
+    "depth_rmse_m": null,
+    "depth_p95_m": null,
+    "depth_absolute_bias_m": null,
+    "bootstrap_mask_precision": null,
+    "bootstrap_mask_recall": null,
+    "fine_mask_precision": null,
+    "fine_mask_recall": null,
+    "final_surface_rmse_m": null,
+    "final_surface_p95_m": null,
+    "final_hole_fraction": null,
+    "thickness_absolute_error_m": null
+  },
+  "measurements": {
+    "depth_rmse_m": null,
+    "depth_p95_m": null,
+    "depth_absolute_bias_m": null,
+    "bootstrap_mask_precision": null,
+    "bootstrap_mask_recall": null,
+    "fine_mask_precision": null,
+    "fine_mask_recall": null,
+    "final_surface_rmse_m": null,
+    "final_surface_p95_m": null,
+    "final_hole_fraction": null,
+    "thickness_absolute_error_m": null
+  },
+  "test_envelope": {
+    "minimum_distance_m": null,
+    "maximum_distance_m": null,
+    "minimum_incidence_deg": null,
+    "maximum_incidence_deg": null
+  },
+  "sample_counts": {
+    "depth_reference": null,
+    "annotated_frames": null,
+    "reconstructed_specimens": null
+  },
+  "checklist": {
+    "traceable_depth_reference_verified": false,
+    "distance_and_incidence_envelope_verified": false,
+    "front_back_and_both_fins_annotated": false,
+    "bootstrap_and_reference_masks_reviewed": false,
+    "final_mesh_holes_and_thickness_reviewed": false,
+    "raw_acceptance_assets_archived": false,
+    "independent_result_review_completed": false
+  },
+  "evidence": {
+    "geometry_evaluation_report": "REPLACE_WITH_CANONICAL_EVALUATION_REPORT_JSON",
+    "raw_acceptance_asset_manifest": "REPLACE_WITH_CANONICAL_RAW_ASSET_MANIFEST_JSON",
+    "independent_review_report": "REPLACE_WITH_CANONICAL_INDEPENDENT_REVIEW_JSON"
+  }
+}

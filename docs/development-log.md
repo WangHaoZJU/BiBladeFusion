@@ -1,5 +1,118 @@
 # Development log
 
+## 2026-08-29 — pre-acceptance supervised unknown-blade scan closure
+
+- Closed the top-level coarse-to-fine experiment authority with the write-once
+  `INIT -> COARSE_CHECKPOINT+ -> PREPARED -> FINE_START_CANDIDATE+ -> FINE_STARTED -> FINE_CHECKPOINT* -> FINE_COMPLETED`
+  chain. Checkpoints bind accepted science generations to exact run-event boundaries;
+  PREPARED separately binds the schema-5/reference transition. A candidate is explicitly
+  non-authoritative until the latest candidate is atomically committed by FINE_STARTED;
+  StopScan appends and outer publication share a canonical-root process `RLock` plus
+  no-follow regular lockfile/`flock`, closing the pre-publication concurrency window.
+  Crash recovery abandons an orphan fine run and creates a fresh candidate. FINE_COMPLETED
+  seals the terminal coverage plus strictly replayed final reconstruction. Source mutation,
+  missing/spliced events or any persistence failure blocks without transferring authority
+  or reporting completion.
+- Added deterministic crash recovery through `scan run-unknown --resume`. Recovery is
+  derived only from the explicitly named, fully replayed experiment chain; it discards
+  old permits, approvals, prepared segments, map freshness and controller authority. A
+  sealed completion returns a read-only report without opening robot or camera hardware.
+- Added immutable geometry-science acceptance and its non-moving recording command. The
+  record covers the configured distance/incidence envelope and binds calibration,
+  FoundationStereo source/checkpoint/model environment, the complete installed Python/OS/
+  CUDA/GPU runtime identity and all geometry policies. It now seals canonical copies of a
+  machine evaluation, raw-asset manifest and independent review, then replays every hash,
+  sample count and metric on read. Unknown runtime doctor blocks on missing or mismatched
+  science acceptance. This gate never authorizes motion.
+- Added an immutable four-budget runtime-timing authority. Cold and warm trials cover the
+  complete perception cycle, operator reposition interval, guarded segment execution, and
+  schema-5/fine handoff. The recorder rebuilds the report/manifest from the canonical raw
+  trace-v2 assets, seals every trace under the acceptance asset, and replays them on read.
+  Each trace binds the measurement implementation, current full runtime contract, Linux boot,
+  a sealed measurement-session manifest, exact monotonic nanoseconds, and the canonical JSON
+  operation evidence embedded with library-computed kind/SHA-256/size; cross-environment or
+  no-evidence reuse is rejected. The measurement-session and final acceptance workcell must
+  match exactly. Readers use one regular non-symlink snapshot for every sealed core/evidence
+  file. Production rechecks the bound asset before hardware construction and enforces each
+  accepted limit at its actual runtime boundary. The default configuration retains null limits
+  and a null authority, so no timing value is silently guessed.
+- Made FoundationStereo retries immutable and unambiguous. Every attempt has a unique
+  directory, failed/cancelled evidence is retained, and exactly one atomic commit marker
+  selects the accepted attempt. Commit, occupancy publication and freeze re-read their
+  disk authorities. Occupancy schema 7 now counts physical captures rather than logical
+  labels; schema 6 is permanently replay-only.
+- Added a measured motion-envelope acceptance bound to the final robot geometry,
+  collision contract and ServoJ control contract. Startup uses a Dashboard stop before
+  driver construction and verifies STOPPED/IDLE/safety plus actual and target joint/TCP
+  velocity channels over a complete stationary window. Segment stop acknowledgement and
+  physical stationarity are persisted independently, and continuous envelopes include
+  the accepted tracking/stop uncertainty. A segment deadline watchdog now requests
+  Dashboard stop through a software channel independent of the ServoJ command lock;
+  rejected, blocked or repeated stop failure is persisted as emergency-stop-unconfirmed
+  rather than reported as normal recovery. This is not a hard-real-time safety stop and
+  remains subject to physical SDK-concurrency and RTSI-stationarity acceptance.
+- Replaced the live observer's alternate robot depiction with the exact active
+  ES68+D435i collision manifest/STLs and added a disk-backed append-only registry for
+  displayed physical point-cloud sources. Both are rehashed before publication and on
+  restart; the observer remains command-incapable.
+
+- Added a replay-verifiable initial foreground stage for an unknown blade. It uses only
+  occupancy-integration-eligible FoundationStereo depth, rejects components touching the
+  valid-domain boundary, fails on unseeded ambiguity, preserves thin fins by avoiding
+  erosion, and supports explicit rectified-left rectangle/polygon seeds. Every decision,
+  input array and source asset is stored in an immutable hash-bound artifact.
+- Added the online bilateral coarse-science lineage. The first accepted stopped view
+  creates the proxy initialization and endpoint-filtered normal plan; each side also gets
+  paired positive/negative oblique candidates about both in-plane proxy axes. Every
+  accepted view advances one write-once generation and measured proxy coverage. Promotion
+  to schema 5 requires front/back view counts, proxy coverage, an opposing oblique pair on
+  each side, and two observed physical faces for the single protruding fin on each side.
+  The coarse-to-fine handoff is one-way and transfers no motion permit or approval state.
+- Connected typed coarse assets to the FoundationStereo transaction and coordinator. A
+  coarse wrapper is prepared while the continuous stationarity sampler is active, then
+  independently read and appended only after the matching perception transaction commits.
+  Candidate captures may therefore run without a fine reference, while coarse and fine
+  asset triples remain mutually exclusive and source-identity checked.
+- Implemented conservative continuous collision certificates. Robot self/workcell mesh
+  clearance uses adaptive joint-interval subdivision, FCL midpoint separation and
+  serial-chain displacement bounds. Robot-versus-occupancy clearance encloses each full
+  interval with expanded link-geometry spheres and retains `UNKNOWN` as blocking. Proof
+  limits and numerical ambiguity return `UNKNOWN`, never a sampled-path pass. Evidence
+  binds the joint path, geometry/model contract, map, semantic attestation, policies,
+  tolerances and termination reason through preflight and guarded execution.
+- Added immutable static-free workcell acceptance for the narrow self-mask exception.
+  Only complete UNKNOWN voxels inside an exact accepted AABB may be treated as free of
+  external objects; OCCUPIED always blocks. The record binds operator, workcell, time,
+  robot geometry, workspace, exact regions and a mandatory physical checklist, and never
+  authorizes motion by itself.
+- Added a supervised one-segment runner and a command-incapable live-observation bridge.
+  It publishes atomic snapshots for the existing follow-mode GUI: robot/FK scene, planned
+  trajectory, stopped actual samples, occupancy, FoundationStereo images/depth and
+  coarse/fine point clouds. Missing evidence publishes a BLOCKED snapshot and latches the
+  runner. Planned and actual display semantics explicitly avoid claiming high-rate
+  tracking or TSDF fusion where those data do not exist.
+- Added the public, interactive `bbf scan run-unknown` physical-motion composition root.
+  Its separate `scan doctor --mode unknown` readiness audit is strictly non-moving. The
+  runtime connects one real ES68, one D435i and
+  one FoundationStereo backend only after offline readiness passes; initial views remain
+  explicit `c` captures. Every later segment consumes an exact one-shot approval, may
+  perform capability-gated power/brake preparation only after consumption, revalidates
+  the complete safety binding, executes ServoJ, stops, and captures exactly once. The
+  schema-5 transition forks only fresh, independently rehashed perception sources into a
+  new fine coordinator; no permit, prepared trajectory, publication or coverage state is
+  migrated. Coarse and fine phases reuse one read-only live timeline so copied coarse
+  clouds survive the event-stream reset.
+- Added GPU bootstrap and non-moving readiness checks. The readiness audit verifies the
+  active calibration, kinematics, view/workspace policy, final collision assembly, both
+  continuous backends, FoundationStereo/CUDA prerequisites and the exact static-free
+  acceptance before a hardware runtime may be opened. Defaults remain fail-closed and all
+  physical dimensions, timing thresholds and safety release evidence remain subject to
+  controlled ES68+D435i acceptance.
+- This entry supersedes earlier same-day statements that the continuous proofs,
+  coarse-science transaction, live composition or public supervised entry point were
+  absent. Those statements remain below as historical increment records, not current
+  capability descriptions.
+
 ## 2026-08-29 — reference-guided foreground and transactional fine-science staging
 
 - Connected the fixed-reference fine branch to the concrete FoundationStereo cycle at
@@ -318,10 +431,12 @@ authoritative fine-grained record; this page records the experiment-facing state
 ## Non-negotiable constraints
 
 - Python 3.12 with `uv`; Elite SDK is installed from the local CPython 3.12 wheel.
-- All currently exposed CLI commands remain non-moving with respect to the robot; commands
-  that acquire or derive data write only their declared digital assets. A library-level
-  Elite control backend exists but is blocked by default configuration, offline preflight,
-  exact operator confirmation, an expiring one-shot permit, and live revalidation.
+- Offline planning, coverage, calibration, acquisition and doctor commands do not execute
+  exported robot poses. The production `scan run-unknown` entry point can move the ES68,
+  but only after its complete science/timing/motion authority chain, live stop and
+  stationarity checks, collision revalidation, exact per-segment operator confirmation and
+  expiring one-shot permit have all succeeded. Default configuration remains fail-closed
+  until the required physical acceptance assets and limits are supplied.
 - Every exported view plan has `motion_authorized: false`.
 - Raw synchronized observations are immutable; derived products use separate outputs.
 - Thermal capture remains an explicit disabled placeholder until hardware is selected.
@@ -513,48 +628,44 @@ authoritative fine-grained record; this page records the experiment-facing state
   reconstruction remains software-verified on deterministic data and pending physical
   hardware validation; later commits add their own regression evidence.
 
-## In progress
+## Software pre-acceptance status
 
-- Robot-stack migration to the pinned HoloRobot implementation is active. Model,
-  self/workcell collision, control, ServoJ trajectory, guarded-execution, and ordered
-  tool-goal preflight artifact layers are copied/adapted. The library-level
-  FoundationStereo-only stop-and-capture coordinator, fresh-window occupancy transaction,
-  stationarity interlocks and run-event evidence chain are now implemented and covered by
-  deterministic tests. Fixed-reference coverage and deterministic next-view selection
-  and online blade-mask/reconstruction/coverage staging are implemented at library level.
-  The two continuous swept-volume proofs, public composition-root/CLI integration and
-  hardware acceptance remain. Consequently no production motion path or CLI is released.
-- The migration sequence and safety boundary are recorded in
-  `docs/robot-stack-migration.md`. Existing MDH/capsule code remains temporarily for
-  artifact compatibility and will not receive new motion functionality.
-- Real D435i/ES68 coarse scans are not yet available, so the new curved reconstruction
-  is verified on deterministic synthetic bilateral blade data. Hardware threshold
-  tuning, edge occlusion acceptance, and Open3D-versus-NumPy mesh comparison remain.
+- The ES68+D435i software path is complete to the pre-acceptance boundary: exact robot
+  geometry, guarded one-segment execution, both conservative continuous sweep proofs,
+  FoundationStereo-only stop/capture transactions, physical-source occupancy identity,
+  bilateral coarse science, schema-5 promotion, reference-guided fine reconstruction,
+  deterministic coverage selection, terminal reconstruction replay, append-only global
+  sealing, exact-chain resume, and the public supervised CLI are integrated and covered by
+  deterministic regression tests.
+- Recovery and completion are evidence operations, not motion shortcuts. Resume restores
+  no permit, approval, prepared trajectory, freshness or driver authority; a completed
+  chain opens no hardware. Every motion-capable segment still requires a fresh accepted
+  map, both continuous proofs and the operator's exact one-shot confirmation.
+- Earlier entries below/above that describe missing continuous proofs, missing public
+  composition, library-only fine staging, or an `INIT -> PREPARED -> FINE_STARTED` chain
+  are retained as historical increment records and are superseded by the 2026-08-29
+  closure entry. They must not be read as current status.
+- No statement here claims physical accuracy, collision-envelope or GPU timing acceptance,
+  unattended/autonomous robot operation, or completed thermal imaging.
+- Final software verification on 2026-08-29 passed 986 tests, repository-wide Ruff,
+  Python bytecode compilation, both bootstrap-script syntax checks, strict JSON-template
+  parsing, local Markdown-link validation and `uv lock --check`.
 
-## Pending, in priority order
+## Remaining physical acceptance and future scope
 
-1. Record overlapping front/back coarse blade views, run `bbf reconstruct coarse-model`,
-   and tune footprint, Angle Criterion, curvature, ICP, TSDF, and quality gates against
-   physical dimensional references.
-2. Run a real FoundationStereo checkpoint/CUDA smoke test; no compatible checkpoint or
-   CUDA device is currently available in this workspace.
-3. Collect paired blade observations and compare FoundationStereo with native RealSense
-   depth using the offline evaluator and aggregate report.
-4. Install and accept the final ES68+D435i STL manifest, then close the self-masked
-   `UNKNOWN`-volume problem without ray-clearing occluded space. Implement and validate
-   two independent continuous proofs for every segment: swept ES68+D435i mesh/FCL
-   clearance and swept robot-versus-voxel occupancy clearance. Discrete bounding-sphere
-   samples remain diagnostic only.
-5. Build a private experiment composition root for the now-connected foreground,
-   reconstruction, coverage and selector libraries; do not expose production motion.
-   Validate the complete transaction on recorded and live blade data, including mask
-   precision/recall at the main surface, both fin faces, roots, rims and blade boundaries.
-   After both continuous sweep proofs exist, perform controlled hardware acceptance and
-   measure FoundationStereo latency, bootstrap-window duration, map replay, preflight,
-   operator response, short-segment execution and settle time. The default 5 s map age and
-   null segment bound are software placeholders, not accepted physical values. Offline
-   `build-replay` must remain `STALE/BLOCKED`.
-6. Hardware-validate the deterministic coverage-derived sequence from separately
-   approved known-safe poses. Joint-motion cost may later be evaluated only as a
-   non-safety tie-breaker, not as a reachability or clearance substitute.
-7. Implement the thermal-camera adapter after its model and radiometric SDK are known.
+1. On the target GPU machine, validate the pinned FoundationStereo source, checkpoint and
+   model configuration; record worst-case inference and schema-5 handoff durations rather
+   than using guessed budgets.
+2. With an attended, low-speed, emergency-stop-ready ES68 setup, accept the final
+   ES68+D435i STL/manifest, static-free regions, tracking/stop envelope, continuous-proof
+   behavior and workcell bounds using known-safe and known-collision cases.
+3. Acquire real front/back/fins datasets with traceable dimensional references. Measure
+   the required distance/incidence envelope, mask precision/recall, depth errors, final
+   surface/thickness/normal/hole metrics and selector behavior; archive the declaration
+   through `bbf safety record-science-acceptance` and configure its exact path/ID.
+4. Run `scan doctor --mode unknown` against those immutable acceptances, then execute only
+   the attended per-segment approval protocol. Record bootstrap, map replay, preflight,
+   operator response, segment execution, stop and handoff timing evidence.
+5. Implement and separately calibrate/validate the thermal-camera acquisition,
+   radiometric correction, hand-eye relationship and geometry-temperature fusion after
+   the final sensor/SDK is selected. Thermal reconstruction remains future work.

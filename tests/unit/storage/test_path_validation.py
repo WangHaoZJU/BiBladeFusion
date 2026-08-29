@@ -294,7 +294,7 @@ def test_motion_preflight_without_occupancy_is_rederived_as_blocked(tmp_path: Pa
     )
     assert stored.report.legs[0].preflight.servoj_stream is None
     assert stored.report.legs[0].preflight.blocking_reasons == (
-        "continuous_swept_mesh_unavailable",
+        "occupancy_checker_unavailable",
         "endpoint_fk_tcp_translation_error_exceeded",
         "endpoint_fk_tcp_rotation_error_exceeded",
     )

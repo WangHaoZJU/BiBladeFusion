@@ -17,7 +17,11 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from biblade_fusion.core.pose import PoseSE3
-from biblade_fusion.core.settings import SurfacePartitionConfig, ViewPlanningConfig
+from biblade_fusion.core.settings import (
+    ReacquisitionPerturbationConfig,
+    SurfacePartitionConfig,
+    ViewPlanningConfig,
+)
 from biblade_fusion.devices.depth_camera import CameraIntrinsics
 from biblade_fusion.perception.boundary import (
     BladeBoundaryModel,
@@ -220,6 +224,113 @@ class CurvedViewPlan:
     @property
     def motion_authorized(self) -> bool:
         return False
+
+
+def generate_reacquisition_view(
+    candidate: CandidateView,
+    base_t_left_rectified: PoseSE3,
+    left_rectified_t_left_ir: PoseSE3,
+    perturbation: ReacquisitionPerturbationConfig,
+    *,
+    view_id: str,
+    minimum_standoff_distance_m: float,
+    maximum_standoff_distance_m: float,
+) -> tuple[CandidateView, PoseSE3]:
+    """Generate one bounded target-centred retry without bypassing later gates.
+
+    ``tilt_deg`` is the polar offset from the patch outward normal and
+    ``azimuth_deg`` selects its direction in the nominal camera-X tangent basis.
+    The returned raw left-IR pose remains exactly linked to the rectified pose by
+    the pinned stereo calibration.  This function proves geometry only; workspace,
+    IK/FK, occupancy, and swept collision checks remain downstream obligations.
+    """
+
+    identity = str(view_id).strip()
+    if not identity or identity == candidate.view_id:
+        raise ValueError("Reacquisition view ID must be non-empty and new")
+    if (
+        base_t_left_rectified.parent_frame,
+        base_t_left_rectified.child_frame,
+    ) != ("base", "left_rectified") or (
+        left_rectified_t_left_ir.parent_frame,
+        left_rectified_t_left_ir.child_frame,
+    ) != ("left_rectified", "left_ir"):
+        raise ValueError("Reacquisition requires calibrated rectified/raw camera frames")
+    expected_raw = base_t_left_rectified.compose(left_rectified_t_left_ir)
+    if not np.allclose(
+        expected_raw.matrix,
+        candidate.base_t_left_ir.matrix,
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        raise ValueError("Nominal reacquisition pose violates stereo calibration")
+
+    target = candidate.patch.target_m
+    normal = candidate.patch.outward_normal
+    nominal_offset = base_t_left_rectified.translation_m - target
+    nominal_distance = float(np.linalg.norm(nominal_offset))
+    if (
+        nominal_distance <= 1e-9
+        or abs(nominal_distance - candidate.standoff_distance_m) > 1e-6
+        or float(nominal_offset @ normal) / nominal_distance < 1.0 - 1e-6
+    ):
+        raise ValueError("Nominal reacquisition view is not patch-normal-facing")
+    distance = candidate.standoff_distance_m + perturbation.distance_offset_m
+    lower = float(minimum_standoff_distance_m)
+    upper = float(maximum_standoff_distance_m)
+    if (
+        not np.isfinite((lower, upper, distance)).all()
+        or lower <= 0.0
+        or upper < lower
+        or not lower <= distance <= upper
+    ):
+        raise ValueError("Reacquisition distance leaves the calibrated planning interval")
+
+    tangent_x = base_t_left_rectified.rotation[:, 0].copy()
+    tangent_x -= normal * float(tangent_x @ normal)
+    tangent_norm = float(np.linalg.norm(tangent_x))
+    if tangent_norm <= 1e-9:
+        raise ValueError("Nominal reacquisition view has no stable tangent basis")
+    tangent_x /= tangent_norm
+    tangent_y = np.cross(normal, tangent_x)
+    tangent_y /= np.linalg.norm(tangent_y)
+    tilt = np.deg2rad(perturbation.tilt_deg)
+    azimuth = np.deg2rad(perturbation.azimuth_deg)
+    tangent_direction = np.cos(azimuth) * tangent_x + np.sin(azimuth) * tangent_y
+    camera_direction = np.cos(tilt) * normal + np.sin(tilt) * tangent_direction
+    camera_direction /= np.linalg.norm(camera_direction)
+    camera_position = target + distance * camera_direction
+
+    camera_z = -camera_direction
+    camera_x = base_t_left_rectified.rotation[:, 0].copy()
+    camera_x -= camera_z * float(camera_x @ camera_z)
+    if np.linalg.norm(camera_x) <= 1e-9:
+        camera_x = tangent_y - camera_z * float(tangent_y @ camera_z)
+    camera_x /= np.linalg.norm(camera_x)
+    camera_y = np.cross(camera_z, camera_x)
+    camera_y /= np.linalg.norm(camera_y)
+    camera_x = np.cross(camera_y, camera_z)
+    rotation = np.column_stack((camera_x, camera_y, camera_z))
+    retry_rectified = PoseSE3.from_rotation_translation(
+        "base",
+        "left_rectified",
+        rotation,
+        camera_position,
+    )
+    retry_raw = retry_rectified.compose(left_rectified_t_left_ir)
+    scale = distance / candidate.standoff_distance_m
+    angular_factor = float(np.cos(tilt))
+    retry = CandidateView(
+        identity,
+        candidate.patch,
+        retry_raw,
+        distance,
+        tuple(float(value * scale) for value in candidate.footprint_m),
+        float(np.clip(candidate.projection_fraction * angular_factor, 0.0, 1.0)),
+        float(np.clip(candidate.visibility_fraction * angular_factor, 0.0, 1.0)),
+        f"{candidate.distance_policy}+bounded_reacquisition_v1",
+    )
+    return retry, retry_rectified
 
 
 def derive_usable_footprint(
