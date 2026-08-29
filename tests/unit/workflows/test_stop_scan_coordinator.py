@@ -41,6 +41,7 @@ from biblade_fusion.storage.stop_scan_run import StopScanRunWriter, read_stop_sc
 from biblade_fusion.workflows.stop_scan_coordinator import (
     BladePlanningAssetError,
     CapturedStopScanView,
+    CapturePurpose,
     NextViewSelection,
     NextViewTarget,
     NextViewUnavailable,
@@ -124,9 +125,7 @@ def _bundle(view_id: str, sequence: int, state: RobotState) -> SynchronizedFrame
     calibration = StereoCalibrationSnapshot(
         intrinsics,
         intrinsics,
-        PoseSE3.from_rotation_translation(
-            "right_ir", "left_ir", np.eye(3), (-0.05, 0.0, 0.0)
-        ),
+        PoseSE3.from_rotation_translation("right_ir", "left_ir", np.eye(3), (-0.05, 0.0, 0.0)),
         None,
     )
     image = np.zeros((3, 4), dtype=np.uint8)
@@ -159,11 +158,7 @@ def _stored_mapping(
     occupancy_metadata_sha256: str = "e" * 64,
 ) -> StoredOccupancyMapping:
     voxel = (0, 0, 0)
-    state = (
-        OccupancyMapState.MAP_READY
-        if source_count >= 3
-        else OccupancyMapState.MAPPING
-    )
+    state = OccupancyMapState.MAP_READY if source_count >= 3 else OccupancyMapState.MAPPING
     snapshot = OccupancySnapshot(
         frame_id="base",
         voxel_size_m=0.1,
@@ -220,6 +215,9 @@ class FakePerception:
         self.source = source
         self.counts = iter(counts)
         self.captures: list[str] = []
+        self.capture_requests: list[tuple[str, CapturePurpose]] = []
+        self.capture_purpose_override: CapturePurpose | None = None
+        self.result_purpose_override: CapturePurpose | None = None
         self._acquisition_config = acquisition_config
         self._occupancy_config = occupancy_config
         self._coordinator_config = coordinator_config
@@ -243,28 +241,29 @@ class FakePerception:
         return self._coordinator_config
 
     def cancel_pending_capture(self, captured=None) -> None:
-        if self.pending is not None and (
-            captured is None or self.pending[0] is captured
-        ):
+        if self.pending is not None and (captured is None or self.pending[0] is captured):
             self.pending = None
 
     def commit_perception_cycle(self, captured, result) -> None:
         if (
             self.pending is None
             or self.pending[0] is not captured
-            or self.pending[1].occupancy_mapping_path
-            != result.occupancy_mapping_path
-            or self.pending[1].inference_stationarity_sha256
-            != result.inference_stationarity_sha256
+            or self.pending[1].occupancy_mapping_path != result.occupancy_mapping_path
+            or self.pending[1].inference_stationarity_sha256 != result.inference_stationarity_sha256
         ):
             raise RuntimeError("synthetic perception commit mismatch")
-        self.committed.append(
-            (captured.bundle.view_id, captured.bundle.sequence_index)
-        )
+        self.committed.append((captured.bundle.view_id, captured.bundle.sequence_index))
         self.pending = None
 
-    def capture(self, view_id: str, sequence_index: int) -> CapturedStopScanView:
+    def capture(
+        self,
+        view_id: str,
+        sequence_index: int,
+        *,
+        purpose: CapturePurpose,
+    ) -> CapturedStopScanView:
         self.captures.append(view_id)
+        self.capture_requests.append((view_id, purpose))
         cycle = self.root / f"cycle-{sequence_index}-{view_id}"
         session = cycle / "raw-session"
         session.mkdir(parents=True)
@@ -275,14 +274,18 @@ class FakePerception:
                 {
                     "status": "completed",
                     "closed_at_utc": NOW.isoformat(),
-                    "views": [
-                        {"view_id": view_id, "sequence_index": sequence_index}
-                    ],
+                    "views": [{"view_id": view_id, "sequence_index": sequence_index}],
                 }
             ),
             encoding="utf-8",
         )
-        return CapturedStopScanView(bundle, session, cycle, NOW)
+        return CapturedStopScanView(
+            bundle,
+            session,
+            cycle,
+            NOW,
+            self.capture_purpose_override or purpose,
+        )
 
     def infer_and_update(self, captured: CapturedStopScanView) -> PerceptionCycleResult:
         count = next(self.counts)
@@ -301,21 +304,15 @@ class FakePerception:
             json.dumps({"view_id": captured.bundle.view_id}),
             encoding="utf-8",
         )
-        stereo_metadata_sha256 = hashlib.sha256(
-            stereo_metadata_path.read_bytes()
-        ).hexdigest()
+        stereo_metadata_sha256 = hashlib.sha256(stereo_metadata_path.read_bytes()).hexdigest()
         reference = captured.bundle.robot_state_before
         trace = (self.source.read_state(), self.source.read_state())
         stationarity = validate_stationary_trace(
             reference,
             trace,
             max_joint_delta_rad=self._acquisition_config.max_joint_delta_rad,
-            max_tcp_translation_delta_m=(
-                self._acquisition_config.max_tcp_translation_delta_m
-            ),
-            max_tcp_rotation_delta_rad=(
-                self._acquisition_config.max_tcp_rotation_delta_rad
-            ),
+            max_tcp_translation_delta_m=(self._acquisition_config.max_tcp_translation_delta_m),
+            max_tcp_rotation_delta_rad=(self._acquisition_config.max_tcp_rotation_delta_rad),
             maximum_robot_state_staleness_s=(
                 self._coordinator_config.maximum_robot_state_staleness_s
             ),
@@ -329,12 +326,8 @@ class FakePerception:
             evidence=stationarity,
             source_session_manifest=captured.raw_session_path / "manifest.json",
             max_joint_delta_rad=self._acquisition_config.max_joint_delta_rad,
-            max_tcp_translation_delta_m=(
-                self._acquisition_config.max_tcp_translation_delta_m
-            ),
-            max_tcp_rotation_delta_rad=(
-                self._acquisition_config.max_tcp_rotation_delta_rad
-            ),
+            max_tcp_translation_delta_m=(self._acquisition_config.max_tcp_translation_delta_m),
+            max_tcp_rotation_delta_rad=(self._acquisition_config.max_tcp_rotation_delta_rad),
             maximum_robot_state_staleness_s=(
                 self._coordinator_config.maximum_robot_state_staleness_s
             ),
@@ -382,6 +375,7 @@ class FakePerception:
             inference_stationarity=stationarity,
             inference_stationarity_path=stored_stationarity.path,
             inference_stationarity_sha256=stored_stationarity.file_sha256,
+            purpose=self.result_purpose_override or captured.purpose,
         )
         self.pending = (captured, result)
         return result
@@ -485,14 +479,10 @@ class FakeSafetyFactory:
             goal_joint_positions_rad=proposal.goal_joint_positions_rad,
             occupancy=occupancy,
             ready_for_approval=self.clear,
-            blocking_reasons=(
-                () if self.clear else ("continuous_swept_mesh_unavailable",)
-            ),
+            blocking_reasons=(() if self.clear else ("continuous_swept_mesh_unavailable",)),
             diagnostics={
                 "stop_scan_occupancy_generation_id": generation.generation_id,
-                "inference_stationarity_sha256": (
-                    generation.inference_stationarity_sha256
-                ),
+                "inference_stationarity_sha256": (generation.inference_stationarity_sha256),
                 "surface_generation_id": proposal.surface_generation_id,
                 "reference_model_sha256": proposal.reference_model_sha256,
                 "selection_policy_sha256": proposal.selection_policy_sha256,
@@ -581,7 +571,10 @@ def _target() -> NextViewTarget:
     )
 
 
-def test_bootstrap_then_one_short_segment_requires_new_capture(tmp_path: Path) -> None:
+def test_bootstrap_then_one_short_segment_requires_new_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     coordinator, _, stop, perception, safety, _ = _coordinator(
         tmp_path,
         mapping_counts=[1, 2, 3, 3],
@@ -595,6 +588,11 @@ def test_bootstrap_then_one_short_segment_requires_new_capture(tmp_path: Path) -
     coordinator.capture_infer_update("bootstrap-2")
     assert coordinator.checkpoint.phase is StopScanPhase.MAP_READY
     assert len(perception.committed) == 3
+    assert [purpose for _, purpose in perception.capture_requests] == [
+        CapturePurpose.BOOTSTRAP,
+        CapturePurpose.BOOTSTRAP,
+        CapturePurpose.BOOTSTRAP,
+    ]
 
     prepared = coordinator.prepare_next_segment()
 
@@ -617,14 +615,193 @@ def test_bootstrap_then_one_short_segment_requires_new_capture(tmp_path: Path) -
 
     expected_capture = coordinator.checkpoint.expected_capture_view_id
     assert expected_capture == "transit_fine-front-001_cycle_0003"
+    accepted_coverage = (tmp_path / "accepted-surface-coverage").resolve()
+    accepted_coverage.mkdir()
+    stored_coverage = SimpleNamespace(
+        root=accepted_coverage,
+        ledger=SimpleNamespace(observation_ids=()),
+        current_reconstructed_view_path=None,
+    )
+    monkeypatch.setattr(
+        stop_scan_module,
+        "read_surface_coverage_generation",
+        lambda path, **kwargs: stored_coverage,
+    )
+    original_infer = perception.infer_and_update
+
+    def infer_with_carried_coverage(captured):
+        result = replace(original_infer(captured), coverage_path=accepted_coverage)
+        perception.pending = (captured, result)
+        return result
+
+    perception.infer_and_update = infer_with_carried_coverage  # type: ignore[method-assign]
     coordinator.capture_infer_update()
     assert perception.captures[-1] == expected_capture
+    assert perception.capture_requests[-1] == (
+        expected_capture,
+        CapturePurpose.TRANSIT,
+    )
     assert coordinator.checkpoint.phase is StopScanPhase.MAP_READY
     assert len(perception.committed) == 4
 
 
+def test_final_target_capture_is_explicit_candidate_purpose(tmp_path: Path) -> None:
+    target = NextViewTarget(
+        "fine-front-near",
+        (0.04, 0.0, 0.0, 0.0, 0.0, 0.0),
+        tuple(tuple(float(value) for value in row) for row in np.eye(4)),
+    )
+    coordinator, _, _, perception, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3, 3],
+        target=target,
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    prepared = coordinator.prepare_next_segment()
+    assert prepared is not None and prepared.proposal.final_target is True
+    coordinator.execute_approved(
+        operator_id="operator",
+        confirmation="EXECUTE synthetic",
+    )
+
+    # The default fake produces only safety occupancy.  A candidate capture must
+    # therefore be rejected even though its coordinator-assigned purpose is correct.
+    with pytest.raises(StopScanBlocked):
+        coordinator.capture_infer_update()
+
+    assert perception.capture_requests[-1] == (
+        target.view_id,
+        CapturePurpose.CANDIDATE,
+    )
+    assert perception.committed == [("bootstrap-ready", 0)]
+
+
+@pytest.mark.parametrize(
+    "missing_asset",
+    ["blade_foreground_path", "reconstructed_view_path", "coverage_path"],
+)
+def test_candidate_missing_any_science_asset_fails_before_commit_or_publish(
+    tmp_path: Path,
+    missing_asset: str,
+) -> None:
+    target = NextViewTarget(
+        "fine-front-near",
+        (0.04, 0.0, 0.0, 0.0, 0.0, 0.0),
+        tuple(tuple(float(value) for value in row) for row in np.eye(4)),
+    )
+    coordinator, _, _, perception, _, publisher = _coordinator(
+        tmp_path,
+        mapping_counts=[3, 3],
+        target=target,
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    accepted_generation_id = publisher.current.generation_id
+    prepared = coordinator.prepare_next_segment()
+    assert prepared is not None and prepared.proposal.final_target is True
+    coordinator.execute_approved(
+        operator_id="operator",
+        confirmation="EXECUTE synthetic",
+    )
+
+    original_infer = perception.infer_and_update
+
+    def infer_with_incomplete_science(captured):
+        result = original_infer(captured)
+        mask_path = captured.cycle_root / "blade-foreground"
+        reconstructed_path = captured.cycle_root / "reconstructed-view"
+        coverage_path = captured.cycle_root / "surface-coverage"
+        for path in (mask_path, reconstructed_path, coverage_path):
+            path.mkdir()
+        paths = {
+            "blade_foreground_path": mask_path,
+            "reconstructed_view_path": reconstructed_path,
+            "coverage_path": coverage_path,
+        }
+        paths[missing_asset] = None
+        incomplete = replace(result, **paths)
+        perception.pending = (captured, incomplete)
+        return incomplete
+
+    perception.infer_and_update = infer_with_incomplete_science  # type: ignore[method-assign]
+
+    with pytest.raises(StopScanBlocked):
+        coordinator.capture_infer_update()
+
+    assert coordinator.checkpoint.phase is StopScanPhase.FAILED
+    assert perception.committed == [("bootstrap-ready", 0)]
+    assert publisher.current.generation_id == accepted_generation_id
+
+
+def test_motion_blocked_operator_capture_is_safety_refresh(tmp_path: Path) -> None:
+    coordinator, _, _, perception, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3, 3],
+        target=_target(),
+        clear=False,
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    coordinator.prepare_next_segment()
+    assert coordinator.checkpoint.phase is StopScanPhase.MOTION_BLOCKED
+    assert coordinator.checkpoint.expected_capture_view_id is None
+
+    coordinator.capture_infer_update("safety-refresh-0")
+
+    assert perception.capture_requests[-1] == (
+        "safety-refresh-0",
+        CapturePurpose.SAFETY_REFRESH,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tampered_boundary", "message"),
+    [
+        ("capture", "identity, sequence, or purpose changed"),
+        ("result", "Capture purpose changed during perception"),
+    ],
+)
+def test_coordinator_rejects_capture_purpose_drift(
+    tmp_path: Path,
+    tampered_boundary: str,
+    message: str,
+) -> None:
+    coordinator, _, _, perception, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=None,
+    )
+    if tampered_boundary == "capture":
+        perception.capture_purpose_override = CapturePurpose.SAFETY_REFRESH
+    else:
+        perception.result_purpose_override = CapturePurpose.CANDIDATE
+    coordinator.start()
+
+    with pytest.raises(StopScanBlocked, match=message):
+        coordinator.capture_infer_update("bootstrap-ready")
+
+    assert coordinator.checkpoint.phase is StopScanPhase.FAILED
+    assert perception.committed == []
+
+
+def test_awaiting_capture_without_expected_view_is_rejected(tmp_path: Path) -> None:
+    coordinator, *_ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=None,
+    )
+    coordinator.start()
+    coordinator._phase = StopScanPhase.AWAITING_CAPTURE
+    coordinator._expected_capture_view_id = None
+
+    with pytest.raises(StopScanError, match="has no expected post-motion view"):
+        coordinator.capture_infer_update("operator-name-cannot-recover-purpose")
+
+
 def test_transit_cycle_may_carry_prior_coverage_but_not_publish_external_successor(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coordinator, _, _, perception, _, _ = _coordinator(
         tmp_path,
@@ -632,19 +809,50 @@ def test_transit_cycle_may_carry_prior_coverage_but_not_publish_external_success
         target=None,
     )
     coordinator.start()
-    captured = perception.capture("transit_fine-front-001_cycle_0000", 0)
+    captured = perception.capture(
+        "transit_fine-front-001_cycle_0000",
+        0,
+        purpose=CapturePurpose.TRANSIT,
+    )
     result = perception.infer_and_update(captured)
     prior_coverage = tmp_path / "persistent_surface_coverage"
     prior_coverage.mkdir()
+
+    semantic_reads: list[Path] = []
+
+    def read_prior_coverage(path: Path, **kwargs):
+        assert kwargs == {"require_foreground_bound_science": True}
+        semantic_reads.append(Path(path).resolve())
+        return SimpleNamespace(
+            root=prior_coverage.resolve(),
+            ledger=SimpleNamespace(observation_ids=()),
+            current_reconstructed_view_path=None,
+        )
+
+    monkeypatch.setattr(
+        stop_scan_module,
+        "read_surface_coverage_generation",
+        read_prior_coverage,
+    )
     carried = replace(result, coverage_path=prior_coverage)
 
-    with pytest.raises(StopScanBlocked, match="only for an expected transit"):
-        coordinator._validate_perception_result(captured, carried)
+    captured_candidate = replace(captured, purpose=CapturePurpose.CANDIDATE)
+    carried_candidate = replace(carried, purpose=CapturePurpose.CANDIDATE)
+    with pytest.raises(StopScanBlocked, match="allowed only for a bootstrap"):
+        coordinator._validate_perception_result(
+            captured_candidate,
+            carried_candidate,
+            CapturePurpose.CANDIDATE,
+        )
 
-    coordinator._expected_capture_view_id = captured.bundle.view_id
-    verified = coordinator._validate_perception_result(captured, carried)
+    verified = coordinator._validate_perception_result(
+        captured,
+        carried,
+        CapturePurpose.TRANSIT,
+    )
 
     assert verified.snapshot == result.stored_occupancy.snapshot
+    assert semantic_reads == [prior_coverage.resolve()]
 
     reconstruction = captured.cycle_root / "reconstructed_view"
     reconstruction.mkdir()
@@ -653,7 +861,85 @@ def test_transit_cycle_may_carry_prior_coverage_but_not_publish_external_success
         reconstructed_view_path=reconstruction,
     )
     with pytest.raises(StopScanBlocked, match="new surface coverage escaped"):
-        coordinator._validate_perception_result(captured, invalid_successor)
+        coordinator._validate_perception_result(
+            captured,
+            invalid_successor,
+            CapturePurpose.TRANSIT,
+        )
+
+
+def test_resume_bootstrap_may_carry_semantically_verified_prior_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _, _, perception, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=None,
+    )
+    coordinator.start()
+    captured = perception.capture(
+        "resume-bootstrap",
+        0,
+        purpose=CapturePurpose.BOOTSTRAP,
+    )
+    result = perception.infer_and_update(captured)
+    prior_coverage = tmp_path / "accepted_surface_coverage"
+    prior_coverage.mkdir()
+    semantic_reads: list[Path] = []
+
+    def read_prior_coverage(path: Path, **kwargs):
+        assert kwargs == {"require_foreground_bound_science": True}
+        semantic_reads.append(Path(path).resolve())
+        return SimpleNamespace(
+            root=prior_coverage.resolve(),
+            ledger=SimpleNamespace(observation_ids=()),
+            current_reconstructed_view_path=None,
+        )
+
+    monkeypatch.setattr(
+        stop_scan_module,
+        "read_surface_coverage_generation",
+        read_prior_coverage,
+    )
+
+    verified = coordinator._validate_perception_result(
+        captured,
+        replace(result, coverage_path=prior_coverage),
+        CapturePurpose.BOOTSTRAP,
+    )
+
+    assert verified.snapshot == result.stored_occupancy.snapshot
+    assert semantic_reads == [prior_coverage.resolve()]
+
+
+def test_external_coverage_cannot_bypass_semantic_reader(
+    tmp_path: Path,
+) -> None:
+    coordinator, _, _, perception, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=None,
+    )
+    coordinator.start()
+    captured = perception.capture(
+        "resume-bootstrap",
+        0,
+        purpose=CapturePurpose.BOOTSTRAP,
+    )
+    result = perception.infer_and_update(captured)
+    invalid_coverage = tmp_path / "not_a_surface_coverage_asset"
+    invalid_coverage.mkdir()
+
+    with pytest.raises(
+        StopScanBlocked,
+        match="Science asset failed independent semantic readback",
+    ):
+        coordinator._validate_perception_result(
+            captured,
+            replace(result, coverage_path=invalid_coverage),
+            CapturePurpose.BOOTSTRAP,
+        )
 
 
 @pytest.mark.parametrize(
@@ -720,9 +1006,7 @@ def test_map_change_after_preflight_aborts_before_execute(tmp_path: Path) -> Non
     changed = _stored_mapping(
         3,
         sequence_offset=10,
-        occupancy_metadata_sha256=hashlib.sha256(
-            changed_metadata.read_bytes()
-        ).hexdigest(),
+        occupancy_metadata_sha256=hashlib.sha256(changed_metadata.read_bytes()).hexdigest(),
     )
     current = publisher.current
     publisher.publish(
@@ -753,8 +1037,17 @@ def test_multi_view_raw_session_is_rejected_before_inference(tmp_path: Path) -> 
     )
     original_capture = perception.capture
 
-    def invalid_capture(view_id: str, sequence_index: int):
-        captured = original_capture(view_id, sequence_index)
+    def invalid_capture(
+        view_id: str,
+        sequence_index: int,
+        *,
+        purpose: CapturePurpose,
+    ):
+        captured = original_capture(
+            view_id,
+            sequence_index,
+            purpose=purpose,
+        )
         manifest_path = captured.raw_session_path / "manifest.json"
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         payload["views"].append(dict(payload["views"][0]))
@@ -987,12 +1280,8 @@ def test_semantically_valid_but_unrelated_stationarity_asset_is_rejected(
             reference,
             trace,
             max_joint_delta_rad=perception.acquisition_config.max_joint_delta_rad,
-            max_tcp_translation_delta_m=(
-                perception.acquisition_config.max_tcp_translation_delta_m
-            ),
-            max_tcp_rotation_delta_rad=(
-                perception.acquisition_config.max_tcp_rotation_delta_rad
-            ),
+            max_tcp_translation_delta_m=(perception.acquisition_config.max_tcp_translation_delta_m),
+            max_tcp_rotation_delta_rad=(perception.acquisition_config.max_tcp_rotation_delta_rad),
             maximum_robot_state_staleness_s=(
                 perception.coordinator_config.maximum_robot_state_staleness_s
             ),
@@ -1006,12 +1295,8 @@ def test_semantically_valid_but_unrelated_stationarity_asset_is_rejected(
             evidence=evidence,
             source_session_manifest=captured.raw_session_path / "manifest.json",
             max_joint_delta_rad=perception.acquisition_config.max_joint_delta_rad,
-            max_tcp_translation_delta_m=(
-                perception.acquisition_config.max_tcp_translation_delta_m
-            ),
-            max_tcp_rotation_delta_rad=(
-                perception.acquisition_config.max_tcp_rotation_delta_rad
-            ),
+            max_tcp_translation_delta_m=(perception.acquisition_config.max_tcp_translation_delta_m),
+            max_tcp_rotation_delta_rad=(perception.acquisition_config.max_tcp_rotation_delta_rad),
             maximum_robot_state_staleness_s=(
                 perception.coordinator_config.maximum_robot_state_staleness_s
             ),
@@ -1073,14 +1358,18 @@ def test_independent_readback_rejects_current_frame_source_mismatch(
     def mismatched_mapping(captured):
         result = original(captured)
         stored = _FAKE_OCCUPANCY_ASSETS[result.occupancy_mapping_path]
-        wrong = replace(
-            stored.frame_evidence[-1],
-            source_view_id="old-view",
-        ) if hasattr(stored.frame_evidence[-1], "__dataclass_fields__") else SimpleNamespace(
-            **{
-                **vars(stored.frame_evidence[-1]),
-                "source_view_id": "old-view",
-            }
+        wrong = (
+            replace(
+                stored.frame_evidence[-1],
+                source_view_id="old-view",
+            )
+            if hasattr(stored.frame_evidence[-1], "__dataclass_fields__")
+            else SimpleNamespace(
+                **{
+                    **vars(stored.frame_evidence[-1]),
+                    "source_view_id": "old-view",
+                }
+            )
         )
         _FAKE_OCCUPANCY_ASSETS[result.occupancy_mapping_path] = replace(
             stored,
@@ -1116,9 +1405,7 @@ def test_external_map_replacement_breaks_observation_generation_binding(
     changed_mapping = _stored_mapping(
         3,
         sequence_offset=20,
-        occupancy_metadata_sha256=hashlib.sha256(
-            metadata_path.read_bytes()
-        ).hexdigest(),
+        occupancy_metadata_sha256=hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
     )
     publisher.publish(
         OccupancyGeneration.verified(

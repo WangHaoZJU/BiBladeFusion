@@ -1,5 +1,10 @@
 """Reproducible acquisition-session storage."""
 
+from biblade_fusion.storage.blade_foreground import (
+    StoredBladeForegroundMask,
+    read_blade_foreground_mask,
+    write_blade_foreground_mask,
+)
 from biblade_fusion.storage.coarse_model import (
     StoredCoarseModelSummary,
     read_coarse_model_summary,
@@ -86,6 +91,7 @@ from biblade_fusion.storage.stop_scan_run import (
 )
 from biblade_fusion.storage.surface_coverage import (
     StoredSurfaceCoverageGeneration,
+    read_coarse_surface_reference,
     read_surface_coverage_generation,
     write_surface_coverage_generation,
 )
@@ -99,6 +105,7 @@ __all__ = [
     "SessionFormatError",
     "SessionReader",
     "SessionWriter",
+    "StoredBladeForegroundMask",
     "StoredCoverageLedger",
     "StoredCoarseModelSummary",
     "StoredCoverageDrivenPlan",
@@ -119,8 +126,10 @@ __all__ = [
     "StoredViewPlan",
     "StoredViewDescriptor",
     "read_initialization",
+    "read_blade_foreground_mask",
     "read_inference_stationarity",
     "read_coarse_model_summary",
+    "read_coarse_surface_reference",
     "read_motion_preflight",
     "read_native_overlap_report",
     "read_legacy_native_overlap_for_replay",
@@ -138,6 +147,7 @@ __all__ = [
     "verify_stereo_inference_source",
     "read_view_plan",
     "write_initialization",
+    "write_blade_foreground_mask",
     "write_inference_stationarity",
     "write_coarse_model",
     "write_motion_preflight",

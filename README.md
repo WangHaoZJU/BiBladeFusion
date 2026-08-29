@@ -9,8 +9,9 @@ from an Intel RealSense D435i, reproducible session storage, a calibrated
 FoundationStereo inference path, paired native/stereo depth evaluation, a conservative
 single-view blade proxy, paper-derived true curved-surface partitioning, thin-wall-aware
 multi-view TSDF/mesh reconstruction, real-surface quality feedback, and offline Elite KDL
-endpoint IK. A fixed-reference fine-coverage ledger and deterministic bilateral-fin
-next-view selector are implemented at library level. It also contains a fail-closed,
+endpoint IK. A fixed-reference fine-coverage ledger, deterministic bilateral-fin
+next-view selector, and transactional fine-scan foreground/reconstruction/coverage
+branch are implemented at library level. It also contains a fail-closed,
 FoundationStereo-derived three-state safety
 occupancy layer and a read-only supervisory replay console. The curved reconstruction
 chain is currently regression-verified on deterministic synthetic bilateral-blade data;
@@ -19,7 +20,9 @@ capture/fusion is not implemented beyond a disabled interface placeholder. Every
 Elite-arm motion method and every public CLI motion path is sealed; the guarded executor
 can reach the private driver capability only after its complete evidence contract passes.
 The two required continuous swept-volume backends are not implemented, so that contract
-currently blocks before driver preparation.
+currently blocks before driver preparation. The online library components remain disabled
+by default, have no public composition-root or motion CLI, and have not been validated on
+the physical blade/ES68/D435i system.
 
 ## Bootstrap
 
@@ -266,8 +269,15 @@ These functions are software-verified on deterministic synthetic data; real D435
 coarse scans and dimensional references are still required for physical validation.
 The [coverage-driven fine selector](docs/coverage-next-view-selector.md) keeps cumulative
 scientific surface evidence separate from the short-lived safety occupancy window and
-never interprets an unreachable incomplete state as completion. Online mask/reconstruction
-staging into the concrete stop-and-capture cycle remains pending.
+never interprets an unreachable incomplete state as completion. The concrete cycle engine
+can now stage a reference-projected foreground mask, a FoundationStereo reconstructed view,
+and exactly one fine-coverage successor as one library-level transaction. Its schema-3
+scientific view is replayed from the bound stereo depth, occupancy-derived eligible mask,
+foreground mask, point-cloud configuration and raw/rectified camera chain; an online
+recovery rejects legacy schema-2 observations anywhere in the accepted lineage. This branch
+is disabled by default, requires an explicitly pinned schema-5 coarse model and optional
+recovery generation at construction, and is not exposed by a composition-root or motion
+CLI. It is software-tested only; no real-blade accuracy or motion-release claim follows.
 Install
 `uv sync --extra tsdf-open3d` to enable the optional calibrated Open3D backend; the
 locked NumPy fallback remains available without it.
@@ -335,9 +345,11 @@ algorithm verification and audit only, and can never become live motion evidence
 production renderer also fails closed when the ready, final ES68+D435i STL manifest is
 absent or mismatched. Follow the [final ES68+D435i collision-model activation
 checklist](src/biblade_fusion/robotics/resources/elite_cs/collision_models/es68_d435i/README.md)
-when installing those meshes. A native real-time coordinator that atomically combines
-stopped robot state, FoundationStereo inference, map publication, planning invalidation,
-and execution freshness has not yet been implemented or hardware-verified.
+when installing those meshes. A library-level coordinator now atomically combines stopped
+robot state, FoundationStereo inference, fresh-map publication, scientific-asset staging,
+planning invalidation, and execution freshness. It remains default-off, has no public
+composition-root or robot-motion CLI, and has not been hardware-verified. The missing
+continuous swept-mesh and robot-versus-voxel proofs still block production execution.
 
 The current HoloRobot-derived ES68 and D435i-only collision assembly can be checked in a
 fully offline Qt3D viewer. The command exposes no robot IP and never opens a robot or

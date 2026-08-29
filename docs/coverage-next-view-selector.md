@@ -113,14 +113,39 @@ selector只从尚未完成且尚未使用其候选ID的分区中取候选，并�
 `flange_T_left_ir`共同生成`selection_policy_sha256`。选择结果还绑定精扫generation ID和固定
 粗模型metadata SHA-256；短段提议、预检和运行事件继续携带这三个身份。
 
-## 6. 当前尚未接线的环节
+## 6. 在线科学资产事务与当前边界
 
-精扫覆盖资产和具体selector已经具备确定性单元测试，但
-`FoundationStereoOccupancyCycleEngine`目前仍只自动生成raw、stereo、stationarity和安全
-occupancy资产。在线生成`reconstructed_view_path`和`coverage_path`还需要一个明确的叶片mask
-来源；不能把所有有效深度或安全占用体素直接当成叶片，否则桌面、夹具或背景会污染曲面质量。
+`FoundationStereoOccupancyCycleEngine`现已在库级接入明确的叶片科学分支。它不会把全部有效
+深度或安全占用体素当成叶片，而是把固定schema-5粗曲面投影到当前`left_rectified`图像，使用
+粗模型z-buffer与实测FoundationStereo深度的前、后不对称容差生成前景。输入eligible mask与
+占用重建共用质量、量程和机器人自遮罩门；科学mask在此基础上进一步收缩，安全占用则继续保留
+所有eligible场景深度。mask算法不做连通域筛选或腐蚀，以免删除薄鳍片、自由边和单像素边界。
+目标分区还必须以当前视角达到配置的法向入射余弦，并在该像素赢得完整粗曲面的最近深度
+z-buffer；随后才计算目标投影支持和深度匹配率。因而相距仅数毫米的正反表面也不能仅凭落入
+同一深度容差而互相冒充，目标实际不可见或被另一面/鳍片遮挡时失败关闭。
 
-在该科学分割/重建事务接入前，selector会因缺少精扫覆盖资产而失败关闭。默认
-`view_filter.workspace=null`也会使所有候选停留在几何检查阶段。真实运动还独立受连续
-扫掠网格证明、机器人—占用图扫掠证明、真机尺寸验收和人工逐段批准约束；本模块不解除这些
-边界。
+协调器为每次采集赋予不可由调用方猜测的`CapturePurpose`：
+
+- `BOOTSTRAP`：新运行在安全地图首次达到`MAP_READY`时创建空generation 0；恢复运行则只携带
+  构造时已完整校验的既有generation，不创建或推进代际；
+- `TRANSIT`：只刷新安全证据，并精确携带已经接受的精扫generation；
+- `SAFETY_REFRESH`：运动受阻后的安全重采；有既有generation时只携带，无既有generation时
+  只在本次达到`MAP_READY`后创建空generation 0，任何情况下都不制造候选科学观测；
+- `CANDIDATE`：在当前周期内同时产生前景mask、FoundationStereo重建视图和一个覆盖后继。
+
+这些路径先作为候选资产落盘，只有协调器完成独立语义读取、停稳证据检查并接受同一感知事务
+后，周期引擎才推进内部source window和accepted coverage路径。失败或取消只丢弃未提交的内存
+状态；不可变候选目录可保留用于诊断，但不能被下一周期继承为已接受代际。
+在线恢复会递归重放整条覆盖历史，并要求每个非空代际都指向foreground绑定的schema 3重建；
+mask会从绑定的stereo、占用integration-valid mask和粗模型重算，点云则由同一深度、mask、内参、
+点云配置及`base_T_left_rectified`重新去投影和变换。离线/人工schema 2兼容读取不能作为在线精扫
+恢复证据。
+
+该接线仍不是生产放行：`blade_foreground.enabled=false`是默认值；启用时必须由库级composition
+root显式传入固定schema-5参考和可选恢复代际，目前没有公开CLI完成这项组装。真实叶片上的mask
+容差、鳍片保持率、曲面质量和FoundationStereo运行时间尚未验收。默认
+`view_filter.workspace=null`仍会阻断机器人候选；连续扫掠网格证明、机器人—占用图扫掠证明、
+真机尺寸验收和人工逐段批准也仍是相互独立的生产运动前置条件。
+当前owner z-buffer由有限粗曲面点按`projection_radius_px`圆形splat得到，并非三角网格连续光栅化；
+因此真机还必须验收各工作距离下的最大投影采样孔隙，孔隙无法被保守覆盖时应失败关闭或改用
+三角面z-buffer，不能把离散owner直接表述为连续遮挡证明。

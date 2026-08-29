@@ -1,5 +1,40 @@
 # Development log
 
+## 2026-08-29 — reference-guided foreground and transactional fine-science staging
+
+- Connected the fixed-reference fine branch to the concrete FoundationStereo cycle at
+  library level. A scientific mask is now the intersection of occupancy eligibility and
+  depth agreement with the schema-5 coarse-surface z-buffer; a target patch must face the
+  camera and win the full-surface z-buffer, preventing millimetre-separated sides from
+  cross-satisfying target evidence. Safety occupancy still uses all eligible scene depth.
+  The masker has no connected-component or erosion stage so
+  narrow fins and boundary pixels are not removed by topology cleanup.
+- Added immutable, source-bound foreground assets and bound each candidate reconstruction
+  to its exact mask, raw session, stereo inference, occupancy evidence, rectified camera
+  pose and coarse-model reference. Readers replay the decision from the bound stereo,
+  occupancy integration-valid mask and coarse arrays, then re-deproject the stored mask and
+  stereo depth with the recorded point-cloud configuration and camera pose to verify every
+  scientific pixel and base-frame point. Candidate capture stages that mask, one
+  foreground-bound schema-3 reconstructed view and exactly one coverage successor inside
+  the same cycle root; recovery rejects any non-empty lineage containing a legacy schema-2
+  observation.
+- Added typed capture purposes. A new run creates empty generation zero on its first
+  map-ready bootstrap or safety refresh; a recovered run carries its explicitly verified
+  generation through bootstrap. Transit and later safety-refresh cycles carry the exact
+  accepted generation without creating science observations; a formal candidate must
+  publish the complete local successor.
+  Source-window and accepted-coverage state advance only after coordinator readback and
+  transaction acceptance. Cancellation retains immutable diagnostic files but clears the
+  unaccepted in-memory transaction.
+- This closes a software integration boundary only. `blade_foreground` remains disabled by
+  default; callers must explicitly pin a schema-5 reference and optional recovery generation,
+  and no public composition-root or robot-motion CLI currently assembles the path. It has not
+  been validated on a real blade. The current visibility owner uses finite coarse-point
+  splats rather than continuous triangle rasterisation, so projected sampling gaps and the
+  pixel radius are also hardware acceptance items. Workspace acceptance, continuous swept
+  ES68+D435i mesh and robot-versus-voxel proofs, measured timing thresholds and controlled
+  hardware acceptance remain blocking.
+
 ## 2026-08-29 — fixed-reference fine coverage and concrete next-view selection
 
 - Corrected fine-view camera semantics for non-identity stereo rectification. Look-at,
@@ -486,9 +521,9 @@ authoritative fine-grained record; this page records the experiment-facing state
   FoundationStereo-only stop-and-capture coordinator, fresh-window occupancy transaction,
   stationarity interlocks and run-event evidence chain are now implemented and covered by
   deterministic tests. Fixed-reference coverage and deterministic next-view selection
-  are implemented; online blade-mask/reconstruction staging, the two continuous
-  swept-volume proofs and hardware acceptance remain. Consequently no production motion
-  path or CLI is released.
+  and online blade-mask/reconstruction/coverage staging are implemented at library level.
+  The two continuous swept-volume proofs, public composition-root/CLI integration and
+  hardware acceptance remain. Consequently no production motion path or CLI is released.
 - The migration sequence and safety boundary are recorded in
   `docs/robot-stack-migration.md`. Existing MDH/capsule code remains temporarily for
   artifact compatibility and will not receive new motion functionality.
@@ -510,13 +545,14 @@ authoritative fine-grained record; this page records the experiment-facing state
    two independent continuous proofs for every segment: swept ES68+D435i mesh/FCL
    clearance and swept robot-versus-voxel occupancy clearance. Discrete bounding-sphere
    samples remain diagnostic only.
-5. Add a verified blade-mask provider, then stage each FoundationStereo reconstructed
-   view and successor fine-coverage generation inside the concrete cycle transaction.
-   Connect the implemented selector only after those source bindings pass, then perform
-   controlled hardware acceptance after both continuous sweep proofs exist. Measure
-   FoundationStereo latency, bootstrap-window duration, map replay, preflight, operator
-   response, short-segment execution and settle time; the default 5 s map age and null
-   segment bound are software placeholders, not accepted physical values. Offline
+5. Build a private experiment composition root for the now-connected foreground,
+   reconstruction, coverage and selector libraries; do not expose production motion.
+   Validate the complete transaction on recorded and live blade data, including mask
+   precision/recall at the main surface, both fin faces, roots, rims and blade boundaries.
+   After both continuous sweep proofs exist, perform controlled hardware acceptance and
+   measure FoundationStereo latency, bootstrap-window duration, map replay, preflight,
+   operator response, short-segment execution and settle time. The default 5 s map age and
+   null segment bound are software placeholders, not accepted physical values. Offline
    `build-replay` must remain `STALE/BLOCKED`.
 6. Hardware-validate the deterministic coverage-derived sequence from separately
    approved known-safe poses. Joint-motion cost may later be evaluated only as a

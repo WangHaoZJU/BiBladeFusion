@@ -91,6 +91,41 @@ point_cloud:
   pixel_stride: 1
   minimum_valid_points: 100
 
+# Fine-scan science reconstruction projects one explicitly pinned immutable schema-5
+# coarse surface into left_rectified. Enabling this block is insufficient by itself:
+# the library composition root must also pass that exact reference (and, for recovery,
+# an exact accepted coverage generation) to the cycle engine. No public CLI does so yet.
+# The eligible mask comes from the same FoundationStereo quality/range/robot-self-mask
+# gate used for occupancy, but science then keeps only depth consistent with the blade
+# reference. Safety occupancy still consumes every eligible scene depth, including
+# non-blade obstacles. Distances/tolerances are metres; projection radius is pixels.
+# A target patch counts only where it wins the complete coarse-surface z-buffer and
+# its outward normal faces the camera above minimum_target_incidence_cosine; this
+# prevents millimetre-separated front/back surfaces from satisfying each other's gate.
+# No connected-component filtering or erosion is applied, to avoid deleting thin fins
+# and one-pixel boundary evidence. These defaults are software starting values, not
+# physically validated D435i thresholds.
+blade_foreground:
+  enabled: false
+  method: reference_projected
+  # Coarse samples are circularly splatted, not triangle-rasterised. This radius is a
+  # software starting value and must be accepted against projected sampling gaps at the
+  # real blade standoffs; it is not a continuous-occlusion guarantee.
+  projection_radius_px: 3
+  minimum_projection_depth_m: 0.05
+  maximum_projection_depth_m: 3.0
+  front_depth_tolerance_m: 0.006
+  back_depth_tolerance_m: 0.010
+  minimum_target_incidence_cosine: 0.10
+  minimum_reference_pixels: 30
+  minimum_target_reference_pixels: 6
+  minimum_mask_pixels: 30
+  minimum_target_mask_pixels: 3
+  minimum_reference_match_fraction: 0.05
+  minimum_target_match_fraction: 0.05
+  minimum_mask_fraction: 0.0001
+  maximum_mask_fraction: 0.80
+
 hand_eye:
   # The GUI publishes here automatically only after held-out validation passes.
   calibration_path: data/calibrations/es68_left_ir_hand_eye_active.yaml

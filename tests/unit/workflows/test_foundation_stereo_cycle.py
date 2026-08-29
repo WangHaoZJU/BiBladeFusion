@@ -5,10 +5,12 @@ import json
 import threading
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import biblade_fusion.workflows.foundation_stereo_cycle as cycle_module
 from biblade_fusion.acquisition import CaptureMetrics, SynchronizedFrameBundle
 from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
@@ -29,7 +31,9 @@ from biblade_fusion.robotics import load_es68_flange_t_tcp
 from biblade_fusion.workflows.foundation_stereo_cycle import (
     FoundationStereoCycleError,
     FoundationStereoOccupancyCycleEngine,
+    _PendingPerceptionCommit,
 )
+from biblade_fusion.workflows.stop_scan_coordinator import CapturePurpose
 
 
 def _state(timestamp: int) -> RobotState:
@@ -181,7 +185,11 @@ def test_each_capture_is_a_separate_closed_single_view_session(tmp_path: Path) -
     assert engine.occupancy_config.maximum_map_age_s != 999.0
     assert backend.config.scale != 0.5
 
-    first = engine.capture("bootstrap-left", 0)
+    first = engine.capture(
+        "bootstrap-left",
+        0,
+        purpose=CapturePurpose.BOOTSTRAP,
+    )
     first_manifest = first.raw_session_path / "manifest.json"
     first_hash = _sha256(first_manifest)
     first_payload = json.loads(first_manifest.read_text(encoding="utf-8"))
@@ -189,7 +197,11 @@ def test_each_capture_is_a_separate_closed_single_view_session(tmp_path: Path) -
         first_payload["created_at_utc"]
     )
     engine.cancel_pending_capture(first)
-    second = engine.capture("bootstrap-right", 1)
+    second = engine.capture(
+        "bootstrap-right",
+        1,
+        purpose=CapturePurpose.BOOTSTRAP,
+    )
 
     assert first.raw_session_path != second.raw_session_path
     assert _sha256(first_manifest) == first_hash
@@ -243,8 +255,132 @@ def test_duplicate_cycle_identity_fails_before_recapture(tmp_path: Path) -> None
         renderer=UnusedRenderer(),
         output_root=tmp_path / "run",
     )
-    captured = engine.capture("same", 0)
+    captured = engine.capture("same", 0, purpose=CapturePurpose.BOOTSTRAP)
 
     with pytest.raises(FoundationStereoCycleError, match="still awaiting inference"):
-        engine.capture("same", 0)
+        engine.capture("same", 0, purpose=CapturePurpose.BOOTSTRAP)
     engine.cancel_pending_capture(captured)
+
+
+def _engine_with_pending_transaction(
+    tmp_path: Path,
+    *,
+    blade_foreground_path: Path | None = None,
+    reconstructed_view_path: Path | None = None,
+    coverage_path: Path | None = None,
+    coverage_metadata_sha256: str | None = None,
+) -> tuple[
+    FoundationStereoOccupancyCycleEngine,
+    SimpleNamespace,
+    SimpleNamespace,
+]:
+    """Construct only the engine state involved in commit/cancel linearization."""
+
+    engine = object.__new__(FoundationStereoOccupancyCycleEngine)
+    engine._pending_lock = threading.Lock()
+    engine._pending_key = None
+    engine._pending_sampler = None
+    engine._poisoned_reason = None
+    engine._sources = ["accepted-source"]
+    accepted = (tmp_path / "accepted-coverage").resolve()
+    proposed = (tmp_path / "proposed-coverage").resolve()
+    engine._accepted_coverage_path = accepted
+    cycle_root = (tmp_path / "cycle").resolve()
+    cycle_root.mkdir(exist_ok=True)
+    key = ("candidate-001", 7)
+    captured = SimpleNamespace(
+        bundle=SimpleNamespace(view_id=key[0], sequence_index=key[1]),
+        cycle_root=cycle_root,
+    )
+    occupancy_path = cycle_root / "occupancy"
+    stationarity_sha256 = "a" * 64
+    result = SimpleNamespace(
+        occupancy_mapping_path=occupancy_path,
+        inference_stationarity_sha256=stationarity_sha256,
+        blade_foreground_path=blade_foreground_path,
+        reconstructed_view_path=reconstructed_view_path,
+        coverage_path=coverage_path,
+    )
+    engine._pending_commit = _PendingPerceptionCommit(
+        key=key,
+        cycle_root=cycle_root,
+        occupancy_mapping_path=occupancy_path,
+        inference_stationarity_sha256=stationarity_sha256,
+        sources=("proposed-source",),
+        blade_foreground_path=blade_foreground_path,
+        reconstructed_view_path=reconstructed_view_path,
+        coverage_path=coverage_path,
+        coverage_metadata_sha256=coverage_metadata_sha256,
+        accepted_coverage_path_after_commit=proposed,
+    )
+    return engine, captured, result
+
+
+def test_cancel_pending_science_transaction_does_not_advance_coverage_or_sources(
+    tmp_path: Path,
+) -> None:
+    proposed = (tmp_path / "candidate-coverage").resolve()
+    engine, captured, _ = _engine_with_pending_transaction(
+        tmp_path,
+        coverage_path=proposed,
+        coverage_metadata_sha256="b" * 64,
+    )
+    accepted_before = engine.accepted_coverage_path
+    sources_before = list(engine._sources)
+
+    engine.cancel_pending_capture(captured)
+
+    assert engine._pending_commit is None
+    assert engine.accepted_coverage_path == accepted_before
+    assert engine._sources == sources_before
+
+
+def test_tampered_pending_coverage_fails_without_advancing_engine_state(
+    tmp_path: Path,
+) -> None:
+    coverage = (tmp_path / "candidate-coverage").resolve()
+    coverage.mkdir()
+    metadata = coverage / "coverage.json"
+    metadata.write_text('{"generation":"original"}\n', encoding="utf-8")
+    pinned_hash = _sha256(metadata)
+    engine, captured, result = _engine_with_pending_transaction(
+        tmp_path,
+        coverage_path=coverage,
+        coverage_metadata_sha256=pinned_hash,
+    )
+    accepted_before = engine.accepted_coverage_path
+    sources_before = list(engine._sources)
+    metadata.write_text('{"generation":"tampered"}\n', encoding="utf-8")
+
+    with pytest.raises(FoundationStereoCycleError, match="metadata changed"):
+        engine.commit_perception_cycle(captured, result)
+
+    assert engine.accepted_coverage_path == accepted_before
+    assert engine._sources == sources_before
+    assert engine._pending_commit is not None
+
+
+def test_failed_pending_science_readback_does_not_advance_engine_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mask_path = (tmp_path / "blade-foreground").resolve()
+    mask_path.mkdir()
+    engine, captured, result = _engine_with_pending_transaction(
+        tmp_path,
+        blade_foreground_path=mask_path,
+    )
+    accepted_before = engine.accepted_coverage_path
+    sources_before = list(engine._sources)
+    monkeypatch.setattr(
+        cycle_module,
+        "read_blade_foreground_mask",
+        lambda path: (_ for _ in ()).throw(ValueError("synthetic invalid mask")),
+    )
+
+    with pytest.raises(FoundationStereoCycleError, match="asset changed before commit"):
+        engine.commit_perception_cycle(captured, result)
+
+    assert engine.accepted_coverage_path == accepted_before
+    assert engine._sources == sources_before
+    assert engine._pending_commit is not None

@@ -121,6 +121,49 @@ diagnostics, pose refinements, configurations, source hashes, and quality result
 Independent fine coverage starts in a separate surface-coverage generation; coarse
 acquisition views never count as fine scans.
 
+## Library-level online fine-scan transaction
+
+Once a schema-5 coarse model exists, the optional FoundationStereo cycle branch can use
+that exact immutable surface as its scientific foreground prior. It projects all coarse
+surface samples into the current distortion-free `left_rectified` image with a nearest
+depth z-buffer, then accepts only eligible measured depths inside configurable asymmetric
+front/back tolerances. Eligibility is inherited from the safety observation's stereo
+quality, range and robot-self-mask gates. This does **not** make safety occupancy blade-only:
+the occupancy map continues to integrate every eligible scene surface, while the scientific
+mask is the smaller reference-consistent subset. The masker deliberately performs no
+connected-component selection or erosion, because either can remove the specimen's narrow
+fin faces, attachment roots, free rims or one-pixel boundary evidence.
+For the commanded target patch, samples must additionally face the camera according to the
+configured main-normal incidence gate and own the nearest depth in the **full-surface**
+z-buffer. An opposite thin-wall side or intervening fin therefore cannot satisfy target
+support merely by falling inside the numerical depth tolerance.
+
+The online branch is purpose-dependent. With no accepted scientific generation, the first
+`BOOTSTRAP` or `SAFETY_REFRESH` observation that produces a fresh `MAP_READY` safety map
+creates empty fine-coverage generation zero. A recovered `BOOTSTRAP`, every `TRANSIT`, and a
+`SAFETY_REFRESH` with an accepted generation carry that exact generation without
+manufacturing a scientific observation. A formal fixed-reference candidate must create,
+inside the same immutable cycle directory, a source-bound foreground asset, one
+foreground-bound schema-3 FoundationStereo reconstructed view and exactly one coverage
+successor. The mask reader replays the projection from the bound stereo, occupancy
+integration-valid mask and schema-5 coarse arrays. The reconstructed-view reader then
+replays pixel selection and base-frame points from the same depth, mask, stored point-cloud
+configuration and raw/rectified camera chain. Recovery requires every non-empty generation
+in the recursively replayed lineage to use this schema-3 evidence. These assets remain
+staged until coordinator readback and transaction acceptance; cancellation keeps the files
+as diagnostic evidence but does not advance the accepted generation.
+
+This path is currently a library capability, not an experiment command. The default
+configuration disables it, and construction must explicitly pin the schema-5 coarse-model
+path and any recovery generation; no public composition-root or motion CLI supplies those
+arguments. Its visibility owner is a finite coarse-point splat with a configured pixel
+radius, not continuous triangle rasterisation. Consequently the projected sampling gap at
+each real standoff must be measured and accepted (or replaced by mesh rasterisation) before
+using it as experimental occlusion evidence. Mask tolerances, reflective-metal completeness,
+fin retention, latency and all quality thresholds still require real ES68/D435i blade data.
+Continuous swept-mesh and robot-versus-voxel proofs remain independent production-motion
+blockers.
+
 ## Inspecting the fine plan before robot feasibility
 
 Create immutable inspection evidence and open the read-only PySide6 orbit viewer:
@@ -173,6 +216,11 @@ workcell obstacles, ordering, and continuous-trajectory preflight remain separat
 - Start with the stored boundary defaults, then inspect each curve's `fit_rmse_m` and
   `inlier_fraction`. Tighten `boundary_max_fit_rmse_m` only after measuring D435i noise;
   excessive control points or too little smoothing can follow edge outliers.
+- Treat `blade_foreground` projection radius (pixels) and depth tolerances (metres) as
+  experimental gates. A radius that is too small loses sparse edge/fin support; one that
+  is too large can admit nearby surfaces when their depths also fall inside tolerance.
+  Enabling the block without explicitly pinning the matching schema-5 reference is an
+  invalid library assembly, not an automatic coarse-model discovery mechanism.
 
 ## Current validation boundary
 
@@ -186,6 +234,8 @@ checksums, raw/rectified frame composition, and the non-motion invariant. The fi
 additionally verify main-surface decontamination,
 two-face separation, root/free-rim regions, opposing and bisector views, fin-thickness
 TSDF protection, coverage categories, schema-5 persistence, and missing-fin failure.
-Hardware accuracy, final thresholds, reflective-metal depth completeness, final
-line-of-sight acceptance, and real Open3D output still require recorded D435i/ES68 coarse
-scans and calibrated transforms.
+The online foreground/storage and purpose-dependent fine-transaction policies additionally
+have deterministic software tests, but they are not a physical segmentation or accuracy
+validation. Hardware accuracy, final thresholds, reflective-metal depth completeness,
+thin-fin retention, final line-of-sight acceptance, timing, and real Open3D output still
+require recorded D435i/ES68 scans and calibrated transforms.

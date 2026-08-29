@@ -25,6 +25,7 @@ from biblade_fusion.core.settings import (
 from biblade_fusion.devices.robot.base import RobotState, RobotStateSource
 from biblade_fusion.perception.stereo import FoundationStereoBackend
 from biblade_fusion.robotics.stationarity import validate_stationary_trace
+from biblade_fusion.storage.blade_foreground import read_blade_foreground_mask
 from biblade_fusion.storage.inference_stationarity import (
     write_inference_stationarity,
 )
@@ -32,11 +33,18 @@ from biblade_fusion.storage.occupancy_mapping import (
     read_occupancy_mapping,
     write_occupancy_mapping,
 )
+from biblade_fusion.storage.reconstructed_view import read_reconstructed_view
 from biblade_fusion.storage.session import SessionWriter
 from biblade_fusion.storage.stereo_inference import (
     read_stereo_inference,
     verify_stereo_inference_source,
     write_stereo_inference,
+)
+from biblade_fusion.storage.surface_coverage import read_surface_coverage_generation
+from biblade_fusion.workflows.fine_science import (
+    PreparedFineScienceAssets,
+    prepare_fine_science_assets,
+    validate_fine_science_startup,
 )
 from biblade_fusion.workflows.occupancy_mapping import (
     OccupancyFrameUpdate,
@@ -49,6 +57,7 @@ from biblade_fusion.workflows.stereo_inference import (
 )
 from biblade_fusion.workflows.stop_scan_coordinator import (
     CapturedStopScanView,
+    CapturePurpose,
     PerceptionCycleResult,
 )
 
@@ -76,6 +85,11 @@ class _PendingPerceptionCommit:
     occupancy_mapping_path: Path
     inference_stationarity_sha256: str
     sources: tuple[_VerifiedSource, ...]
+    blade_foreground_path: Path | None
+    reconstructed_view_path: Path | None
+    coverage_path: Path | None
+    coverage_metadata_sha256: str | None
+    accepted_coverage_path_after_commit: Path | None
 
 
 class FoundationStereoOccupancyCycleEngine:
@@ -96,6 +110,8 @@ class FoundationStereoOccupancyCycleEngine:
         hand_eye: HandEyeCalibration,
         renderer: RobotDepthRenderer,
         output_root: str | Path,
+        reference_coarse_model: str | Path | None = None,
+        accepted_coverage_path: str | Path | None = None,
         utc_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if settings.stop_and_capture.depth_backend != "foundation_stereo":
@@ -105,9 +121,7 @@ class FoundationStereoOccupancyCycleEngine:
                 "Stop-scan cycle engine requires the concrete FoundationStereo backend"
             )
         if backend.config != settings.foundation_stereo:
-            raise ValueError(
-                "FoundationStereo backend configuration differs from AppSettings"
-            )
+            raise ValueError("FoundationStereo backend configuration differs from AppSettings")
         if not settings.occupancy.enabled:
             raise ValueError("Stop-scan cycle engine requires enabled occupancy mapping")
         if acquirer.robot_state_source is not state_source:
@@ -124,6 +138,25 @@ class FoundationStereoOccupancyCycleEngine:
         if not hand_eye.source_path.resolve().is_file():
             raise ValueError("A persisted flange-primary hand-eye asset is required")
         hand_eye.require_flange_primary()
+        reference = (
+            Path(reference_coarse_model).resolve() if reference_coarse_model is not None else None
+        )
+        accepted_coverage = (
+            Path(accepted_coverage_path).resolve() if accepted_coverage_path is not None else None
+        )
+        if settings.blade_foreground.enabled != (reference is not None):
+            raise ValueError(
+                "Fine science requires both blade_foreground.enabled and a pinned "
+                "reference_coarse_model"
+            )
+        if accepted_coverage is not None and reference is None:
+            raise ValueError("An accepted fine-coverage generation requires fine science")
+        if reference is not None:
+            reference, accepted_coverage = validate_fine_science_startup(
+                settings,
+                reference_coarse_model=reference,
+                accepted_coverage_path=accepted_coverage,
+            )
         self._settings = settings.model_copy(deep=True)
         self._acquirer = acquirer
         self._state_source = state_source
@@ -131,6 +164,8 @@ class FoundationStereoOccupancyCycleEngine:
         self._hand_eye = hand_eye
         self._renderer = renderer
         self._output_root = Path(output_root).resolve()
+        self._reference_coarse_model = reference
+        self._accepted_coverage_path = accepted_coverage
         self._utc_clock = utc_clock
         self._sources: list[_VerifiedSource] = []
         self._capture_roots: dict[tuple[str, int], Path] = {}
@@ -156,13 +191,27 @@ class FoundationStereoOccupancyCycleEngine:
     def coordinator_config(self) -> StopAndCaptureConfig:
         return self._settings.stop_and_capture.model_copy(deep=True)
 
-    def capture(self, view_id: str, sequence_index: int) -> CapturedStopScanView:
+    @property
+    def accepted_coverage_path(self) -> Path | None:
+        """Return the exact committed fine generation, never an inferred "latest" path."""
+
+        with self._pending_lock:
+            return self._accepted_coverage_path
+
+    def capture(
+        self,
+        view_id: str,
+        sequence_index: int,
+        *,
+        purpose: CapturePurpose,
+    ) -> CapturedStopScanView:
         """Capture and close exactly one raw session; no inference occurs here."""
 
+        if type(purpose) is not CapturePurpose:
+            raise ValueError("Capture purpose must be assigned by the coordinator")
+
         safe_view = _safe_name(view_id)
-        cycle_root = self._output_root / "cycles" / (
-            f"{sequence_index:06d}_{safe_view}"
-        )
+        cycle_root = self._output_root / "cycles" / (f"{sequence_index:06d}_{safe_view}")
         key = (view_id, sequence_index)
         sampler = _RobotStateSampler(
             self._state_source,
@@ -194,9 +243,7 @@ class FoundationStereoOccupancyCycleEngine:
             sampler.start()
             bundle = self._acquirer.capture(view_id, sequence_index)
             if (bundle.view_id, bundle.sequence_index) != key:
-                raise FoundationStereoCycleError(
-                    "Acquirer changed the requested capture identity"
-                )
+                raise FoundationStereoCycleError("Acquirer changed the requested capture identity")
             writer.write_bundle(bundle)
             writer.close("completed")
         except BaseException:
@@ -222,6 +269,7 @@ class FoundationStereoOccupancyCycleEngine:
             raw_session_path=writer.path,
             cycle_root=cycle_root,
             captured_at_utc=captured_at,
+            purpose=purpose,
         )
 
     def cancel_pending_capture(
@@ -231,27 +279,19 @@ class FoundationStereoOccupancyCycleEngine:
         """Cancel and join the continuous sampler for an uncommitted transaction."""
 
         expected = (
-            None
-            if captured is None
-            else (captured.bundle.view_id, captured.bundle.sequence_index)
+            None if captured is None else (captured.bundle.view_id, captured.bundle.sequence_index)
         )
         with self._pending_lock:
             sampler = self._pending_sampler
             pending_key = (
                 self._pending_key
                 if sampler is not None
-                else (
-                    self._pending_commit.key
-                    if self._pending_commit is not None
-                    else None
-                )
+                else (self._pending_commit.key if self._pending_commit is not None else None)
             )
             if pending_key is None:
                 return
             if expected is not None and expected != pending_key:
-                raise FoundationStereoCycleError(
-                    "Cannot cancel another perception transaction"
-                )
+                raise FoundationStereoCycleError("Cannot cancel another perception transaction")
             if sampler is None:
                 # Inference finished, but the coordinator has not accepted this
                 # source window.  Rollback is therefore a metadata-state operation;
@@ -284,9 +324,7 @@ class FoundationStereoOccupancyCycleEngine:
                 self._settings.foundation_stereo,
                 self._settings.stereo_rectification,
                 source_session=captured.raw_session_path,
-                source_stereo_calibration=(
-                    self._settings.realsense.stereo_calibration_path
-                ),
+                source_stereo_calibration=(self._settings.realsense.stereo_calibration_path),
             )
             stored_stereo = read_stereo_inference(stereo_path)
             verify_stereo_inference_source(
@@ -298,9 +336,7 @@ class FoundationStereoOccupancyCycleEngine:
                 stereo=stored_stereo.observation,
                 stereo_path=stereo_path.resolve(),
                 stereo_metadata_sha256=_sha256(stereo_path / "metadata.json"),
-                session_manifest_sha256=_sha256(
-                    captured.raw_session_path / "manifest.json"
-                ),
+                session_manifest_sha256=_sha256(captured.raw_session_path / "manifest.json"),
                 session_view_metadata_sha256=_single_view_metadata_hash(
                     captured.raw_session_path,
                     captured.bundle,
@@ -315,12 +351,17 @@ class FoundationStereoOccupancyCycleEngine:
                 self._settings.occupancy,
                 self._settings.acquisition,
                 source_stereo_inferences=[item.stereo_path for item in candidates],
-                source_sessions=[
-                    item.captured.raw_session_path for item in candidates
-                ],
+                source_sessions=[item.captured.raw_session_path for item in candidates],
                 source_hand_eye=self._hand_eye.source_path,
             )
             stored_mapping = read_occupancy_mapping(occupancy_path)
+            science = self._prepare_science_assets(
+                captured,
+                stored_stereo.observation,
+                stereo_path,
+                updates[-1],
+                occupancy_path,
+            )
             full_trace = sampler.finish(
                 additional_states=(
                     captured.bundle.robot_state_before,
@@ -338,9 +379,7 @@ class FoundationStereoOccupancyCycleEngine:
                 max_tcp_translation_delta_m=(
                     self._settings.acquisition.max_tcp_translation_delta_m
                 ),
-                max_tcp_rotation_delta_rad=(
-                    self._settings.acquisition.max_tcp_rotation_delta_rad
-                ),
+                max_tcp_rotation_delta_rad=(self._settings.acquisition.max_tcp_rotation_delta_rad),
                 maximum_robot_state_staleness_s=(
                     self._settings.stop_and_capture.maximum_robot_state_staleness_s
                 ),
@@ -357,9 +396,7 @@ class FoundationStereoOccupancyCycleEngine:
                 max_tcp_translation_delta_m=(
                     self._settings.acquisition.max_tcp_translation_delta_m
                 ),
-                max_tcp_rotation_delta_rad=(
-                    self._settings.acquisition.max_tcp_rotation_delta_rad
-                ),
+                max_tcp_rotation_delta_rad=(self._settings.acquisition.max_tcp_rotation_delta_rad),
                 maximum_robot_state_staleness_s=(
                     self._settings.stop_and_capture.maximum_robot_state_staleness_s
                 ),
@@ -387,7 +424,11 @@ class FoundationStereoOccupancyCycleEngine:
             inference_stationarity=stationarity,
             inference_stationarity_path=stored_stationarity.path,
             inference_stationarity_sha256=stored_stationarity.file_sha256,
+            purpose=captured.purpose,
             depth_backend="foundation_stereo",
+            blade_foreground_path=science.blade_foreground_path,
+            reconstructed_view_path=science.reconstructed_view_path,
+            coverage_path=science.coverage_path,
         )
         # Preparing a valid asset does not make it a source for a later map.  Only
         # the coordinator can accept it after independent readback and stop-latch
@@ -399,10 +440,21 @@ class FoundationStereoOccupancyCycleEngine:
                 key=key,
                 cycle_root=captured.cycle_root,
                 occupancy_mapping_path=result.occupancy_mapping_path,
-                inference_stationarity_sha256=(
-                    result.inference_stationarity_sha256
-                ),
+                inference_stationarity_sha256=(result.inference_stationarity_sha256),
                 sources=candidates,
+                blade_foreground_path=result.blade_foreground_path,
+                reconstructed_view_path=result.reconstructed_view_path,
+                coverage_path=result.coverage_path,
+                coverage_metadata_sha256=(
+                    _sha256(result.coverage_path / "coverage.json")
+                    if result.coverage_path is not None
+                    else None
+                ),
+                accepted_coverage_path_after_commit=(
+                    science.coverage_path
+                    if science.advances_coverage
+                    else self._accepted_coverage_path
+                ),
             ),
         )
         return result
@@ -422,14 +474,66 @@ class FoundationStereoOccupancyCycleEngine:
                 or pending.key != key
                 or pending.cycle_root != captured.cycle_root
                 or pending.occupancy_mapping_path != result.occupancy_mapping_path
-                or pending.inference_stationarity_sha256
-                != result.inference_stationarity_sha256
+                or pending.inference_stationarity_sha256 != result.inference_stationarity_sha256
+                or pending.blade_foreground_path != result.blade_foreground_path
+                or pending.reconstructed_view_path != result.reconstructed_view_path
+                or pending.coverage_path != result.coverage_path
             ):
                 raise FoundationStereoCycleError(
                     "Perception commit does not match the prepared asset transaction"
                 )
+            if pending.coverage_path is not None and (
+                pending.coverage_metadata_sha256 is None
+                or _sha256(pending.coverage_path / "coverage.json")
+                != pending.coverage_metadata_sha256
+            ):
+                raise FoundationStereoCycleError(
+                    "Prepared fine-coverage metadata changed before commit"
+                )
+            try:
+                if pending.blade_foreground_path is not None:
+                    read_blade_foreground_mask(pending.blade_foreground_path)
+                if pending.reconstructed_view_path is not None:
+                    read_reconstructed_view(pending.reconstructed_view_path)
+                if pending.coverage_path is not None:
+                    read_surface_coverage_generation(
+                        pending.coverage_path,
+                        require_foreground_bound_science=True,
+                    )
+            except (OSError, TypeError, ValueError) as exc:
+                raise FoundationStereoCycleError(
+                    f"Prepared fine-science asset changed before commit: {exc}"
+                ) from exc
             self._sources = list(pending.sources)
+            self._accepted_coverage_path = pending.accepted_coverage_path_after_commit
             self._pending_commit = None
+
+    def _prepare_science_assets(
+        self,
+        captured: CapturedStopScanView,
+        stereo: StereoInferenceObservation,
+        stereo_path: Path,
+        occupancy_update: OccupancyFrameUpdate,
+        occupancy_path: Path,
+    ) -> PreparedFineScienceAssets:
+        if self._reference_coarse_model is None:
+            if captured.purpose is CapturePurpose.CANDIDATE:
+                raise FoundationStereoCycleError(
+                    "Candidate capture requires the configured fine-science pipeline"
+                )
+            return PreparedFineScienceAssets(None, None, None, False)
+        return prepare_fine_science_assets(
+            purpose=captured.purpose,
+            captured=captured,
+            stereo=stereo,
+            stereo_path=stereo_path,
+            occupancy_update=occupancy_update,
+            occupancy_path=occupancy_path,
+            settings=self._settings,
+            hand_eye=self._hand_eye,
+            reference_coarse_model=self._reference_coarse_model,
+            accepted_coverage_path=self._accepted_coverage_path,
+        )
 
     def _require_pending_sampler(
         self,
@@ -446,9 +550,7 @@ class FoundationStereoOccupancyCycleEngine:
         with self._pending_lock:
             if self._pending_sampler is sampler:
                 if sampler.is_alive:
-                    self._poisoned_reason = (
-                        "attempted to clear a live robot-state sampler"
-                    )
+                    self._poisoned_reason = "attempted to clear a live robot-state sampler"
                     raise FoundationStereoCycleError(self._poisoned_reason)
                 self._pending_sampler = None
                 self._pending_key = None
@@ -486,17 +588,13 @@ class FoundationStereoOccupancyCycleEngine:
         except BaseException as exc:
             with self._pending_lock:
                 if self._pending_sampler is sampler:
-                    self._poisoned_reason = (
-                        f"{type(exc).__name__}: {exc}"
-                    )
+                    self._poisoned_reason = f"{type(exc).__name__}: {exc}"
             raise
         self._clear_pending_sampler(sampler)
 
     def _fresh_rebuild_sources(self, current: _VerifiedSource) -> tuple[_VerifiedSource, ...]:
         now = self._aware_utc_now()
-        oldest = now - timedelta(
-            seconds=self._settings.occupancy.maximum_map_age_s
-        )
+        oldest = now - timedelta(seconds=self._settings.occupancy.maximum_map_age_s)
         sources = tuple(
             item
             for item in (*self._sources, current)
@@ -527,9 +625,7 @@ class FoundationStereoOccupancyCycleEngine:
                 captured_at_utc=source.captured.captured_at_utc,
                 source_stereo_metadata_sha256=source.stereo_metadata_sha256,
                 source_session_manifest_sha256=source.session_manifest_sha256,
-                source_session_view_metadata_sha256=(
-                    source.session_view_metadata_sha256
-                ),
+                source_session_view_metadata_sha256=(source.session_view_metadata_sha256),
                 previous_evidence_hash=previous_evidence_hash,
             )
             updates.append(update)
@@ -566,16 +662,12 @@ def _single_view_metadata_hash(
             raise ValueError("session view metadata escapes session root")
         return _sha256(metadata_path)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise FoundationStereoCycleError(
-            "Cannot bind the single-view metadata asset"
-        ) from exc
+        raise FoundationStereoCycleError("Cannot bind the single-view metadata asset") from exc
 
 
 def _session_created_at_utc(session_path: Path) -> datetime:
     try:
-        payload = json.loads(
-            (session_path / "manifest.json").read_text(encoding="utf-8")
-        )
+        payload = json.loads((session_path / "manifest.json").read_text(encoding="utf-8"))
         value = datetime.fromisoformat(str(payload["created_at_utc"]))
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("session created_at_utc is not timezone-aware")
@@ -666,9 +758,7 @@ class _RobotStateSampler:
         try:
             self._trace.append(self._source.read_state())
         except BaseException as exc:
-            raise FoundationStereoCycleError(
-                "Post-transaction robot state is unavailable"
-            ) from exc
+            raise FoundationStereoCycleError("Post-transaction robot state is unavailable") from exc
         return _ordered_unique_robot_states((*self._trace, *additional_states))
 
     def cancel(self) -> None:

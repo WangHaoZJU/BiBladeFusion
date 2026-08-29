@@ -68,11 +68,7 @@ def _plane_patch(
     second = np.cross(normal, first)
     offsets = np.linspace(-0.01, 0.01, 3)
     first_grid, second_grid = np.meshgrid(offsets, offsets, indexing="xy")
-    points = (
-        center
-        + first_grid.ravel()[:, None] * first
-        + second_grid.ravel()[:, None] * second
-    )
+    points = center + first_grid.ravel()[:, None] * first + second_grid.ravel()[:, None] * second
     coordinates = np.column_stack((first_grid.ravel(), second_grid.ravel()))
     return CurvedSurfacePatch(
         patch_id,
@@ -434,9 +430,7 @@ def _write_front_view(
         HandEyeConfig(),
         source_session=tmp_path / "session",
         source_stereo_inference=(
-            tmp_path / "stereo_inference"
-            if depth_source == "foundation_stereo"
-            else None
+            tmp_path / "stereo_inference" if depth_source == "foundation_stereo" else None
         ),
     )
 
@@ -522,6 +516,34 @@ def test_successor_replays_one_view_and_uses_source_view_id(tmp_path: Path) -> N
         stored.view_plan.left_rectified_t_left_ir.matrix,
         plan.left_rectified_t_left_ir.matrix,
     )
+
+
+def test_online_reader_rejects_legacy_schema_2_observation_lineage(
+    tmp_path: Path,
+) -> None:
+    coarse, surface, plan = _write_coarse_reference(tmp_path)
+    initial = write_surface_coverage_generation(
+        tmp_path / "generation_000",
+        reference_coarse_model=coarse,
+        quality_config=_fine_quality(),
+    )
+    legacy_view = _write_front_view(tmp_path, surface, plan)
+    successor = write_surface_coverage_generation(
+        tmp_path / "generation_001",
+        reference_coarse_model=coarse,
+        quality_config=_fine_quality(),
+        previous_generation=initial,
+        current_reconstructed_view=legacy_view,
+        observation_id="front_surface",
+    )
+
+    # Generic/offline reading remains backwards compatible.
+    assert read_surface_coverage_generation(successor).root == successor.resolve()
+    with pytest.raises(ValueError, match="foreground-bound schema-3"):
+        read_surface_coverage_generation(
+            successor,
+            require_foreground_bound_science=True,
+        )
 
 
 def test_writer_rejects_observation_id_not_equal_to_candidate_view_id(

@@ -33,7 +33,9 @@ SHA-256的语义复验；仅在metadata中写一个后端名称不能通过。
 - `biblade_fusion.workflows.stop_scan_coordinator`：状态机、短段提议、地图冻结、逐段批准和
   执行后停稳；
 - `biblade_fusion.workflows.foundation_stereo_cycle`：单视图采集、FoundationStereo推理、
-  新鲜窗口全量占用重建及完整语义复验；
+  新鲜窗口全量占用重建、可选精扫科学资产事务及完整语义复验；
+- `biblade_fusion.workflows.fine_science`：固定粗模型投影mask、精扫重建和覆盖代际准备；
+- `biblade_fusion.storage.blade_foreground`：来源绑定、写一次的叶片前景数字资产；
 - `biblade_fusion.robotics.stationarity`：停稳窗口和感知计算区间的有界间隔静止采样证据；
 - `biblade_fusion.storage.inference_stationarity`：写一次、可重算的感知状态证据；
 - `biblade_fusion.storage.stop_scan_run`：写一次API和前向哈希链接的可检出篡改事件资产。
@@ -122,6 +124,9 @@ cycles/<sequence>_<view>/
   stereo_inference/
   occupancy_mapping/
   inference_stationarity.json
+  blade_foreground/       # 仅正式CANDIDATE
+  reconstructed_view/     # 仅正式CANDIDATE
+  surface_coverage/       # generation 0或正式CANDIDATE后继
 ```
 
 `inference_stationarity.json`绑定曝光—推理—占用重建采样区间的参考状态、后续状态序列、
@@ -129,31 +134,48 @@ cycles/<sequence>_<view>/
 返回对象或文件SHA；它重新读取该文件，复算状态证据，并逐项核对view/sequence、阈值、
 manifest、完整状态序列和采集before/selected/after状态，然后才允许发布占用generation。
 
-`PerceptionCycleResult`为`reconstructed_view_path`和`coverage_path`保留了可选字段。独立精扫
-覆盖代际和具体`BladeCoverageNextViewSelector`现已实现：粗扫coverage不能进入精扫账本，
-selector从真实曲面分区质量、raw/rectified相机链和当前停稳关节生成一个候选，并把选择策略、
-参考粗模型和覆盖代际哈希绑定到短段提议。具体周期引擎仍只自动生成原始session、
-FoundationStereo资产和安全占用资产；它尚未拥有可验证的叶片mask来源，因此不会把全部有效
-深度或安全占用图错误写成科学重建。在线`reconstructed_view_path`/`coverage_path`接线仍是
-待完成环节，缺少它们时selector按设计失败关闭。详细契约见
+协调器从状态机而不是视图名称调用方推导typed `CapturePurpose`。操作员引导建图为
+`BOOTSTRAP`；中间短段后的`transit_*`为`TRANSIT`；到达正式参考候选为`CANDIDATE`；
+`MOTION_BLOCKED`状态下额外采集为`SAFETY_REFRESH`。capture对象和perception结果必须携带同一
+purpose，跨边界漂移直接失败。
+
+启用精扫科学分支且显式固定schema-5粗模型后，新运行第一次达到`MAP_READY`的`BOOTSTRAP`
+或无既有代际的`SAFETY_REFRESH`周期在本周期创建空generation 0；非`MAP_READY`安全结果不被
+科学分支阻塞。恢复运行的`BOOTSTRAP`、`TRANSIT`和已有代际的`SAFETY_REFRESH`不产生mask或
+重建，只携带构造时已完整校验的上一份generation；`CANDIDATE`则必须在同一周期内同时生成`blade_foreground`、
+`reconstructed_view`和其唯一覆盖后继。前景只接受与固定粗曲面投影深度一致且通过占用质量/
+量程/机器人自遮罩门的像素；目标块还必须朝向相机并赢得全表面z-buffer可见性所有权。
+自动科学重建写为foreground绑定的schema 3，并完整核对raw/rectified相机链；安全占用仍使用
+全部eligible场景深度。schema 3读取还会用绑定深度、mask、内参、点云配置和
+`base_T_left_rectified`重新生成像素索引与base系点云；恢复代际的整条非空历史均须满足这一
+约束，legacy schema 2不能进入在线精扫连续性。独立
+`BladeCoverageNextViewSelector`随后从真实曲面质量、raw/rectified相机链和当前停稳关节产生
+候选，并把选择策略、参考粗模型和代际哈希绑定到短段提议。详细契约见
 `docs/coverage-next-view-selector.md`。
+
+这仍是库级可选接线：默认关闭，要求composition root显式传入固定粗模型及可选恢复代际，
+当前无公开CLI组装或启动它，也没有真机精扫验收。
 
 ### 4.1 感知结果的两阶段提交
 
 一个完成推理的返回对象不是已经提交的地图来源。感知事务必须分成两个明确阶段：
 
-1. **候选阶段**：在新的周期目录中关闭单视图raw session，写入stereo、occupancy和
-   stationarity候选资产。此时它们没有进入后续source window，也没有改变当前publisher；
+1. **候选阶段**：在新的周期目录中关闭单视图raw session，写入stereo、occupancy、
+   stationarity以及purpose要求的可选mask/reconstruction/coverage资产。此时它们没有进入
+   后续source window，也没有改变当前publisher或accepted coverage；
 2. **验证与提交阶段**：从磁盘重新读取候选资产，而不是继续信任内存返回对象。完整语义读取
    必须复验raw来源、FoundationStereo运行时与校准、占用更新链、自遮罩/FK、静止轨迹、配置
-   身份和全部哈希。随后在协调器独占区内再次检查operator stop锁存、当前地图generation和
-   预期周期身份均未变化，并在线性化决定后通过publisher事务先接受对应source window、再
-   原子暴露新generation；接受异常时当前generation从未改变。
+   身份、科学资产代际和全部哈希。随后在协调器独占区内再次检查operator stop锁存、当前地图
+   generation、capture purpose和预期周期身份均未变化，并在线性化决定后通过publisher事务
+   接受对应source window及科学代际，再原子暴露新安全generation；接受异常时先前已接受的
+   source window、coverage路径和当前generation均不推进。
 
 状态机的感知/运动公开操作受同一操作锁约束；publisher还用同一把内部锁保护`current`、
 `freeze`和事务发布。提交时先在该锁内接受source window，再把对应generation设置为当前值。
 因此并发安全消费者在提交结束前只能等待，不能读取或冻结尚未接受的候选generation；接受
-失败时当前generation保持不变，无需可失败的回滚。`prepare_next_segment()`还要求publisher
+失败时当前generation保持不变，无需删除不可变文件来“回滚”。`cancel_pending_capture()`清除
+尚未接受的sampler或候选事务状态；已写出的候选目录可作为拒绝证据保留，但不会进入下一周期
+source window，也不会更新accepted coverage。`prepare_next_segment()`还要求publisher
 generation与当前observation保存的generation ID一致。这里保证的是单进程publisher与感知
 引擎之间的事务可见性，不把它表述为跨进程数据库事务。
 

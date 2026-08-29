@@ -172,6 +172,49 @@ class PointCloudConfig(BaseModel):
         return self
 
 
+class BladeForegroundConfig(BaseModel):
+    """Fail-closed reference-guided foreground extraction for fine scanning.
+
+    The policy point-splats the immutable coarse blade surface into the current
+    rectified left image and accepts only measured depths that agree with that
+    prediction.  It deliberately contains no connected-component or erosion
+    stage because either operation can discard a thin fin or a one-pixel edge.
+    ``projection_radius_px`` is a sampling-envelope parameter, not proof of a
+    continuous triangle-rasterised visibility surface.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = False
+    method: Literal["reference_projected"] = "reference_projected"
+    projection_radius_px: int = Field(default=3, ge=0, le=20)
+    minimum_projection_depth_m: float = Field(default=0.05, gt=0.0)
+    maximum_projection_depth_m: float = Field(default=3.0, gt=0.0)
+    front_depth_tolerance_m: float = Field(default=0.006, ge=0.0, le=0.10)
+    back_depth_tolerance_m: float = Field(default=0.010, ge=0.0, le=0.20)
+    minimum_target_incidence_cosine: float = Field(default=0.10, ge=0.0, le=1.0)
+    minimum_reference_pixels: int = Field(default=30, ge=1)
+    minimum_target_reference_pixels: int = Field(default=6, ge=1)
+    minimum_mask_pixels: int = Field(default=30, ge=1)
+    minimum_target_mask_pixels: int = Field(default=3, ge=1)
+    minimum_reference_match_fraction: float = Field(default=0.05, gt=0.0, le=1.0)
+    minimum_target_match_fraction: float = Field(default=0.05, gt=0.0, le=1.0)
+    minimum_mask_fraction: float = Field(default=0.0001, ge=0.0, lt=1.0)
+    maximum_mask_fraction: float = Field(default=0.80, gt=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_reference_mask_policy(self) -> Self:
+        if self.maximum_projection_depth_m <= self.minimum_projection_depth_m:
+            raise ValueError(
+                "Blade-foreground maximum projection depth must exceed minimum"
+            )
+        if self.maximum_mask_fraction <= self.minimum_mask_fraction:
+            raise ValueError(
+                "Blade-foreground maximum mask fraction must exceed minimum"
+            )
+        return self
+
+
 class CharucoTargetConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -776,6 +819,7 @@ class AppSettings(BaseModel):
     )
     proxy_model: ProxyModelConfig = Field(default_factory=ProxyModelConfig)
     point_cloud: PointCloudConfig = Field(default_factory=PointCloudConfig)
+    blade_foreground: BladeForegroundConfig = Field(default_factory=BladeForegroundConfig)
     hand_eye: HandEyeConfig = Field(default_factory=HandEyeConfig)
     view_planning: ViewPlanningConfig = Field(default_factory=ViewPlanningConfig)
     view_filter: ViewFilterConfig = Field(default_factory=ViewFilterConfig)

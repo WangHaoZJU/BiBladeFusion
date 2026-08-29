@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from biblade_fusion.core.settings import (
     AppSettings,
+    BladeForegroundConfig,
     OccupancyConfig,
     RobotConfig,
     StopAndCaptureConfig,
@@ -39,6 +40,10 @@ def test_default_settings_load_safely() -> None:
     assert settings.proxy_model.tangential_margin_m == 0.01
     assert settings.point_cloud.minimum_depth_m == 0.15
     assert settings.point_cloud.maximum_depth_m == 1.5
+    assert settings.blade_foreground.enabled is False
+    assert settings.blade_foreground.method == "reference_projected"
+    assert settings.blade_foreground.projection_radius_px == 3
+    assert settings.blade_foreground.minimum_target_incidence_cosine == 0.10
     assert settings.hand_eye.calibration_path == Path(
         "data/calibrations/es68_left_ir_hand_eye_active.yaml"
     )
@@ -107,6 +112,19 @@ def test_fin_growth_gate_must_be_below_seed_gate() -> None:
         SurfacePartitionConfig(
             fin_grow_min_height_m=0.009,
             fin_seed_min_height_m=0.008,
+        )
+
+
+def test_blade_foreground_ranges_fail_closed() -> None:
+    with pytest.raises(ValidationError, match="projection depth"):
+        BladeForegroundConfig(
+            minimum_projection_depth_m=1.0,
+            maximum_projection_depth_m=0.5,
+        )
+    with pytest.raises(ValidationError, match="mask fraction"):
+        BladeForegroundConfig(
+            minimum_mask_fraction=0.8,
+            maximum_mask_fraction=0.2,
         )
 
 

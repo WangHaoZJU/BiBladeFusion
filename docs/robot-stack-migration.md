@@ -101,9 +101,12 @@ license and attribution.
    actual continuous TCP trace is currently persisted. The GUI is read-only, remains
    `REPLAY/BLOCKED`, and cannot approve or transmit motion. `--follow` is only filesystem
    polling, not online obstacle avoidance.
-8. **Pending:** implement and verify the native real-time stop-and-capture coordinator.
-   `bbf occupancy build-replay` deliberately seals every result `STALE`, so it can never
-   supply live motion evidence.
+8. **Implemented at library level; production integration pending:** the stop-and-capture
+   coordinator now binds settled capture, FoundationStereo inference, fresh occupancy,
+   optional fine-science assets, planning invalidation and guarded short-segment state.
+   It is disabled by default, has no public composition-root or motion CLI, and has not
+   been hardware-verified. `bbf occupancy build-replay` still deliberately seals every
+   result `STALE`, so it can never supply live motion evidence.
 9. Remove superseded MDH/capsule code only after artifact compatibility and regression
    tests cover existing offline workflows.
 

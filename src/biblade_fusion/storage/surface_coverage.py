@@ -44,6 +44,7 @@ from biblade_fusion.storage.coarse_model import (
 )
 from biblade_fusion.storage.reconstructed_view import (
     RECONSTRUCTED_VIEW_SCHEMA_VERSION,
+    SCIENCE_RECONSTRUCTED_VIEW_SCHEMA_VERSION,
     StoredReconstructedBladeView,
     read_reconstructed_view,
 )
@@ -143,9 +144,7 @@ def _source_record(root: Path, metadata_name: str) -> dict[str, str]:
     return {"path": str(resolved), "metadata_sha256": _sha256(metadata)}
 
 
-def _verify_source_record(
-    record: dict[str, Any], metadata_name: str, *, label: str
-) -> Path:
+def _verify_source_record(record: dict[str, Any], metadata_name: str, *, label: str) -> Path:
     raw = Path(str(record["path"]))
     resolved = raw.resolve()
     if not raw.is_absolute() or raw != resolved:
@@ -156,9 +155,7 @@ def _verify_source_record(
     return resolved
 
 
-def _offsets(
-    value: np.ndarray, *, count: int, total: int, label: str
-) -> NDArray[np.int64]:
+def _offsets(value: np.ndarray, *, count: int, total: int, label: str) -> NDArray[np.int64]:
     if value.shape != (count + 1,):
         raise ValueError(f"{label} offsets have invalid shape")
     result = np.asarray(value, dtype=np.int64)
@@ -198,9 +195,7 @@ def _surface_from_reference(
         dtype=np.float64,
     )
     offsets = _offsets(
-        _load_array(
-            root, files["patch_offsets"], label="coarse patch offsets", dtype=np.int64
-        ),
+        _load_array(root, files["patch_offsets"], label="coarse patch offsets", dtype=np.int64),
         count=len(patch_data),
         total=len(points),
         label="coarse patch",
@@ -314,9 +309,7 @@ def _surface_from_reference(
         )
         if int(data["root_point_count"]) != int(np.count_nonzero(component.root_mask)):
             raise ValueError("Coarse fin root-point summary is inconsistent")
-        if int(data["free_edge_point_count"]) != int(
-            np.count_nonzero(component.free_edge_mask)
-        ):
+        if int(data["free_edge_point_count"]) != int(np.count_nonzero(component.free_edge_mask)):
             raise ValueError("Coarse fin free-edge summary is inconsistent")
         components.append(component)
 
@@ -360,9 +353,23 @@ def _surface_from_reference(
     return surface, config
 
 
-def _validate_required_fin(
-    surface: CurvedBladeSurface, config: SurfacePartitionConfig
-) -> None:
+def read_coarse_surface_reference(path: str | Path) -> CurvedBladeSurface:
+    """Fully restore the fixed schema-5 surface used by online fine science.
+
+    This public reader deliberately returns geometry only after the coarse-model
+    reader has checked every bound array and source metadata checksum.  It lets a
+    downstream scientific asset replay its projection without manufacturing an
+    empty coverage generation merely to recover the reference surface.
+    """
+
+    summary = read_coarse_model_summary(path)
+    if int(summary.metadata["schema_version"]) != SURFACE_COVERAGE_COARSE_SCHEMA_VERSION:
+        raise ValueError("Fine-science reference requires an exact schema-5 coarse model")
+    surface, _ = _surface_from_reference(summary)
+    return surface
+
+
+def _validate_required_fin(surface: CurvedBladeSurface, config: SurfacePartitionConfig) -> None:
     if config.fin_mode != "required_single_per_side":
         return
     by_side = {component.side: component for component in surface.fin_components}
@@ -417,15 +424,11 @@ def _view_plan_from_reference(
         "left_ir",
         data["left_rectified_T_left_ir"],
     )
-    for index, (patch, item) in enumerate(
-        zip(surface.patches, candidates_data, strict=True)
-    ):
+    for index, (patch, item) in enumerate(zip(surface.patches, candidates_data, strict=True)):
         if str(item["patch_id"]) != patch.patch_id:
             raise ValueError("Coarse candidate order does not match surface patch order")
         metadata_raw = np.asarray(item["base_T_left_ir"], dtype=np.float64)
-        metadata_rectified = np.asarray(
-            item["base_T_left_rectified"], dtype=np.float64
-        )
+        metadata_rectified = np.asarray(item["base_T_left_rectified"], dtype=np.float64)
         if not np.array_equal(metadata_raw, raw_matrices[index]) or not np.array_equal(
             metadata_rectified, rectified_matrices[index]
         ):
@@ -452,9 +455,7 @@ def _view_plan_from_reference(
                 str(item["distance_policy"]),
             )
         )
-        rectified_poses.append(
-            PoseSE3("base", "left_rectified", rectified_matrices[index])
-        )
+        rectified_poses.append(PoseSE3("base", "left_rectified", rectified_matrices[index]))
     footprint = tuple(float(value) for value in data["baseline_footprint_m"])
     if len(footprint) != 2:
         raise ValueError("Coarse baseline footprint must contain two values")
@@ -469,13 +470,8 @@ def _view_plan_from_reference(
 
 def _read_reference(path: Path, expected_sha256: str | None = None) -> _ReferenceGeometry:
     summary = read_coarse_model_summary(path)
-    if (
-        int(summary.metadata["schema_version"])
-        != SURFACE_COVERAGE_COARSE_SCHEMA_VERSION
-    ):
-        raise ValueError(
-            "Surface coverage requires an exact schema-5 coarse-model reference"
-        )
+    if int(summary.metadata["schema_version"]) != SURFACE_COVERAGE_COARSE_SCHEMA_VERSION:
+        raise ValueError("Surface coverage requires an exact schema-5 coarse-model reference")
     metadata_sha256 = _sha256(summary.root / "metadata.json")
     if expected_sha256 is not None and metadata_sha256 != expected_sha256:
         raise ValueError("Coarse-model reference metadata checksum mismatch")
@@ -496,13 +492,28 @@ def _required_regions(surface: CurvedBladeSurface) -> tuple[SurfaceRegion, ...]:
 def _validate_fine_reconstructed_view(
     current: StoredReconstructedBladeView,
     reference: _ReferenceGeometry,
+    *,
+    require_foreground_bound_science: bool,
 ) -> None:
+    schema_version = int(current.metadata["schema_version"])
     if (
-        int(current.metadata["schema_version"]) != RECONSTRUCTED_VIEW_SCHEMA_VERSION
+        schema_version
+        not in {
+            RECONSTRUCTED_VIEW_SCHEMA_VERSION,
+            SCIENCE_RECONSTRUCTED_VIEW_SCHEMA_VERSION,
+        }
         or current.view.pose_authority is None
     ):
         raise ValueError(
-            "Fine coverage requires a current authoritative schema-2 reconstructed view"
+            "Fine coverage requires a current authoritative schema-2/3 reconstructed view"
+        )
+    if (
+        require_foreground_bound_science
+        and schema_version != SCIENCE_RECONSTRUCTED_VIEW_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "Online fine coverage requires every observation in the lineage to use "
+            "a foreground-bound schema-3 reconstructed view"
         )
     if current.view.depth_source != "foundation_stereo":
         raise ValueError("Fine coverage requires a FoundationStereo reconstructed view")
@@ -523,9 +534,7 @@ def _validate_fine_reconstructed_view(
         )
 
 
-def _validate_ledger(
-    ledger: SurfaceCoverageLedger, surface: CurvedBladeSurface
-) -> None:
+def _validate_ledger(ledger: SurfaceCoverageLedger, surface: CurvedBladeSurface) -> None:
     patch_ids = tuple(patch.patch_id for patch in surface.patches)
     if tuple(item.patch_id for item in ledger.evidence) != patch_ids:
         raise ValueError("Fine coverage ledger patch IDs/order do not match the reference")
@@ -629,9 +638,7 @@ def _generation_id(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _ledger_payload(
-    ledger: SurfaceCoverageLedger, offsets: list[int]
-) -> dict[str, Any]:
+def _ledger_payload(ledger: SurfaceCoverageLedger, offsets: list[int]) -> dict[str, Any]:
     return {
         "observation_ids": list(ledger.observation_ids),
         "patches": [
@@ -683,9 +690,7 @@ def _ledger_from_payload(
         label="surface-coverage patch",
     )
     evidence: list[SurfacePatchEvidence] = []
-    for index, (patch, data) in enumerate(
-        zip(surface.patches, patches_data, strict=True)
-    ):
+    for index, (patch, data) in enumerate(zip(surface.patches, patches_data, strict=True)):
         first, last = int(offsets[index]), int(offsets[index + 1])
         _range(data, (first, last), label=f"surface-coverage patch {index}")
         if str(data["patch_id"]) != patch.patch_id or last - first != len(patch.points_m):
@@ -750,8 +755,7 @@ def write_surface_coverage_generation(
         previous = read_surface_coverage_generation(previous_generation)
         if (
             previous.reference.root != reference.summary.root
-            or previous.metadata["reference"]["metadata_sha256"]
-            != reference.metadata_sha256
+            or previous.metadata["reference"]["metadata_sha256"] != reference.metadata_sha256
         ):
             raise ValueError("Previous generation uses a different coarse-model reference")
         if previous.quality_config.model_dump(mode="json") != config.model_dump(mode="json"):
@@ -763,11 +767,13 @@ def write_surface_coverage_generation(
             raise ValueError("Required surface identities cannot drift between generations")
         current_path = Path(current_reconstructed_view).resolve()
         current = read_reconstructed_view(current_path)
-        _validate_fine_reconstructed_view(current, reference)
+        _validate_fine_reconstructed_view(
+            current,
+            reference,
+            require_foreground_bound_science=False,
+        )
         if observation_id != current.view.source_view_id:
-            raise ValueError(
-                "Fine observation ID must equal the reconstructed source view ID"
-            )
+            raise ValueError("Fine observation ID must equal the reconstructed source view ID")
         expected = update_surface_coverage(
             previous.ledger,
             reference.surface,
@@ -820,9 +826,7 @@ def write_surface_coverage_generation(
             "reference": reference_record,
             "previous_generation": previous_record,
             "current_observation": current_record,
-            "files": {
-                name: _record(temporary / f"{name}.npy") for name in arrays
-            },
+            "files": {name: _record(temporary / f"{name}.npy") for name in arrays},
             "quality_configuration": config.model_dump(mode="json"),
             "required_patch_ids": list(required_patch_ids),
             "required_regions": [region.value for region in required_regions],
@@ -847,6 +851,7 @@ def _read_generation(
     *,
     active: set[Path],
     references: dict[tuple[Path, str], _ReferenceGeometry],
+    require_foreground_bound_science: bool,
 ) -> StoredSurfaceCoverageGeneration:
     resolved = root.resolve()
     if resolved in active:
@@ -878,9 +883,7 @@ def _read_generation(
         expected_patch_ids = tuple(patch.patch_id for patch in reference.surface.patches)
         if required_patch_ids != expected_patch_ids:
             raise ValueError("Required patch IDs drifted from the coarse reference")
-        required_regions = tuple(
-            SurfaceRegion(str(value)) for value in payload["required_regions"]
-        )
+        required_regions = tuple(SurfaceRegion(str(value)) for value in payload["required_regions"])
         if required_regions != _required_regions(reference.surface):
             raise ValueError("Required regions drifted from the coarse reference")
         ledger = _ledger_from_payload(resolved, payload, reference.surface)
@@ -907,13 +910,13 @@ def _read_generation(
                 previous_path,
                 active=active,
                 references=references,
+                require_foreground_bound_science=require_foreground_bound_science,
             )
             if str(previous_record["generation_id"]) != previous.generation_id:
                 raise ValueError("Previous surface-coverage generation ID changed")
             if (
                 previous.reference.root != reference.summary.root
-                or previous.metadata["reference"]["metadata_sha256"]
-                != reference.metadata_sha256
+                or previous.metadata["reference"]["metadata_sha256"] != reference.metadata_sha256
             ):
                 raise ValueError("Surface-coverage coarse reference drifted across lineage")
             if previous.quality_config.model_dump(mode="json") != config.model_dump(mode="json"):
@@ -927,7 +930,11 @@ def _read_generation(
                 current_record, "metadata.json", label="current reconstructed view"
             )
             current = read_reconstructed_view(current_path)
-            _validate_fine_reconstructed_view(current, reference)
+            _validate_fine_reconstructed_view(
+                current,
+                reference,
+                require_foreground_bound_science=require_foreground_bound_science,
+            )
             if (
                 str(current_record["source_view_id"]) != current.view.source_view_id
                 or int(current_record["source_sequence_index"])
@@ -981,11 +988,26 @@ def _read_generation(
 
 def read_surface_coverage_generation(
     path: str | Path,
+    *,
+    require_foreground_bound_science: bool = False,
 ) -> StoredSurfaceCoverageGeneration:
-    """Validate provenance, replay lineage, and independently recompute quality."""
+    """Validate provenance, replay lineage, and independently recompute quality.
+
+    The generic reader retains schema-2 compatibility for offline/manual assets.  An
+    online scientific run sets ``require_foreground_bound_science`` so every non-empty
+    generation in the recursively replayed lineage must point to a schema-3 view whose
+    foreground/source bindings have themselves passed semantic readback.
+    """
 
     root = Path(path)
     try:
-        return _read_generation(root, active=set(), references={})
+        if type(require_foreground_bound_science) is not bool:
+            raise TypeError("require_foreground_bound_science must be a bool")
+        return _read_generation(
+            root,
+            active=set(),
+            references={},
+            require_foreground_bound_science=require_foreground_bound_science,
+        )
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid surface-coverage generation {root}: {exc}") from exc

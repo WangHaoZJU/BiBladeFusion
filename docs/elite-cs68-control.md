@@ -54,9 +54,10 @@ evaluation stops at the missing continuous swept-mesh proof before a ServoJ stre
 Existing robot-status, acquisition, planning, validation, occupancy, supervision, and
 preflight commands remain non-moving.
 
-No current CLI publishes a fresh `MAP_READY` occupancy asset. The offline
-`build-replay` path below is deliberately not a substitute for the missing native
-coordinator.
+No current CLI publishes a fresh `MAP_READY` occupancy asset. A default-off library-level
+coordinator can prepare and transactionally publish such an asset when assembled by an
+application, but no public composition root exposes that integration. The offline
+`build-replay` path below is deliberately not a substitute for a live accepted cycle.
 
 `bbf occupancy build-replay` is an offline evidence-reconstruction command. Every map it
 writes is deliberately `STALE`, so supplying it to preflight remains blocked. Likewise,
@@ -65,10 +66,13 @@ writes is deliberately `STALE`, so supplying it to preflight remains blocked. Li
 motion-transmission interface. Its `--follow` mode only observes newly published files
 and is not a real-time control or dynamic-avoidance loop.
 
-Hardware enablement can be considered only after a native coordinator atomically binds
-settled capture, FoundationStereo inference, self-masking, fresh map publication, plan
-invalidation, preflight, and execution; that coordinator has not yet been implemented or
-verified on the ES68/D435i system.
+The library coordinator now atomically binds settled capture, FoundationStereo inference,
+self-masking, fresh-map publication, optional fine-science staging, plan invalidation,
+preflight, and guarded execution state. This closes a software contract, not hardware
+enablement: it is default-off, lacks a public composition-root/motion CLI, and is not
+verified on the ES68/D435i system. Hardware release additionally requires the two
+continuous swept-volume proofs, final dimensions/attachments, measured timing thresholds,
+and controlled operator acceptance.
 
 ## Known limitations
 
