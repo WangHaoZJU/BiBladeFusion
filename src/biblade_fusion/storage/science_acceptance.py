@@ -192,7 +192,7 @@ def _nvidia_driver_identity() -> dict[str, Any]:
         text = content.decode("utf-8", errors="replace").strip()
         match = re.search(r"(?:Kernel Module\s+|NVRM version:\s+NVIDIA[^\d]*)([0-9][\w.-]*)", text)
         if match is None:
-            match = re.search(r"\b[0-9]+(?:\.[0-9]+){1,3}\b", text)
+            match = re.search(r"\b([0-9]+(?:\.[0-9]+){1,3})\b", text)
         return {
             "readable": True,
             "source": source,

@@ -319,6 +319,16 @@ class HandEyeConfig(BaseModel):
     target: CharucoTargetConfig = Field(default_factory=CharucoTargetConfig)
 
 
+class CoarseReachabilityFallbackConfig(BaseModel):
+    """Bounded oblique alternative for an unreachable normal coarse view."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    distance_offset_m: float = Field(ge=-0.08, le=0.08)
+    tilt_deg: float = Field(gt=0.0, le=75.0)
+    azimuth_deg: float = Field(ge=-180.0, le=180.0)
+
+
 class ViewPlanningConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -340,6 +350,7 @@ class ViewPlanningConfig(BaseModel):
     maximum_visibility_split_depth: int = Field(default=2, ge=0, le=5)
     edge_margin_m: float = Field(default=0.005, ge=0.0)
     maximum_candidates: int = Field(default=200, ge=2, le=10000)
+    coarse_reachability_fallbacks: tuple[CoarseReachabilityFallbackConfig, ...] = ()
 
     @model_validator(mode="after")
     def validate_adaptive_standoff(self) -> Self:
@@ -353,6 +364,19 @@ class ViewPlanningConfig(BaseModel):
                 bounds[0] <= self.standoff_distance_m <= bounds[1]
             ):
                 raise ValueError("Baseline standoff distance must lie inside adaptive bounds")
+        if self.coarse_reachability_fallbacks and (
+            bounds[0] is None or bounds[1] is None or self.standoff_distance_m is None
+        ):
+            raise ValueError(
+                "Coarse reachability fallbacks require baseline and bounded standoff distances"
+            )
+        if self.standoff_distance_m is not None and bounds[0] is not None and bounds[1] is not None:
+            for fallback in self.coarse_reachability_fallbacks:
+                distance = self.standoff_distance_m + fallback.distance_offset_m
+                if not bounds[0] <= distance <= bounds[1]:
+                    raise ValueError(
+                        "Coarse reachability fallback leaves the bounded standoff interval"
+                    )
         return self
 
 

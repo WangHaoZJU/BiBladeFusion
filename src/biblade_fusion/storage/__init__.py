@@ -47,6 +47,13 @@ from biblade_fusion.storage.motion_envelope_acceptance import (
     read_motion_envelope_acceptance,
     write_motion_envelope_acceptance,
 )
+from biblade_fusion.storage.motion_envelope_commissioning import (
+    MAXIMUM_COMMISSIONING_CANDIDATE_JOINT_DELTA_RAD,
+    CommissioningTrialCandidate,
+    StoredCommissioningTrialCandidate,
+    read_commissioning_trial_candidate,
+    write_commissioning_trial_candidate,
+)
 from biblade_fusion.storage.motion_preflight import (
     StoredMotionPreflight,
     read_motion_preflight,
@@ -173,6 +180,8 @@ __all__ = [
     "StoredInferenceStationarity",
     "StoredMotionPreflight",
     "StoredMotionEnvelopeAcceptance",
+    "CommissioningTrialCandidate",
+    "StoredCommissioningTrialCandidate",
     "StoredNativeOverlapReport",
     "LegacyNativeOverlapReplay",
     "StoredOccupancyMapping",
@@ -200,6 +209,7 @@ __all__ = [
     "read_coarse_surface_reference",
     "read_motion_preflight",
     "read_motion_envelope_acceptance",
+    "read_commissioning_trial_candidate",
     "motion_control_contract_for_settings",
     "read_native_overlap_report",
     "read_legacy_native_overlap_for_replay",
@@ -234,6 +244,8 @@ __all__ = [
     "write_coarse_model",
     "write_motion_preflight",
     "write_motion_envelope_acceptance",
+    "write_commissioning_trial_candidate",
+    "MAXIMUM_COMMISSIONING_CANDIDATE_JOINT_DELTA_RAD",
     "write_native_overlap_report",
     "write_occupancy_mapping",
     "write_path_validation",

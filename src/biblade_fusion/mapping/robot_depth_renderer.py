@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -31,12 +32,19 @@ class _TriangleMesh:
 
 @dataclass(slots=True)
 class Es68D435iRobotDepthRenderer:
-    """Software z-buffer over the exact articulated collision-mesh asset."""
+    """Depth renderer over the articulated arm collision meshes.
+
+    The D435i attachment is retained in the collision model but excluded from
+    self-mask rendering: its closed collision envelope contains the camera
+    optical centre and is therefore not a valid camera-visible surface.
+    """
 
     template: Es68D435iCollisionTemplate
     pinocchio_model: PinocchioCs68Model
     meshes: tuple[_TriangleMesh, ...]
     model_content_hash: str
+    self_mask_excluded_link_names: tuple[str, ...]
+    self_mask_render_backend: str
     joint_zero_offsets_rad: tuple[float, ...]
     _temporary_directory: TemporaryDirectory[str] = field(repr=False)
 
@@ -61,17 +69,26 @@ class Es68D435iRobotDepthRenderer:
             urdf,
             joint_zero_offsets_rad=offsets,
         )
-        meshes = tuple(_load_template_meshes(template))
+        excluded_link_names = (template.attachment.link_name,)
+        render_backend = _select_self_mask_render_backend()
+        meshes = tuple(
+            _load_template_meshes(
+                template,
+                excluded_link_names=excluded_link_names,
+            )
+        )
         return cls(
-            template,
-            model,
-            meshes,
-            es68_d435i_robot_geometry_hash(
+            template=template,
+            pinocchio_model=model,
+            meshes=meshes,
+            model_content_hash=es68_d435i_robot_geometry_hash(
                 template,
                 joint_zero_offsets_rad=offsets,
             ),
-            offsets,
-            temporary,
+            self_mask_excluded_link_names=excluded_link_names,
+            self_mask_render_backend=render_backend,
+            joint_zero_offsets_rad=offsets,
+            _temporary_directory=temporary,
         )
 
     def render_robot_depth(
@@ -97,7 +114,7 @@ class Es68D435iRobotDepthRenderer:
         )
         pin.updateFramePlacements(self.pinocchio_model.model, self.pinocchio_model.data)
         camera_t_base = np.linalg.inv(transform)
-        depth = np.full((intrinsics.height, intrinsics.width), np.inf, dtype=np.float64)
+        camera_meshes: list[tuple[NDArray[np.float64], NDArray[np.int64]]] = []
         for mesh in self.meshes:
             frame_id = int(self.pinocchio_model.model.getFrameId(mesh.link_name))
             if frame_id >= len(self.pinocchio_model.model.frames):
@@ -108,7 +125,14 @@ class Es68D435iRobotDepthRenderer:
             )
             camera_t_mesh = camera_t_base @ base_t_link @ mesh.link_t_mesh
             vertices = _transform_points(mesh.vertices_m, camera_t_mesh)
-            for face in mesh.faces:
+            camera_meshes.append((vertices, mesh.faces))
+
+        if self.self_mask_render_backend.startswith("open3d_raycasting:"):
+            return _raycast_triangle_meshes_depth(camera_meshes, intrinsics)
+
+        depth = np.full((intrinsics.height, intrinsics.width), np.inf, dtype=np.float64)
+        for vertices, faces in camera_meshes:
+            for face in faces:
                 triangle = vertices[face]
                 for visible_triangle in _clip_triangle_to_near_plane(triangle):
                     _rasterize_triangle_depth(depth, visible_triangle, intrinsics)
@@ -129,13 +153,65 @@ class Es68D435iRobotDepthRenderer:
         return matrix
 
 
+def _select_self_mask_render_backend() -> str:
+    try:
+        import open3d  # noqa: F401
+
+        open3d_version = version("open3d")
+    except (ImportError, OSError, PackageNotFoundError):
+        return "numpy_zbuffer:v1"
+    return f"open3d_raycasting:{open3d_version}"
+
+
+def _raycast_triangle_meshes_depth(
+    camera_meshes: Sequence[tuple[NDArray[np.float64], NDArray[np.int64]]],
+    intrinsics: CameraIntrinsics,
+) -> NDArray[np.float64]:
+    """Cast pinhole rays against exact camera-frame triangles with Open3D."""
+
+    import open3d as o3d
+
+    scene = o3d.t.geometry.RaycastingScene()
+    for vertices, faces in camera_meshes:
+        scene.add_triangles(
+            o3d.core.Tensor(np.asarray(vertices, dtype=np.float32)),
+            o3d.core.Tensor(np.asarray(faces, dtype=np.uint32)),
+        )
+    columns, rows = np.meshgrid(
+        np.arange(intrinsics.width, dtype=np.float32),
+        np.arange(intrinsics.height, dtype=np.float32),
+    )
+    directions = np.stack(
+        (
+            (columns - np.float32(intrinsics.cx)) / np.float32(intrinsics.fx),
+            (rows - np.float32(intrinsics.cy)) / np.float32(intrinsics.fy),
+            np.ones_like(columns),
+        ),
+        axis=-1,
+    )
+    rays = np.concatenate((np.zeros_like(directions), directions), axis=-1)
+    hit_depth = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+    depth = np.asarray(hit_depth, dtype=np.float64)
+    depth.setflags(write=False)
+    return depth
+
+
 def _load_template_meshes(
     template: Es68D435iCollisionTemplate,
+    *,
+    excluded_link_names: Sequence[str] = (),
 ) -> list[_TriangleMesh]:
     import trimesh
 
+    excluded = frozenset(str(name) for name in excluded_link_names)
+    available = {spec.link_name for spec in (*template.links, template.attachment)}
+    unknown = sorted(excluded - available)
+    if unknown:
+        raise ValueError(f"Unknown self-mask mesh exclusions: {unknown}")
     loaded: list[_TriangleMesh] = []
     for spec in (*template.links, template.attachment):
+        if spec.link_name in excluded:
+            continue
         raw = trimesh.load_mesh(spec.mesh_path, process=False)
         if isinstance(raw, trimesh.Scene):
             geometries = tuple(raw.geometry.values())

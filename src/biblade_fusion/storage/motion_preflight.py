@@ -7,7 +7,7 @@ import json
 import math
 import shutil
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +20,7 @@ from biblade_fusion.core.settings import (
 )
 from biblade_fusion.robotics import (
     Es68PinocchioCollisionChecker,
+    MotionPreflightStatus,
     OccupancyRobotCollisionChecker,
 )
 from biblade_fusion.storage.coverage_plan import read_coverage_driven_plan
@@ -109,6 +110,53 @@ def _validate_coverage_sequence_binding(
         )
 
 
+def _offline_occupancy_configuration_matches(
+    active: OccupancyConfig,
+    artifact: OccupancyConfig,
+) -> bool:
+    """Allow disabled deployment config to inspect an enabled replay map."""
+
+    if not artifact.enabled:
+        return False
+    active_payload = active.model_dump(mode="json")
+    artifact_payload = artifact.model_dump(mode="json")
+    active_payload.pop("enabled")
+    artifact_payload.pop("enabled")
+    return active_payload == artifact_payload
+
+
+def _block_disabled_occupancy(
+    report: ViewSequenceMotionPreflight,
+) -> ViewSequenceMotionPreflight:
+    reason = "occupancy_config_disabled"
+    legs = []
+    for leg in report.legs:
+        preflight = leg.preflight
+        status = (
+            MotionPreflightStatus.BLOCKED
+            if preflight.status is MotionPreflightStatus.CLEAR
+            else preflight.status
+        )
+        reasons = preflight.blocking_reasons
+        if reason not in reasons:
+            reasons = (*reasons, reason)
+        legs.append(
+            replace(
+                leg,
+                preflight=replace(
+                    preflight,
+                    status=status,
+                    blocking_reasons=reasons,
+                    diagnostics={
+                        **preflight.diagnostics,
+                        "active_occupancy_enabled": False,
+                    },
+                ),
+            )
+        )
+    return replace(report, legs=tuple(legs))
+
+
 def _derive(
     plan: Path,
     initialization: Path,
@@ -184,7 +232,10 @@ def _derive(
         artifact_config = OccupancyConfig.model_validate(
             stored_occupancy.metadata["configuration"]["occupancy"]
         )
-        if artifact_config != occupancy_config:
+        if not _offline_occupancy_configuration_matches(
+            occupancy_config,
+            artifact_config,
+        ):
             raise ValueError("Active occupancy configuration differs from the map artifact")
         snapshot = stored_occupancy.snapshot
         if checker is not None:
@@ -216,7 +267,7 @@ def _derive(
                 semantic_attestation=stored_occupancy.semantic_attestation,
                 utc_clock=lambda: evaluated_at_utc,
             )
-    return preflight_view_sequence_motion(
+    report = preflight_view_sequence_motion(
         stored_plan.result.filtered_plan,
         ordered_view_ids,
         stored_initialization.observation.seed_joint_positions_rad,
@@ -228,6 +279,9 @@ def _derive(
         execution_freshness_margin_s=execution_freshness_margin_s,
         evaluated_at_utc=evaluated_at_utc,
     )
+    if occupancy is not None and occupancy_config is not None and not occupancy_config.enabled:
+        report = _block_disabled_occupancy(report)
+    return report
 
 
 def write_motion_preflight(

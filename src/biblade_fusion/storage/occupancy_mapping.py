@@ -716,6 +716,14 @@ def _validate_semantic_source_chain(
         robot["model_content_hash"],
         label="robot.model_content_hash",
     )
+    context_self_mask_exclusions = _string_tuple(
+        robot["self_mask_excluded_link_names"],
+        label="robot.self_mask_excluded_link_names",
+    )
+    context_self_mask_backend = _non_empty_string(
+        robot["self_mask_render_backend"],
+        label="robot.self_mask_render_backend",
+    )
     context_hand_eye_hash = _sha256_digest(
         hand_eye["artifact_sha256"],
         label="hand_eye.artifact_sha256",
@@ -741,6 +749,10 @@ def _validate_semantic_source_chain(
     renderer = dependencies.renderer_factory(offsets)
     if renderer.model_content_hash != context_robot_hash:
         raise ValueError("Mapping context robot hash is not the active robot geometry hash")
+    if tuple(renderer.self_mask_excluded_link_names) != context_self_mask_exclusions:
+        raise ValueError("Active robot renderer self-mask exclusions differ from mapping context")
+    if renderer.self_mask_render_backend != context_self_mask_backend:
+        raise ValueError("Active robot renderer self-mask backend differs from mapping context")
     renderer_offsets = tuple(float(value) for value in renderer.joint_zero_offsets_rad)
     if renderer_offsets != offsets:
         raise ValueError("Active robot renderer offsets differ from mapping context")
@@ -1157,6 +1169,8 @@ def _validate_context_configuration(
         robot,
         {
             "model_content_hash",
+            "self_mask_excluded_link_names",
+            "self_mask_render_backend",
             "joint_zero_offsets_rad",
             "flange_T_tcp",
             "flange_tcp_asset_sha256",
@@ -1347,6 +1361,23 @@ def _finite_six_vector(
         float(array[4]),
         float(array[5]),
     )
+
+
+def _string_tuple(value: Any, *, label: str) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"Mapping context {label} must be an array")
+    result = tuple(str(item).strip() for item in value)
+    if any(not item for item in result) or len(set(result)) != len(result):
+        raise ValueError(
+            f"Mapping context {label} must contain unique non-empty strings"
+        )
+    return result
+
+
+def _non_empty_string(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Mapping context {label} must be a non-empty string")
+    return value.strip()
 
 
 def _pose_from_payload(

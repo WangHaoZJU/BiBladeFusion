@@ -198,7 +198,7 @@ class FakeGuardedArm:
         assert capability is not None
         assert deadline_exceeded is None or deadline_exceeded() is False
         assert dt_s == 0.004
-        assert warmup_duration_s == 0.0
+        assert warmup_duration_s == 0.2
         if self._stop_generation != expected_stop_generation or self.stopped:
             raise RobotMotionInterruptedError("stop generation changed before prepare")
         self.events.append("prepare")

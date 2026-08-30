@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import sys
+from collections import defaultdict
 from importlib import import_module
 from importlib.util import find_spec
 from pathlib import Path
+from threading import RLock
 from types import ModuleType
 from typing import Any, Protocol
 
@@ -31,6 +33,7 @@ _OPTIONAL_ACCELERATION_MODULES = (
     ("xformers", "xFormers"),
     ("flash_attn", "FlashAttention"),
 )
+_CHECKPOINT_SAFE_GLOBALS_LOCK = RLock()
 
 
 def _path_check(name: str, path: Path, expected_child: str | None = None) -> CheckResult:
@@ -153,6 +156,59 @@ def _plain_scalar(value: Any) -> bool | int | float | str | None:
     if callable(item):
         return _plain_scalar(item())
     return str(value)
+
+
+def _load_official_checkpoint_safely(
+    torch: Any,
+    checkpoint: Path,
+    *,
+    map_location: str,
+) -> Any:
+    """Load the official training checkpoint without enabling arbitrary pickle globals."""
+
+    serialization = torch.serialization
+    required_api = ("add_safe_globals", "clear_safe_globals", "get_safe_globals")
+    if not all(hasattr(serialization, name) for name in required_api):
+        raise FoundationStereoError(
+            "installed PyTorch cannot isolate the FoundationStereo checkpoint allowlist"
+        )
+
+    codecs_module = import_module("_codecs")
+    numpy_multiarray = import_module("numpy.core.multiarray")
+    omegaconf_base = import_module("omegaconf.base")
+    omegaconf_dictconfig = import_module("omegaconf.dictconfig")
+    omegaconf_listconfig = import_module("omegaconf.listconfig")
+    omegaconf_nodes = import_module("omegaconf.nodes")
+    safe_globals = (
+        dict,
+        list,
+        int,
+        codecs_module.encode,
+        defaultdict,
+        np.dtype,
+        numpy_multiarray.scalar,
+        type(np.dtype(np.float64)),
+        omegaconf_base.ContainerMetadata,
+        omegaconf_base.Metadata,
+        omegaconf_dictconfig.DictConfig,
+        omegaconf_listconfig.ListConfig,
+        omegaconf_nodes.AnyNode,
+        Any,
+    )
+    with _CHECKPOINT_SAFE_GLOBALS_LOCK:
+        previous_safe_globals = tuple(serialization.get_safe_globals())
+        serialization.clear_safe_globals()
+        serialization.add_safe_globals(list(safe_globals))
+        try:
+            return torch.load(
+                str(checkpoint),
+                map_location=map_location,
+                weights_only=True,
+            )
+        finally:
+            serialization.clear_safe_globals()
+            if previous_safe_globals:
+                serialization.add_safe_globals(list(previous_safe_globals))
 
 
 def _ensure_upstream_import_path(repository_path: Path) -> None:
@@ -303,10 +359,10 @@ class _OfficialFoundationStereoRuntime:
             torch.hub.load = original_hub_load
 
         try:
-            checkpoint_payload = torch.load(
-                str(checkpoint),
+            checkpoint_payload = _load_official_checkpoint_safely(
+                torch,
+                checkpoint,
                 map_location=config.device,
-                weights_only=True,
             )
             model.load_state_dict(checkpoint_payload["model"], strict=True)
         except Exception as exc:

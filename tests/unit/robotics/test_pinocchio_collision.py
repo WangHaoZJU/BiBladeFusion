@@ -331,3 +331,8 @@ def test_renderer_and_checker_share_nonzero_offset_robot_geometry_hash(
 
     assert renderer.model_content_hash == checker.robot_geometry_hash
     assert renderer.model_content_hash != zero_renderer.model_content_hash
+    assert renderer.self_mask_excluded_link_names == (renderer.template.attachment.link_name,)
+    assert renderer.self_mask_render_backend.startswith(("open3d_raycasting:", "numpy_zbuffer:"))
+    assert renderer.template.attachment.link_name not in {
+        mesh.link_name for mesh in renderer.meshes
+    }

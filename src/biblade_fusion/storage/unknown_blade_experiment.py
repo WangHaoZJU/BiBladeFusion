@@ -440,19 +440,33 @@ def _write_new_json(
 class UnknownBladeExperimentWriter:
     """Append the checkpointed one-way coarse-to-fine experiment chain."""
 
-    def __init__(self, stored: StoredUnknownBladeExperiment) -> None:
-        if stored.science_authority is None or stored.runtime_timing_authority is None:
+    def __init__(
+        self,
+        stored: StoredUnknownBladeExperiment,
+        *,
+        production: bool = True,
+    ) -> None:
+        if production and (
+            stored.science_authority is None or stored.runtime_timing_authority is None
+        ):
             raise ValueError(
                 "Production experiment writer requires science and runtime timing authorities; "
                 "legacy chains are audit-readable only"
             )
-        if stored.fine_start_protocol != UNKNOWN_BLADE_FINE_START_PROTOCOL:
+        if production and stored.fine_start_protocol != UNKNOWN_BLADE_FINE_START_PROTOCOL:
             raise ValueError(
                 "Legacy single-phase fine-start chains are audit-readable only and "
                 "cannot be resumed by the production writer"
             )
+        if not production and (
+            stored.science_authority is not None
+            or stored.runtime_timing_authority is not None
+            or stored.fine_start_protocol is not None
+        ):
+            raise ValueError("Experimental coarse writer cannot carry production authorities")
         self.root = stored.root
         self.experiment_id = stored.experiment_id
+        self._production = production
         self._events = list(stored.events)
         self._lock = threading.RLock()
 
@@ -463,17 +477,37 @@ class UnknownBladeExperimentWriter:
         *,
         experiment_id: str,
         coarse_run_root: str | Path,
+        coarse_run_id: str | None = None,
         science_authority: ScienceAcceptanceAuthority | None = None,
         runtime_timing_authority: RuntimeTimingAcceptanceAuthority | None = None,
+        production: bool = True,
     ) -> UnknownBladeExperimentWriter:
-        if science_authority is None or runtime_timing_authority is None:
+        if production and (science_authority is None or runtime_timing_authority is None):
             raise ValueError(
                 "New production experiment chains require science and runtime timing authorities"
             )
+        if not production and (
+            science_authority is not None or runtime_timing_authority is not None
+        ):
+            raise ValueError(
+                "Experimental coarse chains cannot claim production acceptance authorities"
+            )
         output = Path(output_dir).resolve()
         coarse_root = Path(coarse_run_root).resolve()
-        coarse = read_stop_scan_run(coarse_root)
-        if coarse.run_id != validate_stop_scan_run_id(experiment_id):
+        expected_id = validate_stop_scan_run_id(experiment_id)
+        events_root = coarse_root / "events"
+        if events_root.is_dir() and not any(events_root.iterdir()):
+            if coarse_run_id is None:
+                raise ValueError(
+                    "An eventless coarse run reservation requires its explicit run ID"
+                )
+            bound_run_id = validate_stop_scan_run_id(coarse_run_id)
+            bound_run_root = coarse_root
+        else:
+            coarse = read_stop_scan_run(coarse_root)
+            bound_run_id = coarse.run_id
+            bound_run_root = coarse.root
+        if bound_run_id != expected_id:
             raise ValueError("coarse run ID differs from experiment ID")
         output.parent.mkdir(parents=True, exist_ok=True)
         output.mkdir()
@@ -484,16 +518,20 @@ class UnknownBladeExperimentWriter:
             (),
             science_authority,
             runtime_timing_authority,
-            UNKNOWN_BLADE_FINE_START_PROTOCOL,
+            UNKNOWN_BLADE_FINE_START_PROTOCOL if production else None,
         )
-        writer = cls(stored)
+        writer = cls(stored, production=production)
         writer._append(
             "experiment_initialized",
             {
                 "experiment_id": experiment_id,
-                "coarse_run_id": coarse.run_id,
-                "coarse_run_root": str(coarse.root),
-                "fine_start_protocol": UNKNOWN_BLADE_FINE_START_PROTOCOL,
+                "coarse_run_id": bound_run_id,
+                "coarse_run_root": str(bound_run_root),
+                **(
+                    {"fine_start_protocol": UNKNOWN_BLADE_FINE_START_PROTOCOL}
+                    if production
+                    else {}
+                ),
                 **(
                     {"science_acceptance_authority": science_authority.to_payload()}
                     if science_authority is not None
@@ -803,6 +841,38 @@ class UnknownBladeExperimentWriter:
                         },
                     },
                     before_publish=require_budget_before_publish,
+                )
+
+    def append_unaccepted_fine_started(
+        self,
+        *,
+        fine_run_root: str | Path,
+    ) -> UnknownBladeExperimentEvent:
+        """Bind an experiment-only fine run without claiming release acceptance."""
+
+        if self._production:
+            raise ValueError("Production chains cannot use an unaccepted fine handoff")
+        with self._lock:
+            self._require_current_chain()
+            if self._events[-1].event_type != "handoff_prepared":
+                raise ValueError("Experimental FINE_STARTED requires PREPARED")
+            prepared = self._events[-1]
+            with exclusive_stop_scan_run_authority(fine_run_root):
+                fine = read_stop_scan_run(fine_run_root)
+                _validate_fine_start_bootstrap_run(
+                    fine,
+                    require_exactly_one_event=True,
+                )
+                if fine.run_id != self.experiment_id:
+                    raise ValueError("experimental fine run ID differs from experiment ID")
+                return self._append(
+                    "fine_started",
+                    {
+                        "prepared_event_sha256": prepared.event_sha256,
+                        "fine_run_id": fine.run_id,
+                        "fine_run_root": str(fine.root),
+                        "fine_first_event_sha256": fine.events[0].event_sha256,
+                    },
                 )
 
     def append_fine_checkpoint(

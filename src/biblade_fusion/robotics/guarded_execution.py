@@ -635,6 +635,7 @@ class GuardedEliteExecutor:
             )
             self._arm._guarded_prepare_servoj_stream(
                 dt_s=stream.dt_s,
+                warmup_duration_s=approved_runtime_config.warmup_duration_s,
                 expected_stop_generation=permit.stop_generation,
                 capability=_GUARDED_MOTION_CAPABILITY,
                 deadline_exceeded=deadline_exceeded,

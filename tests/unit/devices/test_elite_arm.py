@@ -332,6 +332,78 @@ def test_bootstrap_controller_stop_is_dashboard_only_and_latches_generation() ->
     assert ("stopProgram", None) in sdk.dashboard.calls
 
 
+def test_bootstrap_controller_stop_accepts_already_stopped_dashboard_task() -> None:
+    class AlreadyStoppedDashboard(FakeDashboard):
+        def runningStatus(self) -> str:
+            self.calls.append(("runningStatus", None))
+            return "STOPPED"
+
+        def stopProgram(self) -> bool:
+            raise AssertionError("already-stopped task must not receive stopProgram")
+
+    sdk = FakeSdk()
+    sdk.dashboard = AlreadyStoppedDashboard()
+    arm = EliteArm(config(motion_enabled=True), sdk_module=sdk, sleep_fn=lambda _: None)
+    arm.connect(with_driver=False)
+
+    generation = arm.establish_bootstrap_controller_stop()
+
+    assert generation == 1
+    assert arm.stop_snapshot == (generation, True)
+    assert sdk.dashboard.calls[-1] == ("runningStatus", None)
+
+
+def test_bootstrap_controller_stop_stops_and_rechecks_running_dashboard_task() -> None:
+    class RunningDashboard(FakeDashboard):
+        def __init__(self) -> None:
+            super().__init__()
+            self.statuses = iter(("PLAYING", "STOPPED"))
+
+        def runningStatus(self) -> str:
+            self.calls.append(("runningStatus", None))
+            return next(self.statuses)
+
+    sdk = FakeSdk()
+    sdk.dashboard = RunningDashboard()
+    arm = EliteArm(config(motion_enabled=True), sdk_module=sdk, sleep_fn=lambda _: None)
+    arm.connect(with_driver=False)
+
+    arm.establish_bootstrap_controller_stop()
+
+    assert sdk.dashboard.calls[-3:] == [
+        ("runningStatus", None),
+        ("stopProgram", None),
+        ("runningStatus", None),
+    ]
+
+
+def test_bootstrap_controller_stop_rejects_failed_or_unconfirmed_dashboard_stop() -> None:
+    class UnstoppableDashboard(FakeDashboard):
+        def __init__(self, *, accepted: bool) -> None:
+            super().__init__()
+            self.accepted = accepted
+
+        def runningStatus(self) -> str:
+            self.calls.append(("runningStatus", None))
+            return "PLAYING"
+
+        def stopProgram(self) -> bool:
+            self.calls.append(("stopProgram", None))
+            return self.accepted
+
+    for accepted, message in (
+        (False, "rejected bootstrap controller stop"),
+        (True, "did not reach STOPPED"),
+    ):
+        sdk = FakeSdk()
+        sdk.dashboard = UnstoppableDashboard(accepted=accepted)
+        arm = EliteArm(config(motion_enabled=True), sdk_module=sdk, sleep_fn=lambda _: None)
+        arm.connect(with_driver=False)
+
+        with pytest.raises(RobotCommandError, match=message):
+            arm.establish_bootstrap_controller_stop()
+
+
 def test_move_joints_executes_holorobot_single_point_trajectory() -> None:
     arm, sdk = enabled_arm()
     target = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6]
@@ -392,6 +464,7 @@ def test_unknown_or_unparseable_safety_state_fails_closed(safety_status) -> None
     "config",
     [
         ServoJStreamConfig(dt_s=float("nan")),
+        ServoJStreamConfig(warmup_duration_s=float("nan")),
         ServoJStreamConfig(tracking_error_rad=float("nan")),
         ServoJStreamConfig(timing_violation_factor=float("nan")),
     ],

@@ -67,6 +67,8 @@ class _Artifacts:
 
 class _NoRobotPixelsRenderer:
     model_content_hash = "a" * 64
+    self_mask_excluded_link_names: tuple[str, ...] = ()
+    self_mask_render_backend = "test_no_robot_pixels:v1"
     joint_zero_offsets_rad = (0.0,) * 6
 
     def base_t_flange_matrix(self, joint_positions_rad):
@@ -105,6 +107,10 @@ def _bundle() -> SynchronizedFrameBundle:
         "NORMAL",
         0.2,
     )
+    relative_rotation = state.base_t_tcp.rotation.T @ state.base_t_tcp.rotation
+    rotation_delta_rad = float(
+        np.arccos(np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0))
+    )
     return SynchronizedFrameBundle(
         "view-a",
         0,
@@ -113,7 +119,7 @@ def _bundle() -> SynchronizedFrameBundle:
         state,
         stereo,
         None,
-        CaptureMetrics(0.0, 0.0, 0.0, 0.0, 0.0),
+        CaptureMetrics(0.0, 0.0, 0.0, rotation_delta_rad, 0.0),
     )
 
 

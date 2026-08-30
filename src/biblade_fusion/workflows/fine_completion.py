@@ -15,6 +15,7 @@ from biblade_fusion.storage.fine_reconstruction import (
     read_final_fine_reconstruction,
     replay_final_fine_reconstruction,
     write_final_fine_reconstruction,
+    write_unaccepted_legacy_fine_reconstruction,
 )
 from biblade_fusion.storage.science_authority import ScienceAcceptanceAuthority
 from biblade_fusion.storage.surface_coverage import StoredSurfaceCoverageGeneration
@@ -99,6 +100,58 @@ def finalize_fine_science(
     verified = read_final_fine_reconstruction(output)
     if verified.science_authority != science_authority:
         raise ValueError("Terminal reconstruction science authority changed")
+    return FinalFineCompletionEvidence(
+        verified.root,
+        verified.artifact_id,
+        verified.metadata_sha256,
+    )
+
+
+def finalize_unaccepted_fine_science(
+    state: StoredSurfaceCoverageGeneration,
+    *,
+    fusion_config: MultiViewFusionConfig,
+    tsdf_config: TSDFConfig,
+    surface_quality_config: SurfaceQualityConfig,
+    finalization_config: FineFinalizationConfig,
+    output_dir: str | Path | None = None,
+) -> FinalFineCompletionEvidence:
+    """Create a replayable experiment result without a science acceptance claim."""
+
+    output = (
+        Path(output_dir).resolve()
+        if output_dir is not None
+        else (state.root.parent / "final_reconstruction").resolve()
+    )
+    if output.exists():
+        stored = replay_final_fine_reconstruction(output)
+    else:
+        result = build_final_fine_reconstruction(
+            state.root,
+            fusion_config=fusion_config,
+            tsdf_config=tsdf_config,
+            surface_quality_config=surface_quality_config,
+            finalization_config=finalization_config,
+        )
+        write_unaccepted_legacy_fine_reconstruction(
+            output,
+            result,
+            fusion_config=fusion_config,
+            tsdf_config=tsdf_config,
+            surface_quality_config=surface_quality_config,
+            finalization_config=finalization_config,
+        )
+        stored = replay_final_fine_reconstruction(output)
+    if (
+        stored.result.coverage.root != state.root
+        or stored.result.coverage.generation_id != state.generation_id
+        or stored.result.coverage.metadata_sha256 != state.metadata_sha256
+        or stored.science_authority is not None
+    ):
+        raise ValueError("Unaccepted reconstruction changed its source or claimed authority")
+    verified = read_final_fine_reconstruction(output)
+    if verified.science_authority is not None:
+        raise ValueError("Unaccepted reconstruction unexpectedly claims science authority")
     return FinalFineCompletionEvidence(
         verified.root,
         verified.artifact_id,

@@ -221,6 +221,12 @@ class _ExperimentHandoffChain(Protocol):
         budget_check: Callable[[], float],
     ) -> object: ...
 
+    def append_unaccepted_fine_started(
+        self,
+        *,
+        fine_run_root: str | Path,
+    ) -> object: ...
+
     def append_fine_checkpoint(
         self,
         *,
@@ -671,6 +677,7 @@ class UnknownBladeSupervisedRuntime:
         science_settings: AppSettings | None = None,
         runtime_timing_authority: RuntimeTimingAcceptanceAuthority | None = None,
         maximum_schema5_handoff_duration_s: float | None = None,
+        experimental: bool = False,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not operator_id.strip():
@@ -721,6 +728,7 @@ class UnknownBladeSupervisedRuntime:
                 )
         self._runtime_timing_authority = runtime_timing_authority
         self._maximum_schema5_handoff_duration_s = maximum_schema5_handoff_duration_s
+        self._experimental = experimental
         self._monotonic_clock = monotonic_clock
         self._bootstrap_count = 0
         self._fine_replenishment_count = 0
@@ -1192,17 +1200,22 @@ class UnknownBladeSupervisedRuntime:
                 self._set_phase(UnknownBladeRuntimePhase.STOPPED)
                 return
             self._require_schema5_handoff_budget(handoff_started_monotonic_s)
-            self._experiment_handoff.append_fine_start_candidate(
-                fine_run_root=fine_status.run_root,
-            )
-            self._verify_handoff_chain()
-            self._require_schema5_handoff_budget(handoff_started_monotonic_s)
-            self._experiment_handoff.append_fine_started(
-                timing_scope="uninterrupted_total",
-                budget_check=lambda: self._require_schema5_commit_budget(
-                    handoff_started_monotonic_s
-                ),
-            )
+            if self._experimental:
+                self._experiment_handoff.append_unaccepted_fine_started(
+                    fine_run_root=fine_status.run_root,
+                )
+            else:
+                self._experiment_handoff.append_fine_start_candidate(
+                    fine_run_root=fine_status.run_root,
+                )
+                self._verify_handoff_chain()
+                self._require_schema5_handoff_budget(handoff_started_monotonic_s)
+                self._experiment_handoff.append_fine_started(
+                    timing_scope="uninterrupted_total",
+                    budget_check=lambda: self._require_schema5_commit_budget(
+                        handoff_started_monotonic_s
+                    ),
+                )
             # The final event's atomic publication is the activation
             # linearization point; its storage callback checked the accepted
             # deadline after fsync and before publication.
@@ -1334,6 +1347,7 @@ class UnknownBladeSupervisedRuntime:
     def _seal_fine_completion(self, status: ExperimentStatusSnapshot) -> None:
         if (
             isinstance(self._experiment_handoff, UnknownBladeExperimentWriter)
+            and not self._experimental
             and (self._science_authority is None or self._science_settings is None)
         ):
             raise UnknownBladeRuntimeError(
@@ -1461,7 +1475,11 @@ class UnknownBladeSupervisedRuntime:
             raise UnknownBladeRuntimeError("Unknown-blade runtime is not started")
 
 
-def unknown_blade_runtime_readiness(settings: AppSettings) -> tuple[CheckResult, ...]:
+def unknown_blade_runtime_readiness(
+    settings: AppSettings,
+    *,
+    require_release_acceptance: bool = True,
+) -> tuple[CheckResult, ...]:
     """Audit the complete coarse-to-fine runtime without touching hardware."""
 
     results = list(run_supervised_scan_readiness(settings, mode="bootstrap"))
@@ -1492,9 +1510,9 @@ def unknown_blade_runtime_readiness(settings: AppSettings) -> tuple[CheckResult,
     science_eligible = False
     science_path = settings.science_acceptance.path
     science_id = settings.science_acceptance.acceptance_id
-    if science_path is None or science_id is None:
+    if require_release_acceptance and (science_path is None or science_id is None):
         missing.append("science_acceptance.path/id")
-    else:
+    elif require_release_acceptance:
         try:
             required_envelope = required_science_test_envelope_for_settings(settings)
             science = read_science_acceptance(science_path)
@@ -1513,13 +1531,16 @@ def unknown_blade_runtime_readiness(settings: AppSettings) -> tuple[CheckResult,
         "maximum_segment_execution_duration_s": (timing.maximum_segment_execution_duration_s),
         "maximum_schema5_handoff_duration_s": timing.maximum_schema5_handoff_duration_s,
     }
-    missing.extend(f"stop_and_capture.{name}" for name, value in measured.items() if value is None)
+    if require_release_acceptance:
+        missing.extend(
+            f"stop_and_capture.{name}" for name, value in measured.items() if value is None
+        )
     timing_acceptance_eligible = False
     timing_path = timing.runtime_timing_acceptance_path
     timing_id = timing.runtime_timing_acceptance_id
-    if timing_path is None or timing_id is None:
+    if require_release_acceptance and (timing_path is None or timing_id is None):
         missing.append("stop_and_capture.runtime_timing_acceptance_path/id")
-    elif all(value is not None for value in measured.values()):
+    elif require_release_acceptance and all(value is not None for value in measured.values()):
         try:
             accepted_timing = read_runtime_timing_acceptance(timing_path)
             accepted_timing.assert_matches(settings=settings, acceptance_id=timing_id)
@@ -1527,7 +1548,7 @@ def unknown_blade_runtime_readiness(settings: AppSettings) -> tuple[CheckResult,
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             missing.append(f"runtime timing acceptance invalid: {exc}")
     required_map_age_s: float | None = None
-    if all(value is not None for value in measured.values()):
+    if require_release_acceptance and all(value is not None for value in measured.values()):
         perception = float(measured["maximum_perception_cycle_duration_s"])
         reposition = float(measured["maximum_operator_reposition_interval_s"])
         segment = float(measured["maximum_segment_execution_duration_s"])
@@ -1566,14 +1587,25 @@ def unknown_blade_runtime_readiness(settings: AppSettings) -> tuple[CheckResult,
                 "bootstrap_controller_stop_motion_eligible": envelope_motion_eligible,
                 "geometry_science_acceptance_eligible": science_eligible,
                 "runtime_timing_acceptance_eligible": timing_acceptance_eligible,
+                "release_scope": (
+                    "production" if require_release_acceptance else "experimental"
+                ),
+                "release_acceptance_bypassed": not require_release_acceptance,
             },
         )
     )
     return tuple(results)
 
 
-def require_unknown_blade_runtime_ready(settings: AppSettings) -> tuple[CheckResult, ...]:
-    results = unknown_blade_runtime_readiness(settings)
+def require_unknown_blade_runtime_ready(
+    settings: AppSettings,
+    *,
+    require_release_acceptance: bool = True,
+) -> tuple[CheckResult, ...]:
+    results = unknown_blade_runtime_readiness(
+        settings,
+        require_release_acceptance=require_release_acceptance,
+    )
     failures = tuple(item for item in results if item.level is CheckLevel.FAIL)
     if failures:
         summary = "; ".join(f"{item.name}: {item.message}" for item in failures)
@@ -1629,7 +1661,12 @@ def _finalize_production_runtime(
 
     stop_errors: list[BaseException] = []
     try:
-        if runtime.snapshot.phase is not UnknownBladeRuntimePhase.COMPLETE:
+        snapshot = runtime.snapshot
+        runner_status = getattr(snapshot, "runner_status", None)
+        if (
+            snapshot.phase is not UnknownBladeRuntimePhase.COMPLETE
+            and getattr(runner_status, "phase", None) != "failed"
+        ):
             runtime.request_stop("production runtime context closed")
     except BaseException as exc:
         stop_errors.append(exc)
@@ -1679,10 +1716,35 @@ def _finalize_production_runtime(
     if len(stop_errors) == 1:
         raise stop_errors[0]
     if stop_errors:
-        raise BaseExceptionGroup(
+        grouped = BaseExceptionGroup(
             "Production runtime cleanup had multiple stop failures",
             stop_errors,
         )
+        details = "; ".join(_failure_summary(exc) for exc in stop_errors)
+        raise UnknownBladeRuntimeError(
+            f"production runtime cleanup stop failures: {details}"
+        ) from grouped
+
+
+def _failure_summary(exc: BaseException) -> str:
+    if isinstance(exc, BaseExceptionGroup):
+        nested = "; ".join(_failure_summary(item) for item in exc.exceptions)
+        return f"{type(exc).__name__}[{nested}]"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _raise_combined_runtime_failure(
+    primary: BaseException,
+    cleanup: BaseException,
+) -> None:
+    grouped = BaseExceptionGroup(
+        "Unknown-blade runtime and cleanup both failed",
+        [primary, cleanup],
+    )
+    raise UnknownBladeRuntimeError(
+        "runtime failure: "
+        f"{_failure_summary(primary)}; cleanup failure: {_failure_summary(cleanup)}"
+    ) from grouped
 
 
 @contextmanager
@@ -1693,6 +1755,7 @@ def open_production_unknown_blade_runtime(
     operator_id: str,
     run_id: str | None = None,
     resume: bool = False,
+    experimental: bool = False,
 ) -> Iterator[UnknownBladeSupervisedRuntime | CompletedUnknownBladeRuntime]:
     """Open the real ES68+D435i runtime after a complete offline gate.
 
@@ -1704,6 +1767,8 @@ def open_production_unknown_blade_runtime(
 
     operator = validate_stop_scan_run_id(operator_id)
     root = Path(output_root).resolve()
+    if experimental and resume:
+        raise UnknownBladeRuntimeError("Experimental coarse-only runs cannot be resumed")
     resume_plan: UnknownBladeResumePlan | None = None
     if resume:
         if not root.is_dir():
@@ -1745,12 +1810,23 @@ def open_production_unknown_blade_runtime(
             )
         yield CompletedUnknownBladeRuntime(resume_plan)
         return
-    require_unknown_blade_runtime_ready(settings)
+    if experimental:
+        require_unknown_blade_runtime_ready(
+            settings,
+            require_release_acceptance=False,
+        )
+    else:
+        require_unknown_blade_runtime_ready(settings)
     # The exact accepted science authority is loaded and the current executable,
     # dependency, model, calibration and policy contract is recomputed before any
     # hardware object is constructed.  Resume may inherit only this exact authority.
-    science_authority = load_science_acceptance_authority(settings)
-    timing_authority = load_runtime_timing_acceptance_authority(settings)
+    science_authority = (
+        None if experimental else load_science_acceptance_authority(settings)
+    )
+    timing_authority = (
+        None if experimental else load_runtime_timing_acceptance_authority(settings)
+    )
+    science_authority_settings = settings if science_authority is not None else None
     if resume_plan is not None and resume_plan.science_authority != science_authority:
         raise UnknownBladeRuntimeError(
             "Resume science authority differs from the experiment INIT authority"
@@ -1853,7 +1929,7 @@ def open_production_unknown_blade_runtime(
             output_root=root / "perception" / "coarse",
             coarse_science_preparer=coarse_session.prepare_engine_cycle,
             science_authority=science_authority,
-            science_authority_settings=settings,
+            science_authority_settings=science_authority_settings,
         )
         publisher = OccupancyGenerationPublisher()
 
@@ -1940,8 +2016,10 @@ def open_production_unknown_blade_runtime(
                 root / "experiment_handoff",
                 experiment_id=identity,
                 coarse_run_root=coarse_runner.status.run_root,  # type: ignore[union-attr]
+                coarse_run_id=coarse_runner.status.run_id,  # type: ignore[union-attr]
                 science_authority=science_authority,
                 runtime_timing_authority=timing_authority,
+                production=not experimental,
             )
         )
         fine_checkpoint_recorder = _FineCheckpointRecorder(
@@ -1997,7 +2075,7 @@ def open_production_unknown_blade_runtime(
                     reference_coarse_model=reference,
                     accepted_coverage_path=accepted_coverage,
                     science_authority=science_authority,
-                    science_authority_settings=settings,
+                    science_authority_settings=science_authority_settings,
                 )
             )
             selector = BladeCoverageNextViewSelector.from_settings(
@@ -2005,6 +2083,7 @@ def open_production_unknown_blade_runtime(
                 hand_eye,
                 reference_coarse_model=reference,
                 science_authority=science_authority,
+                experimental=experimental,
             )
             coarse_bridge.begin_new_event_stream(run_id=identity)
             runner_kwargs = {
@@ -2133,15 +2212,26 @@ def open_production_unknown_blade_runtime(
             ),
             recovered_fine_runner=recovered_fine_runner,
             science_authority=science_authority,
-            science_settings=settings,
+            science_settings=science_authority_settings,
             runtime_timing_authority=timing_authority,
             maximum_schema5_handoff_duration_s=(
-                settings.stop_and_capture.maximum_schema5_handoff_duration_s
+                None
+                if experimental
+                else settings.stop_and_capture.maximum_schema5_handoff_duration_s
             ),
+            experimental=experimental,
         )
         try:
             yield runtime
-        finally:
+        except BaseException as primary:
+            try:
+                _finalize_production_runtime(runtime, arm, settings, motion_envelope)
+            except BaseException as cleanup:
+                if isinstance(primary, Exception) and isinstance(cleanup, Exception):
+                    _raise_combined_runtime_failure(primary, cleanup)
+                raise primary from cleanup
+            raise
+        else:
             _finalize_production_runtime(runtime, arm, settings, motion_envelope)
 
 

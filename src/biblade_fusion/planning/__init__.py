@@ -32,6 +32,7 @@ from biblade_fusion.planning.views import (
     SurfacePatch,
     ViewPlanningError,
     generate_bilateral_view_plan,
+    generate_oblique_coarse_fallback,
 )
 
 __all__ = [
@@ -67,6 +68,7 @@ __all__ = [
     "filter_candidate_views",
     "create_coverage_ledger",
     "generate_bilateral_view_plan",
+    "generate_oblique_coarse_fallback",
     "select_uncovered_candidates",
     "update_coverage",
 ]

@@ -1,0 +1,40 @@
+{
+  "workcell_id": "es68-d435i-cell-001",
+  "operator_id": "eiai",
+  "accepted_at_utc": "2026-08-30T11:38:38+00:00",
+  "maximum_tracking_deviation_rad": [
+    0.015866629563584755,
+    0.001564125130273819,
+    0.0055938884342068285,
+    0.0021479939482492716,
+    0.019055871076944175,
+    0.015817046346198627
+  ],
+  "maximum_stop_drift_rad": [
+    0.00008113617390481664,
+    0.000009015130433720486,
+    0.000027045391301605548,
+    0.000020200570046258193,
+    0.00009426932688194611,
+    0.0000942693268823902
+  ],
+  "safety_margin_factor": 1.5,
+  "maximum_feedback_interval_s": 0.075,
+  "maximum_stop_acknowledgement_s": 0.001,
+  "maximum_stopped_actual_joint_velocity_rad_s": 0.001,
+  "maximum_stopped_target_joint_velocity_rad_s": 0.001,
+  "maximum_stopped_actual_tcp_linear_velocity_m_s": 0.001,
+  "maximum_stopped_actual_tcp_angular_velocity_rad_s": 0.001,
+  "maximum_stopped_target_tcp_linear_velocity_m_s": 0.001,
+  "maximum_stopped_target_tcp_angular_velocity_rad_s": 0.001,
+  "trial_count": 4,
+  "checklist": {
+    "final_collision_assembly_verified": true,
+    "final_servoj_configuration_verified": true,
+    "representative_workspace_paths_verified": true,
+    "intentional_tracking_fault_stop_verified": true,
+    "bootstrap_multichannel_stop_verified": true,
+    "segment_boundary_stop_verified": true,
+    "emergency_stop_verified": true
+  }
+}

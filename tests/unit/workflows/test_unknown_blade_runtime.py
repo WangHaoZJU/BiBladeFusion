@@ -426,6 +426,12 @@ class _FakeExperimentHandoff:
         self.fine_run_root = self.fine_start_candidates[-1]
         return SimpleNamespace(event_sha256="c" * 64)
 
+    def append_unaccepted_fine_started(self, *, fine_run_root):
+        assert self.prepared is not None
+        path = Path(fine_run_root).resolve()
+        self.fine_run_root = path
+        return SimpleNamespace(event_sha256="c" * 64)
+
     def append_fine_checkpoint(self, *, accepted_surface_coverage_generation):
         path = Path(accepted_surface_coverage_generation).resolve()
         self.fine_checkpoints.append(path)
@@ -458,6 +464,7 @@ def _runtime(
     recovered_reference: Path | None = None,
     recovered_fine_runner: _FakeRunner | None = None,
     maximum_schema5_handoff_duration_s: float | None = None,
+    experimental: bool = False,
     monotonic_clock=None,
 ) -> tuple[UnknownBladeSupervisedRuntime, _FakeRunner, _FakeCoarseSession]:
     session = _FakeCoarseSession(tmp_path, transitions=transitions)
@@ -515,6 +522,7 @@ def _runtime(
         recovered_reference=recovered_reference,
         recovered_fine_runner=recovered_fine_runner,
         maximum_schema5_handoff_duration_s=maximum_schema5_handoff_duration_s,
+        experimental=experimental,
         **runtime_kwargs,
     )
     return runtime, runner, session
@@ -575,6 +583,53 @@ def test_operator_bootstrap_capture_can_directly_activate_ready_schema5(
     assert coarse_runner.stop_count == 1
     assert fine_runner.start_count == 1
     assert fine_runner.capture_count == 1
+
+
+def test_experimental_runtime_enters_unaccepted_fine_without_release_authorities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transitions = [
+        _transition(tmp_path),
+        _transition(tmp_path),
+        _transition(tmp_path, CoarsePhase.READY_FOR_FINE),
+    ]
+    handoff = _FakeExperimentHandoff()
+    fine_runner = _FakeRunner(tmp_path / "fine", None, bootstrap_ready_after=1)
+    monkeypatch.setattr(
+        runtime_module,
+        "read_coarse_scan_generation",
+        lambda path: SimpleNamespace(
+            root=Path(path).resolve(),
+            previous_generation_path=(tmp_path / "generation").resolve(),
+            coarse_model_path=(tmp_path / "schema5-reference").resolve(),
+        ),
+    )
+    runtime, coarse_runner, _session = _runtime(
+        tmp_path,
+        transitions=transitions,
+        fine_factory=lambda _reference: fine_runner,
+        experiment_handoff=handoff,
+        experimental=True,
+    )
+    runtime.start()
+    runtime.capture_operator_view()
+    runtime.capture_operator_view()
+
+    snapshot = runtime.capture_operator_view()
+
+    assert snapshot.phase is UnknownBladeRuntimePhase.FINE_SCAN
+    assert snapshot.reference_coarse_model_path == (
+        tmp_path / "schema5-reference"
+    ).resolve()
+    assert coarse_runner.stop_count == 1
+    assert fine_runner.start_count == 1
+    assert fine_runner.capture_count == 1
+    assert handoff.fine_run_root == (tmp_path / "fine" / "run").resolve()
+    assert handoff.prepared == (
+        (tmp_path / "ready-generation").resolve(),
+        (tmp_path / "schema5-reference").resolve(),
+    )
 
 
 def test_schema_promotion_refuses_a_result_that_is_not_the_exact_map_ready_authority(
@@ -761,6 +816,95 @@ def test_cleanup_attempts_physical_stop_when_runtime_stop_raises(
         )
 
     assert calls == ["runtime_stop", "arm_stop", "stationarity"]
+
+
+def test_cleanup_skips_invalid_runner_transition_after_terminal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FailedRuntime:
+        snapshot = SimpleNamespace(
+            phase=UnknownBladeRuntimePhase.BLOCKED,
+            runner_status=SimpleNamespace(phase="failed"),
+        )
+
+        def request_stop(self, _reason: str):
+            calls.append("runtime_stop")
+
+    class Arm:
+        def stop(self) -> None:
+            calls.append("arm_stop")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "wait_until_settled",
+        lambda *_args, **_kwargs: calls.append("stationarity"),
+    )
+    envelope = SimpleNamespace(
+        maximum_feedback_interval_s=0.01,
+        maximum_stopped_actual_joint_velocity_rad_s=0.001,
+        maximum_stopped_target_joint_velocity_rad_s=0.001,
+        maximum_stopped_actual_tcp_linear_velocity_m_s=0.001,
+        maximum_stopped_actual_tcp_angular_velocity_rad_s=0.001,
+        maximum_stopped_target_tcp_linear_velocity_m_s=0.001,
+        maximum_stopped_target_tcp_angular_velocity_rad_s=0.001,
+    )
+
+    runtime_module._finalize_production_runtime(
+        FailedRuntime(),
+        Arm(),
+        load_settings("configs/default.yaml"),
+        envelope,
+    )
+
+    assert calls == ["arm_stop", "stationarity"]
+
+
+def test_cleanup_reports_each_stop_failure_without_hiding_details() -> None:
+    class FailingRuntime:
+        snapshot = SimpleNamespace(phase=UnknownBladeRuntimePhase.COARSE_SCAN)
+
+        def request_stop(self, _reason: str):
+            raise RuntimeError("coordinator stop failed")
+
+    class FailingArm:
+        def stop(self) -> None:
+            raise RuntimeError("dashboard stop failed")
+
+    envelope = SimpleNamespace(
+        maximum_feedback_interval_s=0.01,
+        maximum_stopped_actual_joint_velocity_rad_s=0.001,
+        maximum_stopped_target_joint_velocity_rad_s=0.001,
+        maximum_stopped_actual_tcp_linear_velocity_m_s=0.001,
+        maximum_stopped_actual_tcp_angular_velocity_rad_s=0.001,
+        maximum_stopped_target_tcp_linear_velocity_m_s=0.001,
+        maximum_stopped_target_tcp_angular_velocity_rad_s=0.001,
+    )
+
+    with pytest.raises(UnknownBladeRuntimeError) as captured:
+        runtime_module._finalize_production_runtime(
+            FailingRuntime(),
+            FailingArm(),
+            load_settings("configs/default.yaml"),
+            envelope,
+        )
+
+    message = str(captured.value)
+    assert "coordinator stop failed" in message
+    assert "dashboard stop failed" in message
+
+
+def test_combined_runtime_failure_reports_primary_and_cleanup_errors() -> None:
+    with pytest.raises(UnknownBladeRuntimeError) as captured:
+        runtime_module._raise_combined_runtime_failure(
+            RuntimeError("bootstrap failed"),
+            RuntimeError("cleanup failed"),
+        )
+
+    message = str(captured.value)
+    assert "bootstrap failed" in message
+    assert "cleanup failed" in message
 
 
 def test_ready_schema5_switches_to_fine_runner_without_coarse_completion_decision(
@@ -1521,6 +1665,124 @@ def test_fine_checkpoint_records_run_advance_even_when_coverage_path_is_same(
     assert verify_calls == ["verified", "verified"]
 
 
+def test_experimental_open_keeps_science_authority_and_settings_unbound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings("configs/default.yaml")
+    settings = settings.model_copy(
+        update={
+            "occupancy": settings.occupancy.model_copy(
+                update={
+                    "workspace_bounds_min_m": (-1.0, -1.0, -1.0),
+                    "workspace_bounds_max_m": (1.0, 1.0, 1.0),
+                }
+            ),
+            "kinematics": settings.kinematics.model_copy(
+                update={"model_path": tmp_path / "robot.urdf"}
+            ),
+        }
+    )
+    captured: dict[str, object] = {}
+
+    class ExpectedEngineConstruction(Exception):
+        pass
+
+    class FakeArm:
+        def __init__(self, _config) -> None:
+            pass
+
+        def connect(self, *, with_driver: bool) -> None:
+            assert with_driver is False
+
+        def release(self) -> None:
+            pass
+
+        def read_state(self):
+            return SimpleNamespace(joint_positions_rad=(0.0,) * 6)
+
+    class FakeCamera:
+        def __init__(self, _config) -> None:
+            pass
+
+        def open(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    hand_eye = SimpleNamespace(require_flange_primary=lambda: None)
+    checker = SimpleNamespace(
+        collision_model_id="collision-model",
+        collision_model_hash="collision-hash",
+        robot_geometry_hash="geometry-hash",
+    )
+    coarse_session = SimpleNamespace(prepare_engine_cycle=lambda *_args, **_kwargs: None)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "require_unknown_blade_runtime_ready",
+        lambda _settings, *, require_release_acceptance: (),
+    )
+    monkeypatch.setattr(runtime_module, "load_hand_eye_calibration", lambda _config: hand_eye)
+    monkeypatch.setattr(
+        runtime_module.Es68D435iCollisionResources,
+        "packaged_template",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        runtime_module.Cs68PinocchioCollisionChecker,
+        "from_es68_resources",
+        lambda *_args, **_kwargs: checker,
+    )
+    monkeypatch.setattr(
+        runtime_module.LiveCollisionGeometry,
+        "from_active_resources",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(runtime_module, "_load_motion_envelope", lambda *_args: (object(), "hash"))
+    monkeypatch.setattr(
+        runtime_module.Es68D435iRobotDepthRenderer,
+        "from_active_resources",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        runtime_module.Es68KinematicModel,
+        "from_resources",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(runtime_module, "EliteArm", FakeArm)
+    monkeypatch.setattr(runtime_module, "RealSenseD435i", FakeCamera)
+    monkeypatch.setattr(runtime_module, "load_cs68_kinematics", lambda _path: object())
+    monkeypatch.setattr(runtime_module, "EliteCs68IkChecker", lambda *_args: object())
+    monkeypatch.setattr(runtime_module, "_bootstrap_foreground_config", lambda _settings: object())
+    monkeypatch.setattr(runtime_module, "CoarseSciencePolicy", lambda **_kwargs: object())
+    monkeypatch.setattr(runtime_module, "CoarseScienceSession", lambda **_kwargs: coarse_session)
+    monkeypatch.setattr(runtime_module, "CoarseSessionNextViewAdapter", lambda _session: object())
+    monkeypatch.setattr(runtime_module, "SynchronizedAcquirer", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runtime_module, "FoundationStereoBackend", lambda _config: object())
+
+    def capture_engine(**kwargs):
+        captured.update(kwargs)
+        raise ExpectedEngineConstruction
+
+    monkeypatch.setattr(runtime_module, "FoundationStereoOccupancyCycleEngine", capture_engine)
+
+    with (
+        pytest.raises(ExpectedEngineConstruction),
+        open_production_unknown_blade_runtime(
+            settings,
+            output_root=tmp_path / "experimental",
+            operator_id="operator-1",
+            experimental=True,
+        ),
+    ):
+        raise AssertionError("engine construction should stop this focused test")
+
+    assert captured["science_authority"] is None
+    assert captured["science_authority_settings"] is None
+
+
 def test_production_open_checks_readiness_before_hardware_or_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1845,6 +2107,55 @@ def test_unknown_runtime_requires_bound_science_acceptance_and_schema5_budget(
         in scope.details["missing"]
     )
     assert scope.details["geometry_science_acceptance_eligible"] is False
+
+
+def test_unknown_runtime_experimental_scope_skips_only_release_acceptance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runtime_module,
+        "run_supervised_scan_readiness",
+        lambda _settings, *, mode: (),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_load_motion_envelope",
+        lambda _settings, _checker: (object(), "control-hash"),
+    )
+    monkeypatch.setattr(
+        runtime_module.Cs68PinocchioCollisionChecker,
+        "from_es68_resources",
+        lambda *_args, **_kwargs: object(),
+    )
+    settings = load_settings("configs/default.yaml")
+    settings = settings.model_copy(
+        update={
+            "proxy_model": settings.proxy_model.model_copy(
+                update={"estimated_thickness_m": 0.003}
+            ),
+            "blade_foreground": settings.blade_foreground.model_copy(
+                update={"enabled": True}
+            ),
+            "motion_preflight": settings.motion_preflight.model_copy(
+                update={
+                    "motion_envelope_acceptance_path": Path("/accepted/motion"),
+                    "motion_envelope_acceptance_id": "a" * 64,
+                }
+            ),
+        }
+    )
+
+    results = unknown_blade_runtime_readiness(
+        settings,
+        require_release_acceptance=False,
+    )
+
+    scope = next(item for item in results if item.name == "unknown_blade_coarse_to_fine")
+    assert scope.level.value == "pass"
+    assert scope.details["missing"] == []
+    assert scope.details["release_scope"] == "experimental"
+    assert scope.details["release_acceptance_bypassed"] is True
+    assert scope.details["tracking_stop_envelope_motion_eligible"] is True
 
 
 def test_unknown_runtime_science_gate_checks_contract_envelope_and_map_age_formula(

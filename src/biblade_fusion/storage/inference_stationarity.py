@@ -20,7 +20,8 @@ from biblade_fusion.robotics.stationarity import (
     validate_stationary_trace,
 )
 
-INFERENCE_STATIONARITY_SCHEMA_VERSION = 1
+INFERENCE_STATIONARITY_SCHEMA_VERSION = 2
+_SUPPORTED_SCHEMA_VERSIONS = {1, INFERENCE_STATIONARITY_SCHEMA_VERSION}
 _SHA256_LENGTH = 64
 
 
@@ -85,13 +86,14 @@ def _state_payload(state: RobotState) -> dict[str, Any]:
         "robot_mode": state.robot_mode,
         "safety_status": state.safety_status,
         "speed_scaling": float(state.speed_scaling),
+        "runtime_state": state.runtime_state,
     }
 
 
-def _state_from_payload(payload: object) -> RobotState:
+def _state_from_payload(payload: object, *, schema_version: int) -> RobotState:
     if not isinstance(payload, dict):
         raise ValueError("stationarity robot state must be an object")
-    if set(payload) != {
+    expected_fields = {
         "monotonic_time_ns",
         "controller_time_s",
         "joint_positions_rad",
@@ -99,7 +101,10 @@ def _state_from_payload(payload: object) -> RobotState:
         "robot_mode",
         "safety_status",
         "speed_scaling",
-    }:
+    }
+    if schema_version >= 2:
+        expected_fields.add("runtime_state")
+    if set(payload) != expected_fields:
         raise ValueError("stationarity robot-state fields differ from schema")
     return RobotState(
         monotonic_time_ns=int(payload["monotonic_time_ns"]),
@@ -111,6 +116,11 @@ def _state_from_payload(payload: object) -> RobotState:
         robot_mode=str(payload["robot_mode"]),
         safety_status=str(payload["safety_status"]),
         speed_scaling=float(payload["speed_scaling"]),
+        runtime_state=(
+            None
+            if schema_version < 2 or payload["runtime_state"] is None
+            else str(payload["runtime_state"])
+        ),
     )
 
 
@@ -290,9 +300,9 @@ def read_inference_stationarity(
         }
         if set(payload) != expected_keys:
             raise ValueError("stationarity asset fields differ from schema")
+        schema_version = int(payload["schema_version"])
         if (
-            int(payload["schema_version"])
-            != INFERENCE_STATIONARITY_SCHEMA_VERSION
+            schema_version not in _SUPPORTED_SCHEMA_VERSIONS
             or payload["depth_backend"] != "foundation_stereo"
         ):
             raise ValueError("unsupported inference-stationarity contract")
@@ -331,11 +341,17 @@ def read_inference_stationarity(
         }:
             raise ValueError("stationarity thresholds differ from schema")
         thresholds = _threshold_payload(**raw_thresholds)
-        reference = _state_from_payload(payload["reference_robot_state"])
+        reference = _state_from_payload(
+            payload["reference_robot_state"],
+            schema_version=schema_version,
+        )
         raw_trace = payload["inference_robot_state_trace"]
         if not isinstance(raw_trace, list):
             raise ValueError("stationarity trace must be an array")
-        trace = tuple(_state_from_payload(item) for item in raw_trace)
+        trace = tuple(
+            _state_from_payload(item, schema_version=schema_version)
+            for item in raw_trace
+        )
         evidence = _recompute(reference, trace, thresholds)
         if payload["evidence"] != _evidence_payload(evidence):
             raise ValueError("recorded stationarity metrics do not reproduce")

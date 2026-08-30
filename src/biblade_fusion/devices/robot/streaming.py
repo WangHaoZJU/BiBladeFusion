@@ -14,6 +14,7 @@ class ServoJStreamConfig:
     """Runtime guards applied while sending a prevalidated ServoJ stream."""
 
     dt_s: float = 0.004
+    warmup_duration_s: float = 0.2
     tracking_error_rad: float = 0.03
     max_consecutive_tracking_violations: int = 5
     tracking_check_every_n_commands: int = 2
@@ -23,6 +24,8 @@ class ServoJStreamConfig:
     def validate(self) -> None:
         if not math.isfinite(self.dt_s) or self.dt_s <= 0.0:
             raise ValueError("ServoJ dt_s must be finite and positive")
+        if not math.isfinite(self.warmup_duration_s) or not 0.0 <= self.warmup_duration_s <= 2.0:
+            raise ValueError("ServoJ warmup_duration_s must be finite and in [0, 2]")
         if not math.isfinite(self.tracking_error_rad) or self.tracking_error_rad <= 0.0:
             raise ValueError("ServoJ tracking_error_rad must be finite and positive")
         if self.max_consecutive_tracking_violations < 1:

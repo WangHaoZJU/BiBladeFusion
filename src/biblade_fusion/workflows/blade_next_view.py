@@ -66,6 +66,7 @@ from biblade_fusion.storage.surface_coverage import (
 from biblade_fusion.workflows.fine_completion import (
     FinalFineCompletionEvidence,
     finalize_fine_science,
+    finalize_unaccepted_fine_science,
 )
 from biblade_fusion.workflows.stop_scan_coordinator import (
     BladePlanningAssetError,
@@ -359,13 +360,18 @@ class BladeCoverageNextViewSelector:
         hand_eye: HandEyeCalibration,
         *,
         reference_coarse_model: str | Path,
-        science_authority: ScienceAcceptanceAuthority,
+        science_authority: ScienceAcceptanceAuthority | None,
+        experimental: bool = False,
     ) -> BladeCoverageNextViewSelector:
         """Build the production selector without connecting to the robot."""
 
-        if science_authority is None:
+        if science_authority is None and not experimental:
             raise BladePlanningAssetError(
                 "Production fine selector requires a science acceptance authority"
+            )
+        if science_authority is not None and experimental:
+            raise BladePlanningAssetError(
+                "Experimental fine selector cannot claim a science acceptance authority"
             )
 
         reference_root = Path(reference_coarse_model).resolve()
@@ -387,13 +393,23 @@ class BladeCoverageNextViewSelector:
             motion_config=settings.motion_preflight,
             expected_reference_root=reference_root,
             expected_reference_sha256=reference_sha256,
-            fine_finalizer=lambda state: finalize_fine_science(
-                state,
-                fusion_config=settings.multi_view_fusion,
-                tsdf_config=settings.tsdf,
-                surface_quality_config=settings.surface_quality,
-                finalization_config=settings.fine_finalization,
-                science_authority=science_authority,
+            fine_finalizer=(
+                lambda state: finalize_unaccepted_fine_science(
+                    state,
+                    fusion_config=settings.multi_view_fusion,
+                    tsdf_config=settings.tsdf,
+                    surface_quality_config=settings.surface_quality,
+                    finalization_config=settings.fine_finalization,
+                )
+                if experimental
+                else lambda state: finalize_fine_science(
+                    state,
+                    fusion_config=settings.multi_view_fusion,
+                    tsdf_config=settings.tsdf,
+                    surface_quality_config=settings.surface_quality,
+                    finalization_config=settings.fine_finalization,
+                    science_authority=science_authority,  # type: ignore[arg-type]
+                )
             ),
             fusion_config=settings.multi_view_fusion,
             tsdf_config=settings.tsdf,

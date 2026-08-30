@@ -28,7 +28,7 @@ preserve upstream provenance; they must not be interpreted as a CS68 production 
   through known robot geometry; those rays remain `UNKNOWN`. The voxel states are
   `FREE`, `OCCUPIED`, and `UNKNOWN`, and unknown/out-of-grid space blocks.
 
-## Gates before any motion
+## Gates before production motion
 
 All of the following are mandatory:
 
@@ -51,7 +51,7 @@ mesh/occupancy contracts for an ordered view sequence, and never connects to the
 Robot-status, ordinary acquisition, planning, validation, occupancy replay, supervision
 and standalone preflight commands remain non-moving.
 
-The only public physical-motion composition is the default-off, interactive
+The only public closed-loop physical-motion composition is the default-off, interactive
 `bbf scan run-unknown` runtime. It first requires `scan doctor --mode unknown`, opens one
 ES68 and one D435i, and accepts explicit operator-positioned `c` captures until a live
 `MAP_READY` generation exists. It then prepares one bounded segment at a time. The
@@ -61,6 +61,20 @@ does not clear the stop latch or transmit a trajectory. Joint state, occupancy i
 freshness, both continuous proofs, stop generation and permit expiry are checked again
 before the compare-and-clear resume and ServoJ transport. Every successful segment ends
 with an acknowledged stop and one capture.
+
+Before a measured motion envelope exists, `bbf commission motion-envelope-trial` is the
+only narrower hardware-commissioning exception. Its dry-run is hardware-free. Execution
+requires one immutable planner-derived candidate, an exact candidate-and-output-bound confirmation,
+a live start within 0.001 rad, a fresh continuous mesh proof, SDK FIFO priority 99,
+and a hard 0.02 rad maximum joint delta. It temporarily enables only its process-local
+driver configuration, retains the configured controller speed scaling, primes the reverse
+socket with a 0.2-second current-position ServoJ hold, adds a bounded goal-hold window,
+installs an independent three-second deadline stop, requires a measured
+endpoint error no greater than 0.002 rad, ends with `writeIdle`, and requires a
+multi-sample stationary window instead of accepting one stopped-state sample. It stores
+the complete settling trace with the tracking/stop evidence. It
+deliberately does not treat replay occupancy as motion authority, issue a production
+permit, change `configs/local.yaml`, or authorize `run-unknown`.
 
 `bbf occupancy build-replay` is an offline evidence-reconstruction command. Every map it
 writes is deliberately `STALE`, so supplying it to preflight remains blocked. Likewise,

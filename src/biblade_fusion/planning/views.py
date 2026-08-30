@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from math import atan, ceil, tan
+from math import atan, ceil, cos, radians, sin, tan
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from biblade_fusion.core.pose import PoseSE3
-from biblade_fusion.core.settings import ViewPlanningConfig
+from biblade_fusion.core.settings import (
+    CoarseReachabilityFallbackConfig,
+    ViewPlanningConfig,
+)
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.perception.proxy import BilateralBladeProxy
 
@@ -88,6 +91,70 @@ class CandidateView:
         """Camera +Z axis expressed in the base frame."""
 
         return self.base_t_left_ir.rotation[:, 2]
+
+
+def generate_oblique_coarse_fallback(
+    candidate: CandidateView,
+    fallback: CoarseReachabilityFallbackConfig,
+    *,
+    view_id: str,
+) -> CandidateView:
+    """Generate one target-centred oblique alternative to a normal coarse view."""
+
+    identity = str(view_id).strip()
+    if not identity or identity == candidate.view_id:
+        raise ValueError("Fallback view ID must be non-empty and new")
+    normal = candidate.patch.outward_normal
+    nominal_offset = candidate.base_t_left_ir.translation_m - candidate.patch.target_m
+    nominal_distance = float(np.linalg.norm(nominal_offset))
+    if nominal_distance <= 1e-9 or float(nominal_offset @ normal) / nominal_distance < 1.0 - 1e-6:
+        raise ValueError("Coarse fallback requires a normal-facing nominal candidate")
+    distance = candidate.standoff_distance_m + fallback.distance_offset_m
+    if distance <= 0.0:
+        raise ValueError("Coarse fallback distance must be positive")
+
+    tangent_x = candidate.base_t_left_ir.rotation[:, 0].copy()
+    tangent_x -= normal * float(tangent_x @ normal)
+    tangent_norm = float(np.linalg.norm(tangent_x))
+    if tangent_norm <= 1e-9:
+        raise ValueError("Coarse fallback has no stable tangent basis")
+    tangent_x /= tangent_norm
+    tangent_y = np.cross(normal, tangent_x)
+    tangent_y /= np.linalg.norm(tangent_y)
+    tilt = radians(fallback.tilt_deg)
+    azimuth = radians(fallback.azimuth_deg)
+    tangent_direction = cos(azimuth) * tangent_x + sin(azimuth) * tangent_y
+    camera_direction = cos(tilt) * normal + sin(tilt) * tangent_direction
+    camera_direction /= np.linalg.norm(camera_direction)
+    camera_position = candidate.patch.target_m + distance * camera_direction
+
+    camera_z = -camera_direction
+    camera_x = candidate.base_t_left_ir.rotation[:, 0].copy()
+    camera_x -= camera_z * float(camera_x @ camera_z)
+    if np.linalg.norm(camera_x) <= 1e-9:
+        camera_x = tangent_y - camera_z * float(tangent_y @ camera_z)
+    camera_x /= np.linalg.norm(camera_x)
+    camera_y = np.cross(camera_z, camera_x)
+    camera_y /= np.linalg.norm(camera_y)
+    camera_x = np.cross(camera_y, camera_z)
+    pose = PoseSE3.from_rotation_translation(
+        "base",
+        f"{identity}_left_ir",
+        np.column_stack((camera_x, camera_y, camera_z)),
+        camera_position,
+    )
+    scale = distance / candidate.standoff_distance_m
+    angular_support = float(np.clip(cos(tilt), 0.0, 1.0))
+    return CandidateView(
+        identity,
+        candidate.patch,
+        pose,
+        distance,
+        tuple(float(value * scale) for value in candidate.footprint_m),
+        angular_support,
+        angular_support,
+        "bounded_coarse_reachability_fallback_v1",
+    )
 
 
 @dataclass(frozen=True, slots=True)

@@ -117,6 +117,8 @@ class FakeStateSource:
 
 class UnusedRenderer:
     model_content_hash = "1" * 64
+    self_mask_excluded_link_names: tuple[str, ...] = ()
+    self_mask_render_backend = "test_unused:v1"
     joint_zero_offsets_rad = (0.0,) * 6
 
     def base_t_flange_matrix(self, joints):  # pragma: no cover

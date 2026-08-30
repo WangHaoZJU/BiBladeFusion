@@ -103,6 +103,8 @@ def _context(
             "acquisition_contract": acquisition.model_dump(mode="json"),
             "robot": {
                 "model_content_hash": "a" * 64,
+                "self_mask_excluded_link_names": [],
+                "self_mask_render_backend": "test_fake:v1",
                 "joint_zero_offsets_rad": [0.0] * 6,
                 "flange_T_tcp": flange_t_tcp.matrix.tolist(),
                 "flange_tcp_asset_sha256": _sha256(resources.tcp_offset_json),
@@ -307,6 +309,8 @@ class _FakeRenderer:
         predicted_depth_m: np.ndarray,
     ) -> None:
         self.model_content_hash = model_content_hash
+        self.self_mask_excluded_link_names: tuple[str, ...] = ()
+        self.self_mask_render_backend = "test_fake:v1"
         self.joint_zero_offsets_rad = joint_zero_offsets_rad
         self._predicted_depth_m = predicted_depth_m
 

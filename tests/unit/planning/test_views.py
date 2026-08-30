@@ -2,13 +2,17 @@ import numpy as np
 import pytest
 
 from biblade_fusion.core.pose import PoseSE3
-from biblade_fusion.core.settings import ViewPlanningConfig
+from biblade_fusion.core.settings import (
+    CoarseReachabilityFallbackConfig,
+    ViewPlanningConfig,
+)
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.perception.proxy import BilateralBladeProxy
 from biblade_fusion.planning import (
     BladeSide,
     ViewPlanningError,
     generate_bilateral_view_plan,
+    generate_oblique_coarse_fallback,
 )
 
 
@@ -108,3 +112,39 @@ def test_view_plan_rejects_margin_larger_than_coverage() -> None:
                 edge_margin_m=0.02,
             ),
         )
+
+
+def test_oblique_coarse_fallback_remains_target_centred_and_bounded() -> None:
+    plan = generate_bilateral_view_plan(
+        make_proxy((0.1, 0.1, 0.02)),
+        make_intrinsics(),
+        ViewPlanningConfig(
+            standoff_distance_m=0.1,
+            overlap_fraction=0.0,
+            footprint_utilization=1.0,
+            edge_margin_m=0.0,
+        ),
+    )
+    nominal = plan.for_side(BladeSide.BACK)[0]
+
+    fallback = generate_oblique_coarse_fallback(
+        nominal,
+        CoarseReachabilityFallbackConfig(
+            distance_offset_m=0.02,
+            tilt_deg=60.0,
+            azimuth_deg=45.0,
+        ),
+        view_id="back_oblique",
+    )
+
+    camera_to_target = fallback.patch.target_m - fallback.base_t_left_ir.translation_m
+    assert np.linalg.norm(camera_to_target) == pytest.approx(0.12)
+    np.testing.assert_allclose(
+        fallback.optical_axis,
+        camera_to_target / np.linalg.norm(camera_to_target),
+        atol=1e-12,
+    )
+    camera_direction = -fallback.optical_axis
+    assert camera_direction @ fallback.patch.outward_normal == pytest.approx(0.5)
+    assert fallback.projection_fraction == pytest.approx(0.5)
+    assert fallback.distance_policy == "bounded_coarse_reachability_fallback_v1"

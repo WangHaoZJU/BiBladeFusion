@@ -52,6 +52,7 @@ from biblade_fusion.storage import (
     SessionReader,
     SessionWriter,
     read_coarse_model_summary,
+    read_commissioning_trial_candidate,
     read_coverage_driven_plan,
     read_coverage_ledger,
     read_depth_aggregate,
@@ -65,6 +66,7 @@ from biblade_fusion.storage import (
     read_stereo_inference,
     read_view_plan,
     write_coarse_model,
+    write_commissioning_trial_candidate,
     write_coverage_driven_plan,
     write_coverage_ledger,
     write_depth_aggregate,
@@ -136,6 +138,10 @@ coverage_app = typer.Typer(help="Offline bilateral coverage tracking.", no_args_
 reconstruct_app = typer.Typer(help="Pose-register stored blade depth views.", no_args_is_help=True)
 evaluate_app = typer.Typer(help="Offline experiment evaluation.", no_args_is_help=True)
 safety_app = typer.Typer(help="Offline, non-executable safety validation.", no_args_is_help=True)
+commission_app = typer.Typer(
+    help="Attended, bounded hardware commissioning tools.",
+    no_args_is_help=True,
+)
 occupancy_app = typer.Typer(
     help="Depth-derived unknown-environment occupancy assets.",
     no_args_is_help=True,
@@ -159,6 +165,7 @@ app.add_typer(coverage_app, name="coverage")
 app.add_typer(reconstruct_app, name="reconstruct")
 app.add_typer(evaluate_app, name="evaluate")
 app.add_typer(safety_app, name="safety")
+app.add_typer(commission_app, name="commission")
 app.add_typer(occupancy_app, name="occupancy")
 app.add_typer(supervise_app, name="supervise")
 app.add_typer(scan_app, name="scan")
@@ -195,6 +202,17 @@ def scan_doctor(
         ),
     ] = None,
     output_json: Annotated[bool, typer.Option("--json")] = False,
+    experimental: Annotated[
+        bool,
+        typer.Option(
+            "--experimental",
+            help=(
+                "Audit experiment-only coarse-to-fine scanning without requiring "
+                "geometry-science or runtime-timing release acceptance. Motion safety gates "
+                "remain mandatory."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Audit all pre-acceptance scan prerequisites without touching hardware."""
 
@@ -211,8 +229,13 @@ def scan_doctor(
 
             if reference_coarse_model is not None:
                 raise ValueError("Unknown mode creates its own schema-5 reference")
-            results = unknown_blade_runtime_readiness(settings)
+            results = unknown_blade_runtime_readiness(
+                settings,
+                require_release_acceptance=not experimental,
+            )
         else:
+            if experimental:
+                raise ValueError("--experimental is only valid with --mode unknown")
             from biblade_fusion.diagnostics.supervised_scan import (
                 run_supervised_scan_readiness,
             )
@@ -277,6 +300,17 @@ def scan_run_unknown(
             help="Resume exactly this output root from its verified experiment chain.",
         ),
     ] = False,
+    experimental: Annotated[
+        bool,
+        typer.Option(
+            "--experimental",
+            help=(
+                "MOTION-CAPABLE experiment-only coarse-to-fine scan: bypass science/timing "
+                "release acceptance while retaining every motion safety gate. Outputs remain "
+                "unaccepted."
+            ),
+        ),
+    ] = False,
     bootstrap_rectangle: Annotated[
         str | None,
         typer.Option(
@@ -313,6 +347,9 @@ def scan_run_unknown(
 
     if not operator_id.strip():
         typer.echo("--operator-id must be non-empty.", err=True)
+        raise typer.Exit(code=2)
+    if experimental and resume:
+        typer.echo("--experimental cannot be combined with --resume.", err=True)
         raise typer.Exit(code=2)
     if bootstrap_rectangle is not None and bootstrap_polygon is not None:
         typer.echo(
@@ -360,12 +397,18 @@ def scan_run_unknown(
                 raise ValueError("--first-side may only be 'front'")
             initial_side = BladeSide.FRONT
         settings = load_settings(config)
+        if experimental:
+            typer.echo(
+                "EXPERIMENTAL: science/timing release acceptance is bypassed; outputs may be "
+                "evaluated later but do not authorize production use."
+            )
         with open_production_unknown_blade_runtime(
             settings,
             output_root=output,
             operator_id=operator_id,
             run_id=run_id,
             resume=resume,
+            experimental=experimental,
         ) as runtime:
             if seed is None and initial_side is None:
                 return_code = run_unknown_blade_operator_console(runtime)
@@ -2633,6 +2676,190 @@ def safety_validate_path(
         f"collision free: {'yes' if stored.report.collision_free else 'no'}"
     )
     typer.echo("Motion authorized: no")
+
+
+@safety_app.command("prepare-motion-envelope-trial")
+def safety_prepare_motion_envelope_trial(
+    plan: Annotated[
+        Path,
+        typer.Option("--plan", exists=True, file_okay=False, readable=True),
+    ],
+    initialization: Annotated[
+        Path,
+        typer.Option("--initialization", exists=True, file_okay=False, readable=True),
+    ],
+    start_session: Annotated[
+        Path,
+        typer.Option("--start-session", exists=True, file_okay=False, readable=True),
+    ],
+    start_view_id: Annotated[str, typer.Option("--start-view-id")],
+    occupancy: Annotated[
+        Path,
+        typer.Option("--occupancy", exists=True, file_okay=False, readable=True),
+    ],
+    target_view_id: Annotated[str, typer.Option("--target-view-id")],
+    maximum_candidate_joint_delta_rad: Annotated[
+        float,
+        typer.Option(
+            "--maximum-candidate-joint-delta-rad",
+            min=0.0001,
+            max=0.02,
+            help=(
+                "Diagnostic commissioning clip only; this does not set the accepted "
+                "production segment bound."
+            ),
+        ),
+    ] = 0.02,
+    output: Annotated[Path, typer.Option("--output", "-o")] = Path(
+        "outputs/motion_envelope_commissioning_candidate"
+    ),
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Prepare a planner-bound commissioning segment without robot write access."""
+
+    try:
+        if not start_view_id.strip() or not target_view_id.strip():
+            raise ValueError("Start and target view IDs must be non-empty")
+        settings = load_settings(config)
+        stored = write_commissioning_trial_candidate(
+            output,
+            plan=plan,
+            initialization=initialization,
+            start_session=start_session,
+            start_view_id=start_view_id,
+            occupancy=occupancy,
+            target_view_id=target_view_id,
+            maximum_candidate_joint_delta_rad=maximum_candidate_joint_delta_rad,
+            motion_config=settings.motion_preflight,
+            collision_config=settings.collision,
+            joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
+        )
+        verified = read_commissioning_trial_candidate(stored.path)
+    except Exception as exc:
+        typer.echo(f"Motion-envelope trial preparation failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    candidate = verified.candidate
+    typer.echo(f"Saved non-executable commissioning candidate: {verified.path}")
+    typer.echo(f"Candidate ID: {candidate.candidate_id}")
+    typer.echo(
+        "Maximum joint delta: "
+        f"{candidate.maximum_candidate_joint_delta_rad:.6f} rad; "
+        f"mesh status: {candidate.mesh_status}; "
+        "continuous proof: "
+        f"{'yes' if candidate.mesh_continuous_swept_volume_verified else 'no'}"
+    )
+    typer.echo("Motion authorized: no; no ServoJ commands or robot write interface were stored")
+
+
+@commission_app.command("motion-envelope-trial")
+def commission_motion_envelope_trial(
+    candidate: Annotated[
+        Path,
+        typer.Option("--candidate", exists=True, file_okay=False, readable=True),
+    ],
+    operator_id: Annotated[str, typer.Option("--operator-id")],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+    direction: Annotated[
+        str,
+        typer.Option(
+            "--direction",
+            help="Use 'forward' for start-to-goal or 'reverse' for goal-to-start.",
+        ),
+    ] = "forward",
+    intentional_tracking_fault: Annotated[
+        bool,
+        typer.Option(
+            "--intentional-tracking-fault",
+            help=(
+                "MOTION-CAPABLE acceptance mode: require an early "
+                "tracking_error_exceeded abort and confirmed stop."
+            ),
+        ),
+    ] = False,
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+    execute: Annotated[
+        bool,
+        typer.Option(
+            "--execute",
+            help="MOTION-CAPABLE: consume the exact confirmation and run one bounded trial.",
+        ),
+    ] = False,
+    confirmation: Annotated[
+        str | None,
+        typer.Option(
+            "--confirmation",
+            help="Exact one-candidate approval prompt printed by the dry-run.",
+        ),
+    ] = None,
+) -> None:
+    """Prepare or execute one attended, <=0.02 rad commissioning segment."""
+
+    try:
+        from biblade_fusion.robotics.motion_envelope_commissioning import (
+            bind_motion_envelope_commissioning_output,
+            execute_motion_envelope_commissioning_trial,
+            intentional_tracking_fault_motion_envelope_commissioning_trial,
+            prepare_motion_envelope_commissioning_trial,
+            probe_fifo_scheduler,
+            reverse_motion_envelope_commissioning_trial,
+        )
+
+        settings = load_settings(config)
+        prepared = prepare_motion_envelope_commissioning_trial(candidate, settings)
+        normalized_direction = direction.strip().lower()
+        if normalized_direction == "reverse":
+            prepared = reverse_motion_envelope_commissioning_trial(prepared, settings)
+        elif normalized_direction != "forward":
+            raise ValueError("--direction must be 'forward' or 'reverse'")
+        if intentional_tracking_fault:
+            prepared = intentional_tracking_fault_motion_envelope_commissioning_trial(
+                prepared
+            )
+        prepared = bind_motion_envelope_commissioning_output(prepared, output)
+        prompt = prepared.approval_prompt
+        try:
+            probe_fifo_scheduler()
+        except Exception as exc:
+            typer.echo(f"FIFO scheduling: unavailable ({exc})", err=True)
+            typer.echo(f"Approval prompt after all gates pass: {prompt}")
+            raise typer.Exit(code=1) from exc
+        typer.echo("FIFO scheduling: available")
+        typer.echo(f"Candidate ID: {prepared.stored_candidate.candidate.candidate_id}")
+        typer.echo(f"Exact approval prompt: {prompt}")
+        if not execute:
+            typer.echo("Dry-run only: robot connection and motion were not attempted")
+            return
+        if confirmation is None:
+            raise ValueError("--execute requires --confirmation from the dry-run")
+        result = execute_motion_envelope_commissioning_trial(
+            prepared,
+            settings,
+            operator_id=operator_id,
+            confirmation=confirmation,
+            output_path=output,
+        )
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        typer.echo(f"Motion-envelope commissioning failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved physical commissioning evidence: {result.output_path}")
+    typer.echo(f"Trial status: {'PASS' if result.ok else 'FAIL'}")
+    if result.stream_result is not None:
+        typer.echo(
+            f"ServoJ commands: {result.stream_result.commands_sent}; "
+            f"maximum tracking error: {result.stream_result.max_tracking_error_rad:.6f} rad"
+        )
+    typer.echo("Production motion authorized: no")
+    if not result.ok:
+        typer.echo(f"Trial error: {result.error}", err=True)
+        raise typer.Exit(code=1)
 
 
 @safety_app.command("record-static-free-acceptance")

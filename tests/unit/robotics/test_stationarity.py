@@ -185,6 +185,24 @@ def test_bootstrap_stop_requires_full_stopped_controller_and_velocity_window() -
     assert len(evidence.evidence_sha256) == 64
 
 
+@pytest.mark.parametrize("robot_mode", ("RUNNING", "7"))
+def test_bootstrap_stop_accepts_powered_robot_with_stopped_runtime(
+    robot_mode: str,
+) -> None:
+    source = BootstrapStateSource(
+        [
+            replace(_bootstrap_state(0.0), robot_mode=robot_mode),
+            replace(_bootstrap_state(0.25), robot_mode=robot_mode),
+            replace(_bootstrap_state(0.50), robot_mode=robot_mode),
+        ]
+    )
+
+    evidence = _wait_bootstrap(source, FakeTime())
+
+    assert evidence.robot_mode == robot_mode
+    assert evidence.runtime_state == "STOPPED"
+
+
 def test_bootstrap_stop_fails_closed_when_velocity_channels_are_missing() -> None:
     source = BootstrapStateSource([_state(0.0)])
 
@@ -592,7 +610,7 @@ def test_trace_rejects_one_post_reference_sample() -> None:
 @pytest.mark.parametrize(
     ("field_name", "value", "message"),
     [
-        ("robot_mode", "RUNNING", "robot_mode=IDLE"),
+        ("robot_mode", "RUNNING", "runtime_state=STOPPED"),
         ("safety_status", "PROTECTIVE_STOP", "NORMAL or REDUCED"),
     ],
 )
@@ -611,6 +629,31 @@ def test_trace_rejects_non_idle_or_unsafe_controller_state(
             max_tcp_translation_delta_m=0.001,
             max_tcp_rotation_delta_rad=0.001,
         )
+
+
+@pytest.mark.parametrize("robot_mode", ("RUNNING", "7"))
+def test_trace_accepts_powered_mode_only_with_stopped_runtime(
+    robot_mode: str,
+) -> None:
+    reference = replace(
+        _state(0.0),
+        robot_mode=robot_mode,
+        runtime_state="STOPPED",
+    )
+    trace = [
+        replace(_state(0.1), robot_mode=robot_mode, runtime_state="STOPPED"),
+        replace(_state(0.2), robot_mode=robot_mode, runtime_state="STOPPED"),
+    ]
+
+    evidence = validate_stationary_trace(
+        reference,
+        trace,
+        max_joint_delta_rad=0.001,
+        max_tcp_translation_delta_m=0.001,
+        max_tcp_rotation_delta_rad=0.001,
+    )
+
+    assert evidence.sample_count == 3
 
 
 def test_trace_rejects_controller_freeze_and_monotonic_gap() -> None:

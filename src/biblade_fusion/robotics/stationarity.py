@@ -15,9 +15,10 @@ from numpy.typing import ArrayLike
 
 from biblade_fusion.devices.robot.base import RobotState
 
-_STATIONARY_ROBOT_MODES = {"IDLE"}
+_STATIONARY_ROBOT_MODES = {"IDLE", "3"}
+_POWERED_STATIONARY_ROBOT_MODES = {"RUNNING", "7"}
 _ACCEPTED_SAFETY_STATUSES = {"NORMAL", "REDUCED"}
-_BOOTSTRAP_SAFE_ROBOT_MODES = {"IDLE", "POWER_OFF", "3", "5"}
+_BOOTSTRAP_SAFE_ROBOT_MODES = {"IDLE", "POWER_OFF", "RUNNING", "3", "5", "7"}
 _BOOTSTRAP_STOPPED_RUNTIME_STATES = {"STOPPED", "3"}
 
 
@@ -353,9 +354,22 @@ def _validate_state_contract(state: RobotState) -> None:
         "tcp",
     ):
         raise StationarityError("stationarity requires robot base_T_tcp state")
-    if state.robot_mode.upper() not in _STATIONARY_ROBOT_MODES:
+    robot_mode = state.robot_mode.strip().upper()
+    runtime_state = (
+        None
+        if state.runtime_state is None
+        else state.runtime_state.strip().upper()
+    )
+    if robot_mode in _POWERED_STATIONARY_ROBOT_MODES:
+        if runtime_state not in _BOOTSTRAP_STOPPED_RUNTIME_STATES:
+            raise StationarityError(
+                "stationarity in powered robot_mode RUNNING requires "
+                f"runtime_state=STOPPED, got {state.runtime_state!r}"
+            )
+    elif robot_mode not in _STATIONARY_ROBOT_MODES:
         raise StationarityError(
-            f"stationarity requires controller robot_mode=IDLE, got {state.robot_mode!r}"
+            "stationarity requires controller robot_mode=IDLE, or RUNNING with "
+            f"runtime_state=STOPPED; got robot_mode={state.robot_mode!r}"
         )
     if state.safety_status.upper() not in _ACCEPTED_SAFETY_STATUSES:
         raise StationarityError(
@@ -707,7 +721,7 @@ def wait_until_bootstrap_safe_state(
     monotonic_clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> BootstrapSafeStateEvidence:
-    """Prove the explicit Dashboard bootstrap stop from independent RTSI channels.
+    """Prove the Dashboard bootstrap STOPPED postcondition from independent RTSI channels.
 
     Velocity or controller-state observations that are still settling reset the
     candidate window. Missing channels, unsafe safety modes, stale feedback, time

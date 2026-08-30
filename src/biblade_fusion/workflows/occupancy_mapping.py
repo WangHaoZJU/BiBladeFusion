@@ -45,6 +45,8 @@ class OccupancyMappingError(ValueError):
 
 class RobotDepthRenderer(Protocol):
     model_content_hash: str
+    self_mask_excluded_link_names: tuple[str, ...]
+    self_mask_render_backend: str
     joint_zero_offsets_rad: tuple[float, ...]
 
     def base_t_flange_matrix(
@@ -61,7 +63,7 @@ class RobotDepthRenderer(Protocol):
 
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
-MAPPING_CONTEXT_SCHEMA_VERSION = 4
+MAPPING_CONTEXT_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -678,6 +680,8 @@ def integrate_foundation_stereo_occupancy(
         hand_eye_hash=hand_eye_hash,
         flange_t_left_ir=hand_eye.flange_t_left_ir.matrix,
         robot_model_hash=renderer.model_content_hash,
+        self_mask_excluded_link_names=renderer.self_mask_excluded_link_names,
+        self_mask_render_backend=renderer.self_mask_render_backend,
         joint_zero_offsets_rad=renderer.joint_zero_offsets_rad,
         flange_t_tcp=flange_t_tcp.matrix,
         flange_tcp_asset_hash=_file_sha256(es68_resources.tcp_offset_json),
@@ -930,6 +934,8 @@ def _build_mapping_context(
     hand_eye_hash: str,
     flange_t_left_ir: NDArray[np.float64],
     robot_model_hash: str,
+    self_mask_excluded_link_names: tuple[str, ...],
+    self_mask_render_backend: str,
     joint_zero_offsets_rad: tuple[float, ...],
     flange_t_tcp: NDArray[np.float64],
     flange_tcp_asset_hash: str,
@@ -947,6 +953,17 @@ def _build_mapping_context(
         raise OccupancyMappingError(
             "Robot renderer joint_zero_offsets_rad must be a finite six-vector"
         )
+    excluded_link_names = tuple(str(name).strip() for name in self_mask_excluded_link_names)
+    if (
+        any(not name for name in excluded_link_names)
+        or len(set(excluded_link_names)) != len(excluded_link_names)
+    ):
+        raise OccupancyMappingError(
+            "Robot renderer self-mask exclusions must be unique non-empty link names"
+        )
+    render_backend = str(self_mask_render_backend).strip()
+    if not render_backend:
+        raise OccupancyMappingError("Robot renderer self-mask backend must be non-empty")
     try:
         flange_tcp_matrix = _validated_transform_matrix(
             flange_t_tcp,
@@ -970,6 +987,8 @@ def _build_mapping_context(
         "acquisition_contract": acquisition_config.model_dump(mode="json"),
         "robot": {
             "model_content_hash": robot_model_hash,
+            "self_mask_excluded_link_names": list(excluded_link_names),
+            "self_mask_render_backend": render_backend,
             "joint_zero_offsets_rad": offsets.tolist(),
             "flange_T_tcp": flange_tcp_matrix.tolist(),
             "flange_tcp_asset_sha256": flange_tcp_asset_hash,

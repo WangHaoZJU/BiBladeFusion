@@ -1,0 +1,42 @@
+{
+  "workcell_id": "es68-d435i-cell-001",
+  "operator_id": "eiai",
+  "accepted_at_utc": "2026-08-30T06:07:57+00:00",
+  "workspace_bounds_m": {
+    "minimum": [-0.22, -0.38, -0.05],
+    "maximum": [0.65, 0.35, 0.87]
+  },
+  "accepted_static_free_aabbs": [
+    {
+      "name": "base_x_before_target",
+      "minimum_m": [-0.22, -0.38, 0.0],
+      "maximum_m": [0.47, 0.35, 0.87]
+    },
+    {
+      "name": "base_x_beyond_target",
+      "minimum_m": [0.63, -0.38, 0.0],
+      "maximum_m": [0.65, 0.35, 0.87]
+    },
+    {
+      "name": "target_column_negative_y",
+      "minimum_m": [0.47, -0.38, 0.0],
+      "maximum_m": [0.63, -0.1, 0.87]
+    },
+    {
+      "name": "target_column_positive_y",
+      "minimum_m": [0.47, 0.14, 0.0],
+      "maximum_m": [0.63, 0.35, 0.87]
+    },
+    {
+      "name": "above_target_envelope",
+      "minimum_m": [0.47, -0.1, 0.37],
+      "maximum_m": [0.63, 0.14, 0.87]
+    }
+  ],
+  "checklist": {
+    "final_collision_assembly_verified": true,
+    "workcell_cleared_verified": true,
+    "emergency_stop_verified": true,
+    "low_speed_known_safe_path_verified": false
+  }
+}

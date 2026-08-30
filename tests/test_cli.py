@@ -66,6 +66,18 @@ def test_supervised_scan_preparation_commands_are_exposed() -> None:
     assert "--resume" in runtime_help.stdout
 
 
+def test_motion_envelope_commissioning_command_is_exposed() -> None:
+    result = runner.invoke(app, ["commission", "motion-envelope-trial", "--help"])
+
+    assert result.exit_code == 0
+    assert "--candidate" in result.stdout
+    assert "--direction" in result.stdout
+    assert "--intentional-tracking-fault" in result.stdout
+    assert "--execute" in result.stdout
+    assert "--confirmation" in result.stdout
+    assert "0.02 rad" in result.stdout
+
+
 def test_unknown_scan_cli_forwards_identity_and_output_without_hidden_motion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -74,8 +86,10 @@ def test_unknown_scan_cli_forwards_identity_and_output_without_hidden_motion(
     fake_runtime = object()
 
     @contextmanager
-    def fake_open(settings, *, output_root, operator_id, run_id, resume):
-        calls.append((settings.robot.model, Path(output_root), operator_id, run_id, resume))
+    def fake_open(settings, *, output_root, operator_id, run_id, resume, experimental):
+        calls.append(
+            (settings.robot.model, Path(output_root), operator_id, run_id, resume, experimental)
+        )
         yield fake_runtime
 
     def fake_console(runtime) -> int:
@@ -113,7 +127,7 @@ def test_unknown_scan_cli_forwards_identity_and_output_without_hidden_motion(
 
     assert result.exit_code == 0
     assert calls == [
-        ("es68", output, "operator-7", "blade-run-7", False),
+        ("es68", output, "operator-7", "blade-run-7", False, False),
         ("console",),
     ]
 
@@ -125,10 +139,11 @@ def test_unknown_scan_cli_forwards_explicit_resume(
     calls: list[bool] = []
 
     @contextmanager
-    def fake_open(_settings, *, output_root, operator_id, run_id, resume):
+    def fake_open(_settings, *, output_root, operator_id, run_id, resume, experimental):
         assert Path(output_root) == tmp_path / "existing-run"
         assert operator_id == "operator-7"
         assert run_id is None
+        assert experimental is False
         calls.append(resume)
         yield object()
 
@@ -162,6 +177,52 @@ def test_unknown_scan_cli_forwards_explicit_resume(
     assert calls == [True]
 
 
+def test_unknown_scan_cli_marks_experimental_coarse_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[bool] = []
+
+    @contextmanager
+    def fake_open(_settings, *, output_root, operator_id, run_id, resume, experimental):
+        assert Path(output_root) == tmp_path / "experimental-run"
+        assert operator_id == "operator-7"
+        assert run_id is None
+        assert resume is False
+        calls.append(experimental)
+        yield object()
+
+    monkeypatch.setattr(
+        unknown_runtime_module,
+        "open_production_unknown_blade_runtime",
+        fake_open,
+    )
+    monkeypatch.setattr(
+        unknown_runtime_module,
+        "run_unknown_blade_operator_console",
+        lambda _runtime: 0,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "run-unknown",
+            "--config",
+            "configs/default.yaml",
+            "--output",
+            str(tmp_path / "experimental-run"),
+            "--operator-id",
+            "operator-7",
+            "--experimental",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [True]
+    assert "EXPERIMENTAL:" in result.stdout
+
+
 def test_unknown_scan_doctor_routes_complete_coarse_to_fine_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -169,7 +230,10 @@ def test_unknown_scan_doctor_routes_complete_coarse_to_fine_gate(
     monkeypatch.setattr(
         unknown_runtime_module,
         "unknown_blade_runtime_readiness",
-        lambda settings: calls.append(settings.robot.model) or (),
+        lambda settings, *, require_release_acceptance: calls.append(
+            (settings.robot.model, require_release_acceptance)
+        )
+        or (),
     )
 
     result = runner.invoke(
@@ -186,8 +250,39 @@ def test_unknown_scan_doctor_routes_complete_coarse_to_fine_gate(
     )
 
     assert result.exit_code == 0
-    assert calls == ["es68"]
+    assert calls == [("es68", True)]
     assert result.stdout.strip() == "[]"
+
+
+def test_unknown_scan_doctor_can_audit_experimental_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        unknown_runtime_module,
+        "unknown_blade_runtime_readiness",
+        lambda _settings, *, require_release_acceptance: calls.append(
+            require_release_acceptance
+        )
+        or (),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "doctor",
+            "--mode",
+            "unknown",
+            "--experimental",
+            "--config",
+            "configs/default.yaml",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [False]
 
 
 def test_static_free_acceptance_recording_command_is_exposed() -> None:
@@ -197,6 +292,13 @@ def test_static_free_acceptance_recording_command_is_exposed() -> None:
     assert "record-static-free-acceptance" in result.stdout
     assert "build-runtime-timing-report" in result.stdout
     assert "record-runtime-timing-acceptance" in result.stdout
+    assert "prepare-motion-envelope-trial" in result.stdout
+
+    commissioning_help = runner.invoke(app, ["safety", "prepare-motion-envelope-trial", "--help"])
+    assert commissioning_help.exit_code == 0
+    assert "--start-session" in commissioning_help.stdout
+    assert "--target-view-id" in commissioning_help.stdout
+    assert "without robot write access" in commissioning_help.stdout
 
 
 def test_science_acceptance_recording_refuses_insufficient_runtime_envelope(
@@ -369,25 +471,19 @@ def test_runtime_timing_acceptance_recording_command_writes_strict_asset(
         lambda _settings: "b" * 64,
     )
     timing_settings = load_settings(config)
-    timing_contract = timing_acceptance_module.runtime_timing_contract_for_settings(
-        timing_settings
-    )
+    timing_contract = timing_acceptance_module.runtime_timing_contract_for_settings(timing_settings)
     measurement_session_payload: dict[str, object] = {
         "schema": "biblade_fusion.runtime_timing_measurement_session.v1",
         "host_run_id": "host-run-1",
         "workcell_id": "cell-1",
         "created_at_utc": "2026-08-29T00:00:00+00:00",
         "runtime_contract_sha256": timing_contract,
-        "measurement_contract_sha256": (
-            timing_acceptance_module._measurement_contract_sha256()
-        ),
+        "measurement_contract_sha256": (timing_acceptance_module._measurement_contract_sha256()),
         "boot_id_sha256": "c" * 64,
         "motion_authorized": False,
     }
-    measurement_session_payload["measurement_session_id"] = (
-        timing_acceptance_module._sha256_bytes(
-            timing_acceptance_module._canonical_json(measurement_session_payload)
-        )
+    measurement_session_payload["measurement_session_id"] = timing_acceptance_module._sha256_bytes(
+        timing_acceptance_module._canonical_json(measurement_session_payload)
     )
 
     traces: list[Path] = []
@@ -414,16 +510,12 @@ def test_runtime_timing_acceptance_recording_command_writes_strict_asset(
                 + b"\n"
             )
             duration_ns = int(duration * 1_000_000_000)
-            started_ns = 1_000_000_000_000 + (
-                trial_index * 10 + role_index
-            ) * 100_000_000_000
+            started_ns = 1_000_000_000_000 + (trial_index * 10 + role_index) * 100_000_000_000
             trace.write_text(
                 json.dumps(
                     {
                         "schema": "biblade_fusion.runtime_timing_trace.v2",
-                        "captured_at_utc": (
-                            f"2026-08-29T00:00:0{trial_index}+00:00"
-                        ),
+                        "captured_at_utc": (f"2026-08-29T00:00:0{trial_index}+00:00"),
                         "duration_s": duration,
                         "host_run_id": "host-run-1",
                         "mode": mode,
@@ -439,16 +531,10 @@ def test_runtime_timing_acceptance_recording_command_writes_strict_asset(
                         "measurement_session_payload": measurement_session_payload,
                         "boot_id_sha256": "c" * 64,
                         "operation_evidence_sha256": (
-                            timing_acceptance_module._sha256_bytes(
-                                operation_evidence_bytes
-                            )
+                            timing_acceptance_module._sha256_bytes(operation_evidence_bytes)
                         ),
-                        "operation_evidence_kind": operation_evidence[
-                            "artifact_kind"
-                        ],
-                        "operation_evidence_size_bytes": len(
-                            operation_evidence_bytes
-                        ),
+                        "operation_evidence_kind": operation_evidence["artifact_kind"],
+                        "operation_evidence_size_bytes": len(operation_evidence_bytes),
                         "operation_evidence_payload": operation_evidence,
                         "measurement_contract_sha256": (
                             timing_acceptance_module._measurement_contract_sha256()

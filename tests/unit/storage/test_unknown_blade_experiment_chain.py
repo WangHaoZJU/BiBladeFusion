@@ -218,6 +218,88 @@ def test_production_writer_rejects_authorityless_and_science_only_creation(
     assert not (tmp_path / "science-only").exists()
 
 
+def test_experimental_coarse_writer_is_authorityless_and_audit_readable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coarse = _run(
+        tmp_path / "coarse",
+        "experimental-coarse-001",
+        event_type="coarse_stopped",
+    )
+
+    writer = UnknownBladeExperimentWriter.create(
+        tmp_path / "experimental-chain",
+        experiment_id="experimental-coarse-001",
+        coarse_run_root=coarse.root,
+        production=False,
+    )
+    generation, reference = _sources(tmp_path / "assets", monkeypatch)
+    writer.append_coarse_checkpoint(coarse_generation=_source_for(generation))
+    writer.prepare_handoff(
+        schema5_generation=generation,
+        reference_coarse_model=reference,
+    )
+    fine = _fine_run(tmp_path / "fine", "experimental-coarse-001")
+    writer.append_unaccepted_fine_started(fine_run_root=fine.root)
+    stored = read_unknown_blade_experiment(writer.root)
+
+    assert stored.science_authority is None
+    assert stored.runtime_timing_authority is None
+    assert stored.fine_start_protocol is None
+    assert stored.latest_event.event_type == "fine_started"
+
+
+def test_experiment_writer_binds_new_eventless_coarse_run_reservation(
+    tmp_path: Path,
+) -> None:
+    coarse = StopScanRunWriter.create(
+        tmp_path / "coarse",
+        run_id="eventless-coarse-001",
+    )
+
+    writer = UnknownBladeExperimentWriter.create(
+        tmp_path / "experimental-chain",
+        experiment_id="eventless-coarse-001",
+        coarse_run_root=coarse.root,
+        coarse_run_id=coarse.run_id,
+        production=False,
+    )
+
+    with pytest.raises(UnknownBladeExperimentFormatError, match="contains no events"):
+        read_unknown_blade_experiment(writer.root)
+
+    coarse.append_event(
+        phase="bootstrap_map_required",
+        cycle_index=0,
+        event_type="run_started",
+        payload={"motion_authorized": False},
+    )
+    stored = read_unknown_blade_experiment(writer.root)
+
+    assert stored.experiment_id == "eventless-coarse-001"
+    assert stored.events[0].payload["coarse_run_id"] == coarse.run_id
+    assert stored.events[0].payload["coarse_run_root"] == str(coarse.root)
+
+
+def test_eventless_coarse_run_reservation_requires_matching_explicit_identity(
+    tmp_path: Path,
+) -> None:
+    coarse = StopScanRunWriter.create(
+        tmp_path / "coarse",
+        run_id="eventless-coarse-002",
+    )
+
+    with pytest.raises(ValueError, match="coarse run ID differs"):
+        UnknownBladeExperimentWriter.create(
+            tmp_path / "experimental-chain",
+            experiment_id="different-experiment",
+            coarse_run_root=coarse.root,
+            coarse_run_id=coarse.run_id,
+            production=False,
+        )
+
+
 def test_legacy_chain_is_audit_readable_but_writer_cannot_resume_it(
     tmp_path: Path,
 ) -> None:

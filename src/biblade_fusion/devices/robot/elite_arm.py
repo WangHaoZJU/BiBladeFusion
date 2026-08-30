@@ -433,17 +433,14 @@ class EliteArm:
                     stop_transport = "writeIdle"
                 else:
                     # Bootstrap is intentionally unpowered and may have no reverse
-                    # EliteDriver session yet.  Dashboard stopProgram is the only
-                    # non-motion controller stop available in that state.  The
-                    # caller must still verify sampled RTSI stationarity before
-                    # treating a capture as stopped.
-                    stop_program = getattr(self._dashboard, "stopProgram", None)
-                    if stop_program is None:
-                        raise RobotCommandError(
-                            "Dashboard does not expose stopProgram for bootstrap stop"
-                        )
-                    accepted = stop_program()
-                    stop_transport = "Dashboard stopProgram"
+                    # EliteDriver session yet.  An already-STOPPED Dashboard task
+                    # satisfies the controller postcondition; stopProgram itself is
+                    # not idempotent on the deployed controller and returns False in
+                    # that state.  The caller must still verify sampled RTSI
+                    # stationarity before treating a capture as stopped.
+                    self._ensure_dashboard_task_stopped(context="bootstrap stop")
+                    accepted = True
+                    stop_transport = "Dashboard task STOPPED"
         except RobotCommandError:
             raise
         except Exception as exc:
@@ -479,7 +476,7 @@ class EliteArm:
             raise RobotCommandError("Dashboard rejected independent deadline stopProgram")
 
     def establish_bootstrap_controller_stop(self) -> int:
-        """Issue the explicit unpowered startup stop contract via Dashboard only.
+        """Establish the unpowered startup stop contract via Dashboard only.
 
         This is deliberately distinct from a segment-boundary ``writeIdle``.  It
         never creates reverse control, powers the arm, releases brakes, or clears a
@@ -494,12 +491,48 @@ class EliteArm:
         generation = self._latch_stop()
         try:
             with self._command_io_lock:
-                accepted = self._dashboard.stopProgram()
+                self._ensure_dashboard_task_stopped(context="bootstrap controller stop")
         except Exception as exc:
+            if isinstance(exc, RobotCommandError):
+                raise
             raise RobotCommandError("Dashboard bootstrap stopProgram failed") from exc
-        if accepted is False:
-            raise RobotCommandError("Dashboard rejected bootstrap stopProgram")
         return generation
+
+    def _ensure_dashboard_task_stopped(self, *, context: str) -> None:
+        """Make Dashboard task STOPPED without rejecting the already-stopped state."""
+
+        status_fn = getattr(self._dashboard, "runningStatus", None)
+        stop_program = getattr(self._dashboard, "stopProgram", None)
+        if stop_program is None:
+            raise RobotCommandError(f"Dashboard does not expose stopProgram for {context}")
+        if status_fn is None:
+            if stop_program() is False:
+                raise RobotCommandError(f"Dashboard rejected {context}")
+            return
+        try:
+            before = _enum_label(status_fn()).strip().upper()
+        except Exception as exc:
+            raise RobotCommandError(f"Dashboard task-status query failed for {context}") from exc
+        if before in {"STOPPED", "3"}:
+            return
+        try:
+            accepted = stop_program()
+        except Exception as exc:
+            raise RobotCommandError(f"Dashboard {context} command failed") from exc
+        if accepted is False:
+            raise RobotCommandError(
+                f"Dashboard rejected {context} from task status {before}"
+            )
+        try:
+            after = _enum_label(status_fn()).strip().upper()
+        except Exception as exc:
+            raise RobotCommandError(
+                f"Dashboard post-stop task-status query failed for {context}"
+            ) from exc
+        if after not in {"STOPPED", "3"}:
+            raise RobotCommandError(
+                f"Dashboard {context} did not reach STOPPED (status={after})"
+            )
 
     def write_joint_velocity(
         self,

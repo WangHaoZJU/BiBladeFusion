@@ -1,5 +1,69 @@
 # Development log
 
+## 2026-08-30 — eiai non-moving hardware P1 bring-up
+
+- Bound the live eiai host robot interface to `192.168.6.61/24` and the only enumerated
+  D435i to serial `243222074585`; ES68 `192.168.6.60` answered four ICMP probes with no
+  loss. The rebuilt Elite SDK 1.0.0, RealSense enumeration, active calibrations and
+  FoundationStereo CUDA doctor checks all passed while `motion_enabled` remained false.
+- Captured `data/hardware_validation/gpu_host_d435i_smoke_20260830.npz` with the emitter
+  disabled. Both infrared frames are 1280x720, and the bundle includes native depth plus
+  the stream calibration transforms. Read-only RTSI reported `POWER_OFF/NORMAL` without
+  loading a task, releasing brakes or sending a trajectory.
+- Created synchronized schema-3 session
+  `data/20260830T033606.728525Z_gpu_host_sync_20260830_001_fbc3ff8f`. Its 36.141 ms robot
+  bracket had zero joint, TCP translation and TCP rotation deltas. Full CUDA inference
+  produced 847,857/921,600 valid depth pixels, and canonical source verification followed
+  and revalidated the raw-session hash chain.
+- Controller-specific MDH export was initially blocked while the controller was
+  `POWER_OFF`: RTSI port 30004 and Dashboard port 29999 accepted connections, but Primary
+  port 30001 returned `Connection refused`. After the operator powered the controller and
+  enabled remote mode, read-only status reported `RUNNING/NORMAL` and Primary exported the
+  schema-2 MDH artifact with SHA-256
+  `e8454a1b6c0ade50c988370232533d8287a5266ef50f3f122b4e8e03c584ed45`. No default or
+  guessed MDH parameters were substituted, and BiBladeFusion issued no power, brake or
+  motion command.
+
+## 2026-08-29 — eiai GPU host environment bring-up
+
+- Initialized the pinned FoundationStereo submodule at
+  `6e8806816b533e4d13ddbb95ffa907b797060a62` and installed every locked dependency group
+  and optional extra into the Python 3.12 virtual environment. The target RTX A6000 ran
+  a CUDA matrix smoke test with PyTorch 2.4.1+cu121 and cuDNN 9.1.
+- Corrected NVIDIA driver-version fallback parsing for driver files whose first matched
+  version uses the generic dotted-version pattern. The previous fallback had no capture
+  group but attempted to read group 1.
+- Made the supervision replay fixture record the same numerically computed TCP rotation
+  delta as the production capture path instead of assuming an exactly zero result from a
+  floating-point rotation product.
+- The eiai login shell exports ROS Humble Python 3.10 paths through `PYTHONPATH`; validation
+  explicitly removed that incompatible external path so the Python 3.12 environment used
+  its locked Pinocchio 2.7 installation. Final verification passed all 986 tests, Ruff,
+  Python bytecode compilation, bootstrap shell syntax, and `uv lock --check`.
+- Added an isolated PyTorch safe-global scope for the official FoundationStereo training
+  checkpoint. It retains `weights_only=True`, admits only the NumPy/OmegaConf container
+  types present in the official archive, and restores the process's previous allowlist
+  after loading instead of falling back to unrestricted pickle execution.
+- Completed full-resolution saved-session inference on the RTX A6000 with the transferred
+  checkpoint and active D435i calibration. The same-process cold/warm measurements were
+  15.718 s and 2.988 s; peak CUDA allocation/reservation was 5.78/10.17 GB. Both runs
+  produced the same 854,577/921,600 valid pixels and byte-identical disparity, validity,
+  depth and confidence arrays. Canonical asset readers revalidated all source and output
+  hashes.
+- The original `elite_cs_sdk-0.10.0-py3-none-any.whl` is not Python-version independent:
+  its binary extension reports that it was compiled for Python 3.10 and rejects the
+  required Python 3.12 interpreter. The replacement
+  `elite_cs_sdk-1.0.0-cp312-cp312-linux_x86_64.whl` initially supplied with SHA-256
+  `8db4db6e7fd96d45b99615106c2a2c3dd9d877c8bba73e7feac879e2eca44d03` installs under
+  Python 3.12, but its bundled native SDK requires `GLIBCXX_3.4.32` and `GLIBC_2.38`,
+  which exceed this Ubuntu 22.04 host. The locally rebuilt wheel with SHA-256
+  `7fa0c9512f44ad0f4632652dab30b7c2346d349d2037af93c4144a62c73ad187` instead requires
+  at most `GLIBCXX_3.4.29` and `GLIBC_2.34`; it installs and imports successfully using
+  the host libraries. After installation, a repeated GPU saved-session inference retained
+  854,577/921,600 valid depth pixels and byte-identical disparity, validity, depth and
+  confidence arrays. No camera stream, robot connection or motion command was used during
+  this environment bring-up.
+
 ## 2026-08-29 — pre-acceptance supervised unknown-blade scan closure
 
 - Closed the top-level coarse-to-fine experiment authority with the write-once
