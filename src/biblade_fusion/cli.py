@@ -293,6 +293,16 @@ def scan_run_unknown(
         str | None,
         typer.Option("--run-id", help="Optional durable run identity."),
     ] = None,
+    placement_id: Annotated[
+        str | None,
+        typer.Option(
+            "--placement-id",
+            help=(
+                "Immutable physical blade+fixture placement identity. Required for a "
+                "new run; reuse only for retries without moving the workpiece."
+            ),
+        ),
+    ] = None,
     resume: Annotated[
         bool,
         typer.Option(
@@ -351,6 +361,9 @@ def scan_run_unknown(
     if experimental and resume:
         typer.echo("--experimental cannot be combined with --resume.", err=True)
         raise typer.Exit(code=2)
+    if not resume and (placement_id is None or not placement_id.strip()):
+        typer.echo("--placement-id is required for a new physical run.", err=True)
+        raise typer.Exit(code=2)
     if bootstrap_rectangle is not None and bootstrap_polygon is not None:
         typer.echo(
             "Supply at most one of --bootstrap-rectangle and --bootstrap-polygon.",
@@ -407,6 +420,7 @@ def scan_run_unknown(
             output_root=output,
             operator_id=operator_id,
             run_id=run_id,
+            placement_id=placement_id,
             resume=resume,
             experimental=experimental,
         ) as runtime:

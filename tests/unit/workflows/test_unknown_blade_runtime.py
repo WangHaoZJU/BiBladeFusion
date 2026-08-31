@@ -1596,6 +1596,7 @@ def test_resume_plan_is_derived_only_from_explicit_handoff_chain(
             "read_unknown_blade_experiment",
             lambda _path, values=events: SimpleNamespace(
                 experiment_id="runtime-test",
+                placement_id="blade-placement-runtime-test",
                 events=values,
                 fine_start_protocol=runtime_module.UNKNOWN_BLADE_FINE_START_PROTOCOL,
             ),
@@ -1603,6 +1604,7 @@ def test_resume_plan_is_derived_only_from_explicit_handoff_chain(
         plan = load_unknown_blade_resume_plan(experiment_root)
         assert plan.phase is expected_phase
         assert plan.coarse_run_root == coarse_run
+        assert plan.placement_id == "blade-placement-runtime-test"
 
 
 def test_prepared_recovery_never_scans_or_reuses_an_orphan_fine_directory(
@@ -1992,6 +1994,42 @@ def test_resume_missing_or_invalid_chain_fails_before_hardware(
         raise AssertionError("context must not open")
 
     assert calls == []
+
+
+def test_resume_rejects_a_different_physical_placement_before_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "placement-bound-run"
+    root.mkdir()
+    plan = UnknownBladeResumePlan(
+        experiment_root=root.resolve(),
+        experiment_id="runtime-test",
+        placement_id="blade-placement-20260831-01",
+        phase=UnknownBladeResumePhase.COARSE,
+        coarse_run_root=(root / "runs" / "coarse").resolve(),
+    )
+    monkeypatch.setattr(runtime_module, "load_unknown_blade_resume_plan", lambda _root: plan)
+    monkeypatch.setattr(
+        runtime_module,
+        "require_unknown_blade_runtime_ready",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("placement mismatch must block before readiness")
+        ),
+    )
+
+    with (
+        pytest.raises(UnknownBladeRuntimeError, match="placement ID differs"),
+        open_production_unknown_blade_runtime(
+            load_settings("configs/default.yaml"),
+            output_root=root,
+            operator_id="operator-1",
+            run_id="runtime-test",
+            placement_id="blade-placement-20260831-02",
+            resume=True,
+        ),
+    ):
+        raise AssertionError("mismatched placement must not open")
 
 
 def test_existing_output_is_refused_before_hardware_connection(

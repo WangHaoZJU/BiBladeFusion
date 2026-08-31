@@ -192,9 +192,16 @@ uv run bbf scan doctor \
 ```bash
 uv run bbf scan run-unknown \
   --config configs/local.yaml \
-  --output data/experiments/unknown_blade_001 \
+  --output data/experiments/blade-placement-20260831-01-attempt-01 \
+  --placement-id blade-placement-20260831-01 \
+  --run-id blade-placement-20260831-01-attempt-01 \
   --operator-id vale
 ```
+
+`placement-id`是夹具和叶片一次不变物理放置的正式身份，并写入顶层INIT哈希链。软件失败但
+实物未动时，重试沿用该placement ID，同时使用新的run ID和全新output；夹具或叶片发生任何
+物理移动后必须创建新的placement ID。不同placement之间禁止复用占用地图、粗模型、schema-5
+参考或精扫覆盖。
 
 输出目录必须不存在；原始双目帧、FoundationStereo结果、占用图、粗扫代际、schema-5、精扫
 资产、事件链和监督快照均在其中按写一次语义保存。实验根中的`experiment_handoff`还以
@@ -227,7 +234,8 @@ uv run bbf supervise replay \
 uv run bbf scan run-unknown \
   --resume \
   --config configs/local.yaml \
-  --output data/experiments/unknown_blade_001 \
+  --output data/experiments/blade-placement-20260831-01-attempt-01 \
+  --placement-id blade-placement-20260831-01 \
   --operator-id vale
 ```
 

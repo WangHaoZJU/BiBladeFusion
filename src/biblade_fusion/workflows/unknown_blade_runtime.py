@@ -276,6 +276,7 @@ class UnknownBladeResumePlan:
     final_reconstruction_path: Path | None = None
     science_authority: ScienceAcceptanceAuthority | None = None
     runtime_timing_authority: RuntimeTimingAcceptanceAuthority | None = None
+    placement_id: str | None = None
 
 
 def _record_root(payload: object, *, label: str) -> Path:
@@ -400,6 +401,7 @@ def load_unknown_blade_resume_plan(output_root: str | Path) -> UnknownBladeResum
         final_reconstruction_path=final_reconstruction,
         science_authority=getattr(stored, "science_authority", None),
         runtime_timing_authority=getattr(stored, "runtime_timing_authority", None),
+        placement_id=getattr(stored, "placement_id", None),
     )
 
 
@@ -1745,6 +1747,7 @@ def open_production_unknown_blade_runtime(
     output_root: str | Path,
     operator_id: str,
     run_id: str | None = None,
+    placement_id: str | None = None,
     resume: bool = False,
     experimental: bool = False,
 ) -> Iterator[UnknownBladeSupervisedRuntime | CompletedUnknownBladeRuntime]:
@@ -1757,9 +1760,14 @@ def open_production_unknown_blade_runtime(
     """
 
     operator = validate_stop_scan_run_id(operator_id)
+    requested_placement_id = (
+        validate_stop_scan_run_id(placement_id)
+        if placement_id is not None
+        else None
+    )
     root = Path(output_root).resolve()
     if experimental and resume:
-        raise UnknownBladeRuntimeError("Experimental coarse-only runs cannot be resumed")
+        raise UnknownBladeRuntimeError("Experimental unknown-blade runs cannot be resumed")
     resume_plan: UnknownBladeResumePlan | None = None
     if resume:
         if not root.is_dir():
@@ -1772,6 +1780,14 @@ def open_production_unknown_blade_runtime(
             raise UnknownBladeRuntimeError(
                 "Requested run ID differs from the experiment handoff authority"
             )
+        if (
+            requested_placement_id is not None
+            and requested_placement_id != resume_plan.placement_id
+        ):
+            raise UnknownBladeRuntimeError(
+                "Requested placement ID differs from the experiment handoff authority"
+            )
+        bound_placement_id = resume_plan.placement_id
     else:
         identity = validate_stop_scan_run_id(
             run_id or f"unknown-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}"
@@ -1780,6 +1796,7 @@ def open_production_unknown_blade_runtime(
             raise FileExistsError(
                 f"Unknown-blade experiment root already exists: {root}"
             )
+        bound_placement_id = requested_placement_id
     if resume_plan is not None and resume_plan.phase is UnknownBladeResumePhase.COMPLETE:
         if (
             resume_plan.science_authority is None
@@ -2012,6 +2029,7 @@ def open_production_unknown_blade_runtime(
                 experiment_id=identity,
                 coarse_run_root=coarse_runner.status.run_root,  # type: ignore[union-attr]
                 coarse_run_id=coarse_runner.status.run_id,  # type: ignore[union-attr]
+                placement_id=bound_placement_id,
                 science_authority=science_authority,
                 runtime_timing_authority=timing_authority,
                 production=not experimental,

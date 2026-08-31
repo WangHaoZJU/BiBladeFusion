@@ -424,9 +424,17 @@ Only after that audit passes, create a new non-overwriting experiment root:
 ```bash
 uv run bbf scan run-unknown \
   --config configs/local.yaml \
-  --output data/experiments/unknown_blade_001 \
+  --output data/experiments/blade-placement-20260831-01-attempt-01 \
+  --placement-id blade-placement-20260831-01 \
+  --run-id blade-placement-20260831-01-attempt-01 \
   --operator-id vale
 ```
+
+`placement-id` identifies one unchanged physical blade+fixture placement and is bound
+into the immutable experiment INIT event. A software retry without moving the workpiece
+reuses that placement ID but uses a new run ID and output root. Any physical movement
+requires a new placement ID; no occupancy map, schema-5 reference, or fine coverage is
+reused across placements.
 
 The first stage never chooses a path through unknown space. The operator manually places
 the stopped arm at at least three independently safe views and presses exactly `c` once
@@ -454,7 +462,8 @@ Resume only the explicitly named immutable experiment root:
 uv run bbf scan run-unknown \
   --resume \
   --config configs/local.yaml \
-  --output data/experiments/unknown_blade_001 \
+  --output data/experiments/blade-placement-20260831-01-attempt-01 \
+  --placement-id blade-placement-20260831-01 \
   --operator-id vale
 ```
 

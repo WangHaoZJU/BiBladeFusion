@@ -62,6 +62,7 @@ def test_supervised_scan_preparation_commands_are_exposed() -> None:
     runtime_help = runner.invoke(app, ["scan", "run-unknown", "--help"])
     assert runtime_help.exit_code == 0
     assert "--operator-id" in runtime_help.stdout
+    assert "--placement-id" in runtime_help.stdout
     assert "--output" in runtime_help.stdout
     assert "--resume" in runtime_help.stdout
 
@@ -90,9 +91,26 @@ def test_unknown_scan_cli_forwards_identity_and_output_without_hidden_motion(
     fake_runtime = object()
 
     @contextmanager
-    def fake_open(settings, *, output_root, operator_id, run_id, resume, experimental):
+    def fake_open(
+        settings,
+        *,
+        output_root,
+        operator_id,
+        run_id,
+        placement_id,
+        resume,
+        experimental,
+    ):
         calls.append(
-            (settings.robot.model, Path(output_root), operator_id, run_id, resume, experimental)
+            (
+                settings.robot.model,
+                Path(output_root),
+                operator_id,
+                run_id,
+                placement_id,
+                resume,
+                experimental,
+            )
         )
         yield fake_runtime
 
@@ -126,14 +144,54 @@ def test_unknown_scan_cli_forwards_identity_and_output_without_hidden_motion(
             "operator-7",
             "--run-id",
             "blade-run-7",
+            "--placement-id",
+            "blade-placement-7",
         ],
     )
 
     assert result.exit_code == 0
     assert calls == [
-        ("es68", output, "operator-7", "blade-run-7", False, False),
+        (
+            "es68",
+            output,
+            "operator-7",
+            "blade-run-7",
+            "blade-placement-7",
+            False,
+            False,
+        ),
         ("console",),
     ]
+
+
+def test_unknown_scan_cli_requires_physical_placement_identity_for_new_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        unknown_runtime_module,
+        "open_production_unknown_blade_runtime",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("missing placement must block before runtime construction")
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "run-unknown",
+            "--config",
+            "configs/default.yaml",
+            "--output",
+            str(tmp_path / "new-run"),
+            "--operator-id",
+            "operator-7",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--placement-id is required" in result.stderr
 
 
 def test_unknown_scan_cli_forwards_explicit_resume(
@@ -143,10 +201,20 @@ def test_unknown_scan_cli_forwards_explicit_resume(
     calls: list[bool] = []
 
     @contextmanager
-    def fake_open(_settings, *, output_root, operator_id, run_id, resume, experimental):
+    def fake_open(
+        _settings,
+        *,
+        output_root,
+        operator_id,
+        run_id,
+        placement_id,
+        resume,
+        experimental,
+    ):
         assert Path(output_root) == tmp_path / "existing-run"
         assert operator_id == "operator-7"
         assert run_id is None
+        assert placement_id is None
         assert experimental is False
         calls.append(resume)
         yield object()
@@ -181,17 +249,27 @@ def test_unknown_scan_cli_forwards_explicit_resume(
     assert calls == [True]
 
 
-def test_unknown_scan_cli_marks_experimental_coarse_only(
+def test_unknown_scan_cli_marks_experimental_coarse_to_fine_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[bool] = []
 
     @contextmanager
-    def fake_open(_settings, *, output_root, operator_id, run_id, resume, experimental):
+    def fake_open(
+        _settings,
+        *,
+        output_root,
+        operator_id,
+        run_id,
+        placement_id,
+        resume,
+        experimental,
+    ):
         assert Path(output_root) == tmp_path / "experimental-run"
         assert operator_id == "operator-7"
         assert run_id is None
+        assert placement_id == "blade-placement-experimental"
         assert resume is False
         calls.append(experimental)
         yield object()
@@ -218,6 +296,8 @@ def test_unknown_scan_cli_marks_experimental_coarse_only(
             str(tmp_path / "experimental-run"),
             "--operator-id",
             "operator-7",
+            "--placement-id",
+            "blade-placement-experimental",
             "--experimental",
         ],
     )

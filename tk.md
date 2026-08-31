@@ -213,11 +213,15 @@
 ```bash
 uv run bbf scan run-unknown \
   --config configs/local.yaml \
-  --output data/experiments/unknown_blade_001 \
+  --output data/experiments/blade-placement-20260831-01-attempt-01 \
+  --placement-id blade-placement-20260831-01 \
+  --run-id blade-placement-20260831-01-attempt-01 \
   --operator-id vale
 ```
 
-`output` 目录必须不存在；写入开始后**永不覆盖**。
+`output` 目录必须不存在；写入开始后**永不覆盖**。同一物理放置的软件重试沿用
+`placement-id`但必须更换`run-id`和`output`；实物移动后必须更换`placement-id`，旧地图、
+schema-5和精扫覆盖不得迁移。
 
 ---
 

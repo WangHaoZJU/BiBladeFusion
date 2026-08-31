@@ -133,6 +133,54 @@ def test_init_chain_binds_science_authority_and_rejects_event_tampering(
         read_unknown_blade_experiment(writer.root)
 
 
+def test_init_chain_persists_immutable_physical_placement_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coarse = _run(tmp_path / "coarse", "placement-run-001", event_type="coarse_stopped")
+    authority, timing = _production_authorities(
+        tmp_path / "authorities",
+        monkeypatch,
+    )
+    writer = UnknownBladeExperimentWriter.create(
+        tmp_path / "chain",
+        experiment_id="placement-run-001",
+        placement_id="blade-placement-20260831-01",
+        coarse_run_root=coarse.root,
+        science_authority=authority,
+        runtime_timing_authority=timing,
+    )
+
+    stored = read_unknown_blade_experiment(writer.root)
+
+    assert stored.placement_id == "blade-placement-20260831-01"
+    assert stored.events[0].payload["placement_id"] == stored.placement_id
+    assert UnknownBladeExperimentWriter.resume(writer.root).placement_id == stored.placement_id
+
+
+def test_invalid_placement_identity_is_rejected_before_chain_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coarse = _run(tmp_path / "coarse", "placement-run-002", event_type="coarse_stopped")
+    authority, timing = _production_authorities(
+        tmp_path / "authorities",
+        monkeypatch,
+    )
+
+    with pytest.raises(ValueError, match="run_id"):
+        UnknownBladeExperimentWriter.create(
+            tmp_path / "chain",
+            experiment_id="placement-run-002",
+            placement_id="../moved-blade",
+            coarse_run_root=coarse.root,
+            science_authority=authority,
+            runtime_timing_authority=timing,
+        )
+
+    assert not (tmp_path / "chain").exists()
+
+
 def test_reader_rejects_duplicate_json_keys(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

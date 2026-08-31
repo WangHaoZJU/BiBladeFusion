@@ -387,6 +387,7 @@ class StoredUnknownBladeExperiment:
     science_authority: ScienceAcceptanceAuthority | None = None
     runtime_timing_authority: RuntimeTimingAcceptanceAuthority | None = None
     fine_start_protocol: str | None = None
+    placement_id: str | None = None
 
     @property
     def latest_event(self) -> UnknownBladeExperimentEvent:
@@ -466,6 +467,7 @@ class UnknownBladeExperimentWriter:
             raise ValueError("Experimental coarse writer cannot carry production authorities")
         self.root = stored.root
         self.experiment_id = stored.experiment_id
+        self.placement_id = stored.placement_id
         self._production = production
         self._events = list(stored.events)
         self._lock = threading.RLock()
@@ -478,6 +480,7 @@ class UnknownBladeExperimentWriter:
         experiment_id: str,
         coarse_run_root: str | Path,
         coarse_run_id: str | None = None,
+        placement_id: str | None = None,
         science_authority: ScienceAcceptanceAuthority | None = None,
         runtime_timing_authority: RuntimeTimingAcceptanceAuthority | None = None,
         production: bool = True,
@@ -495,6 +498,11 @@ class UnknownBladeExperimentWriter:
         output = Path(output_dir).resolve()
         coarse_root = Path(coarse_run_root).resolve()
         expected_id = validate_stop_scan_run_id(experiment_id)
+        bound_placement_id = (
+            validate_stop_scan_run_id(placement_id)
+            if placement_id is not None
+            else None
+        )
         events_root = coarse_root / "events"
         if events_root.is_dir() and not any(events_root.iterdir()):
             if coarse_run_id is None:
@@ -513,12 +521,15 @@ class UnknownBladeExperimentWriter:
         output.mkdir()
         (output / "events").mkdir()
         stored = StoredUnknownBladeExperiment(
-            output,
-            experiment_id,
-            (),
-            science_authority,
-            runtime_timing_authority,
-            UNKNOWN_BLADE_FINE_START_PROTOCOL if production else None,
+            root=output,
+            experiment_id=experiment_id,
+            events=(),
+            science_authority=science_authority,
+            runtime_timing_authority=runtime_timing_authority,
+            fine_start_protocol=(
+                UNKNOWN_BLADE_FINE_START_PROTOCOL if production else None
+            ),
+            placement_id=bound_placement_id,
         )
         writer = cls(stored, production=production)
         writer._append(
@@ -527,6 +538,11 @@ class UnknownBladeExperimentWriter:
                 "experiment_id": experiment_id,
                 "coarse_run_id": bound_run_id,
                 "coarse_run_root": str(bound_run_root),
+                **(
+                    {"placement_id": bound_placement_id}
+                    if bound_placement_id is not None
+                    else {}
+                ),
                 **(
                     {"fine_start_protocol": UNKNOWN_BLADE_FINE_START_PROTOCOL}
                     if production
@@ -1114,12 +1130,13 @@ def read_unknown_blade_experiment(path: str | Path) -> StoredUnknownBladeExperim
         if runtime_timing_authority is not None:
             runtime_timing_authority.assert_acceptance_asset_current()
         return StoredUnknownBladeExperiment(
-            root,
-            events[0].experiment_id,
-            tuple(events),
-            science_authority,
-            runtime_timing_authority,
-            events[0].payload.get("fine_start_protocol"),
+            root=root,
+            experiment_id=events[0].experiment_id,
+            events=tuple(events),
+            science_authority=science_authority,
+            runtime_timing_authority=runtime_timing_authority,
+            fine_start_protocol=events[0].payload.get("fine_start_protocol"),
+            placement_id=events[0].payload.get("placement_id"),
         )
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise UnknownBladeExperimentFormatError(
@@ -1139,17 +1156,35 @@ def _validate_semantic_chain(events: tuple[UnknownBladeExperimentEvent, ...]) ->
     candidate_commit_init_fields = combined_authority_init_fields | {
         "fine_start_protocol"
     }
-    if frozenset(initialized) not in {
+    accepted_init_fields = {
         frozenset(legacy_init_fields),
         frozenset(authority_init_fields),
         frozenset(combined_authority_init_fields),
         frozenset(candidate_commit_init_fields),
-    }:
+    }
+    accepted_init_fields.update(
+        frozenset((*fields, "placement_id"))
+        for fields in (
+            legacy_init_fields,
+            authority_init_fields,
+            combined_authority_init_fields,
+            candidate_commit_init_fields,
+        )
+    )
+    if frozenset(initialized) not in accepted_init_fields:
         raise ValueError("experiment initialization payload changed")
+    placement_id = initialized.get("placement_id")
+    if placement_id is not None:
+        if not isinstance(placement_id, str):
+            raise ValueError("experiment placement_id must be a string")
+        validate_stop_scan_run_id(placement_id)
     fine_start_protocol = initialized.get("fine_start_protocol")
+    expected_candidate_fields = candidate_commit_init_fields | (
+        {"placement_id"} if placement_id is not None else set()
+    )
     if fine_start_protocol is not None and (
         fine_start_protocol != UNKNOWN_BLADE_FINE_START_PROTOCOL
-        or set(initialized) != candidate_commit_init_fields
+        or set(initialized) != expected_candidate_fields
     ):
         raise ValueError("experiment fine-start protocol changed")
     science_authority = (
