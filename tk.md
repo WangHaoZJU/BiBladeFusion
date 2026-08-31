@@ -137,7 +137,7 @@
 ### 2.7 风险与限制
 
 - **不能仅靠软件绿灯判断系统可用**：开发日志反复强调 "passing software doctor is not hardware acceptance"
-- **占用 map age**：从完整 rebuild 周期第一帧起算，**不是连续动态避障**
+- **占用生命周期**：默认由完整generation原子替换驱动；失败的新帧不撤销旧发布，有限map age仅是可选部署策略
 - **机器人自遮罩**：自身及背后永远 `UNKNOWN`，需要"已验收静态自由 AABB"才能局部豁免
 - **FoundationStereo 是必需**：原生 RealSense 深度在监督式运行链中**不是备用后端**
 - **碰撞装配依赖 manifest**：缺/错的最终 STL 会立即 fail-closed
@@ -302,7 +302,7 @@ uv run bbf scan run-unknown \
 
 **流程**：
 
-1. 用当前 UTC 时间过滤来源，仅保留 `[now - maximum_map_age_s, now]` 内的视图（默认 5 s，仅为软件起点）
+1. 保留最多`maximum_source_views`个已提交来源；近重复新帧替换旧帧且不重复贡献FREE票；相邻采集间隔门限可截断来源窗口，`maximum_map_age_s`不删除源帧
 2. 对每个被接收的 FoundationStereo 视图：
    - 左/右一致性证据 + 分数 + 深度范围检查
    - 同步关节 → 标定 FK → `base_T_flange · flange_T_left_ir` 得相机 pose
@@ -541,7 +541,7 @@ IDLE
 2. 工作空间边界、叶片支架 / 夹具是否纳入占用或静态障碍物
 3. 关节短段上限、速度缩放、ServoJ 周期与跟踪误差
 4. Dashboard 启动 stop、段边界 stop、6 类实际/目标速度通道的停稳阈值与反馈新鲜度
-5. FoundationStereo 最坏推理时间、3 个启动视角完成时间、schema-5 交接时间、地图重放/预检/人工响应时间（确定全部时序预算与 `maximum_map_age_s`）
+5. schema-5 交接、预检、人工响应和短段执行时间（形成运行时预算；有限`maximum_map_age_s`仅在部署明确要求时另行验收）
 6. 自遮罩对真实机器人像素的召回率，以及留下的 `UNKNOWN` 壳是否使合法运动无解
 7. 连续网格和连续占用证明在已知安全/已知碰撞轨迹上的假阴/假阳
 8. 初始掩模及参考引导掩模对主表面、两只鳍片、全部边界的分区质量

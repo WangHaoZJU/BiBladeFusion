@@ -839,8 +839,11 @@ def mark_snapshot_stale_if_expired(
 ) -> OccupancySnapshot:
     """Materialise expiry as a new immutable snapshot version for storage/UI."""
 
-    if snapshot.map_state is OccupancyMapState.MAP_READY and snapshot.is_stale(
-        _utc(now_utc), occupancy_config.maximum_map_age_s
+    maximum_age_s = occupancy_config.maximum_map_age_s
+    if (
+        maximum_age_s is not None
+        and snapshot.map_state is OccupancyMapState.MAP_READY
+        and snapshot.is_stale(_utc(now_utc), maximum_age_s)
     ):
         return snapshot.mark_stale("capture age exceeded maximum_map_age_s")
     return snapshot

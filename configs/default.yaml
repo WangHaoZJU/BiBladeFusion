@@ -481,7 +481,9 @@ occupancy:
   integration_stride: 2
   free_space_margin_m: 0.01
   obstacle_inflation_m: 0.01
-  maximum_map_age_s: 5.0
+  # Null means the published generation remains current until the next accepted
+  # stop-and-capture generation replaces it atomically.
+  maximum_map_age_s: null
   unknown_policy: block
   require_robot_self_mask: true
   # Optional hardware-accepted base-frame regions known to contain no external
@@ -504,6 +506,9 @@ occupancy:
   minimum_stereo_confidence: 0.5
   maximum_lr_consistency_error_px: 1.0
   minimum_source_views: 3
+  # Safety occupancy is a bounded rolling generation; cumulative scientific
+  # coverage is stored separately and is never truncated by this value.
+  maximum_source_views: 3
   # A voxel remains UNKNOWN until this many independent captured views vote FREE.
   minimum_free_observations: 3
   # A new FREE-supporting view must differ from every accepted view by at least

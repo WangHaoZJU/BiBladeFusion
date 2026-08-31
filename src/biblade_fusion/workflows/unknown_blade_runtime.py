@@ -966,7 +966,7 @@ class UnknownBladeSupervisedRuntime:
         *,
         view_id: str | None = None,
     ) -> UnknownBladeRuntimeSnapshot:
-        """Add one explicit stopped observation when the fine safety map has aged out."""
+        """Add one explicit stopped observation when fine MAP_READY evidence is incomplete."""
 
         self._require_started()
         if self._phase is not UnknownBladeRuntimePhase.FINE_SCAN:
@@ -1244,10 +1244,9 @@ class UnknownBladeSupervisedRuntime:
             self._block(f"fine handoff failed closed: {type(exc).__name__}: {exc}")
             return
         if initial.disposition is ExperimentDisposition.NEEDS_CAPTURE:
-            # A long schema-5 build may have expired every coarse safety source.
             # The FINE_STARTED chain is already durable, so explicit stopped `c`
             # captures may now replenish the new coordinator without inheriting a
-            # stale publication, permit, or prepared segment.
+            # coarse publication, permit, or prepared segment.
             return
         if initial.disposition is not ExperimentDisposition.READY:
             self._block("fine handoff failed to enter a recoverable safety-map state")
@@ -1549,21 +1548,13 @@ def unknown_blade_runtime_readiness(
             missing.append(f"runtime timing acceptance invalid: {exc}")
     required_map_age_s: float | None = None
     if require_release_acceptance and all(value is not None for value in measured.values()):
-        perception = float(measured["maximum_perception_cycle_duration_s"])
-        reposition = float(measured["maximum_operator_reposition_interval_s"])
         segment = float(measured["maximum_segment_execution_duration_s"])
-        schema5_handoff = float(measured["maximum_schema5_handoff_duration_s"])
-        source_window_budget = (
-            settings.occupancy.minimum_source_views * perception
-            + (settings.occupancy.minimum_source_views - 1) * reposition
-        )
         required_map_age_s = (
-            source_window_budget
-            + schema5_handoff
-            + segment
+            segment
             + settings.stop_and_capture.execution_freshness_margin_s
         )
-        if settings.occupancy.maximum_map_age_s <= required_map_age_s:
+        maximum_map_age_s = settings.occupancy.maximum_map_age_s
+        if maximum_map_age_s is not None and maximum_map_age_s <= required_map_age_s:
             missing.append("occupancy.maximum_map_age_s exceeds measured runtime budget")
     results.append(
         CheckResult(
@@ -1872,6 +1863,11 @@ def open_production_unknown_blade_runtime(
     model_path = settings.kinematics.model_path
     if bounds_min is None or bounds_max is None or model_path is None:
         raise UnknownBladeRuntimeError("Readiness accepted incomplete runtime geometry")
+    # Model construction can dominate the first inference and can expose checkpoint
+    # incompatibilities that a path/dependency doctor cannot.  Complete it before
+    # reserving the run root or opening either hardware endpoint.
+    backend = FoundationStereoBackend(settings.foundation_stereo)
+    backend.prepare()
     # Reserve the immutable experiment root only after every offline asset has
     # independently loaded, but still before either hardware endpoint is opened.
     if not resume:
@@ -1918,7 +1914,6 @@ def open_production_unknown_blade_runtime(
             settings.acquisition,
             require_thermal=False,
         )
-        backend = FoundationStereoBackend(settings.foundation_stereo)
         coarse_engine = FoundationStereoOccupancyCycleEngine(
             settings=coarse_settings,
             acquirer=acquirer,
@@ -2062,6 +2057,7 @@ def open_production_unknown_blade_runtime(
                     settings=fine_settings,
                     reference_coarse_model=reference,
                     output_root=root / "perception" / "fine",
+                    replace_latest_source_on_first_capture=True,
                 )
                 if fork_live_sources
                 else FoundationStereoOccupancyCycleEngine(
@@ -2085,6 +2081,20 @@ def open_production_unknown_blade_runtime(
                 science_authority=science_authority,
                 experimental=experimental,
             )
+            # Coarse and fine coordinators are distinct motion authorities.  Fine
+            # may reuse verified perception sources, but it must publish its own
+            # first MAP_READY generation before any fine preflight.
+            fine_publisher = OccupancyGenerationPublisher()
+            fine_safety_factory = GuardedSegmentSafetyFactory(
+                arm,
+                collision_checker,
+                fine_publisher,
+                settings.motion_preflight,
+                settings.occupancy,
+                settings.stop_and_capture,
+                motion_envelope,
+                motion_control_hash,
+            )
             coarse_bridge.begin_new_event_stream(run_id=identity)
             runner_kwargs = {
                 "config": settings.stop_and_capture,
@@ -2095,8 +2105,8 @@ def open_production_unknown_blade_runtime(
                 "robot": arm,
                 "perception": fine_engine,
                 "selector": selector,
-                "safety_factory": safety_factory,
-                "publisher": publisher,
+                "safety_factory": fine_safety_factory,
+                "publisher": fine_publisher,
                 "motion_executor": GuardedCoordinatorMotionExecutor(),
                 "status_callbacks": (coarse_bridge,),
                 "event_callbacks": (coarse_bridge.observe_event,),
@@ -2215,9 +2225,7 @@ def open_production_unknown_blade_runtime(
             science_settings=science_authority_settings,
             runtime_timing_authority=timing_authority,
             maximum_schema5_handoff_duration_s=(
-                None
-                if experimental
-                else settings.stop_and_capture.maximum_schema5_handoff_duration_s
+                settings.stop_and_capture.maximum_schema5_handoff_duration_s
             ),
             experimental=experimental,
         )

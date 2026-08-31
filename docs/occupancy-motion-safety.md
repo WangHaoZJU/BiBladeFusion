@@ -17,8 +17,9 @@ a calibrated obstacle-existence probability.
 2. The snapshot must contain source depth views and valid SHA-256 `content_hash`,
    `mapping_context_hash`, and `quality_evidence_hash` values. All three hashes remain
    bound through preflight, approval, and execution. A missing or changed hash blocks.
-   Freshness is measured from the first frame of the complete map-rebuild cycle, not the
-   most recently appended frame. The snapshot must remain fresh for the full predicted
+   In the live stop-scan workflow, motion-authorization freshness is measured from the
+   atomic publication of the complete generation. Source capture age does not delete a
+   committed generation or its source views. The authorization must remain fresh for the full predicted
    ServoJ duration plus the configured execution margin—not merely at motion start. The
    default margin is one second.
 3. Occupied and unknown voxels both block motion. Out-of-grid queries are unknown.

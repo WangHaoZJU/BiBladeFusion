@@ -1760,7 +1760,11 @@ def test_experimental_open_keeps_science_authority_and_settings_unbound(
     monkeypatch.setattr(runtime_module, "CoarseScienceSession", lambda **_kwargs: coarse_session)
     monkeypatch.setattr(runtime_module, "CoarseSessionNextViewAdapter", lambda _session: object())
     monkeypatch.setattr(runtime_module, "SynchronizedAcquirer", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(runtime_module, "FoundationStereoBackend", lambda _config: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "FoundationStereoBackend",
+        lambda _config: SimpleNamespace(prepare=lambda: None),
+    )
 
     def capture_engine(**kwargs):
         captured.update(kwargs)
@@ -2230,7 +2234,7 @@ def test_unknown_runtime_science_gate_checks_contract_envelope_and_map_age_formu
     scope = next(item for item in results if item.name == "unknown_blade_coarse_to_fine")
     assert scope.details["geometry_science_acceptance_eligible"] is True
     assert scope.details["runtime_timing_acceptance_eligible"] is True
-    assert scope.details["required_map_age_exclusive_lower_bound_s"] == pytest.approx(26.0)
+    assert scope.details["required_map_age_exclusive_lower_bound_s"] == pytest.approx(7.0)
     assert Path(tmp_path / "science") in calls
     matched = next(item for item in calls if isinstance(item, dict))
     assert matched["acceptance_id"] == "a" * 64

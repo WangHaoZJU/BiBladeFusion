@@ -148,7 +148,11 @@ def _observation(bundle: SynchronizedFrameBundle) -> StereoInferenceObservation:
     )
 
 
-def _real_artifacts(tmp_path: Path) -> _Artifacts:
+def _real_artifacts(
+    tmp_path: Path,
+    *,
+    maximum_map_age_s: float | None = None,
+) -> _Artifacts:
     settings = load_settings(_REPOSITORY_ROOT / "configs/default.yaml")
     bundle = _bundle()
     session_writer = SessionWriter.create(tmp_path / "sessions", settings, label="source")
@@ -213,6 +217,7 @@ def _real_artifacts(tmp_path: Path) -> _Artifacts:
         integration_stride=1,
         minimum_valid_depth_fraction=0.1,
         minimum_source_views=3,
+        maximum_map_age_s=maximum_map_age_s,
     )
     source_reader = SessionReader(session_writer.path)
     captured = datetime.fromisoformat(str(source_reader.manifest["created_at_utc"]))
@@ -371,7 +376,7 @@ def test_replay_snapshot_writer_never_overwrites_existing_asset(tmp_path: Path) 
 
 
 def test_replay_reclassifies_old_mapping_snapshot_as_stale(tmp_path: Path) -> None:
-    artifacts = _real_artifacts(tmp_path)
+    artifacts = _real_artifacts(tmp_path, maximum_map_age_s=5.0)
 
     stored = build_supervisory_replay_snapshot(
         tmp_path / "stale-supervision",

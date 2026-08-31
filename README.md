@@ -285,7 +285,7 @@ fin thickness during TSDF integration, and reports component-level surface/mesh 
 These functions are software-verified on deterministic synthetic data; real D435i/ES68
 coarse scans and dimensional references are still required for physical validation.
 The [coverage-driven fine selector](docs/coverage-next-view-selector.md) keeps cumulative
-scientific surface evidence separate from the short-lived safety occupancy window and
+scientific surface evidence separate from the bounded rolling safety-occupancy window and
 never interprets an unreachable incomplete state as completion. The concrete cycle engine
 can now stage a reference-projected foreground mask, a FoundationStereo reconstructed view,
 and exactly one fine-coverage successor as one library-level transaction. Its schema-3
@@ -344,8 +344,9 @@ The sparse voxel map has exactly three semantic states:
 most one vote per view. A new supporting view must differ from every prior supporting
 view by at least 20 mm of camera-centre translation or 5 degrees of optical-axis angle;
 changing only a view identifier is rejected before ray integration. Mapping is
-stop-and-capture, and map age starts at the first frame of the complete rebuild cycle—it
-is not continuous dynamic obstacle avoidance. The following command reconstructs
+stop-and-capture. Committed source views remain available until a later generation is
+accepted; the motion-authorization age starts when that generation is atomically
+published. This is not continuous dynamic obstacle avoidance. The following command reconstructs
 immutable mapping evidence from at least three previously stored FoundationStereo
 artifacts:
 
@@ -489,8 +490,8 @@ binds the exact calibration, FoundationStereo source/checkpoint/model configurat
 foreground, coarse/fine reconstruction and selection policies. It authorizes no motion.
 Doctor also requires one immutable runtime-timing acceptance whose path/ID matches all four
 configured bounds: complete perception cycle, operator reposition interval, segment
-execution, and stop/checkpoint/schema-5/fine handoff. Those measurements participate in
-map-age readiness and are enforced again at their runtime boundaries; missing, stale, or
+execution, and stop/checkpoint/schema-5/fine handoff. Those measurements are enforced
+again at their runtime boundaries; missing, stale, or
 mismatched timing/science evidence remains blocking. The exact cold/warm trace workflow and
 non-overwriting commands are defined in
 [the supervised experiment protocol](docs/supervised-blade-experiment.md#7-科学验收与schema-5时序预算).
@@ -507,7 +508,8 @@ This observer retains coarse and fine point-cloud history across the handoff but
 robot, approval or stop capability. Its ES68+D435i triangles are reloaded from the exact
 active collision manifest and STL files, and every displayed point-cloud source is
 recorded in a disk-backed append-only hash chain. Source or mesh mutation therefore
-blocks publication rather than silently changing the screen. `q`, `Ctrl-C`, a stale map,
+blocks publication rather than silently changing the screen. `q`, `Ctrl-C`, an explicitly
+stale map,
 changed evidence, a failed continuous proof, or any unsupported runtime state
 stops/blocks the run. Passing the
 software doctor still does not constitute the hardware acceptance listed in

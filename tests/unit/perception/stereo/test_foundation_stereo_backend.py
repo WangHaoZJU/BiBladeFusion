@@ -25,6 +25,14 @@ class FakeRuntime:
         return self.disparity
 
 
+def test_prepare_uses_injected_runtime_without_running_inference() -> None:
+    runtime = FakeRuntime(np.ones((2, 2), dtype=np.float32))
+    backend = FoundationStereoBackend(FoundationStereoConfig(device="cpu"), runtime)
+
+    assert backend.prepare() is None
+    assert runtime.calls == []
+
+
 def test_backend_restores_full_resolution_disparity_units_after_scaling() -> None:
     runtime = FakeRuntime(np.ones((4, 6), dtype=np.float32))
     backend = FoundationStereoBackend(

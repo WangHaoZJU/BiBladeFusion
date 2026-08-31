@@ -975,7 +975,10 @@ class OccupancyConfig(BaseModel):
     integration_stride: int = Field(default=2, ge=1, le=16)
     free_space_margin_m: float = Field(default=0.01, ge=0.0, le=0.10)
     obstacle_inflation_m: float = Field(default=0.01, ge=0.0, le=0.20)
-    maximum_map_age_s: float = Field(default=5.0, gt=0.0, le=300.0)
+    # ``None`` makes map authority generation-driven: the last successfully
+    # published stopped capture remains current until a later accepted capture
+    # atomically replaces it.  A finite value is an optional deployment policy.
+    maximum_map_age_s: float | None = Field(default=None, gt=0.0, le=3600.0)
     unknown_policy: Literal["block"] = "block"
     require_robot_self_mask: bool = True
     # Optional hardware-accepted static free volumes solve the otherwise
@@ -1001,6 +1004,7 @@ class OccupancyConfig(BaseModel):
     minimum_stereo_confidence: float = Field(default=0.5, gt=0.0, le=1.0)
     maximum_lr_consistency_error_px: float = Field(default=1.0, gt=0.0, le=10.0)
     minimum_source_views: int = Field(default=3, ge=3, le=10000)
+    maximum_source_views: int = Field(default=3, ge=3, le=10000)
     minimum_free_observations: int = Field(default=3, ge=2, le=10000)
     minimum_free_view_translation_m: float = Field(default=0.02, gt=0.0, le=1.0)
     minimum_free_view_direction_deg: float = Field(default=5.0, gt=0.0, le=180.0)
@@ -1008,6 +1012,10 @@ class OccupancyConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_occupancy_contract(self) -> Self:
+        if self.maximum_source_views < self.minimum_source_views:
+            raise ValueError("maximum_source_views must cover minimum_source_views")
+        if self.maximum_source_views < self.minimum_free_observations:
+            raise ValueError("maximum_source_views must cover minimum_free_observations")
         bounds = (self.workspace_bounds_min_m, self.workspace_bounds_max_m)
         if (bounds[0] is None) != (bounds[1] is None):
             raise ValueError("Occupancy workspace minimum and maximum must be configured together")

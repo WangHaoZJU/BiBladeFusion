@@ -570,6 +570,44 @@ def test_checker_requires_hash_bound_robot_geometry(checker, occupancy_snapshot)
         )
 
 
+def test_publication_time_starts_motion_authorization_without_refreshing_sources(
+    occupancy_snapshot,
+) -> None:
+    published_at = datetime(2026, 8, 28, 0, 9, 58, tzinfo=UTC)
+    evidence = occupancy_evidence_from_snapshot(
+        occupancy_snapshot,
+        now_utc=datetime(2026, 8, 28, 0, 10, 0, tzinfo=UTC),
+        max_age_s=5.0,
+        authorization_started_at_utc=published_at,
+        verified_robot_geometry_hash="9" * 64,
+    )
+
+    assert evidence.source_view_ids == occupancy_snapshot.source_view_ids
+    with pytest.raises(OccupancyEvidenceError, match="stale_or_unusable"):
+        occupancy_evidence_from_snapshot(
+            occupancy_snapshot,
+            now_utc=datetime(2026, 8, 28, 0, 10, 4, tzinfo=UTC),
+            max_age_s=5.0,
+            authorization_started_at_utc=published_at,
+            verified_robot_geometry_hash="9" * 64,
+        )
+
+
+def test_generation_driven_map_has_no_wall_clock_expiry(occupancy_snapshot) -> None:
+    evidence = occupancy_evidence_from_snapshot(
+        occupancy_snapshot,
+        now_utc=datetime(2036, 8, 28, 0, 10, 0, tzinfo=UTC),
+        max_age_s=None,
+        authorization_started_at_utc=datetime(
+            2026, 8, 28, 0, 9, 58, tzinfo=UTC
+        ),
+        required_freshness_horizon_s=600.0,
+        verified_robot_geometry_hash="9" * 64,
+    )
+
+    assert evidence.source_view_ids == occupancy_snapshot.source_view_ids
+
+
 def test_explicit_robot_identity_cannot_override_checker_hash(
     checker, occupancy_snapshot
 ) -> None:

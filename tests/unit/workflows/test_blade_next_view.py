@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+import biblade_fusion.workflows.blade_next_view as blade_next_view_module
 from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
@@ -18,6 +19,7 @@ from biblade_fusion.core.settings import (
     SurfaceQualityConfig,
     ViewFilterConfig,
     ViewPlanningConfig,
+    load_settings,
 )
 from biblade_fusion.devices.robot.base import RobotState
 from biblade_fusion.perception.features import FinComponent
@@ -60,6 +62,56 @@ def test_production_selector_factory_requires_science_authority(tmp_path: Path) 
             reference_coarse_model=tmp_path / "not-read",
             science_authority=None,  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.parametrize(
+    ("experimental", "expected"),
+    ((False, "accepted"), (True, "unaccepted")),
+)
+def test_selector_factory_binds_the_correct_terminal_finalizer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    experimental: bool,
+    expected: str,
+) -> None:
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    (reference / "metadata.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        blade_next_view_module,
+        "read_coarse_model_summary",
+        lambda _path: SimpleNamespace(metadata={"schema_version": 5}),
+    )
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        blade_next_view_module,
+        "finalize_fine_science",
+        lambda state, **_kwargs: calls.append(("accepted", state)) or "accepted",
+    )
+    monkeypatch.setattr(
+        blade_next_view_module,
+        "finalize_unaccepted_fine_science",
+        lambda state, **_kwargs: calls.append(("unaccepted", state)) or "unaccepted",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_init(_self, **kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(BladeCoverageNextViewSelector, "__init__", fake_init)
+
+    BladeCoverageNextViewSelector.from_settings(
+        load_settings("configs/default.yaml"),
+        None,  # type: ignore[arg-type]
+        reference_coarse_model=reference,
+        science_authority=None if experimental else object(),  # type: ignore[arg-type]
+        experimental=experimental,
+    )
+    finalizer = captured["fine_finalizer"]
+
+    assert callable(finalizer)
+    assert finalizer("state") == expected  # type: ignore[operator]
+    assert calls == [(expected, "state")]
 
 
 def _camera_rotation(outward_normal: np.ndarray) -> np.ndarray:
@@ -1550,6 +1602,65 @@ def test_transit_capture_carries_forward_nonempty_verified_coverage(
 
     assert decision.target is not None
     assert decision.surface_generation_id == carried.generation_id
+
+
+def test_fine_target_stays_staged_across_transit_capture(tmp_path: Path) -> None:
+    patches = (
+        _patch(
+            "a_front_surface",
+            BladeSide.FRONT,
+            SurfaceRegion.SURFACE,
+            center=(-0.1, 0.0, 0.01),
+            normal=(0.0, 0.0, 1.0),
+        ),
+        _patch(
+            "b_back_surface",
+            BladeSide.BACK,
+            SurfaceRegion.SURFACE,
+            center=(0.1, 0.0, -0.01),
+            normal=(0.0, 0.0, -1.0),
+        ),
+    )
+    state = _stored_generation(tmp_path, patches)
+    candidates = state.view_plan.candidates
+    factory = _ReachabilityFactory(
+        candidates,
+        joints_by_id={
+            "a_front_surface": np.zeros(6),
+            "b_back_surface": np.ones(6),
+        },
+    )
+    selector = _selector(
+        tmp_path,
+        state,
+        _selection_config(SurfaceRegion.SURFACE),
+        factory=factory,
+        fk_model=_MappedFk(candidates, factory),
+    )
+
+    first = selector.select_next(
+        _observation(
+            state,
+            np.zeros(6),
+            view_id="fine_transition_bootstrap_000",
+            sequence_index=0,
+        ),
+        object(),
+    )
+    transit = selector.select_next(
+        _observation(
+            state,
+            np.ones(6),
+            view_id="transit_a_front_surface_cycle_0001",
+            sequence_index=1,
+        ),
+        object(),
+    )
+
+    assert first.target is not None
+    assert first.target.view_id == "a_front_surface"
+    assert transit == first
+    assert len(factory.seeds) == 1
 
 
 def test_candidate_capture_without_science_successor_fails_closed(

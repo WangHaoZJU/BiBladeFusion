@@ -40,6 +40,7 @@ def test_default_settings_load_safely() -> None:
     assert settings.proxy_model.estimated_thickness_m is None
     assert settings.collision.require_obstacles is False
     assert settings.occupancy.minimum_source_views == 3
+    assert settings.occupancy.maximum_source_views == 3
     assert settings.occupancy.minimum_free_observations == 3
     assert settings.occupancy.minimum_free_view_translation_m == 0.02
     assert settings.occupancy.minimum_free_view_direction_deg == 5.0
@@ -485,11 +486,19 @@ def test_enabled_stop_scan_requires_motion_driver_boundary() -> None:
 def test_free_vote_threshold_is_independent_from_source_view_readiness() -> None:
     config = OccupancyConfig(
         minimum_source_views=5,
+        maximum_source_views=5,
         minimum_free_observations=2,
     )
 
     assert config.minimum_source_views == 5
     assert config.minimum_free_observations == 2
+
+
+def test_occupancy_source_window_must_cover_readiness_and_free_votes() -> None:
+    with pytest.raises(ValidationError, match="cover minimum_source_views"):
+        OccupancyConfig(minimum_source_views=4, maximum_source_views=3)
+    with pytest.raises(ValidationError, match="cover minimum_free_observations"):
+        OccupancyConfig(minimum_free_observations=4, maximum_source_views=3)
 
 
 @pytest.mark.parametrize(

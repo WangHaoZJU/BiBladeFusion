@@ -445,6 +445,28 @@ def test_expired_ready_map_materializes_stale_version(tmp_path: Path) -> None:
     assert stale.content_hash != update.snapshot.content_hash
 
 
+def test_generation_driven_ready_map_does_not_materialize_wall_clock_stale(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    config = _config().model_copy(update={"maximum_map_age_s": None})
+    update = _integrate_views(
+        tmp_path,
+        3,
+        config=config,
+        first_capture=now - timedelta(days=10),
+    )[-1]
+
+    current = mark_snapshot_stale_if_expired(
+        update.snapshot,
+        config,
+        now_utc=now,
+    )
+
+    assert current is update.snapshot
+    assert current.map_state is OccupancyMapState.MAP_READY
+
+
 def test_external_previous_hash_must_match_snapshot_chain(tmp_path: Path) -> None:
     first = _integrate_views(tmp_path, 1)[0]
     second_bundle = _bundle(

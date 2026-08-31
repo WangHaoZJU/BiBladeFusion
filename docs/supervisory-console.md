@@ -40,8 +40,9 @@ uv run bbf supervise replay --snapshot data/supervision/run_001/snapshot_0001
 继续作为可搬运的回放数字资产保存。无论输入占用图或历史预检曾经是什么状态，生成结果始终是
 `viewer_mode=REPLAY`、`system_state=BLOCKED`、`viewer_motion_command_capable=false`。
 
-桥接会使用占用资产中持久化的`OccupancyConfig.maximum_map_age_s`相对于快照时间重新计算
-地图年龄；超过时限就显示为`STALE`，不会把文件中的历史生命周期状态误当作当前可用状态。
+桥接会显示占用图年龄；只有资产显式配置了有限
+`OccupancyConfig.maximum_map_age_s`时才据此重新判定`STALE`。默认`null`时生命周期由publisher
+代际替换决定，不会把墙钟年龄伪装成一次新发布。
 
 占用图只持久化自由/占用整数索引，桥接时按
 `origin + (index + 0.5) * voxel_size`转换为体素中心；不会错误地把体素角点作为障碍位置。

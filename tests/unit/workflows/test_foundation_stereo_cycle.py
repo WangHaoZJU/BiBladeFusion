@@ -185,6 +185,7 @@ def _window_source(
     sequence_index: int,
     monotonic_time_ns: int,
     captured_at_utc: datetime,
+    camera_x_m: float | None = None,
 ) -> _VerifiedSource:
     bundle = _bundle(f"view-{sequence_index}", sequence_index)
     bundle = replace(
@@ -199,6 +200,12 @@ def _window_source(
         stereo_metadata_sha256="1" * 64,
         session_manifest_sha256="2" * 64,
         session_view_metadata_sha256="3" * 64,
+        camera_center_base_m=(
+            0.03 * sequence_index if camera_x_m is None else camera_x_m,
+            0.0,
+            0.0,
+        ),
+        camera_axis_base=(0.0, 0.0, 1.0),
     )
 
 
@@ -228,6 +235,88 @@ def test_source_window_uses_monotonic_capture_gap_not_wall_clock(tmp_path: Path)
     engine._sources = [first]  # noqa: SLF001
 
     assert engine._fresh_rebuild_sources(second) == (first, second)  # noqa: SLF001
+
+
+def test_source_window_retains_frames_older_than_motion_authorization_age(
+    tmp_path: Path,
+) -> None:
+    engine, _ = _capture_engine(tmp_path)
+    now = datetime(2026, 8, 29, tzinfo=UTC)
+    engine._utc_clock = lambda: now  # noqa: SLF001
+    first = _window_source(
+        tmp_path,
+        sequence_index=0,
+        monotonic_time_ns=1_000_000_000,
+        captured_at_utc=now - timedelta(minutes=10),
+    )
+    second = _window_source(
+        tmp_path,
+        sequence_index=1,
+        monotonic_time_ns=2_000_000_000,
+        captured_at_utc=now - timedelta(minutes=5),
+    )
+    engine._sources = [first]  # noqa: SLF001
+
+    assert engine._fresh_rebuild_sources(second) == (first, second)  # noqa: SLF001
+
+
+def test_source_window_is_bounded_to_latest_configured_views(tmp_path: Path) -> None:
+    engine, _ = _capture_engine(tmp_path)
+    now = datetime(2026, 8, 29, tzinfo=UTC)
+    sources = tuple(
+        _window_source(
+            tmp_path,
+            sequence_index=index,
+            monotonic_time_ns=(index + 1) * 1_000_000_000,
+            captured_at_utc=now + timedelta(seconds=index),
+        )
+        for index in range(4)
+    )
+    engine._sources = list(sources[:3])  # noqa: SLF001
+
+    assert engine._fresh_rebuild_sources(sources[3]) == sources[1:]  # noqa: SLF001
+
+
+def test_near_duplicate_capture_replaces_prior_view_without_free_vote(
+    tmp_path: Path,
+) -> None:
+    engine, _ = _capture_engine(tmp_path)
+    now = datetime(2026, 8, 29, tzinfo=UTC)
+    first = _window_source(
+        tmp_path,
+        sequence_index=0,
+        monotonic_time_ns=1_000_000_000,
+        captured_at_utc=now,
+        camera_x_m=0.0,
+    )
+    second = _window_source(
+        tmp_path,
+        sequence_index=1,
+        monotonic_time_ns=2_000_000_000,
+        captured_at_utc=now + timedelta(seconds=1),
+        camera_x_m=0.03,
+    )
+    prior = _window_source(
+        tmp_path,
+        sequence_index=2,
+        monotonic_time_ns=3_000_000_000,
+        captured_at_utc=now + timedelta(seconds=2),
+        camera_x_m=0.06,
+    )
+    replacement = _window_source(
+        tmp_path,
+        sequence_index=3,
+        monotonic_time_ns=4_000_000_000,
+        captured_at_utc=now + timedelta(seconds=3),
+        camera_x_m=0.061,
+    )
+    engine._sources = [first, second, prior]  # noqa: SLF001
+
+    assert engine._fresh_rebuild_sources(replacement) == (  # noqa: SLF001
+        first,
+        second,
+        replacement,
+    )
 
 
 def test_source_window_discards_prefix_after_monotonic_gap(tmp_path: Path) -> None:

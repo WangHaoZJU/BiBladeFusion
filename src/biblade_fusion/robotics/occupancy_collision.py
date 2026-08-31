@@ -558,7 +558,8 @@ def occupancy_evidence_from_snapshot(
     snapshot: OccupancySnapshot,
     *,
     now_utc: datetime,
-    max_age_s: float,
+    max_age_s: float | None,
+    authorization_started_at_utc: datetime | None = None,
     required_freshness_horizon_s: float = 0.0,
     verified_robot_geometry_hash: str | None = None,
     semantic_attestation: OccupancySemanticAttestation | None = None,
@@ -569,7 +570,9 @@ def occupancy_evidence_from_snapshot(
         raise OccupancyEvidenceError("occupancy_snapshot_must_be_concrete_immutable_snapshot")
     if compute_content_hash(snapshot) != snapshot.content_hash:
         raise OccupancyEvidenceError("occupancy_snapshot_content_hash_mismatch")
-    if not math.isfinite(max_age_s) or max_age_s <= 0.0:
+    if max_age_s is not None and (
+        not math.isfinite(max_age_s) or max_age_s <= 0.0
+    ):
         raise OccupancyEvidenceError("occupancy_max_age_must_be_positive")
     if not isinstance(now_utc, datetime) or now_utc.tzinfo is None:
         raise OccupancyEvidenceError("occupancy_check_time_must_be_timezone_aware")
@@ -610,8 +613,24 @@ def occupancy_evidence_from_snapshot(
         )
     try:
         valid_until = now_utc + timedelta(seconds=horizon)
-        usable = bool(snapshot.is_usable_for_preflight(valid_until, max_age_s))
-        stale = bool(snapshot.is_stale(valid_until, max_age_s))
+        if max_age_s is None:
+            # Publication replacement, not wall-clock age, owns lifecycle.
+            stale = _enum_value(snapshot.map_state) == "stale"
+            usable = _enum_value(snapshot.map_state) == "map_ready" and not stale
+        elif authorization_started_at_utc is None:
+            usable = bool(snapshot.is_usable_for_preflight(valid_until, max_age_s))
+            stale = bool(snapshot.is_stale(valid_until, max_age_s))
+        else:
+            if authorization_started_at_utc.tzinfo is None:
+                raise ValueError("authorization start must be timezone-aware")
+            authorization_started = authorization_started_at_utc.astimezone(UTC)
+            authorization_age_s = (valid_until - authorization_started).total_seconds()
+            stale = (
+                _enum_value(snapshot.map_state) == "stale"
+                or authorization_age_s < 0.0
+                or authorization_age_s > max_age_s
+            )
+            usable = _enum_value(snapshot.map_state) == "map_ready" and not stale
     except Exception as exc:  # pragma: no cover - defensive adapter boundary
         raise OccupancyEvidenceError(f"occupancy_lifecycle_query_failed:{exc}") from exc
     if stale or not usable:
@@ -659,7 +678,8 @@ class OccupancyRobotCollisionChecker:
 
     robot_checker: Cs68PinocchioCollisionChecker
     snapshot_provider: OccupancySnapshotProvider
-    maximum_map_age_s: float = 30.0
+    maximum_map_age_s: float | None = None
+    authorization_started_at_utc: datetime | None = None
     additional_clearance_m: float = 0.0
     ignored_geometry_names: tuple[str, ...] = ()
     accepted_static_free_aabbs: tuple[AcceptedStaticFreeAabb, ...] = ()
@@ -680,8 +700,15 @@ class OccupancyRobotCollisionChecker:
     utc_clock: Callable[[], datetime] = field(default=lambda: datetime.now(UTC), repr=False)
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.maximum_map_age_s) or self.maximum_map_age_s <= 0.0:
+        if self.maximum_map_age_s is not None and (
+            not math.isfinite(self.maximum_map_age_s)
+            or self.maximum_map_age_s <= 0.0
+        ):
             raise ValueError("maximum_map_age_s must be finite and positive")
+        if self.authorization_started_at_utc is not None:
+            if self.authorization_started_at_utc.tzinfo is None:
+                raise ValueError("authorization_started_at_utc must be timezone-aware")
+            self.authorization_started_at_utc = self.authorization_started_at_utc.astimezone(UTC)
         if not math.isfinite(self.additional_clearance_m) or self.additional_clearance_m < 0.0:
             raise ValueError("additional_clearance_m must be finite and non-negative")
         if len(set(self.ignored_geometry_names)) != len(self.ignored_geometry_names):
@@ -800,6 +827,11 @@ class OccupancyRobotCollisionChecker:
             "motion_envelope_metadata_sha256": self.motion_envelope_metadata_sha256,
             "accepted_joint_uncertainty_rad": list(self.accepted_joint_uncertainty_rad),
             "maximum_map_age_s": self.maximum_map_age_s,
+            "authorization_started_at_utc": (
+                self.authorization_started_at_utc.isoformat()
+                if self.authorization_started_at_utc is not None
+                else None
+            ),
             "additional_clearance_m": self.additional_clearance_m,
             "ignored_geometry_names": list(self.ignored_geometry_names),
             "accepted_static_free": {
@@ -838,6 +870,7 @@ class OccupancyRobotCollisionChecker:
                 snapshot,
                 now_utc=self.utc_clock(),
                 max_age_s=self.maximum_map_age_s,
+                authorization_started_at_utc=self.authorization_started_at_utc,
                 required_freshness_horizon_s=required_freshness_horizon_s,
                 verified_robot_geometry_hash=self.verified_robot_geometry_hash,
                 semantic_attestation=self.semantic_attestation,
@@ -878,6 +911,7 @@ class OccupancyRobotCollisionChecker:
                 snapshot,
                 now_utc=self.utc_clock(),
                 max_age_s=self.maximum_map_age_s,
+                authorization_started_at_utc=self.authorization_started_at_utc,
                 required_freshness_horizon_s=required_freshness_horizon_s,
                 verified_robot_geometry_hash=self.verified_robot_geometry_hash,
                 semantic_attestation=self.semantic_attestation,
@@ -1019,6 +1053,7 @@ class OccupancyRobotCollisionChecker:
                 snapshot,
                 now_utc=self.utc_clock(),
                 max_age_s=self.maximum_map_age_s,
+                authorization_started_at_utc=self.authorization_started_at_utc,
                 required_freshness_horizon_s=required_freshness_horizon_s,
                 verified_robot_geometry_hash=self.verified_robot_geometry_hash,
                 semantic_attestation=self.semantic_attestation,

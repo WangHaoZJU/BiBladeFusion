@@ -663,9 +663,10 @@ def build_supervisory_replay_snapshot(
         OccupancyMapState.MAP_READY: "READY",
         OccupancyMapState.STALE: "STALE",
     }
+    maximum_age_s = occupancy_config.maximum_map_age_s
     occupancy_state = (
         "STALE"
-        if map_data.is_stale(created, occupancy_config.maximum_map_age_s)
+        if maximum_age_s is not None and map_data.is_stale(created, maximum_age_s)
         else state_by_map[map_data.map_state]
     )
 

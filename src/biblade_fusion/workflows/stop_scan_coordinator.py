@@ -293,10 +293,16 @@ class OccupancyGeneration:
 class OccupancyGenerationPublisher:
     """Atomically publish a generation and forbid replacement while it is frozen."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        utc_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
         self._lock = threading.RLock()
         self._current: OccupancyGeneration | None = None
+        self._published_at_utc: datetime | None = None
         self._frozen_generation_id: str | None = None
+        self._utc_clock = utc_clock
 
     @property
     def current(self) -> OccupancyGeneration:
@@ -322,6 +328,21 @@ class OccupancyGenerationPublisher:
     def current_snapshot(self) -> OccupancySnapshot:
         return self.current.snapshot
 
+    @property
+    def current_published_at_utc(self) -> datetime:
+        """Return when the current generation became visible to motion consumers."""
+
+        with self._lock:
+            if self._current is None or self._published_at_utc is None:
+                raise StopScanBlocked("No verified occupancy generation is published")
+            return self._published_at_utc
+
+    def _publication_time(self) -> datetime:
+        value = self._utc_clock()
+        if value.tzinfo is None:
+            raise StopScanBlocked("Occupancy publication UTC clock must be timezone-aware")
+        return value.astimezone(UTC)
+
     def publish(
         self,
         generation: OccupancyGeneration,
@@ -342,7 +363,9 @@ class OccupancyGenerationPublisher:
                 raise StopScanBlocked(
                     "Occupancy generation failed disk-authority readback before publish"
                 ) from exc
+            published_at_utc = self._publication_time()
             self._current = authoritative
+            self._published_at_utc = published_at_utc
 
     def publish_after_acceptance(
         self,
@@ -375,8 +398,10 @@ class OccupancyGenerationPublisher:
                     "Occupancy generation failed disk-authority readback before acceptance"
                 ) from exc
             before_publish("after_generation_disk_readback")
+            published_at_utc = self._publication_time()
             accept()
             self._current = authoritative
+            self._published_at_utc = published_at_utc
 
     @contextmanager
     def freeze(
@@ -923,6 +948,7 @@ class GuardedSegmentSafetyFactory:
             self._collision_checker,
             self._publisher.current_snapshot,
             maximum_map_age_s=self._occupancy_config.maximum_map_age_s,
+            authorization_started_at_utc=self._publisher.current_published_at_utc,
             additional_clearance_m=(
                 self._occupancy_config.obstacle_inflation_m
                 + self._collision_checker.minimum_clearance_m
@@ -1300,13 +1326,7 @@ class StopScanCoordinator:
                         "source_view_count": len(snapshot.source_view_ids),
                         "generation_id": generation.generation_id,
                     }
-                elif (
-                    snapshot.map_state is OccupancyMapState.MAP_READY
-                    and snapshot.is_usable_for_preflight(
-                        self._aware_utc_now(),
-                        self._occupancy_config.maximum_map_age_s,
-                    )
-                ):
+                elif snapshot.map_state is OccupancyMapState.MAP_READY:
                     next_phase = StopScanPhase.MAP_READY
                     next_event = "map_ready"
                     next_blocking_reasons = ()
@@ -2241,7 +2261,15 @@ class StopScanCoordinator:
         bound = self._config.maximum_segment_joint_delta_rad
         if bound is None or not math.isfinite(bound) or bound <= 0.0:
             raise StopScanBlocked("Short-segment joint bound is unavailable")
-        scale = 1.0 if maximum_delta <= 1e-12 else min(1.0, bound / maximum_delta)
+        # Split the remaining route into equal bounded legs.  Taking one full-size
+        # leg first can leave an arbitrarily tiny final leg, whose mandatory
+        # capture is not an independent occupancy viewpoint.
+        segment_count = (
+            1
+            if maximum_delta <= 1e-12
+            else max(1, math.ceil(maximum_delta / bound - 1e-12))
+        )
+        scale = 1.0 / segment_count
         goal = start + scale * delta
         final_target = bool(scale >= 1.0 - 1e-12)
         capture_view_id = (

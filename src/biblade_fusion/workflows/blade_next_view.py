@@ -1,7 +1,7 @@
 """Coverage-first next-view selection for the bilateral single-fin blade.
 
 Scientific completion is derived only from an immutable fine-coverage generation.
-The short-lived occupancy generation is intentionally not part of scoring; it is
+The rolling safety-occupancy generation is intentionally not part of scoring; it is
 consumed later by the segment safety preflight.  Rectified camera poses drive image
 geometry while raw left-IR poses remain the robot IK target.
 """
@@ -300,6 +300,7 @@ class BladeCoverageNextViewSelector:
         self._last_cycle_key: tuple[str, int] | None = None
         self._last_surface_root: Path | None = None
         self._last_surface_generation_id: str | None = None
+        self._pending_selection: NextViewSelection | None = None
 
         if reachability_factory is None:
             model_path = self._kinematics_config.model_path
@@ -394,21 +395,25 @@ class BladeCoverageNextViewSelector:
             expected_reference_root=reference_root,
             expected_reference_sha256=reference_sha256,
             fine_finalizer=(
-                lambda state: finalize_unaccepted_fine_science(
-                    state,
-                    fusion_config=settings.multi_view_fusion,
-                    tsdf_config=settings.tsdf,
-                    surface_quality_config=settings.surface_quality,
-                    finalization_config=settings.fine_finalization,
+                (
+                    lambda state: finalize_unaccepted_fine_science(
+                        state,
+                        fusion_config=settings.multi_view_fusion,
+                        tsdf_config=settings.tsdf,
+                        surface_quality_config=settings.surface_quality,
+                        finalization_config=settings.fine_finalization,
+                    )
                 )
                 if experimental
-                else lambda state: finalize_fine_science(
-                    state,
-                    fusion_config=settings.multi_view_fusion,
-                    tsdf_config=settings.tsdf,
-                    surface_quality_config=settings.surface_quality,
-                    finalization_config=settings.fine_finalization,
-                    science_authority=science_authority,  # type: ignore[arg-type]
+                else (
+                    lambda state: finalize_fine_science(
+                        state,
+                        fusion_config=settings.multi_view_fusion,
+                        tsdf_config=settings.tsdf,
+                        surface_quality_config=settings.surface_quality,
+                        finalization_config=settings.fine_finalization,
+                        science_authority=science_authority,  # type: ignore[arg-type]
+                    )
                 )
             ),
             fusion_config=settings.multi_view_fusion,
@@ -819,8 +824,26 @@ class BladeCoverageNextViewSelector:
             raise BladePlanningAssetError(
                 "Fine-quality report does not match the fixed surface reference"
             )
+        previous_cycle_key = self._last_cycle_key
+        cycle_key = (
+            str(observation.bundle.view_id),
+            int(observation.bundle.sequence_index),
+        )
         self._validate_cycle_continuity(observation, state)
+        is_new_cycle = previous_cycle_key is not None and cycle_key != previous_cycle_key
+        is_transit_successor = (
+            is_new_cycle and observation.reconstructed_view_path is None
+        )
+        if is_new_cycle and observation.reconstructed_view_path is not None:
+            # Release an endpoint only after its exact CANDIDATE reconstruction
+            # and coverage successor became authoritative.
+            self._pending_selection = None
         self._record_cycle_binding(observation, state)
+        if is_transit_successor and self._pending_selection is not None:
+            # A split route may contain several safety-only captures.  Keep the
+            # scientific endpoint stable instead of reranking from each new
+            # intermediate IK seed.
+            return self._pending_selection
         incomplete_patch_ids = tuple(
             patch_id
             for patch_id in required_patch_ids
@@ -835,6 +858,7 @@ class BladeCoverageNextViewSelector:
             f"fine_observations={len(state.ledger.observation_ids)}",
         )
         if not incomplete_patch_ids:
+            self._pending_selection = None
             if self._fine_finalizer is None:
                 raise BladePlanningAssetError(
                     "Fine coverage passed, but no terminal reconstruction finalizer "
@@ -994,7 +1018,7 @@ class BladeCoverageNextViewSelector:
             ),
         )
         selected_quality = quality_by_id[selected.candidate.patch.patch_id]
-        return NextViewSelection(
+        selection = NextViewSelection(
             next_view_target_from_candidate(selected, self._hand_eye),
             state.generation_id,
             reference_sha256,
@@ -1013,3 +1037,5 @@ class BladeCoverageNextViewSelector:
                 "occupancy is reserved exclusively for downstream segment safety",
             ),
         )
+        self._pending_selection = selection
+        return selection

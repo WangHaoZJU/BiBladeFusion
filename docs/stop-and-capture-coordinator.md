@@ -191,31 +191,30 @@ publisher或感知提交返回。如果stop在线性化点之后、事务提交�
 不可变资产可以完成接受，但本次运行仍转为`ABORTED`。这一区分的是“运行中止”与“已接受
 数字资产回滚”，不能为了迎合运行状态而删除或篡改已经提交的证据。
 
-## 5. 滑动新鲜窗口与全量重建
+## 5. 源帧保留与generation替换
 
-每获得一帧新的FoundationStereo资产，周期引擎按当前UTC时间过滤来源，仅保留采集时间位于
+每获得一帧新的FoundationStereo资产，周期引擎维护最多
+`occupancy.maximum_source_views`帧的滚动来源窗口，并从`previous_snapshot=None`开始按时间
+顺序重新积分。与当前帧不满足独立视角门槛的旧帧会被当前帧替换，不能重复贡献`FREE`票；若配置了
+`stop_and_capture.maximum_operator_reposition_interval_s`，相邻采集间隔超过该值时才丢弃
+此前的前缀。`occupancy.maximum_map_age_s`不再用于删除源帧。
 
-```text
-[now - occupancy.maximum_map_age_s, now]
-```
+新占用generation只有在来源事务和完整语义验证都成功后才原子发布；失败时已发布generation
+保持不变。默认`occupancy.maximum_map_age_s=null`，当前generation不按墙钟过期，只在下一次
+成功采集、提交并发布后被替换；部署方显式配置有限TTL时，超时只阻止运动，不删除证据。这样保证：
 
-内的视图。随后从`previous_snapshot=None`开始，按时间顺序重新积分整个新鲜来源窗口，而非
-在上一张历史地图末尾无限追加。这样有三个作用：
-
-- 过期的`FREE`证据不能被一帧新图伪装成重新新鲜；
+- 人工引导的三个启动视角不会在推理过程中被墙钟时间删除；
 - 每次发布的地图都是具有完整来源链的新一代不可变资产；
-- 预检、批准和执行可以绑定同一个明确的地图generation。
+- 预检、批准和执行绑定同一个明确generation；失败的新帧不能提前撤销当前generation。
 
 新的占用资产写完后，系统通过完整语义读取器重新验证原始session、用户双目标定、
 FoundationStereo来源与配置、手眼标定、ES68 FK、机器人深度渲染、自遮罩和体素积分。只有
 得到`full_semantic_verified_for_motion_preflight`的`StoredOccupancyMapping`才可构造
 `OccupancyGeneration`。
 
-默认`maximum_map_age_s=5.0`只是软件起始值，不是本设备的实验结论。三个操作员引导视角、
-FoundationStereo推理、占用重放、预检、人工确认和短段执行很可能超过5秒，使最早视图在
-地图达到`MAP_READY`前已经过期。必须在GPU、相机、ES68和最终工作站上测量最坏周期时间，
-再给出有实验依据的地图年龄；既不能因默认5秒频繁阻断就随意放大，也不能篡改采集时间制造
-“新鲜”证据。
+有限`maximum_map_age_s`是可选部署策略，不是软件默认寿命；一旦配置，必须来自设备实验，且从
+generation原子发布时间起算。默认的代际驱动策略仍会在每次授权、执行和freeze边界重验当前
+publisher绑定，不能把旧generation跨越一次成功的新发布继续使用。
 
 ## 6. 下一视点与短段运动
 

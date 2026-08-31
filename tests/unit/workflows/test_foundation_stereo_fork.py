@@ -180,7 +180,7 @@ def test_fine_fork_rejects_changed_committed_source_hash(
         )
 
 
-def test_fine_fork_reverifies_but_drops_expired_sources_for_fresh_rebootstrap(
+def test_fine_fork_reverifies_and_retains_committed_sources_until_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -233,5 +233,66 @@ def test_fine_fork_reverifies_but_drops_expired_sources_for_fresh_rebootstrap(
         output_root=tmp_path / "fine",
     )
 
-    assert forked._sources == []
+    assert forked._sources == [source]
     assert verified == [(stereo.resolve(), session.resolve())]
+
+
+def test_production_fine_fork_replaces_latest_coarse_view_with_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coarse, fine = _settings_pair()
+    engine = _empty_engine(coarse)
+    session = tmp_path / "session"
+    stereo = tmp_path / "stereo"
+    session.mkdir()
+    stereo.mkdir()
+    sources = [
+        SimpleNamespace(
+            captured=SimpleNamespace(raw_session_path=session, bundle=object()),
+            stereo_path=stereo,
+            stereo_metadata_sha256="a" * 64,
+            session_manifest_sha256="b" * 64,
+            session_view_metadata_sha256="c" * 64,
+        )
+        for _ in range(3)
+    ]
+    engine._sources = sources
+    hashes = {
+        (stereo / "metadata.json").resolve(): "a" * 64,
+        (session / "manifest.json").resolve(): "b" * 64,
+    }
+    monkeypatch.setattr(
+        cycle_module,
+        "_sha256",
+        lambda path: hashes[Path(path).resolve()],
+    )
+    monkeypatch.setattr(
+        cycle_module,
+        "_single_view_metadata_hash",
+        lambda *_args: "c" * 64,
+    )
+    monkeypatch.setattr(
+        cycle_module,
+        "read_stereo_inference",
+        lambda path: SimpleNamespace(root=Path(path).resolve()),
+    )
+    monkeypatch.setattr(
+        cycle_module,
+        "verify_stereo_inference_source",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def fake_init(forked, **_kwargs) -> None:
+        forked._sources = []
+
+    monkeypatch.setattr(FoundationStereoOccupancyCycleEngine, "__init__", fake_init)
+
+    forked = engine.fork_for_fine_science(
+        settings=fine,
+        reference_coarse_model=tmp_path / "reference",
+        output_root=tmp_path / "fine",
+        replace_latest_source_on_first_capture=True,
+    )
+
+    assert forked._sources == sources[:-1]

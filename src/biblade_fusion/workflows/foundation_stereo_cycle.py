@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import threading
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
@@ -19,6 +20,7 @@ import numpy as np
 
 from biblade_fusion.acquisition import SynchronizedAcquirer, SynchronizedFrameBundle
 from biblade_fusion.calibration import HandEyeCalibration
+from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     AcquisitionConfig,
     AppSettings,
@@ -93,6 +95,8 @@ class _VerifiedSource:
     stereo_metadata_sha256: str
     session_manifest_sha256: str
     session_view_metadata_sha256: str
+    camera_center_base_m: tuple[float, float, float]
+    camera_axis_base: tuple[float, float, float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +272,7 @@ class FoundationStereoOccupancyCycleEngine:
         settings: AppSettings,
         reference_coarse_model: str | Path,
         output_root: str | Path,
+        replace_latest_source_on_first_capture: bool = False,
     ) -> FoundationStereoOccupancyCycleEngine:
         """Create a fine-science engine from this engine's committed source window.
 
@@ -310,9 +315,15 @@ class FoundationStereoOccupancyCycleEngine:
             raise FoundationStereoCycleError(
                 "Cannot fork fine science before a committed coarse source exists"
             )
-        now = self._aware_utc_now()
-        oldest = now - timedelta(seconds=self._settings.occupancy.maximum_map_age_s)
-        fresh_sources: list[_VerifiedSource] = []
+        if (
+            replace_latest_source_on_first_capture
+            and len(sources) < settings.occupancy.minimum_source_views
+        ):
+            raise FoundationStereoCycleError(
+                "Fine transition cannot replace the latest source before a MAP_READY "
+                "coarse source window exists"
+            )
+        verified_sources: list[_VerifiedSource] = []
         for source in sources:
             if (
                 _sha256(source.stereo_path / "metadata.json") != source.stereo_metadata_sha256
@@ -332,8 +343,7 @@ class FoundationStereoOccupancyCycleEngine:
                 stored,
                 expected_session=source.captured.raw_session_path,
             )
-            if oldest <= source.captured.captured_at_utc <= now:
-                fresh_sources.append(source)
+            verified_sources.append(source)
 
         forked = type(self)(
             settings=settings,
@@ -351,13 +361,18 @@ class FoundationStereoOccupancyCycleEngine:
         )
         # The source records are immutable value/evidence bindings.  Copying the
         # list prevents either engine from mutating the other's source window.
-        # An expensive schema-5 build may legitimately outlive the occupancy
-        # freshness horizon.  Immutable coarse sources are still reverified above,
-        # but expired frames are not migrated into the fine safety map.  The fine
-        # coordinator starts in BOOTSTRAP_MAP_REQUIRED and gathers new explicitly
-        # stopped sources until MAP_READY instead of turning elapsed compute time
-        # into an unrecoverable handoff failure.
-        forked._sources = fresh_sources
+        # Source retention is generation-driven, not tied to the motion-authorization
+        # clock.  The fine coordinator atomically replaces this source generation
+        # only after a later perception cycle is accepted.
+        # Production fine activation immediately captures the still-stopped coarse
+        # endpoint again to create fine coverage generation zero.  Omit that exact
+        # preceding viewpoint so the replacement frame is not rejected as a
+        # geometrically duplicate occupancy source.
+        forked._sources = (
+            verified_sources[:-1]
+            if replace_latest_source_on_first_capture
+            else verified_sources
+        )
         return forked
 
     def capture(
@@ -528,6 +543,7 @@ class FoundationStereoOccupancyCycleEngine:
                     captured.raw_session_path,
                     captured.bundle,
                 ),
+                **self._camera_view_evidence(captured, stored_stereo.observation),
             )
             candidates = self._fresh_rebuild_sources(source)
             updates = self._rebuild_updates(candidates)
@@ -1026,41 +1042,79 @@ class FoundationStereoOccupancyCycleEngine:
         self._clear_pending_sampler(sampler)
 
     def _fresh_rebuild_sources(self, current: _VerifiedSource) -> tuple[_VerifiedSource, ...]:
-        now = self._aware_utc_now()
-        oldest = now - timedelta(seconds=self._settings.occupancy.maximum_map_age_s)
-        age_eligible = tuple(
-            item
-            for item in (*self._sources, current)
-            if oldest <= item.captured.captured_at_utc <= now
-        )
-        if not age_eligible or age_eligible[-1] is not current:
-            raise FoundationStereoCycleError(
-                "Current FoundationStereo frame expired before map rebuild"
-            )
+        retained = (*self._sources, current)
         maximum_gap_s = (
             self._settings.stop_and_capture.maximum_operator_reposition_interval_s
         )
-        if maximum_gap_s is None:
-            return age_eligible
         suffix_start = 0
-        previous_monotonic_ns = (
-            age_eligible[0].captured.bundle.stereo.monotonic_time_ns
-        )
-        maximum_gap_ns = maximum_gap_s * 1e9
-        for index, source in enumerate(age_eligible[1:], start=1):
+        previous_monotonic_ns = retained[0].captured.bundle.stereo.monotonic_time_ns
+        maximum_gap_ns = maximum_gap_s * 1e9 if maximum_gap_s is not None else None
+        for index, source in enumerate(retained[1:], start=1):
             captured_monotonic_ns = source.captured.bundle.stereo.monotonic_time_ns
             gap_ns = captured_monotonic_ns - previous_monotonic_ns
             if gap_ns <= 0:
                 raise FoundationStereoCycleError(
                     "Committed source monotonic capture timestamps did not advance"
                 )
-            if gap_ns > maximum_gap_ns:
+            if maximum_gap_ns is not None and gap_ns > maximum_gap_ns:
                 # The earlier safety window is no longer accepted evidence.  Rebuild
                 # only from the continuous tail, which returns the map to MAPPING
                 # until the configured independent-view count is reacquired.
                 suffix_start = index
             previous_monotonic_ns = captured_monotonic_ns
-        return age_eligible[suffix_start:]
+        continuous = retained[suffix_start:]
+        # A short segment can end too close to its preceding stopped frame to add
+        # an independent FREE vote.  Replace conflicting older viewpoints instead
+        # of rejecting the whole mandatory capture or counting duplicate evidence.
+        independent = tuple(
+            source
+            for source in continuous[:-1]
+            if self._views_are_independent(source, current)
+        )
+        refreshed = (*independent, current)
+        return refreshed[-self._settings.occupancy.maximum_source_views :]
+
+    def _camera_view_evidence(
+        self,
+        captured: CapturedStopScanView,
+        stereo: StereoInferenceObservation,
+    ) -> dict[str, tuple[float, float, float]]:
+        joints = captured.bundle.selected_robot_state.joint_positions_rad
+        base_t_flange = PoseSE3(
+            "base",
+            "flange",
+            self._renderer.base_t_flange_matrix(joints),
+        )
+        flange_t_left_ir = self._hand_eye.require_flange_primary()
+        base_t_camera = base_t_flange.compose(flange_t_left_ir).compose(
+            stereo.rectified.calibration.left_rectified_t_left_ir.inverse()
+        )
+        return {
+            "camera_center_base_m": tuple(
+                float(value) for value in base_t_camera.translation_m
+            ),
+            "camera_axis_base": tuple(
+                float(value) for value in base_t_camera.rotation[:, 2]
+            ),
+        }
+
+    def _views_are_independent(
+        self,
+        existing: _VerifiedSource,
+        current: _VerifiedSource,
+    ) -> bool:
+        existing_center = np.asarray(existing.camera_center_base_m, dtype=np.float64)
+        current_center = np.asarray(current.camera_center_base_m, dtype=np.float64)
+        translation_m = float(np.linalg.norm(current_center - existing_center))
+        existing_axis = np.asarray(existing.camera_axis_base, dtype=np.float64)
+        current_axis = np.asarray(current.camera_axis_base, dtype=np.float64)
+        cosine = float(np.clip(np.dot(current_axis, existing_axis), -1.0, 1.0))
+        direction_deg = math.degrees(math.acos(cosine))
+        config = self._settings.occupancy
+        return (
+            translation_m >= config.minimum_free_view_translation_m
+            or direction_deg >= config.minimum_free_view_direction_deg
+        )
 
     def _rebuild_updates(
         self,

@@ -67,7 +67,11 @@ def test_supervised_scan_preparation_commands_are_exposed() -> None:
 
 
 def test_motion_envelope_commissioning_command_is_exposed() -> None:
-    result = runner.invoke(app, ["commission", "motion-envelope-trial", "--help"])
+    result = runner.invoke(
+        app,
+        ["commission", "motion-envelope-trial", "--help"],
+        env={"COLUMNS": "160"},
+    )
 
     assert result.exit_code == 0
     assert "--candidate" in result.stdout

@@ -836,6 +836,29 @@ def test_bootstrap_then_one_short_segment_requires_new_capture(
     assert len(perception.committed) == 4
 
 
+def test_short_route_is_evenly_split_without_a_tiny_final_capture(
+    tmp_path: Path,
+) -> None:
+    target = NextViewTarget(
+        "fine-front-just-over-bound",
+        (0.051, 0.0, 0.0, 0.0, 0.0, 0.0),
+        tuple(tuple(float(value) for value in row) for row in np.eye(4)),
+    )
+    coordinator, *_ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=target,
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+
+    prepared = coordinator.prepare_next_segment()
+
+    assert prepared is not None
+    assert prepared.proposal.final_target is False
+    assert prepared.proposal.goal_joint_positions_rad[0] == pytest.approx(0.0255)
+
+
 def test_exact_approval_is_persisted_once_before_motion(tmp_path: Path) -> None:
     class RecordingSink:
         def __init__(self) -> None:

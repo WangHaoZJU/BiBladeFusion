@@ -448,6 +448,11 @@ class FoundationStereoBackend:
             self._runtime = _OfficialFoundationStereoRuntime(self._config)
         return self._runtime
 
+    def prepare(self) -> None:
+        """Load and validate the pinned model before a physical capture starts."""
+
+        self._get_runtime()
+
     def infer(
         self,
         left_rectified: NDArray[np.uint8],
