@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError, dataclass, field, replace
 import numpy as np
 import pytest
 
+import biblade_fusion.robotics.stationarity as stationarity_module
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.devices.robot.base import RobotState
 from biblade_fusion.robotics.stationarity import (
@@ -534,6 +535,59 @@ def test_trace_rejects_slow_cumulative_drift_from_reference() -> None:
             max_tcp_translation_delta_m=0.001,
             max_tcp_rotation_delta_rad=0.001,
         )
+
+
+def test_long_repeated_kinematic_trace_avoids_pairwise_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = stationarity_module._state_deltas
+
+    def counted(reference: RobotState, current: RobotState):
+        nonlocal calls
+        calls += 1
+        return original(reference, current)
+
+    monkeypatch.setattr(stationarity_module, "_state_deltas", counted)
+    trace = [_state(index * 0.05) for index in range(1, 7201)]
+
+    evidence = validate_stationary_trace(
+        _state(0.0),
+        trace,
+        max_joint_delta_rad=0.001,
+        max_tcp_translation_delta_m=0.001,
+        max_tcp_rotation_delta_rad=0.001,
+        maximum_robot_state_staleness_s=0.25,
+    )
+
+    assert calls == 0
+    assert evidence.sample_count == 7201
+    assert evidence.duration_s == pytest.approx(360.0)
+    assert evidence.max_sample_gap_s == pytest.approx(0.05)
+
+
+def test_trace_rejects_feedback_gap_before_pairwise_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        stationarity_module,
+        "_state_deltas",
+        lambda *_args: pytest.fail("pairwise motion validation must not precede freshness"),
+    )
+
+    with pytest.raises(StationarityError, match="sample gap") as raised:
+        validate_stationary_trace(
+            _state(0.0),
+            [_state(0.3), _state(0.35)],
+            max_joint_delta_rad=0.001,
+            max_tcp_translation_delta_m=0.001,
+            max_tcp_rotation_delta_rad=0.001,
+            maximum_robot_state_staleness_s=0.25,
+        )
+
+    assert "local=0.3 s" in str(raised.value)
+    assert "host=0.3 s" in str(raised.value)
+    assert "controller=0.3 s" in str(raised.value)
 
 
 def test_trace_rejects_sampled_out_and_return_motion() -> None:

@@ -115,6 +115,21 @@ class FakeStateSource:
         return _state(self.timestamp)
 
 
+class SignallingStateSource(FakeStateSource):
+    def __init__(self, required_reads: int = 3) -> None:
+        super().__init__()
+        self.required_reads = required_reads
+        self.read_count = 0
+        self.ready = threading.Event()
+
+    def read_state(self) -> RobotState:
+        self.read_count += 1
+        state = super().read_state()
+        if self.read_count >= self.required_reads:
+            self.ready.set()
+        return state
+
+
 class UnusedRenderer:
     model_content_hash = "1" * 64
     self_mask_excluded_link_names: tuple[str, ...] = ()
@@ -177,6 +192,63 @@ def _capture_engine(
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_robot_state_sampler_uses_and_restores_fifo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, int, int]] = []
+    monkeypatch.setattr(cycle_module.os, "sched_get_priority_max", lambda _policy: 99)
+    monkeypatch.setattr(cycle_module.os, "sched_getscheduler", lambda _pid: 0)
+    monkeypatch.setattr(
+        cycle_module.os,
+        "sched_getparam",
+        lambda _pid: cycle_module.os.sched_param(0),
+    )
+    monkeypatch.setattr(
+        cycle_module.os,
+        "sched_setscheduler",
+        lambda pid, policy, parameter: calls.append(
+            (pid, policy, parameter.sched_priority)
+        ),
+    )
+    source = SignallingStateSource()
+    sampler = cycle_module._RobotStateSampler(source, 0.001, prefer_fifo=True)
+
+    sampler.start()
+    assert source.ready.wait(timeout=1.0)
+    trace = sampler.finish()
+
+    assert len(trace) >= 3
+    assert calls == [
+        (0, cycle_module.os.SCHED_FIFO, 10),
+        (0, 0, 0),
+    ]
+
+
+def test_robot_state_sampler_retains_fail_closed_trace_when_fifo_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cycle_module.os, "sched_get_priority_max", lambda _policy: 99)
+    monkeypatch.setattr(cycle_module.os, "sched_getscheduler", lambda _pid: 0)
+    monkeypatch.setattr(
+        cycle_module.os,
+        "sched_getparam",
+        lambda _pid: cycle_module.os.sched_param(0),
+    )
+
+    def deny(*_args, **_kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(cycle_module.os, "sched_setscheduler", deny)
+    source = SignallingStateSource()
+    sampler = cycle_module._RobotStateSampler(source, 0.001, prefer_fifo=True)
+
+    sampler.start()
+    assert source.ready.wait(timeout=1.0)
+    trace = sampler.finish()
+
+    assert len(trace) >= 3
 
 
 def _window_source(

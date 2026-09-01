@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pytest
 
+import biblade_fusion.mapping.robot_depth_renderer as renderer_module
 from biblade_fusion.devices.depth_camera import CameraIntrinsics
 from biblade_fusion.mapping.robot_depth_renderer import (
     _clip_triangle_to_near_plane,
@@ -70,8 +74,13 @@ def test_self_mask_mesh_loader_can_exclude_camera_attachment() -> None:
     assert {mesh.link_name for mesh in meshes} == {spec.link_name for spec in template.links}
 
 
-def test_open3d_raycast_depth_uses_camera_z_parameter() -> None:
+def test_open3d_raycast_depth_uses_camera_z_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     pytest.importorskip("open3d")
+    sleeps: list[float] = []
+    monkeypatch.setattr(renderer_module, "_OPEN3D_RAYCAST_ROW_BATCH", 8)
+    monkeypatch.setattr(renderer_module.time, "sleep", sleeps.append)
     vertices = np.array([[-0.4, -0.4, 1.0], [0.4, -0.4, 1.0], [0.0, 0.4, 1.0]])
     faces = np.array([[0, 1, 2]], dtype=np.int64)
 
@@ -79,3 +88,38 @@ def test_open3d_raycast_depth_uses_camera_z_parameter() -> None:
 
     assert np.isclose(depth[10, 10], 1.0, atol=1e-6)
     assert np.isinf(depth[0, 0])
+    assert sleeps == [0, 0]
+
+
+def test_large_open3d_raycast_does_not_starve_the_parent_interpreter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("open3d")
+    monkeypatch.setattr(renderer_module, "_OPEN3D_ISOLATED_RAYCAST_MIN_PIXELS", 1)
+    vertices = np.array([[-0.4, -0.4, 1.0], [0.4, -0.4, 1.0], [0.0, 0.4, 1.0]])
+    faces = np.array([[0, 1, 2]], dtype=np.int64)
+    stop = threading.Event()
+    stamps = [time.monotonic()]
+
+    def watchdog() -> None:
+        while not stop.wait(0.01):
+            stamps.append(time.monotonic())
+
+    worker = threading.Thread(target=watchdog, daemon=True)
+    worker.start()
+    try:
+        depth = _raycast_triangle_meshes_depth(
+            ((vertices, faces),),
+            CameraIntrinsics(320, 240, 200.0, 200.0, 160.0, 120.0, "none", ()),
+        )
+    finally:
+        stop.set()
+        worker.join()
+        stamps.append(time.monotonic())
+
+    gaps = [
+        right - left
+        for left, right in zip(stamps, stamps[1:], strict=False)
+    ]
+    assert max(gaps) < 0.25
+    assert np.isclose(depth[120, 160], 1.0, atol=1e-6)

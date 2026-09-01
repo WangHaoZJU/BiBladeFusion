@@ -223,6 +223,14 @@ def _state_deltas(
     )
 
 
+def _kinematic_state_key(state: RobotState) -> tuple[bytes, bytes]:
+    """Return an exact key for motion-relevant state, excluding timestamps."""
+
+    joints = np.ascontiguousarray(state.joint_positions_rad, dtype=np.float64)
+    pose = np.ascontiguousarray(state.base_t_tcp.matrix, dtype=np.float64)
+    return joints.tobytes(), pose.tobytes()
+
+
 def _maximum_trace_deltas(
     states: Sequence[RobotState],
 ) -> tuple[float, float, float]:
@@ -284,17 +292,17 @@ def _validate_feedback_freshness(
         controller_time = float(state.controller_time_s)
         host_time = state.monotonic_time_ns / 1e9
         controller_step_s = controller_time - previous_controller
-        sample_gap_s = max(
-            local_time - previous_local,
-            host_time - previous_host,
-            controller_step_s,
-        )
+        local_gap_s = local_time - previous_local
+        host_gap_s = host_time - previous_host
+        sample_gap_s = max(local_gap_s, host_gap_s, controller_step_s)
         maximum_sample_gap_s = max(maximum_sample_gap_s, sample_gap_s)
         if sample_gap_s > maximum_staleness_s:
             raise StationarityError(
                 "robot feedback monotonic sample gap at sample "
                 f"{index} is {sample_gap_s:.9g} s, exceeding "
-                f"{maximum_staleness_s:.9g} s"
+                f"{maximum_staleness_s:.9g} s "
+                f"(local={local_gap_s:.9g} s, host={host_gap_s:.9g} s, "
+                f"controller={controller_step_s:.9g} s)"
             )
         local_elapsed = local_time - local_start
         host_elapsed = host_time - host_start
@@ -944,18 +952,31 @@ def validate_stationary_trace(
     )
 
     previous = reference
-    accepted_states: list[RobotState] = [reference]
-    maximum_deltas = (0.0, 0.0, 0.0)
     for index, current in enumerate(samples, start=1):
         if not isinstance(current, RobotState):
             raise StationarityError(f"stationary trace sample {index} is not a RobotState")
         _validate_state_contract(current)
         _require_nondecreasing_state_time(previous, current)
-        # Only pairs ending at ``current`` are new.  Updating the running maxima
-        # preserves the exact full-window criterion without recomputing every
-        # earlier pair for every sample (O(n^2), rather than O(n^3)).
+        previous = current
+
+    max_sample_gap_s = _validate_feedback_freshness(
+        (reference, *samples),
+        maximum_staleness_s=maximum_staleness,
+    )
+
+    # Repeated controller samples usually differ only by timestamp.  Comparing one
+    # representative of each exact kinematic state preserves every pairwise motion
+    # delta while keeping a long stopped trace linear in the common case.
+    accepted_states: dict[tuple[bytes, bytes], RobotState] = {
+        _kinematic_state_key(reference): reference
+    }
+    maximum_deltas = (0.0, 0.0, 0.0)
+    for index, current in enumerate(samples, start=1):
+        key = _kinematic_state_key(current)
+        if key in accepted_states:
+            continue
         current_deltas = (0.0, 0.0, 0.0)
-        for earlier in accepted_states:
+        for earlier in accepted_states.values():
             pair = _state_deltas(earlier, current)
             current_deltas = tuple(
                 max(old, new) for old, new in zip(current_deltas, pair, strict=True)
@@ -970,13 +991,7 @@ def validate_stationary_trace(
                 f"tcp_translation={maximum_deltas[1]:.9g} m, "
                 f"tcp_rotation={maximum_deltas[2]:.9g} rad"
             )
-        accepted_states.append(current)
-        previous = current
-
-    max_sample_gap_s = _validate_feedback_freshness(
-        (reference, *samples),
-        maximum_staleness_s=maximum_staleness,
-    )
+        accepted_states[key] = current
 
     final_state = samples[-1]
     duration_s = (final_state.monotonic_time_ns - reference.monotonic_time_ns) / 1e9

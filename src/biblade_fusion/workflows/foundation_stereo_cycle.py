@@ -74,6 +74,9 @@ class FoundationStereoCycleError(RuntimeError):
     """A stopped FoundationStereo asset transaction could not be committed."""
 
 
+_ROBOT_STATE_SAMPLER_FIFO_PRIORITY = 10
+
+
 class CoarseSciencePreparer(Protocol):
     """Prepare one coarse wrapper inside the current stopped transaction."""
 
@@ -396,6 +399,7 @@ class FoundationStereoOccupancyCycleEngine:
         sampler = _RobotStateSampler(
             self._state_source,
             self._settings.stop_and_capture.settle_poll_period_s,
+            prefer_fifo=self._settings.stop_and_capture.enabled,
         )
         with self._pending_lock:
             if self._poisoned_reason is not None:
@@ -1206,9 +1210,16 @@ def _safe_name(value: str) -> str:
 class _RobotStateSampler:
     """Read-only trace spanning exposure, inference, and occupancy reconstruction."""
 
-    def __init__(self, source: RobotStateSource, poll_period_s: float) -> None:
+    def __init__(
+        self,
+        source: RobotStateSource,
+        poll_period_s: float,
+        *,
+        prefer_fifo: bool,
+    ) -> None:
         self._source = source
         self._poll_period_s = poll_period_s
+        self._prefer_fifo = prefer_fifo
         self._trace: list[RobotState] = []
         self._errors: list[BaseException] = []
         self._stop = threading.Event()
@@ -1283,7 +1294,10 @@ class _RobotStateSampler:
             raise FoundationStereoCycleError("Robot-state sampler did not terminate")
 
     def _sample(self) -> None:
+        original_scheduler: tuple[int, os.sched_param] | None = None
         try:
+            if self._prefer_fifo:
+                original_scheduler = _try_enter_robot_state_sampler_fifo()
             self._trace.append(self._source.read_state())
             self._ready.set()
             while not self._stop.wait(self._poll_period_s):
@@ -1292,6 +1306,43 @@ class _RobotStateSampler:
             self._errors.append(exc)
             self._stop.set()
             self._ready.set()
+        finally:
+            if original_scheduler is not None:
+                try:
+                    _restore_robot_state_sampler_scheduler(original_scheduler)
+                except BaseException as exc:
+                    self._errors.append(exc)
+                    self._stop.set()
+                    self._ready.set()
+
+
+def _try_enter_robot_state_sampler_fifo() -> tuple[int, os.sched_param] | None:
+    """Give the short, sleeping sampler priority over CPU-heavy perception work."""
+
+    try:
+        maximum = os.sched_get_priority_max(os.SCHED_FIFO)
+        original = (os.sched_getscheduler(0), os.sched_getparam(0))
+        if not 1 <= _ROBOT_STATE_SAMPLER_FIFO_PRIORITY <= maximum:
+            return None
+        os.sched_setscheduler(
+            0,
+            os.SCHED_FIFO,
+            os.sched_param(_ROBOT_STATE_SAMPLER_FIFO_PRIORITY),
+        )
+    except (AttributeError, OSError):
+        return None
+    return original
+
+
+def _restore_robot_state_sampler_scheduler(
+    original: tuple[int, os.sched_param],
+) -> None:
+    try:
+        os.sched_setscheduler(0, original[0], original[1])
+    except (AttributeError, OSError) as exc:
+        raise FoundationStereoCycleError(
+            "Robot-state sampler could not restore its original scheduler"
+        ) from exc
 
 
 def _robot_state_values_equal(left: RobotState, right: RobotState) -> bool:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -23,6 +24,9 @@ from biblade_fusion.mapping.occupancy import (
 
 class DepthIntegrationError(ValueError):
     """A depth observation cannot safely update the occupancy map."""
+
+
+_COOPERATIVE_YIELD_RAY_BATCH = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,7 +179,12 @@ class DepthRayIntegrator:
         observed_indices: set[VoxelIndex] = set()
         new_free: set[VoxelIndex] = set()
         new_occupied: set[VoxelIndex] = set()
-        for hit_point in base_points:
+        for ray_number, hit_point in enumerate(base_points, start=1):
+            if ray_number % _COOPERATIVE_YIELD_RAY_BATCH == 0:
+                # The safety sampler shares this interpreter.  Explicitly release
+                # the GIL during the long deterministic ray loop so controller
+                # feedback remains observable while the stopped map is rebuilt.
+                time.sleep(0)
             hit_index = _world_to_index(hit_point, self.grid)
             if hit_index is not None:
                 new_occupied.add(hit_index)

@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 import pytest
 
+import biblade_fusion.mapping.integrator as integrator_module
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.mapping.integrator import (
@@ -58,6 +59,36 @@ def integrator() -> DepthRayIntegrator:
         ),
         mapping_context_hash=CONTEXT_HASH,
     )
+
+
+def test_large_ray_batch_cooperatively_releases_the_gil(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(integrator_module.time, "sleep", sleeps.append)
+    width = integrator_module._COOPERATIVE_YIELD_RAY_BATCH * 2 + 1
+    camera = CameraIntrinsics(
+        width,
+        1,
+        1000.0,
+        1000.0,
+        0.0,
+        0.0,
+        "none",
+        (),
+    )
+
+    snapshot = integrator().integrate(
+        None,
+        np.full((1, width), 1.25, dtype=np.float32),
+        camera,
+        pose(),
+        source_view_id="cooperative-yield",
+        observed_at_utc=NOW,
+    )
+
+    assert snapshot.sequence == 1
+    assert sleeps == [0, 0]
 
 
 def test_one_depth_view_keeps_traversed_segment_unknown() -> None:

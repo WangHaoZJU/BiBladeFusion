@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import math
+import multiprocessing
+import time
 from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -20,6 +23,9 @@ from biblade_fusion.robotics.collision_template import (
     write_es68_d435i_collision_urdf,
 )
 from biblade_fusion.robotics.pinocchio_collision import PinocchioCs68Model
+
+_OPEN3D_RAYCAST_ROW_BATCH = 32
+_OPEN3D_ISOLATED_RAYCAST_MIN_PIXELS = 100_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +175,29 @@ def _raycast_triangle_meshes_depth(
 ) -> NDArray[np.float64]:
     """Cast pinhole rays against exact camera-frame triangles with Open3D."""
 
+    if intrinsics.width * intrinsics.height >= _OPEN3D_ISOLATED_RAYCAST_MIN_PIXELS:
+        # Open3D builds its raycasting acceleration structure while holding the
+        # caller's GIL.  Isolate only that deterministic computation so the main
+        # process can continue collecting stopped-robot feedback without gaps.
+        context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=1, mp_context=context) as executor:
+            depth = executor.submit(
+                _raycast_triangle_meshes_depth_direct,
+                tuple(camera_meshes),
+                intrinsics,
+            ).result(timeout=60.0)
+        depth.setflags(write=False)
+        return depth
+
+    return _raycast_triangle_meshes_depth_direct(camera_meshes, intrinsics)
+
+
+def _raycast_triangle_meshes_depth_direct(
+    camera_meshes: Sequence[tuple[NDArray[np.float64], NDArray[np.int64]]],
+    intrinsics: CameraIntrinsics,
+) -> NDArray[np.float64]:
+    """Execute one exact Open3D raycast in the current process."""
+
     import open3d as o3d
 
     scene = o3d.t.geometry.RaycastingScene()
@@ -190,7 +219,17 @@ def _raycast_triangle_meshes_depth(
         axis=-1,
     )
     rays = np.concatenate((np.zeros_like(directions), directions), axis=-1)
-    hit_depth = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+    hit_depth = np.empty((intrinsics.height, intrinsics.width), dtype=np.float32)
+    for row_start in range(0, intrinsics.height, _OPEN3D_RAYCAST_ROW_BATCH):
+        row_stop = min(row_start + _OPEN3D_RAYCAST_ROW_BATCH, intrinsics.height)
+        hit_depth[row_start:row_stop] = scene.cast_rays(
+            o3d.core.Tensor(rays[row_start:row_stop])
+        )["t_hit"].numpy()
+        if row_stop < intrinsics.height:
+            # Open3D's Python binding holds the GIL for one cast.  Bounded row
+            # batches preserve identical rays while keeping the stopped-robot
+            # feedback sampler observable throughout self-mask rendering.
+            time.sleep(0)
     depth = np.asarray(hit_depth, dtype=np.float64)
     depth.setflags(write=False)
     return depth
