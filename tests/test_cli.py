@@ -194,6 +194,45 @@ def test_unknown_scan_cli_requires_physical_placement_identity_for_new_run(
     assert "--placement-id is required" in result.stderr
 
 
+def test_unknown_scan_cli_rejects_non_hard_operator_seed_before_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polygon = tmp_path / "polygon.json"
+    polygon.write_text(
+        '{"vertices_uv": [[10, 10], [20, 10], [20, 20]]}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        unknown_runtime_module,
+        "open_production_unknown_blade_runtime",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid seed mode must block before runtime construction")
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "run-unknown",
+            "--config",
+            "configs/default.yaml",
+            "--output",
+            str(tmp_path / "new-run"),
+            "--operator-id",
+            "operator-7",
+            "--placement-id",
+            "blade-placement-7",
+            "--bootstrap-polygon",
+            str(polygon),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "requires --bootstrap-seed-mode hard_roi" in result.stderr
+
+
 def test_unknown_scan_cli_forwards_explicit_resume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

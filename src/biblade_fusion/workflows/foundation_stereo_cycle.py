@@ -34,6 +34,7 @@ from biblade_fusion.storage.blade_foreground import read_blade_foreground_mask
 from biblade_fusion.storage.inference_stationarity import (
     read_inference_stationarity,
     write_inference_stationarity,
+    write_inference_stationarity_trace,
 )
 from biblade_fusion.storage.occupancy_mapping import (
     read_occupancy_mapping,
@@ -55,8 +56,11 @@ from biblade_fusion.workflows.fine_science import (
 )
 from biblade_fusion.workflows.occupancy_mapping import (
     OccupancyFrameUpdate,
+    PreparedOccupancyFrame,
     RobotDepthRenderer,
     integrate_foundation_stereo_occupancy,
+    integrate_prepared_foundation_stereo_occupancy,
+    prepare_foundation_stereo_occupancy_frame,
 )
 from biblade_fusion.workflows.stereo_inference import (
     StereoInferenceObservation,
@@ -88,6 +92,34 @@ class CoarseSciencePreparer(Protocol):
         occupancy_update: OccupancyFrameUpdate,
         occupancy_path: Path,
     ) -> str | Path: ...
+
+
+class CoarseSciencePreflighter(Protocol):
+    """Validate current-frame coarse foreground before occupancy ray integration."""
+
+    def __call__(
+        self,
+        captured: CapturedStopScanView,
+        stereo: StereoInferenceObservation,
+        stereo_path: Path,
+        prepared_occupancy: PreparedOccupancyFrame,
+    ) -> None: ...
+
+
+class RobotStateSampler(Protocol):
+    """One-shot continuous state trace owned by one perception transaction."""
+
+    @property
+    def is_alive(self) -> bool: ...
+
+    @property
+    def diagnostics(self) -> dict[str, object]: ...
+
+    def start(self) -> None: ...
+
+    def finish(self) -> tuple[RobotState, ...]: ...
+
+    def cancel(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,9 +163,9 @@ class _PendingPerceptionCommit:
 class FoundationStereoOccupancyCycleEngine:
     """Capture one immutable session, infer once, and rebuild a fresh map window.
 
-    The engine owns no motion interface.  A background thread samples read-only robot
+    The engine owns no motion interface.  A continuous sampler records read-only robot
     state while the main thread performs FoundationStereo inference.  The coordinator
-    validates the returned trace against the capture pose before publishing the map.
+    validates the returned trace and its capture-state binding before publishing the map.
     """
 
     def __init__(
@@ -149,8 +181,10 @@ class FoundationStereoOccupancyCycleEngine:
         reference_coarse_model: str | Path | None = None,
         accepted_coverage_path: str | Path | None = None,
         coarse_science_preparer: CoarseSciencePreparer | None = None,
+        coarse_science_preflighter: CoarseSciencePreflighter | None = None,
         science_authority: ScienceAcceptanceAuthority | None = None,
         science_authority_settings: AppSettings | None = None,
+        robot_state_sampler_factory: Callable[[], RobotStateSampler] | None = None,
         utc_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if settings.stop_and_capture.depth_backend != "foundation_stereo":
@@ -202,6 +236,8 @@ class FoundationStereoOccupancyCycleEngine:
             raise ValueError("An accepted fine-coverage generation requires fine science")
         if reference is not None and coarse_science_preparer is not None:
             raise ValueError("A cycle cannot prepare coarse and fine science together")
+        if (coarse_science_preparer is None) != (coarse_science_preflighter is None):
+            raise ValueError("Coarse science preparation and preflight must be supplied together")
         if reference is not None:
             reference, accepted_coverage = validate_fine_science_startup(
                 settings,
@@ -219,12 +255,14 @@ class FoundationStereoOccupancyCycleEngine:
         self._reference_coarse_model = reference
         self._accepted_coverage_path = accepted_coverage
         self._coarse_science_preparer = coarse_science_preparer
+        self._coarse_science_preflighter = coarse_science_preflighter
         self._science_authority = science_authority
         self._science_authority_settings = (
             science_authority_settings.model_copy(deep=True)
             if science_authority_settings is not None
             else None
         )
+        self._robot_state_sampler_factory = robot_state_sampler_factory
         self._utc_clock = utc_clock
         self._sources: list[_VerifiedSource] = []
         # A logical (view_id, sequence) becomes occupied only at successful commit.
@@ -234,7 +272,7 @@ class FoundationStereoOccupancyCycleEngine:
         self._pending_lock = threading.Lock()
         self._pending_key: tuple[str, int] | None = None
         self._pending_attempt_root: Path | None = None
-        self._pending_sampler: _RobotStateSampler | None = None
+        self._pending_sampler: RobotStateSampler | None = None
         self._pending_commit: _PendingPerceptionCommit | None = None
         self._poisoned_reason: str | None = None
 
@@ -360,6 +398,7 @@ class FoundationStereoOccupancyCycleEngine:
             accepted_coverage_path=None,
             science_authority=self._science_authority,
             science_authority_settings=self._science_authority_settings,
+            robot_state_sampler_factory=self._robot_state_sampler_factory,
             utc_clock=self._utc_clock,
         )
         # The source records are immutable value/evidence bindings.  Copying the
@@ -396,10 +435,14 @@ class FoundationStereoOccupancyCycleEngine:
         attempt_id = uuid4().hex
         cycle_root = (logical_root / f"attempt_{attempt_id}").resolve()
         key = (view_id, sequence_index)
-        sampler = _RobotStateSampler(
-            self._state_source,
-            self._settings.stop_and_capture.settle_poll_period_s,
-            prefer_fifo=self._settings.stop_and_capture.enabled,
+        sampler = (
+            self._robot_state_sampler_factory()
+            if self._robot_state_sampler_factory is not None
+            else _RobotStateSampler(
+                self._state_source,
+                self._settings.stop_and_capture.settle_poll_period_s,
+                prefer_fifo=self._settings.stop_and_capture.enabled,
+            )
         )
         with self._pending_lock:
             if self._poisoned_reason is not None:
@@ -549,8 +592,35 @@ class FoundationStereoOccupancyCycleEngine:
                 ),
                 **self._camera_view_evidence(captured, stored_stereo.observation),
             )
+            prepared_current = None
+            if self._coarse_science_preflighter is not None:
+                prepared_current = prepare_foundation_stereo_occupancy_frame(
+                    source.captured.bundle,
+                    source.stereo,
+                    self._hand_eye,
+                    self._settings.occupancy,
+                    self._settings.acquisition,
+                    self._renderer,
+                    captured_at_utc=source.captured.captured_at_utc,
+                    source_stereo_metadata_sha256=source.stereo_metadata_sha256,
+                    source_session_manifest_sha256=source.session_manifest_sha256,
+                    source_session_view_metadata_sha256=(source.session_view_metadata_sha256),
+                )
+                self._preflight_coarse_science(
+                    captured,
+                    stored_stereo.observation,
+                    stereo_path,
+                    prepared_current,
+                )
             candidates = self._fresh_rebuild_sources(source)
-            updates = self._rebuild_updates(candidates)
+            updates = (
+                self._rebuild_updates(candidates)
+                if prepared_current is None
+                else self._rebuild_updates(
+                    candidates,
+                    prepared_current=prepared_current,
+                )
+            )
             occupancy_path = captured.cycle_root / "occupancy_mapping"
             write_occupancy_mapping(
                 occupancy_path,
@@ -576,14 +646,26 @@ class FoundationStereoOccupancyCycleEngine:
                 updates[-1],
                 occupancy_path,
             )
-            full_trace = sampler.finish(
-                additional_states=(
-                    captured.bundle.robot_state_before,
-                    captured.bundle.selected_robot_state,
-                    captured.bundle.robot_state_after,
-                )
-            )
+            independent_trace = _ordered_unique_robot_states(sampler.finish())
             sampler_finished = True
+            write_inference_stationarity_trace(
+                captured.cycle_root / "inference_stationarity_trace.json",
+                view_id=captured.bundle.view_id,
+                sequence_index=captured.bundle.sequence_index,
+                trace=independent_trace,
+                source_session_manifest=captured.raw_session_path / "manifest.json",
+                sampler_diagnostics=sampler.diagnostics,
+            )
+            capture_states = (
+                captured.bundle.robot_state_before,
+                captured.bundle.selected_robot_state,
+                captured.bundle.robot_state_after,
+            )
+            self._validate_capture_binding(independent_trace, capture_states)
+            full_trace = _build_authoritative_stationarity_trace(
+                independent_trace,
+                capture_states,
+            )
             stationarity_reference = full_trace[0]
             state_trace = full_trace[1:]
             stationarity = validate_stationary_trace(
@@ -985,10 +1067,25 @@ class FoundationStereoOccupancyCycleEngine:
         read_coarse_scan_view(path)
         return path
 
+    def _preflight_coarse_science(
+        self,
+        captured: CapturedStopScanView,
+        stereo: StereoInferenceObservation,
+        stereo_path: Path,
+        prepared_occupancy: PreparedOccupancyFrame,
+    ) -> None:
+        preflighter = self._coarse_science_preflighter
+        if preflighter is None or captured.purpose not in {
+            CapturePurpose.BOOTSTRAP,
+            CapturePurpose.CANDIDATE,
+        }:
+            return
+        preflighter(captured, stereo, stereo_path, prepared_occupancy)
+
     def _require_pending_sampler(
         self,
         key: tuple[str, int],
-    ) -> _RobotStateSampler:
+    ) -> RobotStateSampler:
         with self._pending_lock:
             if self._pending_key != key or self._pending_sampler is None:
                 raise FoundationStereoCycleError(
@@ -996,7 +1093,77 @@ class FoundationStereoOccupancyCycleEngine:
                 )
             return self._pending_sampler
 
-    def _clear_pending_sampler(self, sampler: _RobotStateSampler) -> None:
+    def _validate_capture_binding(
+        self,
+        sampled_trace: tuple[RobotState, ...],
+        capture_states: tuple[RobotState, ...],
+    ) -> None:
+        """Bind the independent trace to the main RTSI camera bracket."""
+
+        maximum_time_delta_s = (
+            self._settings.stop_and_capture.maximum_robot_state_staleness_s
+        )
+        acquisition = self._settings.acquisition
+        for capture_index, captured in enumerate(capture_states):
+            nearest = min(
+                sampled_trace,
+                key=lambda state: abs(
+                    state.controller_time_s - captured.controller_time_s
+                ),
+            )
+            controller_delta_s = abs(
+                nearest.controller_time_s - captured.controller_time_s
+            )
+            if controller_delta_s > maximum_time_delta_s:
+                raise FoundationStereoCycleError(
+                    "Independent RTSI trace does not bracket camera state "
+                    f"{capture_index}: nearest controller delta "
+                    f"{controller_delta_s:.9g} s exceeds {maximum_time_delta_s:.9g} s"
+                )
+            joint_delta_rad = float(
+                np.max(
+                    np.abs(
+                        nearest.joint_positions_rad - captured.joint_positions_rad
+                    )
+                )
+            )
+            tcp_translation_delta_m = float(
+                np.linalg.norm(
+                    nearest.base_t_tcp.translation_m
+                    - captured.base_t_tcp.translation_m
+                )
+            )
+            relative_rotation = (
+                nearest.base_t_tcp.rotation.T @ captured.base_t_tcp.rotation
+            )
+            cosine = float(
+                np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0)
+            )
+            tcp_rotation_delta_rad = float(math.acos(cosine))
+            if (
+                joint_delta_rad > acquisition.max_joint_delta_rad
+                or tcp_translation_delta_m
+                > acquisition.max_tcp_translation_delta_m
+                or tcp_rotation_delta_rad > acquisition.max_tcp_rotation_delta_rad
+            ):
+                raise FoundationStereoCycleError(
+                    "Independent RTSI trace differs from camera bracket state "
+                    f"{capture_index}: joint={joint_delta_rad:.9g} rad, "
+                    f"tcp_translation={tcp_translation_delta_m:.9g} m, "
+                    f"tcp_rotation={tcp_rotation_delta_rad:.9g} rad"
+                )
+            if (
+                nearest.robot_mode.strip().upper()
+                != captured.robot_mode.strip().upper()
+                or nearest.safety_status.strip().upper()
+                != captured.safety_status.strip().upper()
+            ):
+                raise FoundationStereoCycleError(
+                    "Independent RTSI trace controller state differs from camera "
+                    f"bracket state {capture_index}"
+                )
+
+    def _clear_pending_sampler(self, sampler: RobotStateSampler) -> None:
         with self._pending_lock:
             if self._pending_sampler is sampler:
                 if sampler.is_alive:
@@ -1008,7 +1175,7 @@ class FoundationStereoOccupancyCycleEngine:
 
     def _stage_pending_commit(
         self,
-        sampler: _RobotStateSampler,
+        sampler: RobotStateSampler,
         pending: _PendingPerceptionCommit,
     ) -> None:
         """Atomically replace a finished sampler with an uncommitted asset set."""
@@ -1034,7 +1201,7 @@ class FoundationStereoOccupancyCycleEngine:
 
     def _cancel_pending_sampler_instance(
         self,
-        sampler: _RobotStateSampler,
+        sampler: RobotStateSampler,
     ) -> None:
         try:
             sampler.cancel()
@@ -1123,25 +1290,50 @@ class FoundationStereoOccupancyCycleEngine:
     def _rebuild_updates(
         self,
         sources: tuple[_VerifiedSource, ...],
+        *,
+        prepared_current: PreparedOccupancyFrame | None = None,
     ) -> tuple[OccupancyFrameUpdate, ...]:
         updates: list[OccupancyFrameUpdate] = []
         previous = None
         previous_evidence_hash = None
-        for source in sources:
-            update = integrate_foundation_stereo_occupancy(
-                previous,
-                source.captured.bundle,
-                source.stereo,
-                self._hand_eye,
-                self._settings.occupancy,
-                self._settings.acquisition,
-                self._renderer,
-                captured_at_utc=source.captured.captured_at_utc,
-                source_stereo_metadata_sha256=source.stereo_metadata_sha256,
-                source_session_manifest_sha256=source.session_manifest_sha256,
-                source_session_view_metadata_sha256=(source.session_view_metadata_sha256),
-                previous_evidence_hash=previous_evidence_hash,
-            )
+        for index, source in enumerate(sources):
+            if prepared_current is not None and index == len(sources) - 1:
+                identity = (
+                    prepared_current.bundle.view_id,
+                    prepared_current.bundle.sequence_index,
+                    prepared_current.stereo.rectified.source_frame_number,
+                )
+                expected = (
+                    source.captured.bundle.view_id,
+                    source.captured.bundle.sequence_index,
+                    source.stereo.rectified.source_frame_number,
+                )
+                if identity != expected:
+                    raise FoundationStereoCycleError(
+                        "Prepared occupancy frame differs from current rebuild source"
+                    )
+                update = integrate_prepared_foundation_stereo_occupancy(
+                    previous,
+                    prepared_current,
+                    self._settings.occupancy,
+                    self._renderer,
+                    previous_evidence_hash=previous_evidence_hash,
+                )
+            else:
+                update = integrate_foundation_stereo_occupancy(
+                    previous,
+                    source.captured.bundle,
+                    source.stereo,
+                    self._hand_eye,
+                    self._settings.occupancy,
+                    self._settings.acquisition,
+                    self._renderer,
+                    captured_at_utc=source.captured.captured_at_utc,
+                    source_stereo_metadata_sha256=source.stereo_metadata_sha256,
+                    source_session_manifest_sha256=source.session_manifest_sha256,
+                    source_session_view_metadata_sha256=(source.session_view_metadata_sha256),
+                    previous_evidence_hash=previous_evidence_hash,
+                )
             updates.append(update)
             previous = update.snapshot
             previous_evidence_hash = update.evidence.quality_evidence_hash
@@ -1233,6 +1425,15 @@ class _RobotStateSampler:
         self._started = False
 
     @property
+    def diagnostics(self) -> dict[str, object]:
+        return {
+            "sampler_kind": "in_process_thread",
+            "poll_period_s": self._poll_period_s,
+            "retained_sample_count": len(self._trace),
+            "fifo_requested": self._prefer_fifo,
+        }
+
+    @property
     def is_alive(self) -> bool:
         return self._thread.is_alive()
 
@@ -1256,11 +1457,7 @@ class _RobotStateSampler:
                 f"{type(error).__name__}: {error}"
             ) from error
 
-    def finish(
-        self,
-        *,
-        additional_states: tuple[RobotState, ...] = (),
-    ) -> tuple[RobotState, ...]:
+    def finish(self) -> tuple[RobotState, ...]:
         if self._finished:
             raise FoundationStereoCycleError("Robot-state sampler was already finished")
         if not self._started:
@@ -1280,7 +1477,7 @@ class _RobotStateSampler:
             self._trace.append(self._source.read_state())
         except BaseException as exc:
             raise FoundationStereoCycleError("Post-transaction robot state is unavailable") from exc
-        return _ordered_unique_robot_states((*self._trace, *additional_states))
+        return _ordered_unique_robot_states(tuple(self._trace))
 
     def cancel(self) -> None:
         """Stop sampling without asserting that the transaction was stationary."""
@@ -1361,6 +1558,8 @@ def _robot_state_values_equal(left: RobotState, right: RobotState) -> bool:
 
 def _ordered_unique_robot_states(
     states: tuple[RobotState, ...],
+    *,
+    minimum_count: int = 3,
 ) -> tuple[RobotState, ...]:
     """Merge sampler and capture-bracket states into one exact monotonic trace."""
 
@@ -1377,8 +1576,39 @@ def _ordered_unique_robot_states(
                 )
             continue
         unique.append(state)
-    if len(unique) < 3:
+    if len(unique) < minimum_count:
         raise FoundationStereoCycleError(
-            "Perception transaction needs at least three distinct robot-state samples"
+            "Perception transaction needs at least "
+            f"{minimum_count} distinct robot-state samples"
         )
     return tuple(unique)
+
+
+def _build_authoritative_stationarity_trace(
+    independent_trace: tuple[RobotState, ...],
+    capture_states: tuple[RobotState, ...],
+) -> tuple[RobotState, ...]:
+    """Merge exact capture evidence without admitting cross-clock inversions."""
+
+    captures = _ordered_unique_robot_states(capture_states, minimum_count=1)
+    capture_before = captures[0]
+    capture_after = captures[-1]
+    independent_before = tuple(
+        state
+        for state in independent_trace
+        if (
+            state.monotonic_time_ns < capture_before.monotonic_time_ns
+            and state.controller_time_s <= capture_before.controller_time_s
+        )
+    )
+    independent_after = tuple(
+        state
+        for state in independent_trace
+        if (
+            state.monotonic_time_ns > capture_after.monotonic_time_ns
+            and state.controller_time_s >= capture_after.controller_time_s
+        )
+    )
+    return _ordered_unique_robot_states(
+        (*independent_before, *captures, *independent_after)
+    )

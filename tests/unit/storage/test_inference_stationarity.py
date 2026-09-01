@@ -9,10 +9,15 @@ import pytest
 
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.devices.robot.base import RobotState
-from biblade_fusion.robotics.stationarity import validate_stationary_trace
+from biblade_fusion.robotics.stationarity import (
+    StationarityError,
+    validate_stationary_trace,
+)
 from biblade_fusion.storage.inference_stationarity import (
     read_inference_stationarity,
+    read_inference_stationarity_trace,
     write_inference_stationarity,
+    write_inference_stationarity_trace,
 )
 
 
@@ -20,6 +25,18 @@ def _state(time_s: float) -> RobotState:
     return RobotState(
         monotonic_time_ns=round(time_s * 1e9),
         controller_time_s=time_s,
+        joint_positions_rad=np.zeros(6),
+        base_t_tcp=PoseSE3.identity("base", "tcp"),
+        robot_mode="IDLE",
+        safety_status="NORMAL",
+        speed_scaling=0.1,
+    )
+
+
+def _state_with_clocks(host_time_s: float, controller_time_s: float) -> RobotState:
+    return RobotState(
+        monotonic_time_ns=round(host_time_s * 1e9),
+        controller_time_s=controller_time_s,
         joint_positions_rad=np.zeros(6),
         base_t_tcp=PoseSE3.identity("base", "tcp"),
         robot_mode="IDLE",
@@ -197,3 +214,83 @@ def test_asset_is_write_once(tmp_path: Path) -> None:
             max_tcp_rotation_delta_rad=0.001,
             maximum_robot_state_staleness_s=0.25,
         )
+
+
+def test_diagnostic_trace_preserves_rejected_sampler_timing(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"status":"completed"}\n', encoding="utf-8")
+    trace = (
+        _state_with_clocks(1.0, 10.0),
+        _state_with_clocks(1.1, 10.1),
+        _state_with_clocks(1.5, 10.2),
+    )
+
+    with pytest.raises(StationarityError, match="sample gap"):
+        validate_stationary_trace(
+            trace[0],
+            trace[1:],
+            max_joint_delta_rad=0.001,
+            max_tcp_translation_delta_m=0.001,
+            max_tcp_rotation_delta_rad=0.001,
+            maximum_robot_state_staleness_s=0.25,
+        )
+
+    stored = write_inference_stationarity_trace(
+        tmp_path / "inference_stationarity_trace.json",
+        view_id="front-rejected",
+        sequence_index=4,
+        trace=trace,
+        source_session_manifest=manifest,
+        sampler_diagnostics={
+            "sampler_kind": "elite_rtsi_process",
+            "packet_count": 25,
+            "maximum_raw_host_gap_s": 0.4,
+            "scheduler": {
+                "policy": "SCHED_FIFO",
+                "priority": 10,
+                "cpu_affinity": [0, 1],
+            },
+        },
+    )
+
+    reread = read_inference_stationarity_trace(stored.path)
+    assert [state.monotonic_time_ns for state in reread.trace] == [
+        state.monotonic_time_ns for state in trace
+    ]
+    assert [state.controller_time_s for state in reread.trace] == [
+        state.controller_time_s for state in trace
+    ]
+    assert reread.sampler_diagnostics["maximum_raw_host_gap_s"] == 0.4
+    assert reread.sampler_diagnostics["scheduler"]["policy"] == "SCHED_FIFO"
+    assert reread.file_sha256 == stored.file_sha256
+
+
+def test_diagnostic_trace_is_hashed_and_write_once(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"status":"completed"}\n', encoding="utf-8")
+    trace = (_state(1.0), _state(1.1), _state(1.2))
+    destination = tmp_path / "inference_stationarity_trace.json"
+    stored = write_inference_stationarity_trace(
+        destination,
+        view_id="front-001",
+        sequence_index=0,
+        trace=trace,
+        source_session_manifest=manifest,
+        sampler_diagnostics={"packet_count": 3},
+    )
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        write_inference_stationarity_trace(
+            destination,
+            view_id="front-001",
+            sequence_index=0,
+            trace=trace,
+            source_session_manifest=manifest,
+            sampler_diagnostics={"packet_count": 3},
+        )
+
+    payload = json.loads(stored.path.read_text(encoding="utf-8"))
+    payload["sampler_diagnostics"]["packet_count"] = 4
+    stored.path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="content SHA-256 mismatch"):
+        read_inference_stationarity_trace(stored.path)

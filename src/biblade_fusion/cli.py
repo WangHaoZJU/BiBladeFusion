@@ -403,6 +403,10 @@ def scan_run_unknown(
                 mode=normalized_seed_mode,  # type: ignore[arg-type]
                 vertices_uv=tuple((float(vertex[0]), float(vertex[1])) for vertex in vertices),
             )
+        if seed is not None and seed.mode != "hard_roi":
+            raise ValueError(
+                "Unknown-blade operator bootstrap requires --bootstrap-seed-mode hard_roi"
+            )
         initial_side = None
         if first_side is not None:
             normalized_side = first_side.strip().lower()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -773,6 +774,32 @@ def test_console_q_stops_without_capture_or_motion(tmp_path: Path) -> None:
     assert runner.execute_count == 0
     assert runner.stop_count == 1
     assert any("Read-only GUI" in line for line in output)
+
+
+def test_formal_bootstrap_annotation_loader_accepts_exactly_one_blade_polygon(
+    tmp_path: Path,
+) -> None:
+    annotation = tmp_path / "left_rectified.json"
+    annotation.write_text(
+        json.dumps(
+            {
+                "shapes": [
+                    {
+                        "label": "blade",
+                        "shape_type": "polygon",
+                        "points": [[10, 10], [30, 10], [20, 30]],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    seed = runtime_module._read_hard_roi_seed(annotation)
+
+    assert seed.mode == "hard_roi"
+    assert seed.kind == "polygon"
+    assert seed.vertices_uv == ((10.0, 10.0), (30.0, 10.0), (20.0, 30.0))
 
 
 def test_cleanup_attempts_physical_stop_when_runtime_stop_raises(
@@ -1719,7 +1746,10 @@ def test_experimental_open_keeps_science_authority_and_settings_unbound(
         collision_model_hash="collision-hash",
         robot_geometry_hash="geometry-hash",
     )
-    coarse_session = SimpleNamespace(prepare_engine_cycle=lambda *_args, **_kwargs: None)
+    coarse_session = SimpleNamespace(
+        prepare_engine_cycle=lambda *_args, **_kwargs: None,
+        preflight_engine_cycle=lambda *_args, **_kwargs: None,
+    )
 
     monkeypatch.setattr(
         runtime_module,

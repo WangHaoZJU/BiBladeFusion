@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -18,6 +19,7 @@ from math import cos, radians, sin
 from pathlib import Path
 from uuid import uuid4
 
+import cv2
 import numpy as np
 
 from biblade_fusion.calibration import HandEyeCalibration
@@ -25,9 +27,11 @@ from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import AppSettings, ViewFilterConfig, ViewPlanningConfig
 from biblade_fusion.perception.bootstrap_foreground import (
     BootstrapForegroundConfig,
+    BootstrapForegroundResult,
     BootstrapSeed,
     array_content_sha256,
     bootstrap_blade_foreground,
+    bootstrap_seed_payload,
 )
 from biblade_fusion.perception.proxy import (
     BilateralBladeProxy,
@@ -75,6 +79,7 @@ from biblade_fusion.workflows.coarse_model import build_coarse_blade_model
 from biblade_fusion.workflows.initialization import InitialObservation
 from biblade_fusion.workflows.occupancy_mapping import (
     OccupancyFrameUpdate,
+    PreparedOccupancyFrame,
     occupancy_array_content_hash,
 )
 from biblade_fusion.workflows.reconstruction import (
@@ -93,6 +98,9 @@ from biblade_fusion.workflows.view_planning import plan_initial_observation
 
 class UnknownBladeCoarseError(RuntimeError):
     """The coarse phase cannot safely prepare, recover, select, or promote."""
+
+
+BootstrapSeedProvider = Callable[[CapturedStopScanView, Path], BootstrapSeed]
 
 
 class CoarsePhase(StrEnum):
@@ -194,6 +202,76 @@ def _sha256(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _materialize_bootstrap_annotation_request(
+    captured: CapturedStopScanView,
+    stereo: StereoInferenceObservation,
+    stereo_path: Path,
+    integration_valid_mask: np.ndarray,
+) -> tuple[Path, Path]:
+    """Persist the exact formal frame that an operator ROI must annotate."""
+
+    root = captured.cycle_root / "bootstrap_annotation"
+    root.mkdir()
+    image_path = root / "left_rectified.png"
+    image = np.asarray(stereo.rectified.left_ir)
+    if not cv2.imwrite(str(image_path), image):
+        raise UnknownBladeCoarseError("Cannot write formal bootstrap annotation image")
+    request_path = root / "request.json"
+    request = {
+        "schema_version": 1,
+        "artifact_kind": "biblade_fusion.bootstrap_annotation_request",
+        "identity": {
+            "view_id": captured.bundle.view_id,
+            "sequence_index": captured.bundle.sequence_index,
+            "frame_number": captured.bundle.stereo.frame_number,
+        },
+        "sources": {
+            "stereo_inference": str(stereo_path.resolve()),
+            "stereo_metadata_sha256": _sha256(stereo_path / "metadata.json"),
+        },
+        "content_sha256": {
+            "left_rectified": array_content_sha256(image),
+            "integration_valid_mask": array_content_sha256(integration_valid_mask),
+            "left_rectified_png": _sha256(image_path),
+        },
+        "annotation_image": image_path.name,
+    }
+    request_path.write_text(
+        json.dumps(request, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return root, image_path
+
+
+def _write_bootstrap_annotation_response(
+    root: Path,
+    foreground: BootstrapForegroundResult,
+) -> None:
+    response_path = root / "response.json"
+    response_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_kind": "biblade_fusion.bootstrap_annotation_response",
+                "seed": bootstrap_seed_payload(foreground.seed),
+                "policy_sha256": foreground.policy_sha256,
+                "mask_pixel_count": foreground.diagnostics.mask_pixel_count,
+                "mask_fraction": foreground.diagnostics.mask_fraction,
+                "input_content_sha256": {
+                    "left_rectified": foreground.left_image_content_sha256,
+                    "depth_m": foreground.depth_content_sha256,
+                    "integration_valid_mask": foreground.valid_mask_content_sha256,
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _rotation_error_deg(first: PoseSE3, second: PoseSE3) -> float:
@@ -357,6 +435,7 @@ def prepare_unknown_blade_coarse_view(
     target_kind: CoarseTargetKind,
     target_side: BladeSide | None,
     side_proxy: BilateralBladeProxy | None = None,
+    preflight_foreground: BootstrapForegroundResult | None = None,
 ) -> PreparedCoarseScienceView:
     """Prepare one stopped coarse view from the occupancy integration-valid depth."""
 
@@ -382,6 +461,7 @@ def prepare_unknown_blade_coarse_view(
         target_kind=target_kind,
         target_side=target_side,
         side_proxy=side_proxy,
+        preflight_foreground=preflight_foreground,
     )
 
 
@@ -450,6 +530,7 @@ def _prepare_unknown_blade_coarse_view(
     target_kind: CoarseTargetKind,
     target_side: BladeSide | None,
     side_proxy: BilateralBladeProxy | None,
+    preflight_foreground: BootstrapForegroundResult | None = None,
 ) -> PreparedCoarseScienceView:
 
     identity = (
@@ -467,13 +548,15 @@ def _prepare_unknown_blade_coarse_view(
         or identity != integration_identity
     ):
         raise UnknownBladeCoarseError("Coarse cycle source identities differ")
-    foreground = bootstrap_blade_foreground(
+    foreground = preflight_foreground or bootstrap_blade_foreground(
         stereo.rectified.left_ir,
         stereo.depth_m,
         integration_valid_mask,
         foreground_config,
         seed,
     )
+    if foreground.config != foreground_config or foreground.seed != seed:
+        raise UnknownBladeCoarseError("Coarse foreground differs from its staged policy")
     if foreground.valid_mask_content_sha256 != array_content_sha256(
         integration_valid_mask
     ) or integration_valid_mask_content_hash != occupancy_array_content_hash(
@@ -1160,6 +1243,8 @@ class CoarseScienceSession:
         self._pending_selection: NextViewSelection | None = None
         self._pending_operator_side: BladeSide | None = None
         self._pending_seed: BootstrapSeed | None = None
+        self._pending_seed_provider: BootstrapSeedProvider | None = None
+        self._pending_foreground: BootstrapForegroundResult | None = None
         self._pending_prepared: PreparedCoarseScienceView | None = None
         self._operator_capture_staged = False
         if recovered_generation is not None:
@@ -1263,6 +1348,7 @@ class CoarseScienceSession:
         self,
         *,
         seed: BootstrapSeed | None = None,
+        seed_provider: BootstrapSeedProvider | None = None,
         operator_side: BladeSide | None = None,
     ) -> None:
         """Stage one explicitly triggered manual bootstrap for the engine hook."""
@@ -1274,6 +1360,8 @@ class CoarseScienceSession:
         ):
             raise UnknownBladeCoarseError("A coarse engine transaction is already pending")
         self._pending_seed = seed
+        self._pending_seed_provider = seed_provider
+        self._pending_foreground = None
         self._pending_operator_side = operator_side
         # ``None`` selection is meaningful, so pending readiness is represented by
         # a sentinel boolean stored on the instance.
@@ -1298,7 +1386,72 @@ class CoarseScienceSession:
         self._pending_selection = selection
         self._pending_operator_side = None
         self._pending_seed = seed
+        self._pending_seed_provider = None
+        self._pending_foreground = None
         self._operator_capture_staged = False
+
+    def preflight_engine_cycle(
+        self,
+        captured: CapturedStopScanView,
+        stereo: StereoInferenceObservation,
+        stereo_path: Path,
+        prepared_occupancy: PreparedOccupancyFrame,
+    ) -> None:
+        """Resolve and validate foreground before occupancy ray integration."""
+
+        if self._pending_prepared is not None or self._pending_foreground is not None:
+            raise UnknownBladeCoarseError("Prior coarse preflight awaits acceptance")
+        operator_staged = self._operator_capture_staged
+        selection = self._pending_selection
+        if selection is None and not operator_staged:
+            raise UnknownBladeCoarseError(
+                "Coarse capture was not explicitly staged by operator or selector"
+            )
+        identity = (
+            captured.bundle.view_id,
+            captured.bundle.sequence_index,
+            captured.bundle.stereo.frame_number,
+        )
+        prepared_identity = (
+            prepared_occupancy.bundle.view_id,
+            prepared_occupancy.bundle.sequence_index,
+            prepared_occupancy.stereo.rectified.source_frame_number,
+        )
+        if identity != prepared_identity:
+            raise UnknownBladeCoarseError("Coarse preflight source identities differ")
+
+        annotation_root: Path | None = None
+        seed = self._pending_seed
+        if operator_staged:
+            annotation_root, image_path = _materialize_bootstrap_annotation_request(
+                captured,
+                stereo,
+                stereo_path,
+                prepared_occupancy.self_mask.integration_valid_mask,
+            )
+            if seed is None:
+                provider = self._pending_seed_provider
+                if provider is None:
+                    raise UnknownBladeCoarseError(
+                        "Operator bootstrap requires a hard_roi polygon for this formal frame"
+                    )
+                seed = provider(captured, image_path)
+            if seed.mode != "hard_roi":
+                raise UnknownBladeCoarseError(
+                    "Operator bootstrap requires seed mode hard_roi"
+                )
+            self._pending_seed = seed
+
+        foreground = bootstrap_blade_foreground(
+            stereo.rectified.left_ir,
+            stereo.depth_m,
+            prepared_occupancy.self_mask.integration_valid_mask,
+            self._foreground_config,
+            seed,
+        )
+        if annotation_root is not None:
+            _write_bootstrap_annotation_response(annotation_root, foreground)
+        self._pending_foreground = foreground
 
     def prepare_engine_cycle(
         self,
@@ -1317,6 +1470,10 @@ class CoarseScienceSession:
         if selection is None and not operator_staged:
             raise UnknownBladeCoarseError(
                 "Coarse capture was not explicitly staged by operator or selector"
+            )
+        if self._pending_foreground is None:
+            raise UnknownBladeCoarseError(
+                "Coarse foreground preflight was not completed before occupancy rebuild"
             )
         if selection is None:
             target_view_id = captured.bundle.view_id
@@ -1350,6 +1507,7 @@ class CoarseScienceSession:
             target_kind=target_kind,
             target_side=target_side,
             side_proxy=side_proxy,
+            preflight_foreground=self._pending_foreground,
         )
         self._pending_prepared = prepared
         return prepared.coarse_view_path
@@ -1369,6 +1527,8 @@ class CoarseScienceSession:
         self._pending_selection = None
         self._pending_operator_side = None
         self._pending_seed = None
+        self._pending_seed_provider = None
+        self._pending_foreground = None
         self._operator_capture_staged = False
         return generation
 
@@ -1379,6 +1539,8 @@ class CoarseScienceSession:
         self._pending_selection = None
         self._pending_operator_side = None
         self._pending_seed = None
+        self._pending_seed_provider = None
+        self._pending_foreground = None
         self._operator_capture_staged = False
 
     def _candidate(self, view_id: str) -> EvaluatedCandidate:

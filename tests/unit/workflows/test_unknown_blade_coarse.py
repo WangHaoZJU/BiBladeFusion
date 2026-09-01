@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from biblade_fusion.core.settings import (
     load_settings,
 )
 from biblade_fusion.devices.depth_camera import CameraIntrinsics
+from biblade_fusion.perception.bootstrap_foreground import BootstrapSeed
 from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import BilateralBladeProxy, select_proxy_support
 from biblade_fusion.planning import (
@@ -336,6 +338,7 @@ def test_engine_hook_requires_staging_and_appends_only_after_acceptance(
         )
 
     session.stage_operator_capture()
+    session._pending_foreground = SimpleNamespace()  # noqa: SLF001
     path = session.prepare_engine_cycle(
         captured,
         SimpleNamespace(),
@@ -357,6 +360,84 @@ def test_engine_hook_requires_staging_and_appends_only_after_acceptance(
     assert accepted == accepted_generation
     session.stage_operator_capture(operator_side=coarse_module.BladeSide.BACK)
     session.reject_cycle()
+
+
+def test_every_operator_bootstrap_requires_and_binds_its_own_hard_roi(
+    tmp_path: Path,
+) -> None:
+    kinematics = tmp_path / "kinematics.yaml"
+    kinematics.write_text("model: test\n", encoding="utf-8")
+    session = CoarseScienceSession(
+        settings=load_settings("configs/default.yaml"),
+        hand_eye=SimpleNamespace(),  # type: ignore[arg-type]
+        reachability_checker=_Reachable(),
+        source_kinematics=kinematics,
+        output_root=tmp_path / "science",
+    )
+    left = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    depth = np.full((64, 64), 0.8, dtype=np.float32)
+    valid = np.ones((64, 64), dtype=np.bool_)
+    provider_calls: list[Path] = []
+
+    def capture_inputs(
+        index: int,
+    ) -> tuple[SimpleNamespace, SimpleNamespace, Path, SimpleNamespace]:
+        cycle_root = tmp_path / f"cycle-{index}"
+        cycle_root.mkdir()
+        stereo_path = cycle_root / "stereo_inference"
+        stereo_path.mkdir()
+        (stereo_path / "metadata.json").write_text("{}\n", encoding="utf-8")
+        bundle = SimpleNamespace(
+            view_id=f"operator_{index}",
+            sequence_index=index,
+            stereo=SimpleNamespace(frame_number=100 + index),
+        )
+        observation = SimpleNamespace(
+            rectified=SimpleNamespace(
+                left_ir=left,
+                source_frame_number=100 + index,
+            ),
+            depth_m=depth,
+        )
+        prepared = SimpleNamespace(
+            bundle=bundle,
+            stereo=observation,
+            self_mask=SimpleNamespace(integration_valid_mask=valid),
+        )
+        captured = SimpleNamespace(bundle=bundle, cycle_root=cycle_root)
+        return captured, observation, stereo_path, prepared
+
+    first = capture_inputs(0)
+    session.stage_operator_capture()
+    with pytest.raises(UnknownBladeCoarseError, match="requires a hard_roi polygon"):
+        session.preflight_engine_cycle(*first)
+    session.reject_cycle()
+
+    def provider(_captured, image_path: Path) -> BootstrapSeed:
+        provider_calls.append(image_path)
+        return BootstrapSeed.polygon(
+            ((10, 10), (53, 10), (53, 53), (10, 53)),
+            mode="hard_roi",
+        )
+
+    for index in (1, 2):
+        item = capture_inputs(index)
+        session.stage_operator_capture(seed_provider=provider)
+        session.preflight_engine_cycle(*item)
+        annotation_root = item[0].cycle_root / "bootstrap_annotation"
+        assert (annotation_root / "left_rectified.png").is_file()
+        assert (annotation_root / "request.json").is_file()
+        response = json.loads(
+            (annotation_root / "response.json").read_text(encoding="utf-8")
+        )
+        assert response["seed"]["mode"] == "hard_roi"
+        assert response["mask_pixel_count"] > 500
+        session.reject_cycle()
+
+    assert provider_calls == [
+        tmp_path / "cycle-1" / "bootstrap_annotation" / "left_rectified.png",
+        tmp_path / "cycle-2" / "bootstrap_annotation" / "left_rectified.png",
+    ]
 
 
 def test_generation_append_removes_uncommitted_coverage_before_retry(

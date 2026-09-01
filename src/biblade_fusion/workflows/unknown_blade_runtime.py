@@ -13,6 +13,7 @@ evidence only.
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from collections.abc import Callable, Iterator
@@ -30,6 +31,7 @@ from biblade_fusion.calibration import load_cs68_kinematics, load_hand_eye_calib
 from biblade_fusion.core.settings import AppSettings
 from biblade_fusion.devices.depth_camera import RealSenseD435i
 from biblade_fusion.devices.robot import EliteArm
+from biblade_fusion.devices.robot.elite_rtsi_sampler import EliteRtsiProcessSampler
 from biblade_fusion.devices.thermal_camera import NullThermalCamera
 from biblade_fusion.diagnostics.supervised_scan import run_supervised_scan_readiness
 from biblade_fusion.diagnostics.types import CheckLevel, CheckResult
@@ -94,6 +96,7 @@ from biblade_fusion.workflows.foundation_stereo_cycle import (
     FoundationStereoOccupancyCycleEngine,
 )
 from biblade_fusion.workflows.stop_scan_coordinator import (
+    CapturedStopScanView,
     GuardedSegmentSafetyFactory,
     NextViewSelection,
     OccupancyBinding,
@@ -108,6 +111,7 @@ from biblade_fusion.workflows.supervised_experiment import (
     SupervisedExperimentRunner,
 )
 from biblade_fusion.workflows.unknown_blade_coarse import (
+    BootstrapSeedProvider,
     CoarsePhase,
     CoarsePhaseTransition,
     CoarseSciencePolicy,
@@ -172,6 +176,7 @@ class _CoarseSession(Protocol):
         self,
         *,
         seed: BootstrapSeed | None = None,
+        seed_provider: BootstrapSeedProvider | None = None,
         operator_side: BladeSide | None = None,
     ) -> None: ...
 
@@ -517,13 +522,21 @@ class CoarseSessionNextViewAdapter:
         self,
         *,
         seed: BootstrapSeed | None = None,
+        seed_provider: BootstrapSeedProvider | None = None,
         operator_side: BladeSide | None = None,
     ) -> None:
         if self._pending_selection is not None:
             raise UnknownBladeRuntimeError(
                 "A planned coarse target cannot be replaced by an operator capture"
             )
-        self._session.stage_operator_capture(seed=seed, operator_side=operator_side)
+        if seed_provider is None:
+            self._session.stage_operator_capture(seed=seed, operator_side=operator_side)
+        else:
+            self._session.stage_operator_capture(
+                seed=seed,
+                seed_provider=seed_provider,
+                operator_side=operator_side,
+            )
 
     def reject_staged_cycle(self) -> None:
         self._session.reject_cycle()
@@ -873,6 +886,7 @@ class UnknownBladeSupervisedRuntime:
         *,
         view_id: str | None = None,
         seed: BootstrapSeed | None = None,
+        seed_provider: BootstrapSeedProvider | None = None,
         operator_side: BladeSide | None = None,
     ) -> UnknownBladeRuntimeSnapshot:
         """Accept exactly one explicit ``c`` action while the robot is stopped."""
@@ -900,6 +914,7 @@ class UnknownBladeSupervisedRuntime:
         before = self._coarse_adapter.accepted_cycle_count
         self._coarse_adapter.stage_operator_capture(
             seed=seed,
+            seed_provider=seed_provider,
             operator_side=operator_side,
         )
         try:
@@ -1935,6 +1950,13 @@ def open_production_unknown_blade_runtime(
             settings.acquisition,
             require_thermal=False,
         )
+
+        def robot_state_sampler_factory() -> EliteRtsiProcessSampler:
+            return EliteRtsiProcessSampler(
+                settings.robot,
+                evidence_period_s=settings.stop_and_capture.settle_poll_period_s,
+            )
+
         coarse_engine = FoundationStereoOccupancyCycleEngine(
             settings=coarse_settings,
             acquirer=acquirer,
@@ -1944,8 +1966,10 @@ def open_production_unknown_blade_runtime(
             renderer=renderer,
             output_root=root / "perception" / "coarse",
             coarse_science_preparer=coarse_session.prepare_engine_cycle,
+            coarse_science_preflighter=coarse_session.preflight_engine_cycle,
             science_authority=science_authority,
             science_authority_settings=science_authority_settings,
+            robot_state_sampler_factory=robot_state_sampler_factory,
         )
         publisher = OccupancyGenerationPublisher()
 
@@ -2094,6 +2118,7 @@ def open_production_unknown_blade_runtime(
                     accepted_coverage_path=accepted_coverage,
                     science_authority=science_authority,
                     science_authority_settings=science_authority_settings,
+                    robot_state_sampler_factory=robot_state_sampler_factory,
                 )
             )
             selector = BladeCoverageNextViewSelector.from_settings(
@@ -2265,6 +2290,36 @@ def open_production_unknown_blade_runtime(
             _finalize_production_runtime(runtime, arm, settings, motion_envelope)
 
 
+def _read_hard_roi_seed(path: str | Path) -> BootstrapSeed:
+    source = Path(path).expanduser().resolve()
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    vertices: object = None
+    if isinstance(payload, dict):
+        vertices = payload.get("vertices_uv")
+        if vertices is None:
+            shapes = payload.get("shapes")
+            if isinstance(shapes, list):
+                matches = [
+                    item
+                    for item in shapes
+                    if isinstance(item, dict)
+                    and item.get("label") == "blade"
+                    and item.get("shape_type") == "polygon"
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "annotation must contain exactly one polygon labelled 'blade'"
+                    )
+                vertices = matches[0].get("points")
+    elif isinstance(payload, list):
+        vertices = payload
+    if not isinstance(vertices, list):
+        raise ValueError(
+            "annotation must be vertices_uv JSON or an X-AnyLabeling blade polygon"
+        )
+    return BootstrapSeed.polygon(vertices, mode="hard_roi")
+
+
 def run_unknown_blade_operator_console(
     runtime: UnknownBladeSupervisedRuntime | CompletedUnknownBladeRuntime,
     *,
@@ -2283,6 +2338,33 @@ def run_unknown_blade_operator_console(
         "Read-only GUI (another terminal): uv run bbf supervise replay "
         f"--snapshot {runtime.snapshot.timeline_root} --follow"
     )
+
+    def formal_frame_seed_provider(
+        _captured: CapturedStopScanView,
+        image_path: Path,
+    ) -> BootstrapSeed:
+        default_json = image_path.with_suffix(".json")
+        output_fn(
+            "Formal bootstrap frame captured. Annotate exactly one polygon labelled "
+            f"'blade' on: {image_path}"
+        )
+        output_fn(
+            "Save the annotation without moving robot/camera/blade; default JSON: "
+            f"{default_json}"
+        )
+        while True:
+            raw = input_fn(
+                "Enter the hard_roi annotation JSON path (Enter uses default, q aborts): "
+            ).strip()
+            if raw.lower() == "q":
+                raise UnknownBladeRuntimeError(
+                    "operator aborted while the formal bootstrap frame awaited annotation"
+                )
+            candidate = default_json if not raw else Path(raw)
+            try:
+                return _read_hard_roi_seed(candidate)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                output_fn(f"Annotation rejected: {type(exc).__name__}: {exc}")
     while True:
         snapshot = runtime.snapshot
         status = snapshot.runner_status
@@ -2329,6 +2411,7 @@ def run_unknown_blade_operator_console(
                     first_capture = snapshot.operator_bootstrap_views == 0
                     runtime.capture_operator_view(
                         seed=initial_bootstrap_seed if first_capture else None,
+                        seed_provider=formal_frame_seed_provider,
                         operator_side=(
                             explicit_side
                             if explicit_side is not None

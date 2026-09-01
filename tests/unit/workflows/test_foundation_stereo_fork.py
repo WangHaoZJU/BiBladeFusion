@@ -46,6 +46,7 @@ def _empty_engine(coarse_settings):
     # verifies the immutable authority before any inference is possible.
     engine._science_authority = None
     engine._science_authority_settings = None
+    engine._robot_state_sampler_factory = None
     return engine
 
 

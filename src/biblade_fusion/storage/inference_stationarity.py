@@ -22,6 +22,7 @@ from biblade_fusion.robotics.stationarity import (
 
 INFERENCE_STATIONARITY_SCHEMA_VERSION = 2
 _SUPPORTED_SCHEMA_VERSIONS = {1, INFERENCE_STATIONARITY_SCHEMA_VERSION}
+INFERENCE_STATIONARITY_TRACE_SCHEMA_VERSION = 1
 _SHA256_LENGTH = 64
 
 
@@ -36,6 +37,21 @@ class StoredInferenceStationarity:
     source_session_manifest_path: Path
     source_session_manifest_sha256: str
     thresholds: tuple[float, float, float, float]
+    content_sha256: str
+    file_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class StoredInferenceStationarityTrace:
+    """Diagnostic sampler trace that does not assert stationarity acceptance."""
+
+    path: Path
+    view_id: str
+    sequence_index: int
+    trace: tuple[RobotState, ...]
+    source_session_manifest_path: Path
+    source_session_manifest_sha256: str
+    sampler_diagnostics: dict[str, Any]
     content_sha256: str
     file_sha256: str
 
@@ -56,6 +72,34 @@ def _canonical_json(payload: dict[str, Any]) -> bytes:
         allow_nan=False,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _write_once_json(destination: Path, payload: dict[str, Any]) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{uuid4().hex}.partial"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(
+                payload,
+                stream,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, destination)
+        directory = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _strict_json_loads(text: str) -> Any:
@@ -122,6 +166,171 @@ def _state_from_payload(payload: object, *, schema_version: int) -> RobotState:
             else str(payload["runtime_state"])
         ),
     )
+
+
+def _diagnostic_trace(states: tuple[RobotState, ...]) -> tuple[RobotState, ...]:
+    if len(states) < 3:
+        raise ValueError("stationarity diagnostic trace requires at least three states")
+    previous_host_ns = states[0].monotonic_time_ns
+    previous_controller_s = float(states[0].controller_time_s)
+    for state in states[1:]:
+        if state.monotonic_time_ns <= previous_host_ns:
+            raise ValueError(
+                "stationarity diagnostic host timestamps must increase"
+            )
+        controller_s = float(state.controller_time_s)
+        if controller_s < previous_controller_s:
+            raise ValueError(
+                "stationarity diagnostic controller timestamps moved backwards"
+            )
+        previous_host_ns = state.monotonic_time_ns
+        previous_controller_s = controller_s
+    return states
+
+
+def _diagnostics_payload(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("sampler diagnostics must be an object")
+    try:
+        normalized = _strict_json_loads(_canonical_json(value).decode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sampler diagnostics must contain finite JSON values") from exc
+    if not isinstance(normalized, dict):
+        raise ValueError("sampler diagnostics must be an object")
+    return normalized
+
+
+def write_inference_stationarity_trace(
+    path: str | Path,
+    *,
+    view_id: str,
+    sequence_index: int,
+    trace: tuple[RobotState, ...],
+    source_session_manifest: str | Path,
+    sampler_diagnostics: dict[str, Any],
+) -> StoredInferenceStationarityTrace:
+    """Persist a write-once trace before applying any acceptance threshold."""
+
+    destination = Path(path).resolve()
+    if destination.exists():
+        raise FileExistsError(
+            f"Inference-stationarity diagnostic already exists: {destination}"
+        )
+    selected_view = str(view_id).strip()
+    if not selected_view or sequence_index < 0:
+        raise ValueError("stationarity diagnostic source identity is invalid")
+    manifest = Path(source_session_manifest).resolve()
+    if not manifest.is_file():
+        raise ValueError("stationarity diagnostic source session manifest is missing")
+    states = _diagnostic_trace(tuple(trace))
+    diagnostics = _diagnostics_payload(sampler_diagnostics)
+    body: dict[str, Any] = {
+        "schema_version": INFERENCE_STATIONARITY_TRACE_SCHEMA_VERSION,
+        "artifact_kind": "biblade_fusion.inference_stationarity_trace",
+        "depth_backend": "foundation_stereo",
+        "view_id": selected_view,
+        "sequence_index": int(sequence_index),
+        "source_session_manifest": {
+            "path": str(manifest),
+            "sha256": _sha256(manifest),
+        },
+        "robot_state_trace": [_state_payload(item) for item in states],
+        "sampler_diagnostics": diagnostics,
+    }
+    content_sha256 = hashlib.sha256(_canonical_json(body)).hexdigest()
+    _write_once_json(destination, {**body, "content_sha256": content_sha256})
+    return read_inference_stationarity_trace(destination)
+
+
+def read_inference_stationarity_trace(
+    path: str | Path,
+) -> StoredInferenceStationarityTrace:
+    """Verify a diagnostic trace without treating it as motion authority."""
+
+    source = Path(path).resolve()
+    try:
+        payload = _strict_json_loads(source.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("stationarity diagnostic root must be an object")
+        expected_keys = {
+            "schema_version",
+            "artifact_kind",
+            "depth_backend",
+            "view_id",
+            "sequence_index",
+            "source_session_manifest",
+            "robot_state_trace",
+            "sampler_diagnostics",
+            "content_sha256",
+        }
+        if set(payload) != expected_keys:
+            raise ValueError("stationarity diagnostic fields differ from schema")
+        if (
+            payload["schema_version"]
+            != INFERENCE_STATIONARITY_TRACE_SCHEMA_VERSION
+            or payload["artifact_kind"]
+            != "biblade_fusion.inference_stationarity_trace"
+            or payload["depth_backend"] != "foundation_stereo"
+        ):
+            raise ValueError("unsupported stationarity diagnostic contract")
+        declared_content = str(payload["content_sha256"])
+        body = {
+            key: value
+            for key, value in payload.items()
+            if key != "content_sha256"
+        }
+        if (
+            len(declared_content) != _SHA256_LENGTH
+            or hashlib.sha256(_canonical_json(body)).hexdigest()
+            != declared_content
+        ):
+            raise ValueError("stationarity diagnostic content SHA-256 mismatch")
+        view_id = str(payload["view_id"]).strip()
+        sequence_index = int(payload["sequence_index"])
+        if not view_id or sequence_index < 0:
+            raise ValueError("stationarity diagnostic source identity is invalid")
+        manifest_record = payload["source_session_manifest"]
+        if not isinstance(manifest_record, dict) or set(manifest_record) != {
+            "path",
+            "sha256",
+        }:
+            raise ValueError("stationarity diagnostic manifest record is invalid")
+        manifest = Path(str(manifest_record["path"])).resolve()
+        manifest_sha = str(manifest_record["sha256"])
+        if (
+            len(manifest_sha) != _SHA256_LENGTH
+            or not manifest.is_file()
+            or _sha256(manifest) != manifest_sha
+        ):
+            raise ValueError("stationarity diagnostic source manifest changed")
+        raw_trace = payload["robot_state_trace"]
+        if not isinstance(raw_trace, list):
+            raise ValueError("stationarity diagnostic trace must be an array")
+        trace = _diagnostic_trace(
+            tuple(
+                _state_from_payload(
+                    item,
+                    schema_version=INFERENCE_STATIONARITY_SCHEMA_VERSION,
+                )
+                for item in raw_trace
+            )
+        )
+        diagnostics = _diagnostics_payload(payload["sampler_diagnostics"])
+        return StoredInferenceStationarityTrace(
+            source,
+            view_id,
+            sequence_index,
+            trace,
+            manifest,
+            manifest_sha,
+            diagnostics,
+            declared_content,
+            _sha256(source),
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Invalid inference-stationarity diagnostic {source}: {exc}"
+        ) from exc
 
 
 def _evidence_payload(evidence: StationarityEvidence) -> dict[str, int | float]:
@@ -248,31 +457,7 @@ def write_inference_stationarity(
     }
     content_sha256 = hashlib.sha256(_canonical_json(body)).hexdigest()
     payload = {**body, "content_sha256": content_sha256}
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(
-        f".{destination.name}.{uuid4().hex}.partial"
-    )
-    try:
-        with temporary.open("x", encoding="utf-8") as stream:
-            json.dump(
-                payload,
-                stream,
-                indent=2,
-                ensure_ascii=False,
-                allow_nan=False,
-                sort_keys=True,
-            )
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temporary, destination)
-        directory = os.open(destination.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _write_once_json(destination, payload)
     return read_inference_stationarity(destination)
 
 

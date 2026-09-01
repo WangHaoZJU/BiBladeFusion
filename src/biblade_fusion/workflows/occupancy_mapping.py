@@ -30,6 +30,7 @@ from biblade_fusion.mapping import (
 from biblade_fusion.mapping.self_mask import (
     RobotSelfMaskConfig,
     RobotSelfMaskReport,
+    RobotSelfMaskResult,
     depth_consistent_robot_self_mask,
 )
 from biblade_fusion.robotics.es68_model import (
@@ -494,6 +495,59 @@ class OccupancyFrameUpdate:
             raise ValueError("Result snapshot lifecycle sequence is inconsistent")
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedOccupancyFrame:
+    """Current-frame safety inputs prepared before any occupancy ray integration."""
+
+    bundle: SynchronizedFrameBundle
+    stereo: StereoInferenceObservation
+    captured_at_utc: datetime
+    grid: OccupancyGridSpec
+    mapping_context: OccupancyMappingContext
+    predicted_base_t_flange: PoseSE3
+    predicted_base_t_tcp: PoseSE3
+    observed_base_t_tcp: PoseSE3
+    base_t_camera: PoseSE3
+    hand_eye_hash: str
+    physical_source_id: str
+    source_stereo_metadata_sha256: str
+    source_session_manifest_sha256: str
+    source_session_view_metadata_sha256: str
+    fk_tcp_translation_error_m: float
+    fk_tcp_rotation_error_deg: float
+    valid_depth_fraction: float
+    stereo_valid_fraction: float
+    confidence_accepted_fraction: float
+    mean_accepted_confidence: float
+    lr_consistency_threshold_px: float
+    source_depth_m: NDArray[np.float64]
+    stereo_valid_mask: NDArray[np.bool_]
+    stereo_confidence: NDArray[np.float64]
+    predicted_robot_depth_m: NDArray[np.float64]
+    self_mask: RobotSelfMaskResult
+
+    def __post_init__(self) -> None:
+        arrays = {
+            "source_depth_m": np.float64,
+            "stereo_valid_mask": np.bool_,
+            "stereo_confidence": np.float64,
+            "predicted_robot_depth_m": np.float64,
+        }
+        for name, dtype in arrays.items():
+            value = np.array(getattr(self, name), dtype=dtype, copy=True)
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+        shape = self.source_depth_m.shape
+        if (
+            self.source_depth_m.ndim != 2
+            or self.stereo_valid_mask.shape != shape
+            or self.stereo_confidence.shape != shape
+            or self.predicted_robot_depth_m.shape != shape
+            or self.self_mask.integration_valid_mask.shape != shape
+        ):
+            raise ValueError("Prepared occupancy arrays must share one HxW shape")
+
+
 def occupancy_frame_evidence_payload(evidence: OccupancyFrameEvidence) -> dict[str, object]:
     """Return the canonical, independently reproducible per-frame evidence payload."""
 
@@ -597,8 +651,7 @@ def occupancy_array_content_hash(array: NDArray[np.generic]) -> str:
     return digest.hexdigest()
 
 
-def integrate_foundation_stereo_occupancy(
-    previous_snapshot: OccupancySnapshot | None,
+def prepare_foundation_stereo_occupancy_frame(
     bundle: SynchronizedFrameBundle,
     stereo: StereoInferenceObservation,
     hand_eye: HandEyeCalibration,
@@ -610,9 +663,8 @@ def integrate_foundation_stereo_occupancy(
     source_stereo_metadata_sha256: str,
     source_session_manifest_sha256: str,
     source_session_view_metadata_sha256: str,
-    previous_evidence_hash: str | None = None,
-) -> OccupancyFrameUpdate:
-    """Integrate one settled frame and promote it only after explicit quality gates."""
+) -> PreparedOccupancyFrame:
+    """Prepare exact current-frame masks without performing expensive ray integration."""
 
     if not occupancy_config.enabled:
         raise OccupancyMappingError("Occupancy mapping is disabled in the active configuration")
@@ -721,20 +773,6 @@ def integrate_foundation_stereo_occupancy(
             "Post-self-mask valid depth fraction is below the configured gate "
             f"({valid_fraction:.6f} < {occupancy_config.minimum_valid_depth_fraction:.6f})"
         )
-    integrator = DepthRayIntegrator(
-        grid,
-        DepthIntegrationConfig(
-            minimum_depth_m=occupancy_config.minimum_depth_m,
-            maximum_depth_m=occupancy_config.maximum_depth_m,
-            pixel_stride=occupancy_config.integration_stride,
-            minimum_valid_rays=1,
-            free_space_margin_m=occupancy_config.free_space_margin_m,
-            minimum_free_observations=(occupancy_config.minimum_free_observations),
-            minimum_free_view_translation_m=(occupancy_config.minimum_free_view_translation_m),
-            minimum_free_view_direction_deg=(occupancy_config.minimum_free_view_direction_deg),
-        ),
-        mapping_context_hash=context.content_hash,
-    )
     physical_source_id = occupancy_physical_source_id(
         source_session_manifest_sha256=source_session_manifest_sha256,
         source_session_view_metadata_sha256=source_session_view_metadata_sha256,
@@ -742,14 +780,68 @@ def integrate_foundation_stereo_occupancy(
         frame_number=stereo.rectified.source_frame_number,
         source_view_id=bundle.view_id,
     )
+    return PreparedOccupancyFrame(
+        bundle=bundle,
+        stereo=stereo,
+        captured_at_utc=captured,
+        grid=grid,
+        mapping_context=context,
+        predicted_base_t_flange=predicted_base_t_flange,
+        predicted_base_t_tcp=predicted_base_t_tcp,
+        observed_base_t_tcp=observed_base_t_tcp,
+        base_t_camera=base_t_camera,
+        hand_eye_hash=hand_eye_hash,
+        physical_source_id=physical_source_id,
+        source_stereo_metadata_sha256=source_stereo_metadata_sha256,
+        source_session_manifest_sha256=source_session_manifest_sha256,
+        source_session_view_metadata_sha256=source_session_view_metadata_sha256,
+        fk_tcp_translation_error_m=fk_tcp_translation_error_m,
+        fk_tcp_rotation_error_deg=fk_tcp_rotation_error_deg,
+        valid_depth_fraction=valid_fraction,
+        stereo_valid_fraction=stereo_valid_fraction,
+        confidence_accepted_fraction=confidence_accepted_fraction,
+        mean_accepted_confidence=mean_accepted_confidence,
+        lr_consistency_threshold_px=lr_threshold_px,
+        source_depth_m=depth,
+        stereo_valid_mask=np.asarray(stereo.result.valid_mask, dtype=np.bool_),
+        stereo_confidence=np.asarray(stereo.result.confidence, dtype=np.float64),
+        predicted_robot_depth_m=predicted_depth,
+        self_mask=self_mask,
+    )
+
+
+def integrate_prepared_foundation_stereo_occupancy(
+    previous_snapshot: OccupancySnapshot | None,
+    prepared: PreparedOccupancyFrame,
+    occupancy_config: OccupancyConfig,
+    renderer: RobotDepthRenderer,
+    *,
+    previous_evidence_hash: str | None = None,
+) -> OccupancyFrameUpdate:
+    """Integrate one already-validated current frame into the safety map."""
+
+    integrator = DepthRayIntegrator(
+        prepared.grid,
+        DepthIntegrationConfig(
+            minimum_depth_m=occupancy_config.minimum_depth_m,
+            maximum_depth_m=occupancy_config.maximum_depth_m,
+            pixel_stride=occupancy_config.integration_stride,
+            minimum_valid_rays=1,
+            free_space_margin_m=occupancy_config.free_space_margin_m,
+            minimum_free_observations=occupancy_config.minimum_free_observations,
+            minimum_free_view_translation_m=(occupancy_config.minimum_free_view_translation_m),
+            minimum_free_view_direction_deg=(occupancy_config.minimum_free_view_direction_deg),
+        ),
+        mapping_context_hash=prepared.mapping_context.content_hash,
+    )
     mapping_snapshot = integrator.integrate(
         previous_snapshot,
-        depth,
-        rectified_calibration.left,
-        base_t_camera,
-        valid_mask=self_mask.integration_valid_mask,
-        source_view_id=physical_source_id,
-        observed_at_utc=captured,
+        prepared.source_depth_m,
+        prepared.stereo.rectified.calibration.left,
+        prepared.base_t_camera,
+        valid_mask=prepared.self_mask.integration_valid_mask,
+        source_view_id=prepared.physical_source_id,
+        observed_at_utc=prepared.captured_at_utc,
     )
     inherited_evidence_hash = mapping_snapshot.parent_evidence_hash
     if previous_evidence_hash is not None:
@@ -760,57 +852,55 @@ def integrate_foundation_stereo_occupancy(
                 "previous_evidence_hash is not bound to the previous occupancy snapshot"
             )
     evidence = OccupancyFrameEvidence(
-        source_view_id=bundle.view_id,
-        physical_source_id=physical_source_id,
-        source_sequence_index=bundle.sequence_index,
-        frame_number=stereo.rectified.source_frame_number,
-        captured_at_utc=captured.isoformat(),
+        source_view_id=prepared.bundle.view_id,
+        physical_source_id=prepared.physical_source_id,
+        source_sequence_index=prepared.bundle.sequence_index,
+        frame_number=prepared.stereo.rectified.source_frame_number,
+        captured_at_utc=prepared.captured_at_utc.isoformat(),
         robot_model_hash=renderer.model_content_hash,
-        hand_eye_hash=hand_eye_hash,
-        source_stereo_metadata_sha256=source_stereo_metadata_sha256,
-        source_session_manifest_sha256=source_session_manifest_sha256,
-        source_session_view_metadata_sha256=source_session_view_metadata_sha256,
+        hand_eye_hash=prepared.hand_eye_hash,
+        source_stereo_metadata_sha256=prepared.source_stereo_metadata_sha256,
+        source_session_manifest_sha256=prepared.source_session_manifest_sha256,
+        source_session_view_metadata_sha256=(prepared.source_session_view_metadata_sha256),
         base_t_flange_matrix=tuple(
-            tuple(float(value) for value in row) for row in predicted_base_t_flange.matrix
+            tuple(float(value) for value in row)
+            for row in prepared.predicted_base_t_flange.matrix
         ),
         predicted_base_t_tcp_matrix=tuple(
-            tuple(float(value) for value in row) for row in predicted_base_t_tcp.matrix
+            tuple(float(value) for value in row) for row in prepared.predicted_base_t_tcp.matrix
         ),
         observed_base_t_tcp_matrix=tuple(
-            tuple(float(value) for value in row) for row in observed_base_t_tcp.matrix
+            tuple(float(value) for value in row) for row in prepared.observed_base_t_tcp.matrix
         ),
         base_t_camera_matrix=tuple(
-            tuple(float(value) for value in row) for row in base_t_camera.matrix
+            tuple(float(value) for value in row) for row in prepared.base_t_camera.matrix
         ),
         joint_positions_rad=tuple(
-            float(value) for value in bundle.selected_robot_state.joint_positions_rad
+            float(value)
+            for value in prepared.bundle.selected_robot_state.joint_positions_rad
         ),
-        fk_tcp_translation_error_m=fk_tcp_translation_error_m,
-        fk_tcp_rotation_error_deg=fk_tcp_rotation_error_deg,
-        valid_depth_fraction=valid_fraction,
-        stereo_valid_fraction=stereo_valid_fraction,
-        confidence_accepted_fraction=confidence_accepted_fraction,
-        mean_accepted_confidence=mean_accepted_confidence,
-        lr_consistency_threshold_px=lr_threshold_px,
-        self_mask=self_mask.report,
-        mapping_context_hash=context.content_hash,
+        fk_tcp_translation_error_m=prepared.fk_tcp_translation_error_m,
+        fk_tcp_rotation_error_deg=prepared.fk_tcp_rotation_error_deg,
+        valid_depth_fraction=prepared.valid_depth_fraction,
+        stereo_valid_fraction=prepared.stereo_valid_fraction,
+        confidence_accepted_fraction=prepared.confidence_accepted_fraction,
+        mean_accepted_confidence=prepared.mean_accepted_confidence,
+        lr_consistency_threshold_px=prepared.lr_consistency_threshold_px,
+        self_mask=prepared.self_mask.report,
+        mapping_context_hash=prepared.mapping_context.content_hash,
         previous_evidence_hash=inherited_evidence_hash,
         mapping_snapshot_content_hash=mapping_snapshot.content_hash,
         mapping_snapshot_sequence=mapping_snapshot.sequence,
         mapping_source_view_ids=mapping_snapshot.source_view_ids,
-        source_depth_content_hash=occupancy_array_content_hash(depth),
-        stereo_valid_mask_content_hash=occupancy_array_content_hash(
-            np.asarray(stereo.result.valid_mask, dtype=np.bool_)
-        ),
-        stereo_confidence_content_hash=occupancy_array_content_hash(
-            np.asarray(stereo.result.confidence, dtype=np.float64)
-        ),
+        source_depth_content_hash=occupancy_array_content_hash(prepared.source_depth_m),
+        stereo_valid_mask_content_hash=occupancy_array_content_hash(prepared.stereo_valid_mask),
+        stereo_confidence_content_hash=occupancy_array_content_hash(prepared.stereo_confidence),
         predicted_robot_depth_content_hash=occupancy_array_content_hash(
-            np.asarray(predicted_depth, dtype=np.float64)
+            prepared.predicted_robot_depth_m
         ),
-        robot_mask_content_hash=occupancy_array_content_hash(self_mask.robot_mask),
+        robot_mask_content_hash=occupancy_array_content_hash(prepared.self_mask.robot_mask),
         integration_valid_mask_content_hash=occupancy_array_content_hash(
-            self_mask.integration_valid_mask
+            prepared.self_mask.integration_valid_mask
         ),
     )
     if len(mapping_snapshot.source_view_ids) >= occupancy_config.minimum_source_views:
@@ -820,14 +910,52 @@ def integrate_foundation_stereo_occupancy(
     return OccupancyFrameUpdate(
         snapshot=snapshot,
         mapping_snapshot=mapping_snapshot,
-        mapping_context=context,
-        source_depth_m=depth,
-        stereo_valid_mask=np.asarray(stereo.result.valid_mask, dtype=np.bool_),
-        stereo_confidence=np.asarray(stereo.result.confidence, dtype=np.float64),
-        predicted_robot_depth_m=predicted_depth,
-        robot_mask=self_mask.robot_mask,
-        integration_valid_mask=self_mask.integration_valid_mask,
+        mapping_context=prepared.mapping_context,
+        source_depth_m=prepared.source_depth_m,
+        stereo_valid_mask=prepared.stereo_valid_mask,
+        stereo_confidence=prepared.stereo_confidence,
+        predicted_robot_depth_m=prepared.predicted_robot_depth_m,
+        robot_mask=prepared.self_mask.robot_mask,
+        integration_valid_mask=prepared.self_mask.integration_valid_mask,
         evidence=evidence,
+    )
+
+
+def integrate_foundation_stereo_occupancy(
+    previous_snapshot: OccupancySnapshot | None,
+    bundle: SynchronizedFrameBundle,
+    stereo: StereoInferenceObservation,
+    hand_eye: HandEyeCalibration,
+    occupancy_config: OccupancyConfig,
+    acquisition_config: AcquisitionConfig,
+    renderer: RobotDepthRenderer,
+    *,
+    captured_at_utc: datetime,
+    source_stereo_metadata_sha256: str,
+    source_session_manifest_sha256: str,
+    source_session_view_metadata_sha256: str,
+    previous_evidence_hash: str | None = None,
+) -> OccupancyFrameUpdate:
+    """Prepare and integrate one settled FoundationStereo observation."""
+
+    prepared = prepare_foundation_stereo_occupancy_frame(
+        bundle,
+        stereo,
+        hand_eye,
+        occupancy_config,
+        acquisition_config,
+        renderer,
+        captured_at_utc=captured_at_utc,
+        source_stereo_metadata_sha256=source_stereo_metadata_sha256,
+        source_session_manifest_sha256=source_session_manifest_sha256,
+        source_session_view_metadata_sha256=source_session_view_metadata_sha256,
+    )
+    return integrate_prepared_foundation_stereo_occupancy(
+        previous_snapshot,
+        prepared,
+        occupancy_config,
+        renderer,
+        previous_evidence_hash=previous_evidence_hash,
     )
 
 

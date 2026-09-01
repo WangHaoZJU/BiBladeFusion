@@ -28,7 +28,10 @@ from biblade_fusion.devices.depth_camera import (
 )
 from biblade_fusion.devices.robot.base import RobotState
 from biblade_fusion.perception.stereo import FoundationStereoBackend
-from biblade_fusion.robotics import load_es68_flange_t_tcp
+from biblade_fusion.robotics import StationarityError, load_es68_flange_t_tcp
+from biblade_fusion.storage.inference_stationarity import (
+    read_inference_stationarity_trace,
+)
 from biblade_fusion.workflows.foundation_stereo_cycle import (
     FoundationStereoCycleError,
     FoundationStereoOccupancyCycleEngine,
@@ -249,6 +252,76 @@ def test_robot_state_sampler_retains_fail_closed_trace_when_fifo_is_unavailable(
     trace = sampler.finish()
 
     assert len(trace) >= 3
+
+
+def test_independent_sampler_trace_is_bound_to_camera_rtsi_states(
+    tmp_path: Path,
+) -> None:
+    engine, _ = _capture_engine(tmp_path)
+    sampled = tuple(
+        replace(
+            _state(1_000_000_000 + index * 50_000_000),
+            controller_time_s=1.0 + index * 0.05,
+        )
+        for index in range(3)
+    )
+    captured = tuple(
+        replace(
+            sampled[index],
+            monotonic_time_ns=2_000_000_000 + index,
+            controller_time_s=sampled[index].controller_time_s + 0.001,
+        )
+        for index in range(3)
+    )
+
+    engine._validate_capture_binding(sampled, captured)  # noqa: SLF001
+
+    moved = replace(
+        captured[1],
+        joint_positions_rad=np.full(6, 0.1),
+    )
+    with pytest.raises(
+        FoundationStereoCycleError,
+        match="differs from camera bracket state 1",
+    ):
+        engine._validate_capture_binding(  # noqa: SLF001
+            sampled,
+            (captured[0], moved, captured[2]),
+        )
+
+
+def test_capture_uses_injected_process_sampler_boundary(tmp_path: Path) -> None:
+    engine, _ = _capture_engine(tmp_path)
+
+    class StubSampler:
+        def __init__(self) -> None:
+            self.started = False
+            self.cancelled = False
+
+        @property
+        def is_alive(self) -> bool:
+            return self.started and not self.cancelled
+
+        @property
+        def diagnostics(self) -> dict[str, object]:
+            return {"sampler_kind": "stub"}
+
+        def start(self) -> None:
+            self.started = True
+
+        def finish(self) -> tuple[RobotState, ...]:
+            return (_state(1), _state(2), _state(3))
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    sampler = StubSampler()
+    engine._robot_state_sampler_factory = lambda: sampler  # noqa: SLF001
+
+    captured = engine.capture("process-boundary", 0, purpose=CapturePurpose.BOOTSTRAP)
+    assert sampler.started is True
+    engine.cancel_pending_capture(captured)
+    assert sampler.cancelled is True
 
 
 def _window_source(
@@ -570,6 +643,259 @@ def test_science_authority_is_rechecked_immediately_before_and_after_inference(
 
     assert backend_calls == ["infer"] * expected_backend_calls
     assert authority.current_calls == fail_on_current_call
+
+
+def _stub_perception_pipeline(
+    engine: FoundationStereoOccupancyCycleEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observation = SimpleNamespace()
+
+    def write_stereo(path, *_args, **_kwargs) -> None:
+        path.mkdir()
+        (path / "metadata.json").write_text("{}\n", encoding="utf-8")
+
+    def write_occupancy(path, *_args, **_kwargs) -> None:
+        path.mkdir()
+        (path / "metadata.json").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(cycle_module, "infer_rectified_stereo", lambda *_args: observation)
+    monkeypatch.setattr(cycle_module, "write_stereo_inference", write_stereo)
+    monkeypatch.setattr(
+        cycle_module,
+        "read_stereo_inference",
+        lambda _path: SimpleNamespace(observation=observation),
+    )
+    monkeypatch.setattr(
+        cycle_module,
+        "verify_stereo_inference_source",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(cycle_module, "write_occupancy_mapping", write_occupancy)
+    monkeypatch.setattr(
+        cycle_module,
+        "read_occupancy_mapping",
+        lambda _path: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        cycle_module.OccupancyBinding,
+        "from_mapping",
+        classmethod(lambda cls, _mapping: SimpleNamespace(tuple=("synthetic",))),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_camera_view_evidence",
+        lambda *_args: {
+            "camera_center_base_m": (0.0, 0.0, 0.0),
+            "camera_axis_base": (0.0, 0.0, 1.0),
+        },
+    )
+    monkeypatch.setattr(engine, "_fresh_rebuild_sources", lambda source: (source,))
+    monkeypatch.setattr(
+        engine,
+        "_rebuild_updates",
+        lambda _sources: (SimpleNamespace(),),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_prepare_science_assets",
+        lambda *_args: SimpleNamespace(
+            blade_foreground_path=None,
+            reconstructed_view_path=None,
+            coverage_path=None,
+            advances_coverage=False,
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_prepare_coarse_science_asset",
+        lambda *_args: None,
+    )
+
+
+def test_rejected_stationarity_persists_sampler_trace_before_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _ = _capture_engine(tmp_path)
+
+    class DelayedSampler:
+        def __init__(self) -> None:
+            self.started = False
+
+        @property
+        def is_alive(self) -> bool:
+            return self.started
+
+        @property
+        def diagnostics(self) -> dict[str, object]:
+            return {
+                "sampler_kind": "elite_rtsi_process",
+                "maximum_raw_host_gap_s": 0.4,
+                "scheduler": {"policy": "SCHED_FIFO", "priority": 10},
+            }
+
+        def start(self) -> None:
+            self.started = True
+
+        def finish(self) -> tuple[RobotState, ...]:
+            self.started = False
+            return tuple(
+                RobotState(
+                    monotonic_time_ns=round(host_s * 1e9),
+                    controller_time_s=controller_s,
+                    joint_positions_rad=np.zeros(6),
+                    base_t_tcp=PoseSE3.identity("base", "tcp"),
+                    robot_mode="IDLE",
+                    safety_status="NORMAL",
+                    speed_scaling=0.1,
+                )
+                for host_s, controller_s in (
+                    (1.0, 1.0),
+                    (1.1, 1.1),
+                    (1.5, 1.2),
+                )
+            )
+
+        def cancel(self) -> None:
+            self.started = False
+
+    sampler = DelayedSampler()
+    engine._robot_state_sampler_factory = lambda: sampler  # noqa: SLF001
+    captured = engine.capture(
+        "rejected-trace",
+        0,
+        purpose=CapturePurpose.BOOTSTRAP,
+    )
+    _stub_perception_pipeline(engine, monkeypatch)
+
+    with pytest.raises(StationarityError, match="sample gap"):
+        engine.infer_and_update(captured)
+
+    diagnostic = read_inference_stationarity_trace(
+        captured.cycle_root / "inference_stationarity_trace.json"
+    )
+    assert diagnostic.sampler_diagnostics["maximum_raw_host_gap_s"] == 0.4
+    assert len(diagnostic.trace) == 3
+    assert not (captured.cycle_root / "inference_stationarity.json").exists()
+
+
+def test_coarse_foreground_preflight_failure_precedes_occupancy_rebuild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _ = _capture_engine(tmp_path)
+    captured = engine.capture(
+        "preflight-first",
+        0,
+        purpose=CapturePurpose.BOOTSTRAP,
+    )
+    _stub_perception_pipeline(engine, monkeypatch)
+    prepared = SimpleNamespace()
+    rebuild_calls = 0
+
+    monkeypatch.setattr(
+        cycle_module,
+        "prepare_foundation_stereo_occupancy_frame",
+        lambda *_args, **_kwargs: prepared,
+    )
+
+    def reject_preflight(*_args) -> None:
+        raise ValueError("synthetic foreground rejection")
+
+    def rebuild(*_args, **_kwargs):
+        nonlocal rebuild_calls
+        rebuild_calls += 1
+        return (SimpleNamespace(),)
+
+    engine._coarse_science_preflighter = reject_preflight  # noqa: SLF001
+    monkeypatch.setattr(engine, "_rebuild_updates", rebuild)
+
+    with pytest.raises(ValueError, match="synthetic foreground rejection"):
+        engine.infer_and_update(captured)
+
+    assert rebuild_calls == 0
+
+
+def test_authoritative_stationarity_includes_exact_capture_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _ = _capture_engine(tmp_path)
+
+    class IndependentSampler:
+        def __init__(self) -> None:
+            self.started = False
+
+        @property
+        def is_alive(self) -> bool:
+            return self.started
+
+        @property
+        def diagnostics(self) -> dict[str, object]:
+            return {
+                "sampler_kind": "elite_rtsi_process",
+                "scheduler": {"policy": "SCHED_FIFO", "priority": 10},
+            }
+
+        def start(self) -> None:
+            self.started = True
+
+        def finish(self) -> tuple[RobotState, ...]:
+            self.started = False
+            return tuple(
+                replace(
+                    _state(host_ns),
+                    controller_time_s=controller_s,
+                )
+                for host_ns, controller_s in (
+                    # This packet arrived first but its controller timestamp is
+                    # slightly ahead of the main RTSI capture bracket.
+                    (999_000_000, 1.004),
+                    (1_050_000_000, 1.05),
+                    (1_100_000_000, 1.10),
+                )
+            )
+
+        def cancel(self) -> None:
+            self.started = False
+
+    sampler = IndependentSampler()
+    engine._robot_state_sampler_factory = lambda: sampler  # noqa: SLF001
+    captured = engine.capture(
+        "capture-contract",
+        0,
+        purpose=CapturePurpose.BOOTSTRAP,
+    )
+    _stub_perception_pipeline(engine, monkeypatch)
+
+    result = engine.infer_and_update(captured)
+
+    diagnostic = read_inference_stationarity_trace(
+        captured.cycle_root / "inference_stationarity_trace.json"
+    )
+    authoritative = cycle_module.read_inference_stationarity(
+        result.inference_stationarity_path
+    )
+    authoritative_trace = (authoritative.reference, *authoritative.trace)
+    capture_states = (
+        captured.bundle.robot_state_before,
+        captured.bundle.selected_robot_state,
+        captured.bundle.robot_state_after,
+    )
+    assert not any(
+        cycle_module._robot_state_values_equal(capture_states[0], state)
+        for state in diagnostic.trace
+    )
+    assert all(
+        any(
+            cycle_module._robot_state_values_equal(capture_state, sample)
+            for sample in authoritative_trace
+        )
+        for capture_state in capture_states
+    )
+    assert all(state.controller_time_s != 1.004 for state in authoritative_trace)
+    engine.cancel_pending_capture(captured)
 
 
 def test_committed_logical_key_rejects_before_camera_attempt(tmp_path: Path) -> None:
