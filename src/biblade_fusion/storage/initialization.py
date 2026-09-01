@@ -24,7 +24,11 @@ from biblade_fusion.core.settings import (
 )
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.perception.pointcloud import PointCloud
-from biblade_fusion.perception.proxy import BilateralBladeProxy
+from biblade_fusion.perception.proxy import (
+    BilateralBladeProxy,
+    build_bilateral_proxy,
+    select_proxy_support,
+)
 from biblade_fusion.robotics import (
     Es68KinematicModel,
     Es68ModelResources,
@@ -32,7 +36,9 @@ from biblade_fusion.robotics import (
 )
 from biblade_fusion.workflows import AuthoritativeRobotPose, InitialObservation
 
-INITIALIZATION_SCHEMA_VERSION = 7
+INITIALIZATION_SCHEMA_VERSION = 8
+INITIALIZATION_METADATA_FILENAME = "metadata.json"
+_AUTHORITATIVE_POSE_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +62,41 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         json.dump(payload, stream, indent=2, ensure_ascii=False)
         stream.write("\n")
     temporary.replace(path)
+
+
+def _assert_proxy_reproduces(
+    proxy: BilateralBladeProxy,
+    points_m: np.ndarray,
+    base_t_projection_camera: PoseSE3,
+    proxy_config: ProxyModelConfig,
+) -> None:
+    """Require proxy metadata to be the deterministic result of its support points."""
+
+    replayed = build_bilateral_proxy(points_m, base_t_projection_camera, proxy_config)
+    vector_pairs = (
+        (proxy.frame_T_proxy.matrix, replayed.frame_T_proxy.matrix),
+        (proxy.extents_m, replayed.extents_m),
+        (proxy.observed_surface_centroid_m, replayed.observed_surface_centroid_m),
+        (proxy.pca_eigenvalues_m2, replayed.pca_eigenvalues_m2),
+    )
+    if any(
+        not np.allclose(actual, expected, rtol=0.0, atol=1e-12)
+        for actual, expected in vector_pairs
+    ) or (
+        proxy.raw_point_count,
+        proxy.finite_point_count,
+        proxy.voxel_point_count,
+    ) != (
+        replayed.raw_point_count,
+        replayed.finite_point_count,
+        replayed.voxel_point_count,
+    ) or not np.isclose(
+        proxy.camera_normal_cosine,
+        replayed.camera_normal_cosine,
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError("Initialization proxy does not reproduce from its support points")
 
 
 def _sha256(path: Path) -> str:
@@ -251,6 +292,24 @@ def write_initialization(
     )
 
     proxy = observation.proxy
+    support = select_proxy_support(
+        observation.base_cloud.points_m,
+        proxy_config,
+        frame=observation.base_cloud.frame,
+    )
+    if not np.array_equal(support.mask, observation.proxy_support_mask):
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise ValueError("Initialization proxy-support mask does not reproduce from config")
+    if support.envelope_enabled and proxy.raw_point_count != support.retained_point_count:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise ValueError("Initialization proxy input count does not match support selection")
+    if support.envelope_enabled:
+        _assert_proxy_reproduces(
+            proxy,
+            observation.base_cloud.points_m[support.mask],
+            observation.base_t_projection_camera,
+            proxy_config,
+        )
     metadata: dict[str, Any] = {
         "schema_version": INITIALIZATION_SCHEMA_VERSION,
         "created_at_utc": datetime.now(UTC).isoformat(),
@@ -286,6 +345,7 @@ def write_initialization(
             "voxel_point_count": proxy.voxel_point_count,
             "camera_normal_cosine": proxy.camera_normal_cosine,
         },
+        "proxy_support": support.metadata_payload(),
         "hand_eye": {
             "source": _source_record(hand_eye.source_path),
             "method": hand_eye.method,
@@ -320,15 +380,21 @@ def write_initialization(
         )
         np.save(temporary / "pixel_uv.npy", observation.base_cloud.pixel_uv, allow_pickle=False)
         np.save(temporary / "blade_mask.npy", mask, allow_pickle=False)
+        np.save(
+            temporary / "proxy_support_mask.npy",
+            support.mask,
+            allow_pickle=False,
+        )
         metadata["files"] = {
             name: _array_record(temporary / filename)
             for name, filename in {
                 "base_points_m": "base_points_m.npy",
                 "pixel_uv": "pixel_uv.npy",
                 "blade_mask": "blade_mask.npy",
+                "proxy_support_mask": "proxy_support_mask.npy",
             }.items()
         }
-        _atomic_json(temporary / "metadata.json", metadata)
+        _atomic_json(temporary / INITIALIZATION_METADATA_FILENAME, metadata)
         temporary.replace(output_path)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -341,16 +407,37 @@ def read_initialization(path: str | Path) -> StoredInitialization:
 
     root = Path(path)
     try:
-        metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        metadata = json.loads(
+            (root / INITIALIZATION_METADATA_FILENAME).read_text(encoding="utf-8")
+        )
         if not isinstance(metadata, dict):
             raise TypeError("metadata root must be an object")
         schema_version = int(metadata["schema_version"])
-        if schema_version not in {4, 5, 6, INITIALIZATION_SCHEMA_VERSION}:
+        if schema_version not in {4, 5, 6, 7, INITIALIZATION_SCHEMA_VERSION}:
             raise ValueError(f"unsupported schema {schema_version}")
+        authoritative_schema = schema_version >= _AUTHORITATIVE_POSE_SCHEMA_VERSION
         files = metadata["files"]
         points = _load_contained_array(root, files["base_points_m"])
         pixels = _load_contained_array(root, files["pixel_uv"])
         mask = _load_contained_array(root, files["blade_mask"])
+        if schema_version == INITIALIZATION_SCHEMA_VERSION:
+            proxy_support_mask = _load_contained_array(
+                root,
+                files["proxy_support_mask"],
+            )
+            proxy_config = ProxyModelConfig.model_validate(
+                metadata["processing"]["proxy_model"]
+            )
+            support = select_proxy_support(points, proxy_config, frame="base")
+            if not np.array_equal(proxy_support_mask, support.mask):
+                raise ValueError("initialization proxy-support mask does not reproduce")
+            if metadata["proxy_support"] != support.metadata_payload():
+                raise ValueError("initialization proxy-support diagnostics changed")
+            observation_proxy_support_mask = (
+                proxy_support_mask if support.envelope_enabled else None
+            )
+        else:
+            observation_proxy_support_mask = None
         source_shape = tuple(int(value) for value in metadata["source_image_shape"])
         transforms = metadata["transforms"]
         proxy_data = metadata["proxy"]
@@ -379,6 +466,13 @@ def read_initialization(path: str | Path) -> StoredInitialization:
             voxel_point_count=int(proxy_data["voxel_point_count"]),
             camera_normal_cosine=float(proxy_data["camera_normal_cosine"]),
         )
+        if schema_version == INITIALIZATION_SCHEMA_VERSION and support.envelope_enabled:
+            _assert_proxy_reproduces(
+                proxy,
+                points[proxy_support_mask],
+                base_t_projection_camera,
+                proxy_config,
+            )
         observation = InitialObservation(
             source_view_id=str(metadata["source"]["view_id"]),
             planning_intrinsics=_intrinsics_from_payload(planning_intrinsics_data),
@@ -390,6 +484,7 @@ def read_initialization(path: str | Path) -> StoredInitialization:
             depth_source=depth_source,
             source_sequence_index=int(metadata["source"].get("sequence_index", 0)),
             source_frame_number=int(metadata["source"].get("frame_number", 0)),
+            proxy_support_mask=observation_proxy_support_mask,
         )
         hand_eye_data = metadata["hand_eye"]
         hand_eye = HandEyeCalibration(
@@ -413,7 +508,7 @@ def read_initialization(path: str | Path) -> StoredInitialization:
             source_path=Path(
                 str(
                     hand_eye_data["source"]["path"]
-                    if schema_version == INITIALIZATION_SCHEMA_VERSION
+                    if authoritative_schema
                     else hand_eye_data["source_path"]
                 )
             ),
@@ -434,12 +529,12 @@ def read_initialization(path: str | Path) -> StoredInitialization:
             ),
             flange_t_left_ir=(
                 PoseSE3("flange", "left_ir", hand_eye_data["flange_T_left_ir"])
-                if schema_version == INITIALIZATION_SCHEMA_VERSION
+                if authoritative_schema
                 else None
             ),
         )
         pose_authority = None
-        if schema_version == INITIALIZATION_SCHEMA_VERSION:
+        if authoritative_schema:
             for record in metadata["kinematics_assets"].values():
                 asset_path = Path(str(record["path"])).resolve()
                 if (
@@ -542,6 +637,12 @@ def read_initialization(path: str | Path) -> StoredInitialization:
                 source_sequence_index=observation.source_sequence_index,
                 source_frame_number=observation.source_frame_number,
                 pose_authority=pose_authority,
+                proxy_support_mask=(
+                    observation.proxy_support_mask
+                    if schema_version == INITIALIZATION_SCHEMA_VERSION
+                    and support.envelope_enabled
+                    else None
+                ),
             )
         return StoredInitialization(observation, hand_eye, mask, metadata)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:

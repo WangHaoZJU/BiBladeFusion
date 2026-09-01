@@ -11,6 +11,7 @@ from biblade_fusion.core.settings import (
     FineFinalizationConfig,
     NextViewSelectionConfig,
     OccupancyConfig,
+    ProxyModelConfig,
     ReacquisitionPerturbationConfig,
     RobotConfig,
     ScienceAcceptanceConfig,
@@ -38,6 +39,9 @@ def test_default_settings_load_safely() -> None:
     assert settings.foundation_stereo.left_right_consistency_threshold_px == 1.0
     assert settings.stereo_rectification.alpha == 0.0
     assert settings.proxy_model.estimated_thickness_m is None
+    assert settings.proxy_model.blade_envelope_min_m is None
+    assert settings.proxy_model.blade_envelope_max_m is None
+    assert settings.proxy_model.minimum_envelope_retained_fraction is None
     assert settings.collision.require_obstacles is False
     assert settings.occupancy.minimum_source_views == 3
     assert settings.occupancy.maximum_source_views == 3
@@ -96,6 +100,24 @@ def test_default_settings_load_safely() -> None:
     assert settings.occupancy.accepted_static_free_acceptance_path is None
     assert settings.occupancy.mapping_mode == "stop_and_capture"
     assert settings.occupancy.workspace_bounds_min_m is None
+
+
+def test_proxy_blade_envelope_must_be_complete_and_ordered() -> None:
+    configured = ProxyModelConfig(
+        blade_envelope_min_m=(0.4, -0.2, 0.0),
+        blade_envelope_max_m=(0.8, 0.2, 0.4),
+        minimum_envelope_retained_fraction=0.75,
+    )
+
+    assert configured.blade_envelope_min_m == (0.4, -0.2, 0.0)
+    with pytest.raises(ValidationError, match="configured together"):
+        ProxyModelConfig(blade_envelope_min_m=(0.4, -0.2, 0.0))
+    with pytest.raises(ValidationError, match="finite and ordered"):
+        ProxyModelConfig(
+            blade_envelope_min_m=(0.8, -0.2, 0.0),
+            blade_envelope_max_m=(0.4, 0.2, 0.4),
+            minimum_envelope_retained_fraction=0.75,
+        )
 
 
 def test_unknown_configuration_key_is_rejected() -> None:

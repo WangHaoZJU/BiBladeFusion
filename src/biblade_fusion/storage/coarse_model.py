@@ -14,7 +14,8 @@ from uuid import uuid4
 import numpy as np
 
 from biblade_fusion.core.pose import PoseSE3
-from biblade_fusion.core.settings import AppSettings
+from biblade_fusion.core.settings import AppSettings, ProxyModelConfig
+from biblade_fusion.perception.proxy import PROXY_SUPPORT_ALGORITHM
 from biblade_fusion.workflows.coarse_model import CoarseModelResult
 
 COARSE_MODEL_SCHEMA_VERSION = 5
@@ -57,6 +58,7 @@ def write_coarse_model(
     settings: AppSettings,
     *,
     source_views: tuple[str | Path, ...],
+    source_coarse_views: tuple[str | Path, ...] = (),
 ) -> Path:
     """Persist fused geometry, partitions, TSDF, mesh, plan, and quality atomically."""
 
@@ -183,11 +185,27 @@ def write_coarse_model(
             if not metadata_path.is_file():
                 raise ValueError(f"Reconstructed-view metadata does not exist: {metadata_path}")
             source_records.append({"path": str(root), "metadata_sha256": _sha256(metadata_path)})
+        support_source_records = []
+        for source in source_coarse_views:
+            root = Path(source).resolve()
+            metadata_path = root / "metadata.json"
+            if not metadata_path.is_file():
+                raise ValueError(f"Coarse-view metadata does not exist: {metadata_path}")
+            support_source_records.append(
+                {"path": str(root), "metadata_sha256": _sha256(metadata_path)}
+            )
+        if support_source_records and len(support_source_records) != len(source_records):
+            raise ValueError("Coarse support sources must match reconstructed-view count")
         payload: dict[str, Any] = {
             "schema_version": COARSE_MODEL_SCHEMA_VERSION,
             "created_at_utc": datetime.now(UTC).isoformat(),
             "motion_authorized": False,
             "source_views": source_records,
+            "proxy_support": {
+                "algorithm": PROXY_SUPPORT_ALGORITHM,
+                "configuration": settings.proxy_model.model_dump(mode="json"),
+                "source_coarse_views": support_source_records,
+            },
             "files": {name: _record(temporary / f"{name}.npy") for name in arrays},
             "fusion": {
                 "center_m": result.fused_cloud.center_m.tolist(),
@@ -373,6 +391,18 @@ def read_coarse_model_summary(path: str | Path) -> StoredCoarseModelSummary:
             metadata = Path(str(source["path"])) / "metadata.json"
             if _sha256(metadata) != str(source["metadata_sha256"]):
                 raise ValueError(f"source reconstructed-view checksum mismatch: {metadata}")
+        support = payload.get("proxy_support")
+        if support is not None:
+            if support.get("algorithm") != PROXY_SUPPORT_ALGORITHM:
+                raise ValueError("coarse-model proxy-support algorithm changed")
+            ProxyModelConfig.model_validate(support["configuration"])
+            support_sources = support["source_coarse_views"]
+            if support_sources and len(support_sources) != len(payload["source_views"]):
+                raise ValueError("coarse-model proxy-support source count changed")
+            for source in support_sources:
+                metadata = Path(str(source["path"])) / "metadata.json"
+                if _sha256(metadata) != str(source["metadata_sha256"]):
+                    raise ValueError(f"source coarse-view checksum mismatch: {metadata}")
         for record in payload["files"].values():
             relative = Path(str(record["path"]))
             file_path = (root.resolve() / relative).resolve()

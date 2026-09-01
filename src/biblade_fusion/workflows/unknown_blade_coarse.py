@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from math import cos, radians, sin
@@ -29,7 +29,10 @@ from biblade_fusion.perception.bootstrap_foreground import (
     array_content_sha256,
     bootstrap_blade_foreground,
 )
-from biblade_fusion.perception.proxy import BilateralBladeProxy, build_bilateral_proxy
+from biblade_fusion.perception.proxy import (
+    BilateralBladeProxy,
+    build_bilateral_proxy,
+)
 from biblade_fusion.planning import (
     BladeSide,
     CandidateStatus,
@@ -61,6 +64,7 @@ from biblade_fusion.storage.coarse_scan import (
 )
 from biblade_fusion.storage.coverage import read_coverage_ledger, write_coverage_ledger
 from biblade_fusion.storage.initialization import (
+    INITIALIZATION_METADATA_FILENAME,
     read_initialization,
     write_initialization,
 )
@@ -73,7 +77,10 @@ from biblade_fusion.workflows.occupancy_mapping import (
     OccupancyFrameUpdate,
     occupancy_array_content_hash,
 )
-from biblade_fusion.workflows.reconstruction import reconstruct_foundation_stereo_view
+from biblade_fusion.workflows.reconstruction import (
+    ReconstructedBladeView,
+    reconstruct_foundation_stereo_view,
+)
 from biblade_fusion.workflows.stereo_inference import StereoInferenceObservation
 from biblade_fusion.workflows.stop_scan_coordinator import (
     CapturedStopScanView,
@@ -509,6 +516,7 @@ def _prepare_unknown_blade_coarse_view(
         target_view_id=target_view_id,
         target_kind=target_kind,
         target_side=effective_side,
+        proxy_config=settings.proxy_model,
     )
     return PreparedCoarseScienceView(
         coarse_view_path.resolve(),
@@ -546,6 +554,16 @@ def append_coarse_scan_generation(
     initialization = read_initialization(initialization_root)
     plan = read_view_plan(plan_root)
     current = read_coarse_scan_view(new_view)
+    if current.proxy_config != settings.proxy_model:
+        raise UnknownBladeCoarseError(
+            "Coarse view was not filtered with the active blade-envelope policy"
+        )
+    if initialization.metadata["processing"]["proxy_model"] != (
+        settings.proxy_model.model_dump(mode="json")
+    ):
+        raise UnknownBladeCoarseError(
+            "Coarse initialization and active blade-envelope policy differ"
+        )
     if _camera_side(current, initialization.observation.proxy) is not current.target_side:
         raise UnknownBladeCoarseError("Coarse target-side label disagrees with camera geometry")
     if previous_generation is None:
@@ -586,28 +604,35 @@ def append_coarse_scan_generation(
         ledger,
         plan.result.geometric_plan,
         initialization.observation.proxy,
-        current.reconstructed.view.base_cloud,
+        current.support_cloud,
         current.reconstructed.view.base_t_projection_camera,
         observation_id,
     )
     output = Path(output_dir)
     coverage_path = output.with_name(f"{output.name}_coverage")
-    write_coverage_ledger(
-        coverage_path,
-        ledger,
-        source_plan=plan_root,
-        source_initialization=initialization_root,
-        previous_ledger=previous_coverage,
-    )
-    return write_coarse_scan_generation(
-        output,
-        views=views,
-        coverage=coverage_path,
-        source_initialization=initialization_root,
-        source_view_plan=plan_root,
-        source_discovery_plan=discovery_root,
-        previous_generation=previous_generation,
-    )
+    coverage_created = False
+    try:
+        write_coverage_ledger(
+            coverage_path,
+            ledger,
+            source_plan=plan_root,
+            source_initialization=initialization_root,
+            previous_ledger=previous_coverage,
+        )
+        coverage_created = True
+        return write_coarse_scan_generation(
+            output,
+            views=views,
+            coverage=coverage_path,
+            source_initialization=initialization_root,
+            source_view_plan=plan_root,
+            source_discovery_plan=discovery_root,
+            previous_generation=previous_generation,
+        )
+    except Exception:
+        if coverage_created:
+            shutil.rmtree(coverage_path, ignore_errors=True)
+        raise
 
 
 def _candidate_kind(candidate_id: str) -> CoarseTargetKind:
@@ -747,7 +772,7 @@ def select_coarse_next_view(
             # The coarse coordinator pins the proxy initialization as its reference
             # on the first selection.  Schema-5 is an output handed to a new fine
             # coordinator, not a mid-run replacement for that reference contract.
-            _sha256(initialization_root / "initialization.json"),
+            _sha256(initialization_root / INITIALIZATION_METADATA_FILENAME),
             discovery.policy_sha256,
             required,
             0,
@@ -769,7 +794,7 @@ def select_coarse_next_view(
     return NextViewSelection(
         next_view_target_from_candidate(candidate, hand_eye),
         _sha256(generation.root / "generation.json"),
-        _sha256(initialization_root / "initialization.json"),
+        _sha256(initialization_root / INITIALIZATION_METADATA_FILENAME),
         discovery.policy_sha256,
         required,
         min(incomplete, required),
@@ -839,11 +864,17 @@ def finalize_coarse_generation(
         _assert_reusable_coarse_model(
             coarse_output,
             source_views=reconstructed_roots,
+            source_coarse_views=tuple(item.root for item in generation.views),
             settings=settings,
         )
         coarse_path = coarse_output
     else:
-        views = tuple(item.reconstructed.view for item in generation.views)
+        views = tuple(
+            replace(item.reconstructed.view, base_cloud=item.support_cloud)
+            if isinstance(item.reconstructed.view, ReconstructedBladeView)
+            else item.reconstructed.view
+            for item in generation.views
+        )
         result = build_coarse_blade_model(
             views,
             views[0].planning_intrinsics,
@@ -879,6 +910,7 @@ def finalize_coarse_generation(
             result,
             settings,
             source_views=reconstructed_roots,
+            source_coarse_views=tuple(item.root for item in generation.views),
         )
     initialization_root = Path(
         str(generation.metadata["sources"]["initialization"]["root"])
@@ -913,6 +945,7 @@ def _assert_reusable_coarse_model(
     path: Path,
     *,
     source_views: tuple[Path, ...],
+    source_coarse_views: tuple[Path, ...],
     settings: AppSettings,
 ) -> None:
     """Accept only the exact immutable model left by an interrupted promotion.
@@ -932,6 +965,17 @@ def _assert_reusable_coarse_model(
         )
         if actual_sources != source_views:
             raise ValueError("source reconstructed-view sequence differs")
+        support = metadata.get("proxy_support")
+        if support is None:
+            raise ValueError("existing coarse model lacks per-view blade-envelope provenance")
+        actual_support_sources = tuple(
+            Path(str(record["path"])).resolve()
+            for record in support["source_coarse_views"]
+        )
+        if actual_support_sources != source_coarse_views:
+            raise ValueError("source coarse-view support sequence differs")
+        if support["configuration"] != settings.proxy_model.model_dump(mode="json"):
+            raise ValueError("proxy-support configuration differs")
         expected_configurations = {
             "fusion": settings.multi_view_fusion.model_dump(mode="json"),
             "surface": settings.surface_partition.model_dump(mode="json"),
@@ -991,7 +1035,7 @@ def _write_discovery_plan_asset(
             "policy_sha256": discovery.policy_sha256,
             "sources": {
                 "initialization": _file_source_record(
-                    source_initialization / "initialization.json"
+                    source_initialization / INITIALIZATION_METADATA_FILENAME
                 ),
                 "view_plan": _file_source_record(source_view_plan / "view_plan.json"),
                 "kinematics": _file_source_record(source_kinematics),
@@ -1040,7 +1084,7 @@ def _verify_discovery_plan_asset(
     ):
         raise UnknownBladeCoarseError("Persisted coarse discovery policy changed")
     expected_sources = {
-        "initialization": source_initialization / "initialization.json",
+        "initialization": source_initialization / INITIALIZATION_METADATA_FILENAME,
         "view_plan": source_view_plan / "view_plan.json",
         "kinematics": source_kinematics,
     }
@@ -1354,7 +1398,7 @@ class CoarseScienceSession:
         stored = read_coarse_scan_view(prepared.coarse_view_path)
         if stored.target_view_id != prepared.target_view_id:
             raise UnknownBladeCoarseError("Prepared coarse-view identity changed")
-        if self._generation is None:
+        if self._generation is None and self._initialization is None:
             self._initialize_from_first_view(stored)
         assert self._initialization is not None
         assert self._view_plan is not None
@@ -1377,8 +1421,13 @@ class CoarseScienceSession:
 
     def _initialize_from_first_view(self, stored: StoredCoarseScanView) -> None:
         view = stored.reconstructed.view
+        if stored.proxy_config != self._settings.proxy_model:
+            raise UnknownBladeCoarseError(
+                "First coarse view was not filtered with the active blade-envelope policy"
+            )
+        support = stored.proxy_support
         proxy = build_bilateral_proxy(
-            view.base_cloud.points_m,
+            view.base_cloud.points_m[support.mask],
             view.base_t_projection_camera,
             self._settings.proxy_model,
         )
@@ -1394,52 +1443,63 @@ class CoarseScienceSession:
             view.source_sequence_index,
             view.source_frame_number,
             view.pose_authority,
+            support.mask,
         )
         initialization = self._output_root / "initialization"
-        source = stored.reconstructed.metadata["source"]
-        write_initialization(
-            initialization,
-            observation,
-            stored.foreground.mask,
-            self._hand_eye,
-            self._settings.point_cloud,
-            self._settings.proxy_model,
-            self._settings.kinematics,
-            self._settings.hand_eye,
-            source_session=source["session"],
-            source_stereo_inference=source["stereo_inference"],
-        )
-        planning = plan_initial_observation(
-            observation,
-            self._settings.view_planning,
-            self._settings.view_filter,
-            self._reachability,
-        )
         view_plan = self._output_root / "proxy_view_plan"
-        write_view_plan(
-            view_plan,
-            planning,
-            self._settings.view_planning,
-            self._settings.view_filter,
-            source_initialization=initialization,
-            source_kinematics=self._source_kinematics,
-            joint_zero_offsets_rad=self._settings.kinematics.joint_zero_offsets_rad,
-        )
-        discovery = generate_fin_discovery_plan(
-            proxy,
-            planning.geometric_plan.footprint_m,
-            self._settings.view_planning,
-            self._settings.view_filter,
-            self._policy,
-            self._reachability,
-        )
-        discovery_path = _write_discovery_plan_asset(
-            self._output_root / "fin_discovery_plan",
-            discovery,
-            source_initialization=initialization,
-            source_view_plan=view_plan,
-            source_kinematics=self._source_kinematics,
-        )
+        discovery_output = self._output_root / "fin_discovery_plan"
+        source = stored.reconstructed.metadata["source"]
+        created: list[Path] = []
+        try:
+            write_initialization(
+                initialization,
+                observation,
+                stored.foreground.mask,
+                self._hand_eye,
+                self._settings.point_cloud,
+                self._settings.proxy_model,
+                self._settings.kinematics,
+                self._settings.hand_eye,
+                source_session=source["session"],
+                source_stereo_inference=source["stereo_inference"],
+            )
+            created.append(initialization)
+            planning = plan_initial_observation(
+                observation,
+                self._settings.view_planning,
+                self._settings.view_filter,
+                self._reachability,
+            )
+            write_view_plan(
+                view_plan,
+                planning,
+                self._settings.view_planning,
+                self._settings.view_filter,
+                source_initialization=initialization,
+                source_kinematics=self._source_kinematics,
+                joint_zero_offsets_rad=self._settings.kinematics.joint_zero_offsets_rad,
+            )
+            created.append(view_plan)
+            discovery = generate_fin_discovery_plan(
+                proxy,
+                planning.geometric_plan.footprint_m,
+                self._settings.view_planning,
+                self._settings.view_filter,
+                self._policy,
+                self._reachability,
+            )
+            discovery_path = _write_discovery_plan_asset(
+                discovery_output,
+                discovery,
+                source_initialization=initialization,
+                source_view_plan=view_plan,
+                source_kinematics=self._source_kinematics,
+            )
+            created.append(discovery_output)
+        except Exception:
+            for path in reversed(created):
+                shutil.rmtree(path, ignore_errors=True)
+            raise
         self._initialization = initialization.resolve()
         self._view_plan = view_plan.resolve()
         self._discovery_path = discovery_path

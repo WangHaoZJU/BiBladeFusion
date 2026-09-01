@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +17,7 @@ from biblade_fusion.core.settings import (
 )
 from biblade_fusion.devices.depth_camera import CameraIntrinsics
 from biblade_fusion.perception.pointcloud import PointCloud
-from biblade_fusion.perception.proxy import BilateralBladeProxy
+from biblade_fusion.perception.proxy import BilateralBladeProxy, select_proxy_support
 from biblade_fusion.planning import (
     FilteredViewPlan,
     ReachabilityResult,
@@ -135,7 +136,12 @@ def test_coarse_science_session_creates_proxy_plan_and_discovery_from_first_view
 ) -> None:
     kinematics = tmp_path / "kinematics.yaml"
     kinematics.write_text("model: test\n", encoding="utf-8")
-    proxy = _proxy()
+    proxy = replace(
+        _proxy(),
+        raw_point_count=6,
+        finite_point_count=6,
+        voxel_point_count=6,
+    )
     intrinsics = CameraIntrinsics(4, 4, 3.0, 3.0, 1.5, 1.5, "none", ())
     pixel_uv = np.asarray([(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)])
     cloud = PointCloud(
@@ -176,6 +182,12 @@ def test_coarse_science_session_creates_proxy_plan_and_discovery_from_first_view
             }
         },
     )
+    settings = load_settings("configs/default.yaml")
+    support = select_proxy_support(
+        cloud.points_m,
+        settings.proxy_model,
+        frame=cloud.frame,
+    )
     stored_view = StoredCoarseScanView(
         (tmp_path / "coarse_view").resolve(),
         reconstructed,
@@ -183,6 +195,8 @@ def test_coarse_science_session_creates_proxy_plan_and_discovery_from_first_view
         "operator_0",
         "operator_seed",
         coarse_module.BladeSide.FRONT,
+        support,
+        settings.proxy_model,
         {},
     )
     calls: list[str] = []
@@ -193,7 +207,7 @@ def test_coarse_science_session_creates_proxy_plan_and_discovery_from_first_view
     def write_initialization(output: Path, *_args: object, **_kwargs: object) -> Path:
         calls.append("initialization")
         output.mkdir(parents=True)
-        (output / "initialization.json").write_text("{}", encoding="utf-8")
+        (output / "metadata.json").write_text("{}", encoding="utf-8")
         return output
 
     monkeypatch.setattr(coarse_module, "write_initialization", write_initialization)
@@ -232,7 +246,7 @@ def test_coarse_science_session_creates_proxy_plan_and_discovery_from_first_view
     )
 
     session = CoarseScienceSession(
-        settings=load_settings("configs/default.yaml"),
+        settings=settings,
         hand_eye=SimpleNamespace(),  # type: ignore[arg-type]
         reachability_checker=_Reachable(),
         source_kinematics=kinematics,
@@ -345,6 +359,84 @@ def test_engine_hook_requires_staging_and_appends_only_after_acceptance(
     session.reject_cycle()
 
 
+def test_generation_append_removes_uncommitted_coverage_before_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings("configs/default.yaml")
+    current = SimpleNamespace(
+        root=(tmp_path / "coarse-view").resolve(),
+        target_side=coarse_module.BladeSide.FRONT,
+        proxy_config=settings.proxy_model,
+        support_cloud=object(),
+        reconstructed=SimpleNamespace(
+            metadata={"source": {"session": str((tmp_path / "session").resolve())}},
+            view=SimpleNamespace(
+                source_view_id="coarse-0",
+                source_sequence_index=0,
+                source_frame_number=0,
+                base_t_projection_camera=object(),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        coarse_module,
+        "read_initialization",
+        lambda _path: SimpleNamespace(
+            observation=SimpleNamespace(proxy=object()),
+            metadata={
+                "processing": {
+                    "proxy_model": settings.proxy_model.model_dump(mode="json")
+                }
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        coarse_module,
+        "read_view_plan",
+        lambda _path: SimpleNamespace(result=SimpleNamespace(geometric_plan=object())),
+    )
+    monkeypatch.setattr(coarse_module, "read_coarse_scan_view", lambda _path: current)
+    monkeypatch.setattr(
+        coarse_module,
+        "_camera_side",
+        lambda *_args: coarse_module.BladeSide.FRONT,
+    )
+    ledger = SimpleNamespace()
+    monkeypatch.setattr(coarse_module, "create_coverage_ledger", lambda *_args: ledger)
+    monkeypatch.setattr(coarse_module, "update_coverage", lambda *_args: ledger)
+
+    def write_coverage(path: Path, *_args: object, **_kwargs: object) -> Path:
+        Path(path).mkdir(parents=True)
+        return Path(path)
+
+    monkeypatch.setattr(coarse_module, "write_coverage_ledger", write_coverage)
+    generation_calls = 0
+
+    def write_generation(path: Path, **_kwargs: object) -> Path:
+        nonlocal generation_calls
+        generation_calls += 1
+        if generation_calls == 1:
+            raise OSError("simulated generation commit failure")
+        return Path(path).resolve()
+
+    monkeypatch.setattr(coarse_module, "write_coarse_scan_generation", write_generation)
+    output = tmp_path / "generations" / "000000"
+    kwargs = {
+        "new_view": current.root,
+        "source_initialization": tmp_path / "initialization",
+        "source_view_plan": tmp_path / "view-plan",
+        "source_discovery_plan": tmp_path / "discovery",
+        "settings": settings,
+    }
+
+    with pytest.raises(OSError, match="generation commit failure"):
+        coarse_module.append_coarse_scan_generation(output, **kwargs)
+    assert not output.with_name("000000_coverage").exists()
+
+    assert coarse_module.append_coarse_scan_generation(output, **kwargs) == output.resolve()
+
+
 def test_ready_coarse_selection_keeps_the_run_initialization_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -354,7 +446,7 @@ def test_ready_coarse_selection_keeps_the_run_initialization_binding(
     coarse_model = tmp_path / "coarse_model"
     coverage_root = tmp_path / "coverage"
     for root, filename in (
-        (initialization, "initialization.json"),
+        (initialization, "metadata.json"),
         (generation_root, "generation.json"),
         (coarse_model, "metadata.json"),
     ):
@@ -387,7 +479,7 @@ def test_ready_coarse_selection_keeps_the_run_initialization_binding(
     assert result.coverage_complete is True
     assert result.target is None
     assert result.reference_model_sha256 == coarse_module._sha256(
-        initialization / "initialization.json"
+        initialization / "metadata.json"
     )
     assert result.reference_model_sha256 != coarse_module._sha256(
         coarse_model / "metadata.json"
@@ -443,6 +535,13 @@ def _matching_coarse_metadata(
     return {
         "schema_version": 5,
         "source_views": [{"path": str(path)} for path in source_roots],
+        "proxy_support": {
+            "configuration": settings.proxy_model.model_dump(mode="json"),
+            "source_coarse_views": [
+                {"path": str(path.parent / path.name.replace("reconstructed", "coarse-view"))}
+                for path in source_roots
+            ],
+        },
         "fusion": {"configuration": settings.multi_view_fusion.model_dump(mode="json")},
         "surface": {
             "configuration": settings.surface_partition.model_dump(mode="json"),

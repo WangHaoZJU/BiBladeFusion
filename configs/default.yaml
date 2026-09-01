@@ -84,6 +84,13 @@ proxy_model:
   visible_side_margin_m: 0.003
   hidden_side_margin_m: 0.005
   minimum_camera_normal_cosine: 0.2
+  # Production unknown-blade scans require all three measured values. The AABB
+  # is expressed in base and filters every coarse view before proxy/PCA, coverage,
+  # fusion, TSDF and partitioning; raw hard-ROI clouds remain immutable. Null
+  # defaults keep unmeasured geometry fail-closed.
+  blade_envelope_min_m: null
+  blade_envelope_max_m: null
+  minimum_envelope_retained_fraction: null
 
 point_cloud:
   minimum_depth_m: 0.15

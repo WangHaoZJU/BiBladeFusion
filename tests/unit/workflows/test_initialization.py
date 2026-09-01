@@ -102,6 +102,9 @@ def test_native_depth_initialization_reaches_base_frame_proxy() -> None:
         voxel_size_m=0.0001,
         minimum_points=100,
         estimated_thickness_m=0.01,
+        blade_envelope_min_m=(0.97, -0.06, 0.49),
+        blade_envelope_max_m=(1.03, 0.06, 0.51),
+        minimum_envelope_retained_fraction=0.5,
     )
 
     result = initialize_native_depth(
@@ -121,7 +124,33 @@ def test_native_depth_initialization_reaches_base_frame_proxy() -> None:
     np.testing.assert_allclose(result.base_t_left_ir.translation_m, [1, 0, 0])
     np.testing.assert_allclose(result.base_cloud.points_m[:, 2], 0.5)
     assert result.proxy.frame_T_proxy.parent_frame == "base"
-    assert result.proxy.contains(result.base_cloud.points_m).all()
+    assert result.proxy.raw_point_count == 240
+    assert np.count_nonzero(result.proxy_support_mask) == 240
+    assert result.proxy.contains(result.proxy_support_points_m).all()
+
+
+def test_native_depth_initialization_rejects_low_envelope_retention() -> None:
+    with pytest.raises(ValueError, match="at least 75.000%"):
+        initialize_native_depth(
+            make_bundle(),
+            np.ones((20, 20), dtype=bool),
+            make_hand_eye(),
+            PointCloudConfig(
+                minimum_depth_m=0.1,
+                maximum_depth_m=1.0,
+                minimum_valid_points=100,
+            ),
+            ProxyModelConfig(
+                voxel_size_m=0.0001,
+                minimum_points=100,
+                estimated_thickness_m=0.01,
+                blade_envelope_min_m=(0.97, -0.06, 0.49),
+                blade_envelope_max_m=(1.03, 0.06, 0.51),
+                minimum_envelope_retained_fraction=0.75,
+            ),
+            kinematics_config=KinematicsConfig(),
+            hand_eye_config=HandEyeConfig(),
+        )
 
 
 def test_foundation_stereo_initialization_uses_rectified_camera_frame() -> None:

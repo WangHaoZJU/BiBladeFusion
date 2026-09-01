@@ -53,10 +53,22 @@ class CoarseModelResult:
         return False
 
 
-def registered_cloud_view(view: ReconstructedBladeView) -> RegisteredCloudView:
+def registered_cloud_view(
+    view: ReconstructedBladeView,
+    *,
+    point_mask: np.ndarray | None = None,
+) -> RegisteredCloudView:
     """Adapt an existing pose-registered depth artifact to the fusion contract."""
 
     intrinsics = view.planning_intrinsics
+    points = view.base_cloud.points_m
+    pixels = view.base_cloud.pixel_uv
+    if point_mask is not None:
+        mask = np.asarray(point_mask, dtype=np.bool_)
+        if mask.shape != (len(points),):
+            raise ValueError("Registered-view point mask must match its base cloud")
+        points = points[mask]
+        pixels = pixels[mask]
     intrinsic_matrix = (
         (intrinsics.fx, 0.0, intrinsics.cx),
         (0.0, intrinsics.fy, intrinsics.cy),
@@ -64,9 +76,9 @@ def registered_cloud_view(view: ReconstructedBladeView) -> RegisteredCloudView:
     )
     return RegisteredCloudView(
         view.source_view_id,
-        view.base_cloud.points_m,
+        points,
         view.base_t_projection_camera.translation_m,
-        view.base_cloud.pixel_uv,
+        pixels,
         view.base_cloud.source_image_shape,
         intrinsic_matrix,
         view.base_t_projection_camera.matrix,

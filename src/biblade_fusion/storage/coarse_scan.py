@@ -20,6 +20,7 @@ from uuid import uuid4
 
 import numpy as np
 
+from biblade_fusion.core.settings import ProxyModelConfig
 from biblade_fusion.perception.bootstrap_foreground import (
     BOOTSTRAP_FOREGROUND_ALGORITHM,
     BootstrapForegroundConfig,
@@ -30,9 +31,12 @@ from biblade_fusion.perception.bootstrap_foreground import (
     bootstrap_policy_sha256,
     bootstrap_seed_payload,
 )
+from biblade_fusion.perception.pointcloud import PointCloud
+from biblade_fusion.perception.proxy import ProxySupportSelection, select_proxy_support
 from biblade_fusion.planning import BladeSide
 from biblade_fusion.storage.coarse_model import read_coarse_model_summary
 from biblade_fusion.storage.coverage import read_coverage_ledger
+from biblade_fusion.storage.initialization import INITIALIZATION_METADATA_FILENAME
 from biblade_fusion.storage.occupancy_mapping import read_occupancy_mapping
 from biblade_fusion.storage.reconstructed_view import (
     StoredReconstructedBladeView,
@@ -44,7 +48,7 @@ from biblade_fusion.storage.stereo_inference import (
 )
 from biblade_fusion.workflows.occupancy_mapping import occupancy_array_content_hash
 
-COARSE_SCAN_VIEW_SCHEMA_VERSION = 1
+COARSE_SCAN_VIEW_SCHEMA_VERSION = 2
 COARSE_SCAN_GENERATION_SCHEMA_VERSION = 1
 COARSE_SCAN_VIEW_KIND = "biblade_fusion.coarse_scan_view"
 COARSE_SCAN_GENERATION_KIND = "biblade_fusion.coarse_scan_generation"
@@ -77,11 +81,26 @@ class StoredCoarseScanView:
     target_view_id: str
     target_kind: CoarseTargetKind
     target_side: BladeSide
+    proxy_support: ProxySupportSelection
+    proxy_config: ProxyModelConfig
     metadata: dict[str, Any]
 
     @property
     def motion_authorized(self) -> bool:
         return False
+
+    @property
+    def support_cloud(self) -> PointCloud:
+        """Return the exact per-view cloud allowed to influence coarse geometry."""
+
+        cloud = self.reconstructed.view.base_cloud
+        mask = self.proxy_support.mask
+        return PointCloud(
+            cloud.frame,
+            cloud.points_m[mask],
+            cloud.pixel_uv[mask],
+            cloud.source_image_shape,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,14 +189,23 @@ def _assert_coverage_replays(
         raise ValueError("Coarse coverage physical observation identities differ from views")
 
     initialization = read_initialization(initialization_path)
+    proxy_config = ProxyModelConfig.model_validate(
+        initialization.metadata["processing"]["proxy_model"]
+    )
     plan = read_view_plan(view_plan_path).result.geometric_plan
     replayed = create_coverage_ledger(plan, stored.ledger.config)
     for item, observation_id in zip(views, expected_ids, strict=True):
+        if (
+            int(item.metadata.get("schema_version", 1))
+            == COARSE_SCAN_VIEW_SCHEMA_VERSION
+            and item.proxy_config != proxy_config
+        ):
+            raise ValueError("Coarse-view proxy-support configuration differs from initialization")
         replayed = update_coverage(
             replayed,
             plan,
             initialization.observation.proxy,
-            item.reconstructed.view.base_cloud,
+            item.support_cloud,
             item.reconstructed.view.base_t_projection_camera,
             observation_id,
         )
@@ -352,6 +380,7 @@ def write_coarse_scan_view(
     target_view_id: str,
     target_kind: CoarseTargetKind,
     target_side: BladeSide,
+    proxy_config: ProxyModelConfig,
 ) -> Path:
     """Bind one coarse reconstruction to its replayable unknown-object mask."""
 
@@ -364,6 +393,11 @@ def write_coarse_scan_view(
     stereo_root = Path(source_stereo_inference).resolve()
     occupancy_root = Path(source_occupancy_mapping).resolve()
     reconstructed = read_reconstructed_view(reconstructed_root)
+    proxy_support = select_proxy_support(
+        reconstructed.view.base_cloud.points_m,
+        proxy_config,
+        frame=reconstructed.view.base_cloud.frame,
+    )
     replayed = _replay_foreground(
         stereo_root=stereo_root,
         occupancy_root=occupancy_root,
@@ -416,6 +450,11 @@ def write_coarse_scan_view(
     try:
         np.save(temporary / "mask.npy", foreground.mask, allow_pickle=False)
         np.save(temporary / "seed_mask.npy", foreground.seed_mask, allow_pickle=False)
+        np.save(
+            temporary / "proxy_support_mask.npy",
+            proxy_support.mask,
+            allow_pickle=False,
+        )
         payload = {
             "schema_version": COARSE_SCAN_VIEW_SCHEMA_VERSION,
             "artifact_kind": COARSE_SCAN_VIEW_KIND,
@@ -443,9 +482,16 @@ def write_coarse_scan_view(
                     "integration_valid_mask": foreground.valid_mask_content_sha256,
                 },
             },
+            "proxy_support": {
+                "configuration": proxy_config.model_dump(mode="json"),
+                "diagnostics": proxy_support.metadata_payload(),
+            },
             "files": {
                 "mask": _array_record(temporary / "mask.npy"),
                 "seed_mask": _array_record(temporary / "seed_mask.npy"),
+                "proxy_support_mask": _array_record(
+                    temporary / "proxy_support_mask.npy"
+                ),
             },
             "sources": {
                 "reconstructed_view": _directory_record(reconstructed_root, "metadata.json"),
@@ -471,13 +517,19 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
     try:
         payload = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
         if (
-            int(payload["schema_version"]) != COARSE_SCAN_VIEW_SCHEMA_VERSION
+            int(payload["schema_version"]) not in {1, COARSE_SCAN_VIEW_SCHEMA_VERSION}
             or payload.get("artifact_kind") != COARSE_SCAN_VIEW_KIND
             or payload.get("motion_authorized") is not False
         ):
             raise ValueError("unsupported or motion-authorized coarse-scan view")
         files = payload["files"]
-        if set(files) != {"mask", "seed_mask"}:
+        schema_version = int(payload["schema_version"])
+        expected_files = (
+            {"mask", "seed_mask", "proxy_support_mask"}
+            if schema_version == COARSE_SCAN_VIEW_SCHEMA_VERSION
+            else {"mask", "seed_mask"}
+        )
+        if set(files) != expected_files:
             raise ValueError("coarse-scan view file set changed")
         mask = np.asarray(_load_array(root, files["mask"]), dtype=np.bool_)
         seed_mask = np.asarray(_load_array(root, files["seed_mask"]), dtype=np.bool_)
@@ -517,6 +569,30 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
             or not np.array_equal(mask, reconstructed.blade_mask)
         ):
             raise ValueError("coarse reconstructed-view binding changed")
+        if schema_version == COARSE_SCAN_VIEW_SCHEMA_VERSION:
+            proxy_payload = payload["proxy_support"]
+            proxy_config = ProxyModelConfig.model_validate(proxy_payload["configuration"])
+            proxy_support_mask = np.asarray(
+                _load_array(root, files["proxy_support_mask"]),
+                dtype=np.bool_,
+            )
+            proxy_support = select_proxy_support(
+                reconstructed.view.base_cloud.points_m,
+                proxy_config,
+                frame=reconstructed.view.base_cloud.frame,
+            )
+            if (
+                not np.array_equal(proxy_support_mask, proxy_support.mask)
+                or proxy_payload["diagnostics"] != proxy_support.metadata_payload()
+            ):
+                raise ValueError("coarse proxy support no longer replays")
+        else:
+            proxy_config = ProxyModelConfig()
+            proxy_support = select_proxy_support(
+                reconstructed.view.base_cloud.points_m,
+                proxy_config,
+                frame=reconstructed.view.base_cloud.frame,
+            )
         target = payload["target"]
         if str(target["kind"]) not in _COARSE_TARGET_KINDS:
             raise ValueError("coarse target kind is unsupported")
@@ -527,6 +603,8 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
             str(target["view_id"]),
             str(target["kind"]),  # type: ignore[arg-type]
             BladeSide(str(target["side"])),
+            proxy_support,
+            proxy_config,
             payload,
         )
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -621,6 +699,17 @@ def write_coarse_scan_generation(
         )
         if source_roots != wrapper_roots:
             raise ValueError("Schema-5 coarse model is not built from this exact generation")
+        support = summary.metadata.get("proxy_support")
+        support_roots = (
+            tuple(
+                Path(item["path"]).resolve()
+                for item in support["source_coarse_views"]
+            )
+            if support is not None
+            else ()
+        )
+        if support_roots != tuple(item.root for item in stored_views):
+            raise ValueError("Schema-5 coarse model lacks exact per-view proxy support")
 
     output = Path(output_dir)
     if output.exists():
@@ -641,7 +730,10 @@ def write_coarse_scan_generation(
                 else None
             ),
             "sources": {
-                "initialization": _directory_record(initialization_root, "initialization.json"),
+                "initialization": _directory_record(
+                    initialization_root,
+                    INITIALIZATION_METADATA_FILENAME,
+                ),
                 "view_plan": _directory_record(view_plan_root, "view_plan.json"),
                 "discovery_plan": _directory_record(
                     discovery_plan_root,
@@ -762,6 +854,17 @@ def read_coarse_scan_generation(path: str | Path) -> StoredCoarseScanGeneration:
             )
             if source_roots != wrapper_roots:
                 raise ValueError("coarse model sources differ from its scan generation")
+            support = coarse.metadata.get("proxy_support")
+            support_roots = (
+                tuple(
+                    Path(record["path"]).resolve()
+                    for record in support["source_coarse_views"]
+                )
+                if support is not None
+                else ()
+            )
+            if support_roots != tuple(item.root for item in views):
+                raise ValueError("coarse model proxy support differs from its scan generation")
         if bool(payload["summary"]["schema5_ready"]) != (coarse_path is not None):
             raise ValueError("coarse generation schema-5 readiness changed")
         if previous_payload is not None:

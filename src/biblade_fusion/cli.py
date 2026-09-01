@@ -1806,6 +1806,11 @@ def initialize_from_native_depth(
         typer.echo(f"Initialization failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Saved initialization artifact: {destination}")
+    typer.echo(
+        "Proxy support: retained "
+        f"{observation.proxy.raw_point_count}/{observation.base_cloud.points_m.shape[0]} "
+        "hard-ROI points"
+    )
 
 
 @initialize_app.command("stereo-depth")
@@ -1874,6 +1879,11 @@ def initialize_from_stereo_depth(
         typer.echo(f"Initialization failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Saved FoundationStereo initialization artifact: {destination}")
+    typer.echo(
+        "Proxy support: retained "
+        f"{observation.proxy.raw_point_count}/{observation.base_cloud.points_m.shape[0]} "
+        "hard-ROI points"
+    )
 
 
 @reconstruct_app.command("native-depth")
@@ -2023,6 +2033,9 @@ def reconstruct_coarse_model(
 
     import numpy as np
 
+    from biblade_fusion.perception.pointcloud import PointCloud
+    from biblade_fusion.perception.proxy import select_proxy_support
+
     try:
         if len(views) < 2:
             raise ValueError("At least two reconstructed views are required")
@@ -2039,7 +2052,25 @@ def reconstruct_coarse_model(
         planning_intrinsics = stored[0].view.planning_intrinsics
         if any(item.view.planning_intrinsics != planning_intrinsics for item in stored[1:]):
             raise ValueError("Coarse views use different rectified planning intrinsics")
-        reconstructed_views = tuple(item.view for item in stored)
+        reconstructed_views = tuple(
+            replace(
+                item.view,
+                base_cloud=PointCloud(
+                    item.view.base_cloud.frame,
+                    item.view.base_cloud.points_m[support.mask],
+                    item.view.base_cloud.pixel_uv[support.mask],
+                    item.view.base_cloud.source_image_shape,
+                ),
+            )
+            for item in stored
+            for support in (
+                select_proxy_support(
+                    item.view.base_cloud.points_m,
+                    settings.proxy_model,
+                    frame=item.view.base_cloud.frame,
+                ),
+            )
+        )
         left_rectified_t_left_ir = derive_consistent_left_rectified_t_left_ir(reconstructed_views)
         result = build_coarse_blade_model(
             reconstructed_views,

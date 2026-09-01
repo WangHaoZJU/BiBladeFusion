@@ -1,5 +1,51 @@
 # Development log
 
+## 2026-09-01 — placement-bound coarse support envelope
+
+- Kept the operator hard ROI as the immutable source cloud and added a separate
+  base-frame AABB intersection used by initial proxy PCA. The measured blade
+  envelope and its minimum retained fraction must be configured together; production
+  unknown-blade readiness fails while they are absent.
+- Made the intersection fail closed when it retains too few points or falls below the
+  placement-specific fraction gate. Diagnostics report raw/retained counts and XYZ
+  bounds so an annotation, pose, or envelope mismatch cannot silently become a partial
+  blade proxy. Camera-range MAD rejection remains a secondary in-envelope fallback.
+- Upgraded initialization persistence to schema 8. It stores the complete hard-ROI
+  `base_points_m.npy`, an aligned `proxy_support_mask.npy`, and reproducible filtering
+  diagnostics; readers recompute the intersection from the sealed proxy configuration
+  and reject mask or metadata drift. Schema-7 authoritative FK assets remain readable
+  with their original validation path.
+- Added operator-facing retained-point output and a non-moving placement checklist for
+  measuring, configuring, replaying, and inspecting the envelope before the supervised
+  scan may proceed.
+- Closed the full coarse-chain gap found during the project audit. Coarse-view schema 2
+  stores and replays an aligned support mask for every accepted view; proxy coverage,
+  multi-view PCA/ICP, thickness, TSDF, curved-surface and fin partitioning now consume
+  support clouds rather than the raw hard-ROI clouds. The schema-5 model records the
+  exact coarse-view metadata hashes and proxy-support configuration used to build it.
+- Corrected the initialization authority filename contract: the writer, discovery plan,
+  selector and coarse generation now consistently bind `metadata.json`. A real-writer
+  regression check prevents the former mocked `initialization.json` fixture from hiding
+  this failure again. First-view planning assets are rolled back together on ordinary
+  construction failure and can be reused if generation append alone is retried.
+- Initialization readback now rebuilds a measured-envelope proxy from its support points
+  and rejects changed axes, extents, centroid, eigenvalues, counts or camera incidence.
+- Validation: `ruff check .` passed and the complete suite reported 1061 passed, 2
+  skipped (the existing optional Open3D renderer tests). No hardware-replay claim is
+  recorded: experiment 005 failed on an expired FoundationStereo frame before foreground
+  extraction, so it contains no view-bound hard-ROI artifact. The similarly named
+  `bootstrap_blade_current_position_005_surface_seed_polygon.json` belongs to a different
+  capture and must not be overlaid on `operator_bootstrap_000`. A valid replay remains
+  gated on receiving the exact session, stereo artifact, mask/seed, and pose from one
+  successful capture chain.
+- The earlier `current_position_check_005` diagnostic is not a hard-ROI replay: its
+  `*_surface_seed_polygon.json` is a deliberately small surface seed. The latest locally
+  available full-ROI asset is `bootstrap_blade_view2_polygon.json`; a visual-only pairing
+  with `placed_blade_fixture_bootstrap_002` produced 37,222 valid ROI points and a trial
+  `Z > 0` gate retained 37,179 (99.8845%). This again shows that zero-height clipping is
+  not a useful foreground filter. Neither legacy polygon contains a sealed source hash,
+  so production acceptance still requires a view-bound mask artifact.
+
 ## 2026-08-30 — eiai non-moving hardware P1 bring-up
 
 - Bound the live eiai host robot interface to `192.168.6.61/24` and the only enumerated

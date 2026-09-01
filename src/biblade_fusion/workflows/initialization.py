@@ -19,7 +19,11 @@ from biblade_fusion.core.settings import (
 )
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.perception.pointcloud import PointCloud
-from biblade_fusion.perception.proxy import BilateralBladeProxy, build_bilateral_proxy
+from biblade_fusion.perception.proxy import (
+    BilateralBladeProxy,
+    build_bilateral_proxy,
+    select_proxy_support,
+)
 from biblade_fusion.workflows.reconstruction import (
     AuthoritativeRobotPose,
     reconstruct_foundation_stereo_view,
@@ -45,6 +49,7 @@ class InitialObservation:
     source_sequence_index: int = 0
     source_frame_number: int = 0
     pose_authority: AuthoritativeRobotPose | None = None
+    proxy_support_mask: NDArray[np.bool_] | None = None
 
     def __post_init__(self) -> None:
         joints = np.array(self.seed_joint_positions_rad, dtype=np.float64, copy=True)
@@ -73,6 +78,24 @@ class InitialObservation:
             raise ValueError("Initial proxy must be in the base frame")
         if self.source_sequence_index < 0 or self.source_frame_number < 0:
             raise ValueError("Initial source sequence and frame numbers must be non-negative")
+        explicit_support_mask = self.proxy_support_mask is not None
+        support_mask = (
+            np.ones(self.base_cloud.points_m.shape[0], dtype=np.bool_)
+            if self.proxy_support_mask is None
+            else np.array(self.proxy_support_mask, dtype=np.bool_, copy=True)
+        )
+        if support_mask.shape != (self.base_cloud.points_m.shape[0],):
+            raise ValueError("Initial proxy-support mask must match base-cloud points")
+        support_count = int(np.count_nonzero(support_mask))
+        if explicit_support_mask and support_count != self.proxy.raw_point_count:
+            raise ValueError("Initial proxy-support mask does not match proxy input count")
+        support_mask.setflags(write=False)
+        object.__setattr__(self, "proxy_support_mask", support_mask)
+
+    @property
+    def proxy_support_points_m(self) -> NDArray[np.float64]:
+        assert self.proxy_support_mask is not None
+        return self.base_cloud.points_m[self.proxy_support_mask]
 
 
 def initialize_native_depth(
@@ -95,8 +118,13 @@ def initialize_native_depth(
         kinematics_config=kinematics_config,
         hand_eye_config=hand_eye_config,
     )
-    proxy = build_bilateral_proxy(
+    support = select_proxy_support(
         reconstructed.base_cloud.points_m,
+        proxy_config,
+        frame=reconstructed.base_cloud.frame,
+    )
+    proxy = build_bilateral_proxy(
+        reconstructed.base_cloud.points_m[support.mask],
         reconstructed.base_t_projection_camera,
         proxy_config,
     )
@@ -111,6 +139,7 @@ def initialize_native_depth(
         source_sequence_index=reconstructed.source_sequence_index,
         source_frame_number=reconstructed.source_frame_number,
         pose_authority=reconstructed.pose_authority,
+        proxy_support_mask=support.mask,
     )
 
 
@@ -136,8 +165,13 @@ def initialize_foundation_stereo_depth(
         kinematics_config=kinematics_config,
         hand_eye_config=hand_eye_config,
     )
-    proxy = build_bilateral_proxy(
+    support = select_proxy_support(
         reconstructed.base_cloud.points_m,
+        proxy_config,
+        frame=reconstructed.base_cloud.frame,
+    )
+    proxy = build_bilateral_proxy(
+        reconstructed.base_cloud.points_m[support.mask],
         reconstructed.base_t_projection_camera,
         proxy_config,
     )
@@ -153,4 +187,5 @@ def initialize_foundation_stereo_depth(
         source_sequence_index=reconstructed.source_sequence_index,
         source_frame_number=reconstructed.source_frame_number,
         pose_authority=reconstructed.pose_authority,
+        proxy_support_mask=support.mask,
     )

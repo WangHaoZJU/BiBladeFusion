@@ -352,6 +352,54 @@ $$
 无法区分“物体确实到边界”和“物体已被深度有效域截断”。输入图、深度、有效掩模、多边形策略
 都写入内容哈希，所以修改顶点后必须产生新的检查资产。
 
+### 4.6 配置并回放base坐标系叶片包络
+
+为当前`placement_id`测量完整叶片在base坐标系下的保守AABB，并在`configs/local.yaml`中同时填写：
+
+```yaml
+proxy_model:
+  blade_envelope_min_m: [<x_min>, <y_min>, <z_min>]
+  blade_envelope_max_m: [<x_max>, <y_max>, <z_max>]
+  minimum_envelope_retained_fraction: <measured_gate>
+```
+
+- [ ] 上下界来自当前放置的实测点云或夹具基准，不从图像外观猜测。
+- [ ] AABB包含完整叶片、叶根、叶尖、前后缘和两只鳍片，但不把整张工作台当作叶片空间。
+- [ ] 最小保留比例来自正确hard ROI的重复回放，不直接照搬其他placement。
+- [ ] 三项配置同时存在；任一项为null时，unknown runtime doctor必须失败。
+
+用预览session、FoundationStereo资产和4.5节生成的`mask.npy`执行一次不运动初始化：
+
+```bash
+uv run bbf initialize stereo-depth \
+  --config configs/local.yaml \
+  --session <PREVIEW_SESSION> \
+  --stereo data/placements/blade-placement-20260831-01/preview-stereo \
+  --view-id blade-placement-20260831-01-preview \
+  --mask data/placements/blade-placement-20260831-01/bootstrap-mask-check/mask.npy \
+  --output data/placements/blade-placement-20260831-01/initialization-envelope-check
+```
+
+- [ ] 命令打印的`Proxy support: retained N/M hard-ROI points`符合实测验收区间。
+- [ ] 初始化`base_points_m.npy`仍有M个原始hard-ROI点，`proxy_support_mask.npy`仅标记其中N个支持点。
+- [ ] `metadata.json.proxy_support`中的输入/保留XYZ边界、点数和比例可由两个数组重算。
+- [ ] 剔除过多、保留点不足、标定/位姿错误或AABB错误时初始化显式失败，不继续生成视点计划。
+- [ ] 每个后续`coarse_scan_view`都是schema 2，均含自己的`proxy_support_mask.npy`、同一包络配置和可重放诊断。
+- [ ] coarse generation覆盖率以及最终PCA/ICP、TSDF、曲面/鳍片分区只消费各视角support点；schema-5模型绑定对应coarse-view元数据哈希。
+- [ ] 修改多边形或AABB后使用全新输出目录，不覆盖历史检查资产。
+
+设hard-ROI反投影并变换到base后的点为\(\mathbf p_i\)，AABB上下界为
+\(\boldsymbol\ell,\mathbf u\)，proxy支持掩模为：
+
+$$
+I_i=\left[\boldsymbol\ell\leq\mathbf p_i\leq\mathbf u\right].
+$$
+
+完整点云\(\{\mathbf p_i\}\)作为人工标注事实保留；只有\(I_i=1\)的点进入粗扫代理、覆盖率、
+多视角融合、TSDF和曲面分区。若保留比例
+\(\sum_i I_i/N\)低于本placement实测门限，系统将其解释为ROI、包络或位姿不一致，而不是自动
+把少数交集点冒充完整叶片。
+
 ## 5. 非运动完整doctor
 
 本次配置的科学和运行时发布验收为null，所以必须明确使用实验审计：

@@ -2143,6 +2143,10 @@ def test_unknown_runtime_requires_bound_science_acceptance_and_schema5_budget(
     results = unknown_blade_runtime_readiness(settings)
 
     scope = next(item for item in results if item.name == "unknown_blade_coarse_to_fine")
+    assert (
+        "proxy_model.blade_envelope_min_m/max_m/minimum_envelope_retained_fraction"
+        in scope.details["missing"]
+    )
     assert "science_acceptance.path/id" in scope.details["missing"]
     assert (
         "stop_and_capture.maximum_schema5_handoff_duration_s"
@@ -2173,7 +2177,12 @@ def test_unknown_runtime_experimental_scope_skips_only_release_acceptance(
     settings = settings.model_copy(
         update={
             "proxy_model": settings.proxy_model.model_copy(
-                update={"estimated_thickness_m": 0.003}
+                update={
+                    "estimated_thickness_m": 0.003,
+                    "blade_envelope_min_m": (0.4, -0.2, 0.0),
+                    "blade_envelope_max_m": (0.8, 0.2, 0.4),
+                    "minimum_envelope_retained_fraction": 0.75,
+                }
             ),
             "blade_foreground": settings.blade_foreground.model_copy(
                 update={"enabled": True}

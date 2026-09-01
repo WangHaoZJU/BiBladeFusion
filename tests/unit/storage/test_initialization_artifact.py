@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import biblade_fusion.storage.coarse_scan as coarse_scan_module
 from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
@@ -14,7 +15,7 @@ from biblade_fusion.core.settings import (
 )
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.perception.pointcloud import PointCloud
-from biblade_fusion.perception.proxy import BilateralBladeProxy
+from biblade_fusion.perception.proxy import BilateralBladeProxy, build_bilateral_proxy
 from biblade_fusion.robotics import Es68KinematicModel, load_es68_flange_t_tcp
 from biblade_fusion.storage import read_initialization, write_initialization
 from biblade_fusion.workflows import AuthoritativeRobotPose, InitialObservation
@@ -45,6 +46,45 @@ def make_observation(
         cloud,
         proxy,
         pose_authority=pose_authority,
+    )
+
+
+def make_filtered_observation(
+    pose_authority: AuthoritativeRobotPose,
+    proxy_config: ProxyModelConfig,
+) -> InitialObservation:
+    points = np.array(
+        [
+            [0.50, 0.00, 0.10],
+            [0.51, 0.01, 0.11],
+            [0.52, -0.01, 0.12],
+            [0.53, 0.02, 0.13],
+            [0.54, -0.02, 0.14],
+            [0.55, 0.00, 0.15],
+            [0.30, 0.00, 0.10],
+            [0.80, 0.00, 0.10],
+            [0.50, 0.40, 0.10],
+            [0.50, 0.00, -0.10],
+        ]
+    )
+    pixels = np.array([(u, v) for v in range(2) for u in range(5)])
+    cloud = PointCloud("base", points, pixels, (2, 5))
+    base_t_projection_camera = PoseSE3.identity("base", "depth")
+    proxy = build_bilateral_proxy(
+        points[:6],
+        base_t_projection_camera,
+        proxy_config,
+    )
+    return InitialObservation(
+        "seed",
+        CameraIntrinsics(5, 2, 100, 100, 2, 0.5, "none", ()),
+        np.zeros(6),
+        PoseSE3.identity("base", "left_ir"),
+        base_t_projection_camera,
+        cloud,
+        proxy,
+        pose_authority=pose_authority,
+        proxy_support_mask=np.array([True] * 6 + [False] * 4),
     )
 
 
@@ -138,15 +178,61 @@ def test_initialization_artifact_round_trip(tmp_path: Path) -> None:
     )
     np.testing.assert_array_equal(stored.blade_mask, mask)
     assert stored.metadata["processing"]["proxy_model"]["estimated_thickness_m"] == 0.01
-    assert stored.metadata["schema_version"] == 7
+    assert stored.metadata["schema_version"] == 8
     assert stored.hand_eye.flange_t_left_ir is not None
     assert stored.observation.pose_authority is not None
     assert stored.metadata["files"]["base_points_m"]["sha256"]
+    assert stored.metadata["files"]["proxy_support_mask"]["sha256"]
+    assert stored.observation.proxy_support_mask is not None
+    assert stored.observation.proxy_support_mask.all()
+    source_record = coarse_scan_module._directory_record(output, "metadata.json")
+    assert source_record["authority"] == "metadata.json"
 
     points = np.load(output / "base_points_m.npy", allow_pickle=False)
     points[0, 0] += 1.0
     np.save(output / "base_points_m.npy", points, allow_pickle=False)
     with pytest.raises(ValueError, match="checksum mismatch"):
+        read_initialization(output)
+
+
+def test_initialization_persists_proxy_support_diagnostics(tmp_path: Path) -> None:
+    hand_eye, authority = authoritative_inputs(tmp_path)
+    proxy_config = ProxyModelConfig(
+        estimated_thickness_m=0.01,
+        minimum_points=6,
+        blade_envelope_min_m=(0.45, -0.10, 0.00),
+        blade_envelope_max_m=(0.65, 0.10, 0.30),
+        minimum_envelope_retained_fraction=0.5,
+    )
+    output = write_initialization(
+        tmp_path / "filtered_initialization",
+        make_filtered_observation(authority, proxy_config),
+        np.ones((2, 5), dtype=bool),
+        hand_eye,
+        PointCloudConfig(minimum_valid_points=3),
+        proxy_config,
+        KinematicsConfig(),
+        HandEyeConfig(),
+        source_session=tmp_path / "session",
+    )
+
+    stored = read_initialization(output)
+
+    assert stored.observation.base_cloud.points_m.shape == (10, 3)
+    assert stored.observation.proxy.raw_point_count == 6
+    assert stored.metadata["proxy_support"]["input_point_count"] == 10
+    assert stored.metadata["proxy_support"]["retained_point_count"] == 6
+    assert stored.metadata["proxy_support"]["retained_fraction"] == pytest.approx(0.6)
+    np.testing.assert_array_equal(
+        stored.observation.proxy_support_mask,
+        np.array([True] * 6 + [False] * 4),
+    )
+
+    metadata_path = output / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["proxy"]["extents_m"][0] += 0.01
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    with pytest.raises(ValueError, match="proxy does not reproduce"):
         read_initialization(output)
 
 

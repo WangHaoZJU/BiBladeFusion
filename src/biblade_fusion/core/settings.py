@@ -142,6 +142,13 @@ class ProxyModelConfig(BaseModel):
     visible_side_margin_m: float = Field(default=0.003, ge=0.0)
     hidden_side_margin_m: float = Field(default=0.005, ge=0.0)
     minimum_camera_normal_cosine: float = Field(default=0.2, ge=0.0, le=1.0)
+    blade_envelope_min_m: tuple[float, float, float] | None = None
+    blade_envelope_max_m: tuple[float, float, float] | None = None
+    minimum_envelope_retained_fraction: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+    )
 
     @field_validator("estimated_planar_extents_m")
     @classmethod
@@ -155,6 +162,33 @@ class ProxyModelConfig(BaseModel):
         if value[0] < value[1]:
             raise ValueError("Estimated planar extents must be ordered major then minor")
         return value
+
+    @model_validator(mode="after")
+    def validate_blade_envelope(self) -> Self:
+        values = (
+            self.blade_envelope_min_m,
+            self.blade_envelope_max_m,
+            self.minimum_envelope_retained_fraction,
+        )
+        if any(value is None for value in values):
+            if not all(value is None for value in values):
+                raise ValueError(
+                    "Blade-envelope bounds and retained fraction must be configured together"
+                )
+            return self
+        assert self.blade_envelope_min_m is not None
+        assert self.blade_envelope_max_m is not None
+        bounds = (*self.blade_envelope_min_m, *self.blade_envelope_max_m)
+        if not np.isfinite(bounds).all() or any(
+            lower >= upper
+            for lower, upper in zip(
+                self.blade_envelope_min_m,
+                self.blade_envelope_max_m,
+                strict=True,
+            )
+        ):
+            raise ValueError("Blade-envelope base-frame bounds must be finite and ordered")
+        return self
 
 
 class PointCloudConfig(BaseModel):

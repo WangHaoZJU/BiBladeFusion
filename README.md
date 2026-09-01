@@ -164,6 +164,16 @@ the proxy uses the larger of the observed dimensions and these conservative prio
 dimensions. The resulting proxy center is a planning-volume center, not a claim about
 the blade's physical center of mass.
 
+Production unknown-blade runs additionally require a measured base-frame blade envelope:
+`proxy_model.blade_envelope_min_m`, `blade_envelope_max_m`, and
+`minimum_envelope_retained_fraction`. After the hard ROI is back-projected and transformed
+into `base`, only its intersection with that AABB supports proxy PCA. Every later coarse
+view repeats and persists the same support selection; proxy coverage, multi-view PCA/ICP,
+TSDF, surface partitioning, and fine-reference construction consume only those support
+points. Complete hard-ROI clouds and pixel mappings remain immutable. Initialization schema
+8 and coarse-view schema 2 store aligned support masks plus input/retained bounds and counts.
+Too few retained points or a retained fraction below the configured gate fails closed.
+
 Hand-eye input is quality-gated and is solved as `flange_T_left_ir` from the raw D435i
 left-IR stream and calibrated ES68 FK. See
 [calibration and frame conventions](docs/calibration.md) before processing real data.

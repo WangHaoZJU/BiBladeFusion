@@ -1487,6 +1487,10 @@ def unknown_blade_runtime_readiness(
     missing: list[str] = []
     if settings.proxy_model.estimated_thickness_m is None:
         missing.append("proxy_model.estimated_thickness_m")
+    if settings.proxy_model.blade_envelope_min_m is None:
+        missing.append(
+            "proxy_model.blade_envelope_min_m/max_m/minimum_envelope_retained_fraction"
+        )
     if not settings.blade_foreground.enabled:
         missing.append("blade_foreground.enabled")
     if settings.thermal.enabled or settings.thermal.driver is not None:
