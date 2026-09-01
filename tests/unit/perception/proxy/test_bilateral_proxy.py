@@ -90,6 +90,7 @@ def test_proxy_rejects_grazing_initial_view() -> None:
     config = ProxyModelConfig(
         voxel_size_m=0.001,
         minimum_points=100,
+        estimated_planar_extents_m=(0.2, 0.1),
         estimated_thickness_m=0.01,
         minimum_camera_normal_cosine=0.5,
     )
@@ -99,3 +100,31 @@ def test_proxy_rejects_grazing_initial_view() -> None:
 
     with pytest.raises(ProxyBuildError, match="too grazing"):
         build_bilateral_proxy(make_planar_points(), grazing_camera, config)
+
+
+def test_proxy_uses_robust_surface_normal_with_sparse_far_roi_returns() -> None:
+    surface = make_planar_points()
+    far_depth = -np.linspace(0.35, 1.0, 32)
+    far_returns = np.column_stack(
+        (
+            np.linspace(-0.1, 0.1, far_depth.size),
+            np.linspace(-0.05, 0.05, far_depth.size),
+            far_depth,
+        )
+    )
+    points = np.vstack((surface, far_returns))
+    config = ProxyModelConfig(
+        voxel_size_m=0.001,
+        minimum_points=100,
+        estimated_planar_extents_m=(0.2, 0.1),
+        estimated_thickness_m=0.01,
+        tangential_margin_m=0.002,
+        visible_side_margin_m=0.001,
+        hidden_side_margin_m=0.003,
+    )
+
+    proxy = build_bilateral_proxy(points, camera_pose(), config)
+
+    assert proxy.camera_normal_cosine == pytest.approx(1.0)
+    np.testing.assert_allclose(proxy.outward_normal, [0.0, 0.0, 1.0], atol=1e-12)
+    np.testing.assert_allclose(proxy.extents_m, [0.204, 0.104, 0.014], atol=1e-12)

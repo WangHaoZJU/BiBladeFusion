@@ -14,6 +14,11 @@ class ProxyBuildError(ValueError):
     """The initial observation cannot support a reliable bilateral proxy."""
 
 
+_CAMERA_RANGE_MAD_SCALE = 3.0
+_MINIMUM_RANGE_MARGIN_VOXELS = 2.0
+_MINIMUM_ROBUST_SUPPORT_FRACTION = 0.75
+
+
 def _voxel_centroids(points: NDArray[np.float64], voxel_size_m: float) -> NDArray[np.float64]:
     indices = np.floor(points / voxel_size_m).astype(np.int64)
     _, inverse, counts = np.unique(indices, axis=0, return_inverse=True, return_counts=True)
@@ -37,6 +42,57 @@ def _expand_about_midpoint(
         return lower, upper
     midpoint = (lower + upper) / 2.0
     return midpoint - minimum_extent / 2.0, midpoint + minimum_extent / 2.0
+
+
+def _principal_axes(
+    points: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    centroid = points.mean(axis=0)
+    centered = points - centroid
+    covariance = centered.T @ centered / points.shape[0]
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    order = np.argsort(eigenvalues)[::-1]
+    return centroid, np.maximum(eigenvalues[order], 0.0), eigenvectors[:, order]
+
+
+def _camera_normal_cosine(
+    centroid: NDArray[np.float64],
+    normal_axis: NDArray[np.float64],
+    camera_center: NDArray[np.float64],
+) -> tuple[float, NDArray[np.float64]]:
+    camera_vector = camera_center - centroid
+    camera_distance = float(np.linalg.norm(camera_vector))
+    if camera_distance <= 1e-9:
+        raise ProxyBuildError("Camera optical center coincides with the observed surface")
+    camera_direction = camera_vector / camera_distance
+    return float(abs(normal_axis @ camera_direction)), camera_direction
+
+
+def _robust_far_range_support(
+    points: NDArray[np.float64],
+    range_samples: NDArray[np.float64],
+    camera_center: NDArray[np.float64],
+    voxel_size_m: float,
+) -> NDArray[np.float64] | None:
+    """Reject a sparse far-return tail without clipping near blade or fin support."""
+
+    sample_ranges = np.linalg.norm(range_samples - camera_center, axis=1)
+    median_range = float(np.median(sample_ranges))
+    median_absolute_deviation = float(
+        np.median(np.abs(sample_ranges - median_range))
+    )
+    robust_sigma = 1.4826 * median_absolute_deviation
+    range_margin = max(
+        _CAMERA_RANGE_MAD_SCALE * robust_sigma,
+        _MINIMUM_RANGE_MARGIN_VOXELS * voxel_size_m,
+    )
+    point_ranges = np.linalg.norm(points - camera_center, axis=1)
+    retained = points[point_ranges <= median_range + range_margin]
+    minimum_support = max(
+        3,
+        int(np.ceil(_MINIMUM_ROBUST_SUPPORT_FRACTION * points.shape[0])),
+    )
+    return retained if retained.shape[0] >= minimum_support else None
 
 
 def build_bilateral_proxy(
@@ -74,27 +130,53 @@ def build_bilateral_proxy(
     if points.shape[0] < 3:
         raise ProxyBuildError("Voxelized point cloud contains fewer than three points")
 
-    surface_centroid = points.mean(axis=0)
-    centered = points - surface_centroid
-    covariance = centered.T @ centered / points.shape[0]
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    order = np.argsort(eigenvalues)[::-1]
-    eigenvalues = np.maximum(eigenvalues[order], 0.0)
-    eigenvectors = eigenvectors[:, order]
+    proxy_points = points
+    surface_centroid, eigenvalues, eigenvectors = _principal_axes(proxy_points)
 
     scale = max(float(eigenvalues[0]), np.finfo(np.float64).tiny)
     if eigenvalues[1] <= scale * 1e-10:
         raise ProxyBuildError("Initial point cloud is point-like or line-like")
 
-    camera_vector = frame_T_camera.translation_m - surface_centroid
-    camera_distance = float(np.linalg.norm(camera_vector))
-    if camera_distance <= 1e-9:
-        raise ProxyBuildError("Camera optical center coincides with the observed surface")
-    camera_direction = camera_vector / camera_distance
-
     major_axis = _orient_major_axis(eigenvectors[:, 0])
     normal_axis = eigenvectors[:, 2]
-    camera_normal_cosine = float(abs(normal_axis @ camera_direction))
+    camera_normal_cosine, camera_direction = _camera_normal_cosine(
+        surface_centroid,
+        normal_axis,
+        frame_T_camera.translation_m,
+    )
+    if (
+        camera_normal_cosine < config.minimum_camera_normal_cosine
+        and config.estimated_planar_extents_m is not None
+    ):
+        robust_points = _robust_far_range_support(
+            points,
+            finite_points,
+            frame_T_camera.translation_m,
+            config.voxel_size_m,
+        )
+        if robust_points is not None:
+            robust_centroid, robust_eigenvalues, robust_eigenvectors = _principal_axes(
+                robust_points
+            )
+            robust_scale = max(
+                float(robust_eigenvalues[0]), np.finfo(np.float64).tiny
+            )
+            if robust_eigenvalues[1] > robust_scale * 1e-10:
+                robust_normal = robust_eigenvectors[:, 2]
+                robust_cosine, robust_direction = _camera_normal_cosine(
+                    robust_centroid,
+                    robust_normal,
+                    frame_T_camera.translation_m,
+                )
+                if robust_cosine >= config.minimum_camera_normal_cosine:
+                    proxy_points = robust_points
+                    surface_centroid = robust_centroid
+                    eigenvalues = robust_eigenvalues
+                    eigenvectors = robust_eigenvectors
+                    major_axis = _orient_major_axis(eigenvectors[:, 0])
+                    normal_axis = robust_normal
+                    camera_normal_cosine = robust_cosine
+                    camera_direction = robust_direction
     if camera_normal_cosine < config.minimum_camera_normal_cosine:
         raise ProxyBuildError(
             "Initial view is too grazing for a reliable surface normal: "
@@ -106,7 +188,7 @@ def build_bilateral_proxy(
     minor_axis /= np.linalg.norm(minor_axis)
     axes = np.column_stack((major_axis, minor_axis, normal_axis))
 
-    local_points = centered @ axes
+    local_points = (proxy_points - surface_centroid) @ axes
     lower = local_points.min(axis=0)
     upper = local_points.max(axis=0)
     lower[:2] -= config.tangential_margin_m
