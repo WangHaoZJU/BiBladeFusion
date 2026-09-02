@@ -101,6 +101,8 @@ class _FakeCoarseSession:
         self.stage_operator_calls = 0
         self.accept_calls = 0
         self.reject_calls = 0
+        self.live_readback_calls = 0
+        self.last_accepted_coarse_view: Path | None = None
 
     def stage_operator_capture(self, *, seed=None, operator_side=None) -> None:
         del seed, operator_side
@@ -113,7 +115,14 @@ class _FakeCoarseSession:
     def accept_cycle(self, result) -> Path:
         assert result.coarse_scan_view_path is not None
         self.accept_calls += 1
+        self.last_accepted_coarse_view = Path(result.coarse_scan_view_path).resolve()
         return self.current_generation_path
+
+    def take_live_readback(self, *, expected_coarse_view):
+        expected = Path(expected_coarse_view).resolve()
+        assert expected == self.last_accepted_coarse_view
+        self.live_readback_calls += 1
+        return SimpleNamespace(root=expected)
 
     def reject_cycle(self) -> None:
         self.reject_calls += 1
@@ -143,6 +152,23 @@ def test_coarse_target_is_stable_across_transit_capture(tmp_path: Path) -> None:
     assert session.select_calls == 1
     assert session.stage_selected_calls == 1
     assert session.accept_calls == 0
+
+
+def test_coarse_live_readback_is_bound_and_transferred_once(tmp_path: Path) -> None:
+    session = _FakeCoarseSession(tmp_path)
+    adapter = CoarseSessionNextViewAdapter(session)
+    adapter.bind_checkpoint_sink(lambda _generation: None)
+    result = SimpleNamespace(
+        coarse_scan_view_path=(tmp_path / "coarse-view").resolve()
+    )
+
+    adapter.observe_perception(result)
+    readback = adapter.take_live_readback(result)
+
+    assert readback.root == result.coarse_scan_view_path
+    assert session.live_readback_calls == 1
+    with pytest.raises(UnknownBladeRuntimeError, match="no transaction-local"):
+        adapter.take_live_readback(result)
 
 
 def test_coarse_run_rejects_reference_hash_change(tmp_path: Path) -> None:
@@ -556,7 +582,7 @@ def test_operator_must_trigger_each_initial_capture(tmp_path: Path) -> None:
     assert diagnostic["authority"] == "diagnostic_only_not_safety_or_science_authority"
     assert diagnostic["status"] == "completed"
     assert diagnostic["spans"]["experiment.checkpoint_append"]["count"] == 1
-    assert diagnostic["spans"]["experiment.checkpoint_full_verify"]["count"] == 1
+    assert "experiment.checkpoint_full_verify" not in diagnostic["spans"]
 
 
 def test_operator_bootstrap_capture_can_directly_activate_ready_schema5(

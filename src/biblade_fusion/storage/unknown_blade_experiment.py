@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+from biblade_fusion.diagnostics.performance_timing import performance_span
 from biblade_fusion.storage.coarse_scan import read_coarse_scan_generation
 from biblade_fusion.storage.fine_reconstruction import (
     replay_final_fine_reconstruction,
@@ -52,6 +53,7 @@ UnknownBladeExperimentEventType = Literal[
 
 _EVENT_DIGITS = 8
 _EVENT_PATTERN = re.compile(r"([0-9]{8})\.json")
+_EVENT_PARTIAL_PATTERN = re.compile(r"\.[0-9]{8}\.json\.[0-9a-f]{32}\.partial")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _EVENT_TYPES = (
     "experiment_initialized",
@@ -379,6 +381,62 @@ class UnknownBladeExperimentEvent:
         }
 
 
+def _decode_event_payload(
+    raw: Any,
+    *,
+    expected_sequence: int,
+) -> UnknownBladeExperimentEvent:
+    """Apply the reader's strict schema and canonical-hash checks to one event."""
+
+    if not isinstance(raw, dict) or set(raw) != _EVENT_KEYS:
+        raise ValueError("experiment event keys changed")
+    schema_version = raw["schema_version"]
+    artifact_kind = raw["artifact_kind"]
+    experiment_id = raw["experiment_id"]
+    sequence = raw["sequence"]
+    event_type = raw["event_type"]
+    created_at_utc = raw["created_at_utc"]
+    payload = raw["payload"]
+    previous_event_sha256 = raw["previous_event_sha256"]
+    event_sha256 = raw["event_sha256"]
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise ValueError("experiment schema_version must be an integer")
+    if not isinstance(artifact_kind, str):
+        raise ValueError("experiment artifact_kind must be a string")
+    if not isinstance(experiment_id, str):
+        raise ValueError("experiment experiment_id must be a string")
+    if isinstance(sequence, bool) or not isinstance(sequence, int):
+        raise ValueError("experiment sequence must be an integer")
+    if not isinstance(event_type, str):
+        raise ValueError("experiment event_type must be a string")
+    if not isinstance(created_at_utc, str):
+        raise ValueError("experiment created_at_utc must be a string")
+    if not isinstance(payload, dict):
+        raise ValueError("experiment payload must be an object")
+    if previous_event_sha256 is not None and not isinstance(
+        previous_event_sha256,
+        str,
+    ):
+        raise ValueError("experiment previous_event_sha256 must be null or a string")
+    if not isinstance(event_sha256, str):
+        raise ValueError("experiment event_sha256 must be a string")
+    if (
+        schema_version != UNKNOWN_BLADE_EXPERIMENT_SCHEMA_VERSION
+        or artifact_kind != UNKNOWN_BLADE_EXPERIMENT_KIND
+        or sequence != expected_sequence
+    ):
+        raise ValueError("experiment event schema or sequence changed")
+    return UnknownBladeExperimentEvent(
+        experiment_id=experiment_id,
+        sequence=sequence,
+        event_type=event_type,  # type: ignore[arg-type]
+        created_at_utc=created_at_utc,
+        payload=payload,
+        previous_event_sha256=previous_event_sha256,
+        event_sha256=event_sha256,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class StoredUnknownBladeExperiment:
     root: Path
@@ -405,6 +463,7 @@ def _write_new_json(
     payload: Mapping[str, Any],
     *,
     before_publish: Callable[[], None] | None = None,
+    after_publish: Callable[[], None] | None = None,
 ) -> None:
     if path.exists():
         raise FileExistsError(f"Refusing to overwrite experiment event: {path}")
@@ -434,6 +493,8 @@ def _write_new_json(
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        if after_publish is not None:
+            after_publish()
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -656,34 +717,37 @@ class UnknownBladeExperimentWriter:
         """Bind one accepted coarse generation to the run event that produced it."""
 
         with self._lock:
-            self._require_current_chain()
-            previous = self._events[-1]
-            if previous.event_type not in {"experiment_initialized", "coarse_checkpoint"}:
-                raise ValueError("COARSE_CHECKPOINT is only valid before PREPARED")
-            coarse = read_stop_scan_run(self._events[0].payload["coarse_run_root"])
-            if not coarse.events:
-                raise ValueError("coarse run has no checkpoint event")
-            generation_root = Path(coarse_generation).resolve()
-            generation = read_coarse_scan_generation(generation_root)
-            if generation.root.resolve() != generation_root:
-                raise ValueError("coarse generation readback changed its root")
-            authority = _authority_record(generation_root, "generation.json")
-            if previous.event_type == "coarse_checkpoint" and (
-                previous.payload["coarse_last_event_sha256"]
-                == coarse.latest_event.event_sha256
-                and previous.payload["coarse_generation"] == authority
-            ):
-                raise ValueError("coarse checkpoint run/generation pair must advance")
-            return self._append(
-                "coarse_checkpoint",
-                {
-                    "coarse_run_id": coarse.run_id,
-                    "coarse_run_root": str(coarse.root),
-                    "coarse_last_event_sha256": coarse.latest_event.event_sha256,
-                    "coarse_event_count": len(coarse.events),
-                    "coarse_generation": authority,
-                },
-            )
+            self._require_current_event_integrity()
+            coarse_root = Path(self._events[0].payload["coarse_run_root"]).resolve()
+            with exclusive_stop_scan_run_authority(coarse_root):
+                previous = self._events[-1]
+                if previous.event_type not in {
+                    "experiment_initialized",
+                    "coarse_checkpoint",
+                }:
+                    raise ValueError("COARSE_CHECKPOINT is only valid before PREPARED")
+                coarse = read_stop_scan_run(coarse_root)
+                if not coarse.events:
+                    raise ValueError("coarse run has no checkpoint event")
+                generation_root = Path(coarse_generation).resolve()
+                authority = _authority_record(generation_root, "generation.json")
+                if previous.event_type == "coarse_checkpoint" and (
+                    previous.payload["coarse_last_event_sha256"]
+                    == coarse.latest_event.event_sha256
+                    and previous.payload["coarse_generation"] == authority
+                ):
+                    raise ValueError("coarse checkpoint run/generation pair must advance")
+                return self._append(
+                    "coarse_checkpoint",
+                    {
+                        "coarse_run_id": coarse.run_id,
+                        "coarse_run_root": str(coarse.root),
+                        "coarse_last_event_sha256": coarse.latest_event.event_sha256,
+                        "coarse_event_count": len(coarse.events),
+                        "coarse_generation": authority,
+                    },
+                    incremental_coarse_checkpoint=True,
+                )
 
     def append_fine_start_candidate(
         self,
@@ -996,6 +1060,41 @@ class UnknownBladeExperimentWriter:
         if stored.experiment_id != self.experiment_id or stored.events != tuple(self._events):
             raise ValueError("experiment chain changed since this writer opened it")
 
+    def _require_current_event_integrity(
+        self,
+        expected_events: tuple[UnknownBladeExperimentEvent, ...] | None = None,
+    ) -> None:
+        """Verify the small event head without recursively reopening its sources."""
+
+        expected_values = tuple(self._events) if expected_events is None else expected_events
+        events_root = self.root / "events"
+        all_files = sorted(item for item in events_root.iterdir() if item.is_file())
+        unexpected = [
+            item
+            for item in all_files
+            if _EVENT_PATTERN.fullmatch(item.name) is None
+            and _EVENT_PARTIAL_PATTERN.fullmatch(item.name) is None
+        ]
+        if unexpected:
+            raise ValueError("experiment event directory contains an unexpected file")
+        files = [item for item in all_files if _EVENT_PATTERN.fullmatch(item.name)]
+        expected_names = [_event_filename(index) for index in range(len(expected_values))]
+        if [item.name for item in files] != expected_names:
+            raise ValueError("experiment event files changed since this writer opened it")
+        decoded: list[UnknownBladeExperimentEvent] = []
+        for index, (path, expected) in enumerate(
+            zip(files, expected_values, strict=True)
+        ):
+            raw = _strict_json_loads(path.read_text(encoding="utf-8"))
+            event = _decode_event_payload(raw, expected_sequence=index)
+            if decoded and event.previous_event_sha256 != decoded[-1].event_sha256:
+                raise ValueError("experiment event predecessor chain is broken")
+            if decoded and event.experiment_id != decoded[0].experiment_id:
+                raise ValueError("experiment ID changed within the event chain")
+            if event != expected:
+                raise ValueError("experiment event content changed since this writer opened it")
+            decoded.append(event)
+
     def _events_science_authority(self) -> ScienceAcceptanceAuthority | None:
         payload = self._events[0].payload
         raw = payload.get("science_acceptance_authority")
@@ -1018,6 +1117,7 @@ class UnknownBladeExperimentWriter:
         payload: dict[str, Any],
         *,
         before_publish: Callable[[], None] | None = None,
+        incremental_coarse_checkpoint: bool = False,
     ) -> UnknownBladeExperimentEvent:
         sequence = len(self._events)
         previous = self._events[-1].event_sha256 if self._events else None
@@ -1028,10 +1128,43 @@ class UnknownBladeExperimentWriter:
             payload=payload,
             previous_event_sha256=previous,
         )
+        prospective_events = (*self._events, event)
+
+        def validate_before_publish() -> None:
+            if before_publish is not None:
+                before_publish()
+            if incremental_coarse_checkpoint:
+                self._require_current_event_integrity()
+                science_authority = self._events_science_authority()
+                if science_authority is not None:
+                    science_authority.assert_acceptance_asset_current()
+                timing_authority = self._events_runtime_timing_authority()
+                if timing_authority is not None:
+                    timing_authority.assert_acceptance_asset_current()
+                with performance_span("experiment.checkpoint_incremental_verify"):
+                    _validate_incremental_coarse_checkpoint(tuple(self._events), event)
+
+        def validate_after_publish() -> None:
+            if incremental_coarse_checkpoint:
+                self._require_current_event_integrity(prospective_events)
+                _verify_authority_record(
+                    event.payload["coarse_generation"],
+                    label="coarse checkpoint generation",
+                )
+
         _write_new_json(
             self.root / "events" / _event_filename(sequence),
             event.to_payload(),
-            before_publish=before_publish,
+            before_publish=(
+                validate_before_publish
+                if before_publish is not None or incremental_coarse_checkpoint
+                else None
+            ),
+            after_publish=(
+                validate_after_publish
+                if incremental_coarse_checkpoint
+                else None
+            ),
         )
         self._events.append(event)
         return event
@@ -1056,55 +1189,7 @@ def read_unknown_blade_experiment(path: str | Path) -> StoredUnknownBladeExperim
             if _EVENT_PATTERN.fullmatch(file_path.name) is None:
                 raise ValueError("experiment event filename is invalid")
             raw = _strict_json_loads(file_path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict) or set(raw) != _EVENT_KEYS:
-                raise ValueError("experiment event keys changed")
-            schema_version = raw["schema_version"]
-            artifact_kind = raw["artifact_kind"]
-            experiment_id = raw["experiment_id"]
-            sequence = raw["sequence"]
-            event_type = raw["event_type"]
-            created_at_utc = raw["created_at_utc"]
-            payload = raw["payload"]
-            previous_event_sha256 = raw["previous_event_sha256"]
-            event_sha256 = raw["event_sha256"]
-            if isinstance(schema_version, bool) or not isinstance(schema_version, int):
-                raise ValueError("experiment schema_version must be an integer")
-            if not isinstance(artifact_kind, str):
-                raise ValueError("experiment artifact_kind must be a string")
-            if not isinstance(experiment_id, str):
-                raise ValueError("experiment experiment_id must be a string")
-            if isinstance(sequence, bool) or not isinstance(sequence, int):
-                raise ValueError("experiment sequence must be an integer")
-            if not isinstance(event_type, str):
-                raise ValueError("experiment event_type must be a string")
-            if not isinstance(created_at_utc, str):
-                raise ValueError("experiment created_at_utc must be a string")
-            if not isinstance(payload, dict):
-                raise ValueError("experiment payload must be an object")
-            if previous_event_sha256 is not None and not isinstance(
-                previous_event_sha256,
-                str,
-            ):
-                raise ValueError(
-                    "experiment previous_event_sha256 must be null or a string"
-                )
-            if not isinstance(event_sha256, str):
-                raise ValueError("experiment event_sha256 must be a string")
-            if (
-                schema_version != UNKNOWN_BLADE_EXPERIMENT_SCHEMA_VERSION
-                or artifact_kind != UNKNOWN_BLADE_EXPERIMENT_KIND
-                or sequence != index
-            ):
-                raise ValueError("experiment event schema or sequence changed")
-            event = UnknownBladeExperimentEvent(
-                experiment_id=experiment_id,
-                sequence=sequence,
-                event_type=event_type,  # type: ignore[arg-type]
-                created_at_utc=created_at_utc,
-                payload=payload,
-                previous_event_sha256=previous_event_sha256,
-                event_sha256=event_sha256,
-            )
+            event = _decode_event_payload(raw, expected_sequence=index)
             if events and event.previous_event_sha256 != events[-1].event_sha256:
                 raise ValueError("experiment event predecessor chain is broken")
             if events and event.experiment_id != events[0].experiment_id:
@@ -1142,6 +1227,79 @@ def read_unknown_blade_experiment(path: str | Path) -> StoredUnknownBladeExperim
         raise UnknownBladeExperimentFormatError(
             f"Invalid unknown-blade experiment chain {root}: {exc}"
         ) from exc
+
+
+def _validate_incremental_coarse_checkpoint(
+    prefix: tuple[UnknownBladeExperimentEvent, ...],
+    event: UnknownBladeExperimentEvent,
+) -> None:
+    """Validate one new coarse checkpoint against an already verified prefix."""
+
+    if not prefix or prefix[0].event_type != "experiment_initialized":
+        raise ValueError("coarse checkpoint prefix is not initialized")
+    previous = prefix[-1]
+    if (
+        previous.event_type not in {"experiment_initialized", "coarse_checkpoint"}
+        or event.event_type != "coarse_checkpoint"
+        or event.sequence != len(prefix)
+        or event.previous_event_sha256 != previous.event_sha256
+        or event.experiment_id != prefix[0].experiment_id
+    ):
+        raise ValueError("incremental COARSE_CHECKPOINT chain binding changed")
+    payload = event.payload
+    if set(payload) != {
+        "coarse_run_id",
+        "coarse_run_root",
+        "coarse_last_event_sha256",
+        "coarse_event_count",
+        "coarse_generation",
+    }:
+        raise ValueError("COARSE_CHECKPOINT payload changed")
+    initialized = prefix[0].payload
+    coarse_root = _canonical_root(
+        initialized["coarse_run_root"],
+        label="coarse run root",
+    )
+    coarse = read_stop_scan_run(coarse_root)
+    count = _checkpoint_event_count(
+        payload["coarse_event_count"],
+        label="coarse checkpoint",
+    )
+    if (
+        coarse.run_id != initialized["coarse_run_id"]
+        or coarse.run_id != event.experiment_id
+        or payload["coarse_run_id"] != coarse.run_id
+        or _canonical_root(
+            payload["coarse_run_root"],
+            label="checkpoint coarse run root",
+        )
+        != coarse.root
+        or not coarse.events
+        or count != len(coarse.events)
+        or payload["coarse_last_event_sha256"] != coarse.latest_event.event_sha256
+    ):
+        raise ValueError("COARSE_CHECKPOINT run binding changed or did not advance")
+    generation_record = payload["coarse_generation"]
+    generation_root = _verify_authority_record(
+        generation_record,
+        label="coarse checkpoint generation",
+    )
+    generation = read_coarse_scan_generation(generation_root)
+    if generation.root.resolve() != generation_root:
+        raise ValueError("coarse checkpoint generation readback changed its root")
+    if previous.event_type == "coarse_checkpoint":
+        previous_count = _checkpoint_event_count(
+            previous.payload["coarse_event_count"],
+            label="previous coarse checkpoint",
+        )
+        if (
+            count < previous_count
+            or (
+                count == previous_count
+                and previous.payload["coarse_generation"] == generation_record
+            )
+        ):
+            raise ValueError("COARSE_CHECKPOINT run/generation pair did not advance")
 
 
 def _validate_semantic_chain(events: tuple[UnknownBladeExperimentEvent, ...]) -> None:

@@ -422,6 +422,8 @@ def test_coarse_scan_view_is_strictly_read_and_added_as_current_science(
     points = np.asarray(((0.2, 0.0, 0.4), (0.21, 0.01, 0.41)), dtype=np.float64)
     reconstructed_root = coarse_root / "reconstructed"
     reconstructed_root.mkdir()
+    stereo_root = (tmp_path / "stereo").resolve()
+    occupancy_root = (tmp_path / "occupancy").resolve()
     np.save(reconstructed_root / "base_points_m.npy", points, allow_pickle=False)
     point_sha256 = hashlib.sha256(
         (reconstructed_root / "base_points_m.npy").read_bytes()
@@ -449,13 +451,21 @@ def test_coarse_scan_view_is_strictly_read_and_added_as_current_science(
         calls.append(Path(path).resolve())
         return SimpleNamespace(
             reconstructed=reconstructed,
-            metadata={"sources": {"reconstructed_view": {"root": str(reconstructed_root)}}},
+            metadata={
+                "sources": {
+                    "reconstructed_view": {"root": str(reconstructed_root)},
+                    "stereo_inference": {"root": str(stereo_root)},
+                    "occupancy_mapping": {"root": str(occupancy_root)},
+                }
+            },
         )
 
     monkeypatch.setattr(live_module, "read_coarse_scan_view", read_coarse)
     result = SimpleNamespace(
         reconstructed_view_path=None,
         coarse_scan_view_path=coarse_root,
+        stereo_inference_path=stereo_root,
+        occupancy_mapping_path=occupancy_root,
         bundle=SimpleNamespace(
             view_id="coarse-00",
             sequence_index=3,
@@ -474,6 +484,83 @@ def test_coarse_scan_view_is_strictly_read_and_added_as_current_science(
     assert current.asset.path == coarse_root / "metadata.json"
 
 
+def test_transaction_coarse_readback_skips_duplicate_full_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coarse_root = (tmp_path / "coarse-view").resolve()
+    reconstructed_root = (tmp_path / "reconstructed").resolve()
+    stereo_root = (tmp_path / "stereo").resolve()
+    occupancy_root = (tmp_path / "occupancy").resolve()
+    coarse_root.mkdir()
+    reconstructed_root.mkdir()
+    (coarse_root / "metadata.json").write_text("{}\n", encoding="utf-8")
+    points = np.asarray(((0.2, 0.0, 0.4),), dtype=np.float64)
+    point_path = reconstructed_root / "base_points_m.npy"
+    np.save(point_path, points, allow_pickle=False)
+    (reconstructed_root / "metadata.json").write_text("{}\n", encoding="utf-8")
+    coarse = SimpleNamespace(
+        reconstructed=SimpleNamespace(
+            view=SimpleNamespace(
+                source_view_id="coarse-00",
+                source_sequence_index=3,
+                source_frame_number=17,
+                base_cloud=SimpleNamespace(points_m=points),
+            ),
+            metadata={
+                "files": {
+                    "base_points_m": {
+                        "path": point_path.name,
+                        "sha256": hashlib.sha256(point_path.read_bytes()).hexdigest(),
+                    }
+                }
+            },
+        ),
+        metadata={
+            "sources": {
+                "reconstructed_view": {"root": str(reconstructed_root)},
+                "stereo_inference": {"root": str(stereo_root)},
+                "occupancy_mapping": {"root": str(occupancy_root)},
+            }
+        },
+    )
+    readback = object()
+    monkeypatch.setattr(
+        live_module,
+        "read_coarse_scan_view",
+        lambda _path: pytest.fail("transaction reuse must not replay the coarse view"),
+    )
+    monkeypatch.setattr(
+        live_module,
+        "_revalidate_coarse_scan_view_readback",
+        lambda token, *, expected_root: (
+            coarse
+            if token is readback and Path(expected_root).resolve() == coarse_root
+            else pytest.fail("live readback binding changed")
+        ),
+    )
+    result = SimpleNamespace(
+        reconstructed_view_path=None,
+        coarse_scan_view_path=coarse_root,
+        stereo_inference_path=stereo_root,
+        occupancy_mapping_path=occupancy_root,
+        bundle=SimpleNamespace(
+            view_id="coarse-00",
+            sequence_index=3,
+            stereo=SimpleNamespace(frame_number=17),
+        ),
+    )
+
+    current = live_module._read_current_science_view(
+        result,
+        coarse_readback=readback,
+    )
+
+    assert current.points_m is not None
+    assert np.array_equal(current.points_m, points)
+    assert current.points_m.flags.writeable is False
+
+
 def test_coarse_scan_identity_mismatch_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -483,6 +570,8 @@ def test_coarse_scan_identity_mismatch_is_rejected(
     (coarse_root / "metadata.json").write_text("{}\n", encoding="utf-8")
     reconstructed_root = coarse_root / "reconstructed"
     reconstructed_root.mkdir()
+    stereo_root = (tmp_path / "stereo").resolve()
+    occupancy_root = (tmp_path / "occupancy").resolve()
     mismatch_points = np.zeros((1, 3))
     np.save(reconstructed_root / "base_points_m.npy", mismatch_points, allow_pickle=False)
     point_sha256 = hashlib.sha256(
@@ -510,12 +599,20 @@ def test_coarse_scan_identity_mismatch_is_rejected(
         "read_coarse_scan_view",
         lambda _: SimpleNamespace(
             reconstructed=reconstructed,
-            metadata={"sources": {"reconstructed_view": {"root": str(reconstructed_root)}}},
+            metadata={
+                "sources": {
+                    "reconstructed_view": {"root": str(reconstructed_root)},
+                    "stereo_inference": {"root": str(stereo_root)},
+                    "occupancy_mapping": {"root": str(occupancy_root)},
+                }
+            },
         ),
     )
     result = SimpleNamespace(
         reconstructed_view_path=None,
         coarse_scan_view_path=coarse_root,
+        stereo_inference_path=stereo_root,
+        occupancy_mapping_path=occupancy_root,
         bundle=SimpleNamespace(
             view_id="coarse-00",
             sequence_index=3,

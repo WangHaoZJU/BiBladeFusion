@@ -11,6 +11,10 @@ from types import SimpleNamespace
 import pytest
 
 import biblade_fusion.storage.unknown_blade_experiment as experiment_module
+from biblade_fusion.diagnostics.performance_timing import (
+    PerformanceTimingRecorder,
+    activate_performance_timing,
+)
 from biblade_fusion.storage.runtime_timing_acceptance import (
     RuntimeTimingAcceptanceAuthority,
 )
@@ -296,6 +300,178 @@ def test_experimental_coarse_writer_is_authorityless_and_audit_readable(
     assert stored.runtime_timing_authority is None
     assert stored.fine_start_protocol is None
     assert stored.latest_event.event_type == "fine_started"
+
+
+def test_coarse_checkpoint_incremental_validation_fails_before_event_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coarse = _run(tmp_path / "coarse", "checkpoint-prepublish-001", event_type="coarse_stopped")
+    writer = UnknownBladeExperimentWriter.create(
+        tmp_path / "chain",
+        experiment_id="checkpoint-prepublish-001",
+        coarse_run_root=coarse.root,
+        production=False,
+    )
+    generation = (tmp_path / "generation").resolve()
+    generation.mkdir()
+    (generation / "generation.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        experiment_module,
+        "read_coarse_scan_generation",
+        lambda _path: (_ for _ in ()).throw(ValueError("synthetic invalid generation")),
+    )
+
+    with pytest.raises(ValueError, match="synthetic invalid generation"):
+        writer.append_coarse_checkpoint(coarse_generation=generation)
+
+    assert [item.name for item in (writer.root / "events").iterdir()] == [
+        "00000000.json"
+    ]
+    assert len(writer.events) == 1
+
+
+def test_coarse_checkpoint_uses_one_incremental_generation_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coarse = _run(tmp_path / "coarse", "checkpoint-incremental-001", event_type="stopped")
+    writer = UnknownBladeExperimentWriter.create(
+        tmp_path / "chain",
+        experiment_id="checkpoint-incremental-001",
+        coarse_run_root=coarse.root,
+        production=False,
+    )
+    generation = (tmp_path / "generation").resolve()
+    generation.mkdir()
+    (generation / "generation.json").write_text("{}\n", encoding="utf-8")
+    reads = 0
+
+    def read_generation(path: str | Path) -> SimpleNamespace:
+        nonlocal reads
+        reads += 1
+        return SimpleNamespace(root=Path(path).resolve())
+
+    monkeypatch.setattr(
+        experiment_module,
+        "read_coarse_scan_generation",
+        read_generation,
+    )
+    recorder = PerformanceTimingRecorder(transaction_kind="checkpoint-test")
+
+    with activate_performance_timing(recorder):
+        event = writer.append_coarse_checkpoint(coarse_generation=generation)
+
+    timing = recorder.payload(status="completed")
+    assert event.event_type == "coarse_checkpoint"
+    assert reads == 1
+    assert timing["spans"]["experiment.checkpoint_incremental_verify"]["count"] == 1
+    assert "experiment.checkpoint_full_verify" not in timing["spans"]
+    assert read_unknown_blade_experiment(writer.root).events == writer.events
+
+
+def test_three_incremental_checkpoints_do_not_replay_verified_prefix_generations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment_id = "checkpoint-three-frame-001"
+    coarse = _run(tmp_path / "coarse", experiment_id, event_type="view_000")
+    writer = UnknownBladeExperimentWriter.create(
+        tmp_path / "chain",
+        experiment_id=experiment_id,
+        coarse_run_root=coarse.root,
+        production=False,
+    )
+    generations = tuple((tmp_path / f"generation-{index}").resolve() for index in range(3))
+    for generation in generations:
+        generation.mkdir()
+        (generation / "generation.json").write_text("{}\n", encoding="utf-8")
+    reads: list[Path] = []
+
+    def read_generation(path: str | Path) -> SimpleNamespace:
+        root = Path(path).resolve()
+        reads.append(root)
+        return SimpleNamespace(root=root)
+
+    monkeypatch.setattr(
+        experiment_module,
+        "read_coarse_scan_generation",
+        read_generation,
+    )
+
+    for index, generation in enumerate(generations):
+        writer.append_coarse_checkpoint(coarse_generation=generation)
+        if index < 2:
+            coarse.append_event(
+                phase="map_ready",
+                cycle_index=index + 1,
+                event_type=f"view_{index + 1:03d}",
+                payload={"motion_authorized": False},
+            )
+
+    assert reads == list(generations)
+    assert [event.event_type for event in writer.events] == [
+        "experiment_initialized",
+        "coarse_checkpoint",
+        "coarse_checkpoint",
+        "coarse_checkpoint",
+    ]
+
+
+def test_fast_event_integrity_recomputes_canonical_event_hash(
+    tmp_path: Path,
+) -> None:
+    coarse = _run(tmp_path / "coarse", "checkpoint-event-hash-001", event_type="stopped")
+    writer = UnknownBladeExperimentWriter.create(
+        tmp_path / "chain",
+        experiment_id="checkpoint-event-hash-001",
+        coarse_run_root=coarse.root,
+        production=False,
+    )
+    writer.events[0].payload["coarse_run_id"] = "changed-in-memory"
+    event_path = writer.root / "events" / "00000000.json"
+    raw = json.loads(event_path.read_text(encoding="utf-8"))
+    raw["payload"]["coarse_run_id"] = "changed-in-memory"
+    event_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="event SHA-256"):
+        writer._require_current_event_integrity()
+
+
+def test_coarse_checkpoint_post_publish_authority_change_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coarse = _run(tmp_path / "coarse", "checkpoint-post-link-001", event_type="stopped")
+    writer = UnknownBladeExperimentWriter.create(
+        tmp_path / "chain",
+        experiment_id="checkpoint-post-link-001",
+        coarse_run_root=coarse.root,
+        production=False,
+    )
+    generation = (tmp_path / "generation").resolve()
+    generation.mkdir()
+    authority = generation / "generation.json"
+    authority.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        experiment_module,
+        "read_coarse_scan_generation",
+        lambda path: SimpleNamespace(root=Path(path).resolve()),
+    )
+    original_link = experiment_module.os.link
+
+    def mutate_after_link(source: Path, destination: Path) -> None:
+        original_link(source, destination)
+        if Path(destination).name == "00000001.json":
+            authority.write_text('{"changed":true}\n', encoding="utf-8")
+
+    monkeypatch.setattr(experiment_module.os, "link", mutate_after_link)
+
+    with pytest.raises(ValueError, match="authority content changed"):
+        writer.append_coarse_checkpoint(coarse_generation=generation)
+
+    assert (writer.root / "events" / "00000001.json").is_file()
+    assert len(writer.events) == 1
 
 
 def test_experiment_writer_binds_new_eventless_coarse_run_reservation(

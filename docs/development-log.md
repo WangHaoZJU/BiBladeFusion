@@ -1,5 +1,82 @@
 # Development log
 
+## 2026-09-02 — three-frame cumulative replay de-dup and GPU boundary
+
+- Corrected the performance scope from “first bootstrap frame” to the complete three-frame
+  coarse bootstrap. Immutable attempt-09 evidence shows perception cycles of
+  `531.567/991.799/1406.192 s`; the FoundationStereo-started to stereo-artifact timestamps
+  stayed near three seconds while the later intervals grew with cumulative source-window
+  replay. Attempt-09 did not record a backend-only online span, and checkpoint-to-live
+  includes the old post-publication chain verification.
+- Reduced the structural source-integration schedule from `18/44/92` to `13/28/57` for
+  frames 1/2/3. The coarse-view writer remains the separately reviewed `3 -> 2` full-read
+  change; generation now reuses one typed current view and one typed predecessor inside
+  the append transaction; checkpoint validates only the new current generation against
+  an already verified event prefix; read-only live ingest consumes a one-shot authority-
+  bound view readback instead of replaying occupancy again.
+- Added read-time metadata SHA/size to stored coarse views and generations. Private reuse
+  rechecks exact view/reconstructed/stereo/occupancy and predecessor records before
+  publication. Checkpoint fast validation now uses the same strict event schema and
+  canonical-hash decoder as the full reader, holds the coarse-run publication lock, and
+  verifies the new event/current generation both before and immediately after hard-link
+  publication.
+- Kept the MAP_READY transition and schema-5 promotion as independent strict boundaries.
+  The third attempt-09 frame performs two full transition reads but returns COLLECTING
+  because the configured gate requires six views; it does not write schema-5. A proposed
+  in-memory reuse at the later schema-5 boundary was removed after safety review because
+  root equality alone did not prove the complete coarse-to-fine authority closure. Resume,
+  schema-5 handoff and final completion continue to execute full experiment/generation
+  replay.
+- Added `scripts/report_three_frame_replay_schedule.py`, which checks attempt-09's exact
+  `1/2/3` occupancy, generation and checkpoint topology without hardware, then applies a
+  source-reviewed call-count model. It neither instruments production reader calls nor
+  makes elapsed-time claims. The `18/44/92 -> 13/28/57` boundary ends at the third capture's
+  MAP_READY transition; it excludes later selection, a successful schema-5 write and the
+  fine handoff. A new attended three-frame eiai run remains required for wall/CPU p50/p95
+  and exact artifact equivalence.
+- Repository-wide Ruff and `git diff --check` passed; the full suite reported
+  `1143 passed, 2 skipped`, with both skips caused by the existing optional Open3D
+  renderer dependency.
+- Audited GPU feasibility without enabling it. The Python Amanatides-Woo loop is suitable
+  for a per-source free/occupied bitmap CUDA backend, but same-source one-vote,
+  occupied-wins, float64 tie behavior and fixed merge order must remain exact. The next
+  stage should be a PyTorch CUDA shadow backend with CPU authority; no GPU production
+  path, dependency, configuration or fallback was added in this change.
+- Detailed formulas, safety decisions, GPU design and the eiai acceptance command are in
+  `docs/phase1-three-frame-replay-dedup-2026-09-02.md`.
+
+## 2026-09-02 — attempt-11 coarse-view writer readback de-dup
+
+- Validated the copied attempt-11 timing authorities from commit `838d6bb`: the first
+  perception cycle took `537.654 s`, including `226.127 s` of operator foreground
+  preflight wait. FoundationStereo backend time was only `3.344 s`; seven measured DDA
+  validations consumed `220.510 s` in the cycle, with another `31.380 s` DDA in coarse
+  generation.
+- Optimized one Phase-1 transaction boundary only. `write_coarse_scan_view` now reuses
+  the first typed, fully verified integration source for foreground replay and frame
+  identity, reducing its production full occupancy reads from three to two. A second
+  unchanged production full reader remains immediately before atomic publication and
+  revalidates the complete occupancy/stereo/session/hand-eye/active-robot authority
+  closure. Identity, content hash, mask and the initially bound metadata record must
+  remain exact; failure removes the partial output.
+- Rejected a more aggressive one-read prototype after independent review found that a
+  writer-local metadata/final-mask check would not cover the complete authority closure.
+  The accepted two-read design closes that TOCTOU gap without duplicating the storage
+  layer's manifest logic. Public readers, DDA, occupancy semantics, configuration,
+  safety/science thresholds and all motion gates are unchanged.
+- Added an immutable attempt-11 writer benchmark with cold 3 / warm 5 trials, an exact
+  DDA-count oracle (`3` before, `2` after), strict production post-readback, normalized
+  semantic comparison, input-tree no-write proof, no-clobber output, non-daemon nested
+  process support and host/revision/source-file provenance. Process CPU/RSS excludes DDA
+  child processes, so wall time is the authoritative performance metric.
+- Final local validation reported `1090 passed, 2 skipped`; both skips are the existing
+  optional Open3D renderer tests. Targeted Ruff and `git diff --check` passed. eiai was
+  not used because its robot and depth camera were occupied. The expected one-DDA saving
+  is about `31.5 s`, but no before/after speedup is claimed until the acquisition host
+  completes the recorded cold/warm benchmark.
+- Full evidence, commands and remaining gates are recorded in
+  `docs/phase1-attempt11-coarse-writer-optimization-2026-09-02.md`.
+
 ## 2026-09-01 — Phase 0 performance timing and attempt-09 baseline
 
 - Added bounded aggregate timing across stereo, occupancy integration and readback,

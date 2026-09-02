@@ -73,6 +73,9 @@ from biblade_fusion.storage.coarse_scan import (
     CoarseTargetKind,
     StoredCoarseScanGeneration,
     StoredCoarseScanView,
+    _bind_coarse_scan_view_readback,
+    _CoarseScanViewReadback,
+    _write_coarse_scan_generation_from_verified,
     read_coarse_integration_source,
     read_coarse_scan_generation,
     read_coarse_scan_view,
@@ -758,13 +761,43 @@ def append_coarse_scan_generation(
 ) -> Path:
     """Append one independently verified view and update measured proxy coverage."""
 
+    with performance_span("coarse.generation_source_read"):
+        current = read_coarse_scan_view(new_view)
+    previous = None
+    if previous_generation is not None:
+        with performance_span("coarse.generation_previous_read"):
+            previous = read_coarse_scan_generation(previous_generation)
+    return _append_coarse_scan_generation_from_verified(
+        output_dir,
+        current=current,
+        source_initialization=source_initialization,
+        source_view_plan=source_view_plan,
+        source_discovery_plan=source_discovery_plan,
+        settings=settings,
+        previous_generation=previous_generation,
+        verified_previous_generation=previous,
+    )
+
+
+def _append_coarse_scan_generation_from_verified(
+    output_dir: str | Path,
+    *,
+    current: StoredCoarseScanView,
+    source_initialization: str | Path,
+    source_view_plan: str | Path,
+    source_discovery_plan: str | Path,
+    settings: AppSettings,
+    previous_generation: str | Path | None,
+    verified_previous_generation: StoredCoarseScanGeneration | None,
+) -> Path:
+    """Append using strict current/predecessor reads from this transaction."""
+
     initialization_root = Path(source_initialization).resolve()
     plan_root = Path(source_view_plan).resolve()
     discovery_root = Path(source_discovery_plan).resolve()
-    with performance_span("coarse.generation_source_read"):
+    with performance_span("coarse.generation_planning_source_read"):
         initialization = read_initialization(initialization_root)
         plan = read_view_plan(plan_root)
-        current = read_coarse_scan_view(new_view)
     if current.proxy_config != settings.proxy_model:
         raise UnknownBladeCoarseError(
             "Coarse view was not filtered with the active blade-envelope policy"
@@ -777,7 +810,20 @@ def append_coarse_scan_generation(
         )
     if _camera_side(current, initialization.observation.proxy) is not current.target_side:
         raise UnknownBladeCoarseError("Coarse target-side label disagrees with camera geometry")
-    if previous_generation is None:
+    previous_path = Path(previous_generation).resolve() if previous_generation else None
+    if (verified_previous_generation is None) != (previous_path is None):
+        raise UnknownBladeCoarseError(
+            "Verified coarse predecessor presence differs from append source"
+        )
+    if (
+        verified_previous_generation is not None
+        and verified_previous_generation.root.resolve() != previous_path
+    ):
+        raise UnknownBladeCoarseError(
+            "Verified coarse predecessor root differs from append source"
+        )
+    previous = verified_previous_generation
+    if previous is None:
         views = (current.root,)
         previous_coverage = None
         ledger: CoverageLedger = create_coverage_ledger(
@@ -785,8 +831,6 @@ def append_coarse_scan_generation(
             settings.coverage,
         )
     else:
-        with performance_span("coarse.generation_previous_read"):
-            previous = read_coarse_scan_generation(previous_generation)
         expected_initialization = Path(
             str(previous.metadata["sources"]["initialization"]["root"])
         ).resolve()
@@ -836,14 +880,20 @@ def append_coarse_scan_generation(
             )
         coverage_created = True
         with performance_span("coarse.generation_write"):
-            return write_coarse_scan_generation(
+            return _write_coarse_scan_generation_from_verified(
                 output,
                 views=views,
+                verified_views=(
+                    (*previous.views, current)
+                    if previous is not None
+                    else (current,)
+                ),
                 coverage=coverage_path,
                 source_initialization=initialization_root,
                 source_view_plan=plan_root,
                 source_discovery_plan=discovery_root,
                 previous_generation=previous_generation,
+                verified_previous_generation=previous,
             )
     except Exception:
         if coverage_created:
@@ -1413,6 +1463,7 @@ class CoarseScienceSession:
         self._pending_seed_provider: BootstrapSeedProvider | None = None
         self._pending_foreground: BootstrapForegroundResult | None = None
         self._pending_prepared: PreparedCoarseScienceView | None = None
+        self._pending_live_readback: _CoarseScanViewReadback | None = None
         self._operator_capture_staged = False
         if recovered_generation is not None:
             self._recover(Path(recovered_generation).resolve())
@@ -1746,7 +1797,25 @@ class CoarseScienceSession:
         self._pending_seed = None
         self._pending_seed_provider = None
         self._pending_foreground = None
+        self._pending_live_readback = None
         self._operator_capture_staged = False
+
+    def take_live_readback(
+        self,
+        *,
+        expected_coarse_view: str | Path,
+    ) -> _CoarseScanViewReadback:
+        """Transfer one accepted strict read to the command-incapable live observer."""
+
+        readback = self._pending_live_readback
+        self._pending_live_readback = None
+        if readback is None:
+            raise UnknownBladeCoarseError("Accepted coarse view has no live readback")
+        if readback.root != Path(expected_coarse_view).resolve():
+            raise UnknownBladeCoarseError(
+                "Accepted coarse live readback differs from the coordinator result"
+            )
+        return readback
 
     def _candidate(self, view_id: str) -> EvaluatedCandidate:
         candidates: list[EvaluatedCandidate] = []
@@ -1764,6 +1833,7 @@ class CoarseScienceSession:
 
         with performance_span("coarse.scan_view_readback"):
             stored = read_coarse_scan_view(prepared.coarse_view_path)
+            live_readback = _bind_coarse_scan_view_readback(stored)
         if stored.target_view_id != prepared.target_view_id:
             raise UnknownBladeCoarseError("Prepared coarse-view identity changed")
         if self._generation is None and self._initialization is None:
@@ -1773,20 +1843,24 @@ class CoarseScienceSession:
         assert self._view_plan is not None
         assert self._discovery_path is not None
         index = 0
+        previous = None
         if self._generation is not None:
             with performance_span("coarse.generation_head_read"):
-                index = read_coarse_scan_generation(self._generation).generation_index + 1
+                previous = read_coarse_scan_generation(self._generation)
+                index = previous.generation_index + 1
         output = self._output_root / "generations" / f"{index:06d}"
-        generation = append_coarse_scan_generation(
+        generation = _append_coarse_scan_generation_from_verified(
             output,
-            new_view=stored.root,
+            current=stored,
             source_initialization=self._initialization,
             source_view_plan=self._view_plan,
             source_discovery_plan=self._discovery_path,
             settings=self._settings,
             previous_generation=self._generation,
+            verified_previous_generation=previous,
         )
         self._generation = generation
+        self._pending_live_readback = live_readback
         return generation
 
     def _initialize_from_first_view(self, stored: StoredCoarseScanView) -> None:

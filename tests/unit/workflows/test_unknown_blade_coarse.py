@@ -388,6 +388,8 @@ def test_coarse_science_session_creates_proxy_plan_and_discovery_from_first_view
         support,
         settings.proxy_model,
         {},
+        "0" * 64,
+        0,
     )
     calls: list[str] = []
 
@@ -445,8 +447,13 @@ def test_coarse_science_session_creates_proxy_plan_and_discovery_from_first_view
     generation_path = (tmp_path / "science" / "generations" / "000000").resolve()
     monkeypatch.setattr(
         coarse_module,
-        "append_coarse_scan_generation",
+        "_append_coarse_scan_generation_from_verified",
         lambda output, **_kwargs: output.resolve(),
+    )
+    monkeypatch.setattr(
+        coarse_module,
+        "_bind_coarse_scan_view_readback",
+        lambda view: SimpleNamespace(root=view.root),
     )
 
     session = CoarseScienceSession(
@@ -471,6 +478,93 @@ def test_coarse_science_session_creates_proxy_plan_and_discovery_from_first_view
     assert session.discovery_plan is discovery
     assert calls == ["initialization", "view_plan", "discovery"]
     assert session.motion_authorized is False
+
+
+@pytest.mark.parametrize(
+    ("view_number", "expected_source_replays"),
+    ((1, 1), (2, 3), (3, 6)),
+)
+def test_generation_accept_reuses_one_current_and_one_predecessor_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    view_number: int,
+    expected_source_replays: int,
+) -> None:
+    current_root = (tmp_path / f"view-{view_number}").resolve()
+    current = SimpleNamespace(
+        root=current_root,
+        target_view_id=f"view-{view_number}",
+    )
+    previous_root = (
+        (tmp_path / f"generation-{view_number - 1}").resolve()
+        if view_number > 1
+        else None
+    )
+    previous = (
+        SimpleNamespace(
+            root=previous_root,
+            generation_index=view_number - 2,
+        )
+        if previous_root is not None
+        else None
+    )
+    source_replays = 0
+
+    def read_current(path: str | Path) -> SimpleNamespace:
+        nonlocal source_replays
+        assert Path(path).resolve() == current_root
+        source_replays += view_number
+        return current
+
+    def read_previous(path: str | Path) -> SimpleNamespace:
+        nonlocal source_replays
+        assert previous_root is not None
+        assert Path(path).resolve() == previous_root
+        source_replays += view_number * (view_number - 1) // 2
+        return previous
+
+    captured: dict[str, object] = {}
+
+    def append_generation(output: Path, **kwargs: object) -> Path:
+        captured.update(kwargs)
+        return Path(output).resolve()
+
+    monkeypatch.setattr(coarse_module, "read_coarse_scan_view", read_current)
+    monkeypatch.setattr(coarse_module, "read_coarse_scan_generation", read_previous)
+    monkeypatch.setattr(
+        coarse_module,
+        "_append_coarse_scan_generation_from_verified",
+        append_generation,
+    )
+    readback = SimpleNamespace(root=current_root)
+    monkeypatch.setattr(
+        coarse_module,
+        "_bind_coarse_scan_view_readback",
+        lambda _view: readback,
+    )
+    session = object.__new__(CoarseScienceSession)
+    session._generation = previous_root
+    session._initialization = (tmp_path / "initialization").resolve()
+    session._view_plan = (tmp_path / "view-plan").resolve()
+    session._discovery_path = (tmp_path / "discovery").resolve()
+    session._output_root = (tmp_path / "science").resolve()
+    session._settings = load_settings("configs/default.yaml")
+
+    output = session.accept_prepared_view(
+        PreparedCoarseScienceView(
+            current_root,
+            tmp_path / "reconstructed",
+            current.target_view_id,
+            "operator_seed",
+            coarse_module.BladeSide.FRONT,
+        )
+    )
+
+    assert source_replays == expected_source_replays
+    assert captured["current"] is current
+    assert captured["verified_previous_generation"] is previous
+    assert session.take_live_readback(expected_coarse_view=current_root) is readback
+    assert output.name == f"{view_number - 1:06d}"
 
 
 def test_operator_bootstrap_side_is_automatic_after_proxy_exists() -> None:
@@ -711,7 +805,11 @@ def test_generation_append_removes_uncommitted_coverage_before_retry(
             raise OSError("simulated generation commit failure")
         return Path(path).resolve()
 
-    monkeypatch.setattr(coarse_module, "write_coarse_scan_generation", write_generation)
+    monkeypatch.setattr(
+        coarse_module,
+        "_write_coarse_scan_generation_from_verified",
+        write_generation,
+    )
     output = tmp_path / "generations" / "000000"
     kwargs = {
         "new_view": current.root,

@@ -55,7 +55,10 @@ from biblade_fusion.robotics import (
     wait_until_bootstrap_safe_state,
     wait_until_settled,
 )
-from biblade_fusion.storage.coarse_scan import read_coarse_scan_generation
+from biblade_fusion.storage.coarse_scan import (
+    _CoarseScanViewReadback,
+    read_coarse_scan_generation,
+)
 from biblade_fusion.storage.fine_reconstruction import (
     replay_final_fine_reconstruction,
 )
@@ -195,6 +198,12 @@ class _CoarseSession(Protocol):
     def accept_cycle(self, result: PerceptionCycleResult) -> Path: ...
 
     def reject_cycle(self) -> None: ...
+
+    def take_live_readback(
+        self,
+        *,
+        expected_coarse_view: str | Path,
+    ) -> _CoarseScanViewReadback: ...
 
     def select_next(self) -> NextViewSelection: ...
 
@@ -495,6 +504,7 @@ class CoarseSessionNextViewAdapter:
         self._run_selection_policy_sha256: str | None = None
         self._checkpoint_sink: Callable[[Path], None] | None = None
         self._last_checkpoint_generation: Path | None = None
+        self._pending_live_readback: _CoarseScanViewReadback | None = None
 
     @property
     def last_transition(self) -> CoarsePhaseTransition | None:
@@ -546,6 +556,7 @@ class CoarseSessionNextViewAdapter:
     def reject_staged_cycle(self) -> None:
         self._session.reject_cycle()
         self._pending_selection = None
+        self._pending_live_readback = None
 
     def observe_perception(self, result: PerceptionCycleResult) -> None:
         if result.coarse_scan_view_path is None:
@@ -553,12 +564,16 @@ class CoarseSessionNextViewAdapter:
             # safety occupancy but intentionally do not consume the staged science
             # target.
             return
+        self._pending_live_readback = None
         generation = Path(self._session.accept_cycle(result)).resolve()
         if self._checkpoint_sink is None:
             raise UnknownBladeRuntimeError(
                 "Accepted coarse science has no top-level checkpoint sink"
             )
         self._checkpoint_sink(generation)
+        self._pending_live_readback = self._session.take_live_readback(
+            expected_coarse_view=result.coarse_scan_view_path,
+        )
         self._last_checkpoint_generation = generation
         self._pending_selection = None
         self._accepted_cycle_count += 1
@@ -566,6 +581,24 @@ class CoarseSessionNextViewAdapter:
         # evaluate it only after this exact result is the current MAP_READY disk
         # authority; accepting a science asset alone is insufficient.
         self._pending_transition_result = result
+
+    def take_live_readback(
+        self,
+        result: PerceptionCycleResult,
+    ) -> _CoarseScanViewReadback:
+        """Transfer the exact accepted view once to read-only live supervision."""
+
+        readback = self._pending_live_readback
+        self._pending_live_readback = None
+        if result.coarse_scan_view_path is None or readback is None:
+            raise UnknownBladeRuntimeError(
+                "Accepted coarse perception has no transaction-local live readback"
+            )
+        if readback.root != result.coarse_scan_view_path.resolve():
+            raise UnknownBladeRuntimeError(
+                "Coarse live readback differs from the accepted perception result"
+            )
+        return readback
 
     def promote_after_exact_map_ready(
         self,
@@ -813,8 +846,6 @@ class UnknownBladeSupervisedRuntime:
             self._experiment_handoff.append_coarse_checkpoint(
                 coarse_generation=generation,
             )
-        with performance_span("experiment.checkpoint_full_verify"):
-            self._verify_handoff_chain()
 
     @property
     def snapshot(self) -> UnknownBladeRuntimeSnapshot:
@@ -2047,6 +2078,19 @@ def open_production_unknown_blade_runtime(
             kinematics=display_kinematics,
             collision_geometry=live_collision_geometry,
         )
+
+        def observe_coarse_perception(result: PerceptionCycleResult) -> None:
+            """Keep coarse acceptance/checkpoint/live reuse in one ordered transaction."""
+
+            coarse_adapter.observe_perception(result)
+            if result.coarse_scan_view_path is None:
+                coarse_bridge.observe_perception(result)
+                return
+            coarse_bridge.observe_perception(
+                result,
+                coarse_readback=coarse_adapter.take_live_readback(result),
+            )
+
         coarse_runner: SupervisedExperimentRunner | None = None
         if resume_plan is None or resume_plan.phase is UnknownBladeResumePhase.COARSE:
             coarse_runner_kwargs = {
@@ -2063,10 +2107,7 @@ def open_production_unknown_blade_runtime(
                 "motion_executor": GuardedCoordinatorMotionExecutor(),
                 "status_callbacks": (coarse_bridge,),
                 "event_callbacks": (coarse_bridge.observe_event,),
-                "perception_callbacks": (
-                    coarse_adapter.observe_perception,
-                    coarse_bridge.observe_perception,
-                ),
+                "perception_callbacks": (observe_coarse_perception,),
                 "prepared_segment_callbacks": (
                     coarse_bridge.observe_prepared_segment,
                 ),

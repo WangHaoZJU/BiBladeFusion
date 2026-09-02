@@ -84,6 +84,8 @@ class StoredCoarseScanView:
     proxy_support: ProxySupportSelection
     proxy_config: ProxyModelConfig
     metadata: dict[str, Any]
+    metadata_sha256: str
+    metadata_size_bytes: int
 
     @property
     def motion_authorized(self) -> bool:
@@ -104,6 +106,23 @@ class StoredCoarseScanView:
 
 
 @dataclass(frozen=True, slots=True)
+class _CoarseScanViewReadback:
+    """Transaction-local proof for read-only reuse of one strict view read.
+
+    The token is intentionally private and short lived.  It is not a cache and
+    is never persisted or accepted by a motion/science decision boundary.  The
+    immutable scalar records let a read-only consumer close the TOCTOU window
+    without replaying occupancy rays a second time.
+    """
+
+    view: StoredCoarseScanView
+    root: Path
+    metadata_sha256: str
+    metadata_size_bytes: int
+    source_records: tuple[tuple[str, str, str, str, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class StoredCoarseScanGeneration:
     root: Path
     generation_index: int
@@ -112,6 +131,8 @@ class StoredCoarseScanGeneration:
     previous_generation_path: Path | None
     coarse_model_path: Path | None
     metadata: dict[str, Any]
+    metadata_sha256: str
+    metadata_size_bytes: int
 
     @property
     def motion_authorized(self) -> bool:
@@ -269,6 +290,124 @@ def _resolve_directory_record(record: dict[str, Any]) -> Path:
     return root
 
 
+def _stored_view_authority_records(
+    view: StoredCoarseScanView,
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
+    if type(view) is not StoredCoarseScanView:
+        raise ValueError("Coarse view authority requires a typed strict-reader result")
+    record = {
+        "root": str(view.root.resolve()),
+        "authority": "metadata.json",
+        "sha256": view.metadata_sha256,
+        "size_bytes": view.metadata_size_bytes,
+    }
+    _resolve_directory_record(record)
+    payload = json.loads((view.root / "metadata.json").read_text(encoding="utf-8"))
+    if payload != view.metadata:
+        raise ValueError("Coarse view metadata differs from its strict readback")
+    sources = tuple(
+        dict(view.metadata["sources"][name])
+        for name in ("reconstructed_view", "stereo_inference", "occupancy_mapping")
+    )
+    for source in sources:
+        _resolve_directory_record(source)
+    return record, sources
+
+
+def _stored_generation_authority_record(
+    generation: StoredCoarseScanGeneration,
+) -> dict[str, Any]:
+    if type(generation) is not StoredCoarseScanGeneration:
+        raise ValueError("Coarse generation authority requires a typed strict-reader result")
+    record = {
+        "root": str(generation.root.resolve()),
+        "authority": "generation.json",
+        "sha256": generation.metadata_sha256,
+        "size_bytes": generation.metadata_size_bytes,
+    }
+    _resolve_directory_record(record)
+    payload = json.loads((generation.root / "generation.json").read_text(encoding="utf-8"))
+    if payload != generation.metadata:
+        raise ValueError("Coarse generation metadata differs from its strict readback")
+    return record
+
+
+def _bind_coarse_scan_view_readback(
+    view: StoredCoarseScanView,
+) -> _CoarseScanViewReadback:
+    """Bind a strict view result to exact on-disk authorities for one transaction."""
+
+    if type(view) is not StoredCoarseScanView:
+        raise ValueError("Coarse view readback requires a typed strict-reader result")
+    root = view.root.resolve()
+    metadata_record, sources = _stored_view_authority_records(view)
+    frozen_sources: list[tuple[str, str, str, str, int]] = []
+    for name, source in zip(
+        ("reconstructed_view", "stereo_inference", "occupancy_mapping"),
+        sources,
+        strict=True,
+    ):
+        record = dict(source)
+        source_root = _resolve_directory_record(record)
+        frozen_sources.append(
+            (
+                name,
+                str(source_root),
+                str(record["authority"]),
+                str(record["sha256"]),
+                int(record["size_bytes"]),
+            )
+        )
+    return _CoarseScanViewReadback(
+        view=view,
+        root=root,
+        metadata_sha256=str(metadata_record["sha256"]),
+        metadata_size_bytes=int(metadata_record["size_bytes"]),
+        source_records=tuple(frozen_sources),
+    )
+
+
+def _revalidate_coarse_scan_view_readback(
+    readback: _CoarseScanViewReadback,
+    *,
+    expected_root: str | Path,
+) -> StoredCoarseScanView:
+    """Recheck a read-only reuse token without semantic occupancy replay."""
+
+    if type(readback) is not _CoarseScanViewReadback:
+        raise ValueError("Coarse view reuse requires a typed transaction readback")
+    view = readback.view
+    root = Path(expected_root).resolve()
+    if (
+        type(view) is not StoredCoarseScanView
+        or root != readback.root
+        or view.root.resolve() != root
+    ):
+        raise ValueError("Coarse view reuse root differs from its transaction readback")
+    metadata_path = root / "metadata.json"
+    if (
+        not metadata_path.is_file()
+        or _sha256(metadata_path) != readback.metadata_sha256
+        or metadata_path.stat().st_size != readback.metadata_size_bytes
+    ):
+        raise ValueError("Coarse view metadata changed after transaction readback")
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if payload != view.metadata:
+        raise ValueError("Coarse view metadata no longer matches its typed readback")
+    sources = payload["sources"]
+    for name, source_root, authority, sha256, size_bytes in readback.source_records:
+        frozen = {
+            "root": source_root,
+            "authority": authority,
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+        }
+        if dict(sources[name]) != frozen:
+            raise ValueError("Coarse view source binding changed after transaction readback")
+        _resolve_directory_record(frozen)
+    return view
+
+
 def _array_record(path: Path) -> dict[str, Any]:
     value = np.load(path, mmap_mode="r", allow_pickle=False)
     try:
@@ -354,11 +493,15 @@ def _replay_foreground(
     occupancy_root: Path,
     config: BootstrapForegroundConfig,
     seed: BootstrapSeed | None,
+    verified_integration: StoredCoarseIntegrationSource | None = None,
 ) -> BootstrapForegroundResult:
     stereo = read_stereo_inference(stereo_root)
     source_session = Path(str(stereo.metadata["source"]["session"])).resolve()
     verify_stereo_inference_source(stereo, expected_session=source_session)
-    integration_valid = _load_final_integration_mask(occupancy_root)
+    if verified_integration is None:
+        integration_valid = _load_final_integration_mask(occupancy_root)
+    else:
+        integration_valid = verified_integration.mask
     if integration_valid.shape != stereo.observation.depth_m.shape:
         raise ValueError("Coarse integration-valid mask shape changed")
     return bootstrap_blade_foreground(
@@ -398,11 +541,14 @@ def write_coarse_scan_view(
         proxy_config,
         frame=reconstructed.view.base_cloud.frame,
     )
+    integration = read_coarse_integration_source(occupancy_root)
+    occupancy_source_record = _directory_record(occupancy_root, "metadata.json")
     replayed = _replay_foreground(
         stereo_root=stereo_root,
         occupancy_root=occupancy_root,
         config=foreground.config,
         seed=foreground.seed,
+        verified_integration=integration,
     )
     scalar_fields = (
         "diagnostics",
@@ -428,14 +574,12 @@ def write_coarse_scan_view(
         or str(source["view_id"]) == ""
     ):
         raise ValueError("Coarse reconstructed-view stereo source changed")
-    occupancy = read_occupancy_mapping(occupancy_root)
-    evidence = occupancy.frame_evidence[-1]
-    integration_valid = _load_final_integration_mask(occupancy_root)
+    integration_valid = integration.mask
     if (
-        evidence.source_view_id != reconstructed.view.source_view_id
-        or evidence.source_sequence_index != reconstructed.view.source_sequence_index
-        or evidence.frame_number != reconstructed.view.source_frame_number
-        or evidence.integration_valid_mask_content_hash
+        integration.source_view_id != reconstructed.view.source_view_id
+        or integration.source_sequence_index != reconstructed.view.source_sequence_index
+        or integration.frame_number != reconstructed.view.source_frame_number
+        or integration.occupancy_content_sha256
         != occupancy_array_content_hash(integration_valid)
         or foreground.valid_mask_content_sha256 != array_content_sha256(integration_valid)
     ):
@@ -496,13 +640,25 @@ def write_coarse_scan_view(
             "sources": {
                 "reconstructed_view": _directory_record(reconstructed_root, "metadata.json"),
                 "stereo_inference": _directory_record(stereo_root, "metadata.json"),
-                "occupancy_mapping": _directory_record(occupancy_root, "metadata.json"),
+                "occupancy_mapping": occupancy_source_record,
             },
         }
         (temporary / "metadata.json").write_text(
             json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
             encoding="utf-8",
         )
+        rechecked_integration = read_coarse_integration_source(occupancy_root)
+        if (
+            rechecked_integration.source_view_id != integration.source_view_id
+            or rechecked_integration.source_sequence_index
+            != integration.source_sequence_index
+            or rechecked_integration.frame_number != integration.frame_number
+            or rechecked_integration.occupancy_content_sha256
+            != integration.occupancy_content_sha256
+            or not np.array_equal(rechecked_integration.mask, integration.mask)
+        ):
+            raise ValueError("Coarse occupancy integration source changed before publication")
+        _resolve_directory_record(occupancy_source_record)
         temporary.replace(output)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -515,7 +671,8 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
 
     root = Path(path).resolve()
     try:
-        payload = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        metadata_bytes = (root / "metadata.json").read_bytes()
+        payload = json.loads(metadata_bytes.decode("utf-8"))
         if (
             int(payload["schema_version"]) not in {1, COARSE_SCAN_VIEW_SCHEMA_VERSION}
             or payload.get("artifact_kind") != COARSE_SCAN_VIEW_KIND
@@ -606,6 +763,8 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
             proxy_support,
             proxy_config,
             payload,
+            hashlib.sha256(metadata_bytes).hexdigest(),
+            len(metadata_bytes),
         )
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid coarse-scan view artifact {root}: {exc}") from exc
@@ -626,7 +785,62 @@ def write_coarse_scan_generation(
 
     if not views:
         raise ValueError("Coarse-scan generation requires at least one view")
+    previous_path = Path(previous_generation).resolve() if previous_generation else None
     stored_views = tuple(read_coarse_scan_view(path) for path in views)
+    previous = (
+        read_coarse_scan_generation(previous_path)
+        if previous_path is not None
+        else None
+    )
+    return _write_coarse_scan_generation_from_verified(
+        output_dir,
+        views=views,
+        verified_views=stored_views,
+        coverage=coverage,
+        source_initialization=source_initialization,
+        source_view_plan=source_view_plan,
+        source_discovery_plan=source_discovery_plan,
+        previous_generation=previous_generation,
+        verified_previous_generation=previous,
+        coarse_model=coarse_model,
+    )
+
+
+def _write_coarse_scan_generation_from_verified(
+    output_dir: str | Path,
+    *,
+    views: tuple[str | Path, ...],
+    verified_views: tuple[StoredCoarseScanView, ...],
+    coverage: str | Path,
+    source_initialization: str | Path,
+    source_view_plan: str | Path,
+    source_discovery_plan: str | Path,
+    previous_generation: str | Path | None,
+    verified_previous_generation: StoredCoarseScanGeneration | None,
+    coarse_model: str | Path | None = None,
+) -> Path:
+    """Write from strict readers already completed in this append transaction.
+
+    This is deliberately private and accepts typed storage objects, not arbitrary
+    decoded dictionaries.  It only removes repeated semantic replay inside one
+    append call; public readers and all later checkpoint/resume boundaries remain
+    independent full verifications.
+    """
+
+    expected_view_roots = tuple(Path(path).resolve() for path in views)
+    actual_view_roots = tuple(item.root.resolve() for item in verified_views)
+    if not verified_views or actual_view_roots != expected_view_roots:
+        raise ValueError("Verified coarse views do not match generation sources")
+    previous_path = Path(previous_generation).resolve() if previous_generation else None
+    if (verified_previous_generation is None) != (previous_path is None):
+        raise ValueError("Verified predecessor presence differs from generation source")
+    if (
+        verified_previous_generation is not None
+        and verified_previous_generation.root.resolve() != previous_path
+    ):
+        raise ValueError("Verified predecessor root differs from generation source")
+
+    stored_views = verified_views
     physical_ids = tuple(
         (
             item.reconstructed.view.source_view_id,
@@ -641,6 +855,33 @@ def write_coarse_scan_generation(
     view_plan_root = Path(source_view_plan).resolve()
     discovery_plan_root = Path(source_discovery_plan).resolve()
     coverage_root = Path(coverage).resolve()
+    coarse_root = Path(coarse_model).resolve() if coarse_model is not None else None
+    # Capture every top-level authority before the strict readers below.  The
+    # same records are rechecked immediately before publication, so a source
+    # cannot be replaced in the read-to-record gap and silently become the new
+    # authority for an old typed object.
+    initialization_record = _directory_record(
+        initialization_root,
+        INITIALIZATION_METADATA_FILENAME,
+    )
+    view_plan_record = _directory_record(view_plan_root, "view_plan.json")
+    discovery_plan_record = _directory_record(discovery_plan_root, "discovery.json")
+    coverage_record = _directory_record(coverage_root, "coverage.json")
+    previous_record = (
+        _stored_generation_authority_record(verified_previous_generation)
+        if verified_previous_generation is not None
+        else None
+    )
+    coarse_record = (
+        _directory_record(coarse_root, "metadata.json")
+        if coarse_root is not None
+        else None
+    )
+    view_authorities = tuple(
+        _stored_view_authority_records(item) for item in stored_views
+    )
+    view_records = tuple(item[0] for item in view_authorities)
+    view_source_records = tuple(item[1] for item in view_authorities)
     coverage_asset = read_coverage_ledger(coverage_root)
     _assert_coverage_replays(
         views=stored_views,
@@ -648,11 +889,11 @@ def write_coarse_scan_generation(
         initialization_path=initialization_root,
         view_plan_path=view_plan_root,
     )
-    previous_path = Path(previous_generation).resolve() if previous_generation else None
     if previous_path is None:
         generation_index = 0
     else:
-        previous = read_coarse_scan_generation(previous_path)
+        assert verified_previous_generation is not None
+        previous = verified_previous_generation
         generation_index = previous.generation_index + 1
         previous_roots = tuple(item.root for item in previous.views)
         current_roots = tuple(item.root for item in stored_views)
@@ -686,7 +927,6 @@ def write_coarse_scan_generation(
             or Path(str(coverage_predecessor)).resolve() != previous_coverage
         ):
             raise ValueError("Coarse coverage predecessor differs from generation predecessor")
-    coarse_root = Path(coarse_model).resolve() if coarse_model is not None else None
     if coarse_root is not None:
         summary = read_coarse_model_summary(coarse_root)
         source_roots = tuple(
@@ -724,29 +964,15 @@ def write_coarse_scan_generation(
             "created_at_utc": datetime.now(UTC).isoformat(),
             "motion_authorized": False,
             "generation_index": generation_index,
-            "previous_generation": (
-                _directory_record(previous_path, "generation.json")
-                if previous_path is not None
-                else None
-            ),
+            "previous_generation": previous_record,
             "sources": {
-                "initialization": _directory_record(
-                    initialization_root,
-                    INITIALIZATION_METADATA_FILENAME,
-                ),
-                "view_plan": _directory_record(view_plan_root, "view_plan.json"),
-                "discovery_plan": _directory_record(
-                    discovery_plan_root,
-                    "discovery.json",
-                ),
-                "coverage": _directory_record(coverage_root, "coverage.json"),
-                "coarse_model": (
-                    _directory_record(coarse_root, "metadata.json")
-                    if coarse_root is not None
-                    else None
-                ),
+                "initialization": initialization_record,
+                "view_plan": view_plan_record,
+                "discovery_plan": discovery_plan_record,
+                "coverage": coverage_record,
+                "coarse_model": coarse_record,
             },
-            "views": [_directory_record(item.root, "metadata.json") for item in stored_views],
+            "views": list(view_records),
             "summary": {
                 "view_count": len(stored_views),
                 "front_view_count": sum(
@@ -760,6 +986,26 @@ def write_coarse_scan_generation(
             json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
             encoding="utf-8",
         )
+        # Close the transaction-local TOCTOU window without replaying occupancy
+        # rays again: every typed source was fully verified above, and its bound
+        # authority must still have the exact path, digest and size immediately
+        # before the append-only generation is published.
+        records = (
+            initialization_record,
+            view_plan_record,
+            discovery_plan_record,
+            coverage_record,
+            *view_records,
+        )
+        for record in records:
+            _resolve_directory_record(record)
+        for source_records in view_source_records:
+            for record in source_records:
+                _resolve_directory_record(record)
+        if previous_record is not None:
+            _resolve_directory_record(previous_record)
+        if coarse_record is not None:
+            _resolve_directory_record(coarse_record)
         temporary.replace(output)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -772,7 +1018,8 @@ def read_coarse_scan_generation(path: str | Path) -> StoredCoarseScanGeneration:
 
     root = Path(path).resolve()
     try:
-        payload = json.loads((root / "generation.json").read_text(encoding="utf-8"))
+        metadata_bytes = (root / "generation.json").read_bytes()
+        payload = json.loads(metadata_bytes.decode("utf-8"))
         if (
             int(payload["schema_version"]) != COARSE_SCAN_GENERATION_SCHEMA_VERSION
             or payload.get("artifact_kind") != COARSE_SCAN_GENERATION_KIND
@@ -899,6 +1146,8 @@ def read_coarse_scan_generation(path: str | Path) -> StoredCoarseScanGeneration:
             previous_path,
             coarse_path,
             payload,
+            hashlib.sha256(metadata_bytes).hexdigest(),
+            len(metadata_bytes),
         )
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid coarse-scan generation {root}: {exc}") from exc

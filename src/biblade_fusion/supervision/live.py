@@ -41,7 +41,11 @@ from biblade_fusion.robotics.collision_template import (
     es68_d435i_collision_content_hash,
     es68_d435i_robot_geometry_hash,
 )
-from biblade_fusion.storage.coarse_scan import read_coarse_scan_view
+from biblade_fusion.storage.coarse_scan import (
+    _CoarseScanViewReadback,
+    _revalidate_coarse_scan_view_readback,
+    read_coarse_scan_view,
+)
 from biblade_fusion.storage.display_source_registry import AppendOnlyDisplaySourceRegistry
 from biblade_fusion.storage.reconstructed_view import read_reconstructed_view
 from biblade_fusion.storage.stereo_inference import read_stereo_inference
@@ -582,7 +586,11 @@ def _coverage_values(path: Path | None) -> tuple[float, float, float, float, int
     )
 
 
-def _read_current_science_view(result: PerceptionCycleResult) -> _CurrentScienceView:
+def _read_current_science_view(
+    result: PerceptionCycleResult,
+    *,
+    coarse_readback: _CoarseScanViewReadback | None = None,
+) -> _CurrentScienceView:
     """Resolve exactly one fine or coarse reconstructed view for display."""
 
     if result.reconstructed_view_path is not None and result.coarse_scan_view_path is not None:
@@ -594,7 +602,29 @@ def _read_current_science_view(result: PerceptionCycleResult) -> _CurrentScience
     source_kind = None
     reconstructed_root = None
     if result.coarse_scan_view_path is not None:
-        coarse = read_coarse_scan_view(result.coarse_scan_view_path)
+        try:
+            coarse = (
+                read_coarse_scan_view(result.coarse_scan_view_path)
+                if coarse_readback is None
+                else _revalidate_coarse_scan_view_readback(
+                    coarse_readback,
+                    expected_root=result.coarse_scan_view_path,
+                )
+            )
+        except ValueError as exc:
+            raise LiveSupervisionError(
+                f"Coarse live readback authority changed: {exc}"
+            ) from exc
+        sources = coarse.metadata["sources"]
+        if (
+            Path(str(sources["stereo_inference"]["root"])).resolve()
+            != result.stereo_inference_path.resolve()
+            or Path(str(sources["occupancy_mapping"]["root"])).resolve()
+            != result.occupancy_mapping_path.resolve()
+        ):
+            raise LiveSupervisionError(
+                "Coarse live readback sources differ from the perception result"
+            )
         reconstructed = coarse.reconstructed
         source_kind = "coarse_scan_view"
         reconstructed_root = Path(
@@ -607,6 +637,10 @@ def _read_current_science_view(result: PerceptionCycleResult) -> _CurrentScience
             result.coarse_scan_view_path / "metadata.json",
         )
     elif result.reconstructed_view_path is not None:
+        if coarse_readback is not None:
+            raise LiveSupervisionError(
+                "A coarse transaction readback cannot authorize a fine reconstruction"
+            )
         reconstructed = read_reconstructed_view(result.reconstructed_view_path)
         source_kind = "fine_reconstructed_view"
         reconstructed_root = result.reconstructed_view_path.resolve()
@@ -637,6 +671,21 @@ def _read_current_science_view(result: PerceptionCycleResult) -> _CurrentScience
     if not point_path.is_file() or _sha256(point_path) != point_file_sha256:
         raise LiveSupervisionError("Reconstructed display point file changed")
     points = _readonly_array(reconstructed.view.base_cloud.points_m, dtype=np.float64)
+    points_f64le_sha256 = _array_content_sha256(points, dtype="<f8")
+    try:
+        persisted_points = np.load(point_path, allow_pickle=False)
+        persisted_f64le_sha256 = _array_content_sha256(
+            persisted_points,
+            dtype="<f8",
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise LiveSupervisionError(
+            "Reconstructed display point array cannot be verified"
+        ) from exc
+    if persisted_f64le_sha256 != points_f64le_sha256:
+        raise LiveSupervisionError(
+            "Typed reconstructed display points differ from their immutable array"
+        )
     return _CurrentScienceView(
         points_m=points,
         asset=asset,
@@ -648,7 +697,7 @@ def _read_current_science_view(result: PerceptionCycleResult) -> _CurrentScience
         metadata_sha256=_sha256(metadata_path),
         point_array_path=point_path,
         point_array_file_sha256=point_file_sha256,
-        points_f64le_sha256=_array_content_sha256(points, dtype="<f8"),
+        points_f64le_sha256=points_f64le_sha256,
     )
 
 
@@ -894,13 +943,21 @@ class LiveSupervisionBridge:
             self._planned_joint_path = None
             self._existing_session_id = identity
 
-    def observe_perception(self, result: PerceptionCycleResult) -> None:
+    def observe_perception(
+        self,
+        result: PerceptionCycleResult,
+        *,
+        coarse_readback: _CoarseScanViewReadback | None = None,
+    ) -> None:
         """Time one ingest without changing the callback's typed contract."""
 
         if type(result) is not PerceptionCycleResult:
             # Preserve the original validation path without inspecting an
             # untrusted protocol substitute for diagnostic identity.
-            self._observe_perception_transaction(result)
+            self._observe_perception_transaction(
+                result,
+                coarse_readback=coarse_readback,
+            )
             return
         recorder = try_create_performance_timing(
             transaction_kind="live_perception_ingest",
@@ -911,7 +968,10 @@ class LiveSupervisionBridge:
             },
         )
         if recorder is None:
-            self._observe_perception_transaction(result)
+            self._observe_perception_transaction(
+                result,
+                coarse_readback=coarse_readback,
+            )
             return
         status = "failed"
         error: str | None = None
@@ -919,7 +979,10 @@ class LiveSupervisionBridge:
             with activate_performance_timing(recorder), performance_span(
                 "live.perception_ingest"
             ):
-                self._observe_perception_transaction(result)
+                self._observe_perception_transaction(
+                    result,
+                    coarse_readback=coarse_readback,
+                )
             status = "completed"
         except BaseException as exc:
             error = type(exc).__name__
@@ -933,7 +996,12 @@ class LiveSupervisionBridge:
                 error=error,
             )
 
-    def _observe_perception_transaction(self, result: PerceptionCycleResult) -> None:
+    def _observe_perception_transaction(
+        self,
+        result: PerceptionCycleResult,
+        *,
+        coarse_readback: _CoarseScanViewReadback | None = None,
+    ) -> None:
         """Verify and copy one coordinator-accepted stopped perception result."""
 
         if type(result) is not PerceptionCycleResult:
@@ -962,7 +1030,10 @@ class LiveSupervisionBridge:
         ):
             raise LiveSupervisionError("Live stereo and captured view identities differ")
 
-        current_science = _read_current_science_view(result)
+        current_science = _read_current_science_view(
+            result,
+            coarse_readback=coarse_readback,
+        )
         current_points = current_science.points_m
         with self._lock:
             if current_points is not None:
