@@ -530,7 +530,8 @@ def _runtime(
 
 
 def test_operator_must_trigger_each_initial_capture(tmp_path: Path) -> None:
-    runtime, runner, session = _runtime(tmp_path)
+    handoff = _FakeExperimentHandoff()
+    runtime, runner, session = _runtime(tmp_path, experiment_handoff=handoff)
     runtime.start()
 
     with pytest.raises(UnknownBladeRuntimeError, match="Press c"):
@@ -544,6 +545,18 @@ def test_operator_must_trigger_each_initial_capture(tmp_path: Path) -> None:
     assert runner.capture_count == 3
     assert runner.execute_count == 0
     assert session.stage_operator_calls == 3
+    assert handoff.coarse_checkpoints == [(tmp_path / "generation").resolve()] * 3
+    diagnostic = json.loads(
+        (
+            tmp_path
+            / "performance_diagnostics"
+            / "coarse_checkpoint_generation.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert diagnostic["authority"] == "diagnostic_only_not_safety_or_science_authority"
+    assert diagnostic["status"] == "completed"
+    assert diagnostic["spans"]["experiment.checkpoint_append"]["count"] == 1
+    assert diagnostic["spans"]["experiment.checkpoint_full_verify"]["count"] == 1
 
 
 def test_operator_bootstrap_capture_can_directly_activate_ready_schema5(

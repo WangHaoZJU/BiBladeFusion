@@ -16,6 +16,10 @@ from biblade_fusion.calibration import (
     load_hand_eye_calibration,
 )
 from biblade_fusion.core.settings import AppSettings
+from biblade_fusion.devices.thermal_camera import (
+    ThermalSdkKind,
+    audit_tsr605_usb_sdk,
+)
 from biblade_fusion.diagnostics.types import CheckLevel, CheckResult
 from biblade_fusion.mapping.occupancy import OccupancyState
 from biblade_fusion.robotics.collision_template import (
@@ -131,22 +135,83 @@ def _check_robot_address(settings: AppSettings) -> CheckResult:
 
 
 def _check_thermal(settings: AppSettings) -> CheckResult:
+    audit = audit_tsr605_usb_sdk(settings.thermal.sdk_root)
+    details = {
+        **audit.as_dict(),
+        "enabled": settings.thermal.enabled,
+        "driver": settings.thermal.driver,
+        "model": settings.thermal.model,
+        "transport": settings.thermal.transport,
+        "serial_number_configured": settings.thermal.serial_number is not None,
+        "expected_shape": (
+            [settings.thermal.expected_height, settings.thermal.expected_width]
+            if settings.thermal.expected_width is not None
+            and settings.thermal.expected_height is not None
+            else None
+        ),
+        "unknown_blade_motion_scope": "blocked",
+    }
     if not settings.thermal.enabled:
+        if audit.kind is ThermalSdkKind.HIKVISION_DEVICE_NETWORK:
+            return CheckResult(
+                "thermal_camera",
+                CheckLevel.WARN,
+                "disabled safely; configured HCNetSDK is not a verified TSR605 USB binding",
+                details,
+            )
         return CheckResult(
             "thermal_camera",
             CheckLevel.PASS,
-            "disabled; interface reserved",
+            "disabled; TSR605 capture and thermal fusion remain closed",
+            details,
         )
     if settings.thermal.driver is None:
         return CheckResult(
             "thermal_camera",
             CheckLevel.FAIL,
             "enabled without a configured driver",
+            details,
+        )
+    if settings.thermal.driver != "tsr605_usb":
+        return CheckResult(
+            "thermal_camera",
+            CheckLevel.FAIL,
+            f"unsupported thermal driver {settings.thermal.driver!r}",
+            details,
+        )
+    if settings.thermal.model.strip().casefold() != "tsr605":
+        return CheckResult(
+            "thermal_camera",
+            CheckLevel.FAIL,
+            "the reviewed USB adapter boundary is restricted to model TSR605",
+            details,
+        )
+    if settings.thermal.serial_number is None:
+        return CheckResult(
+            "thermal_camera",
+            CheckLevel.FAIL,
+            "enabled TSR605 capture requires a pinned device serial number",
+            details,
+        )
+    if audit.kind is ThermalSdkKind.HIKVISION_DEVICE_NETWORK:
+        return CheckResult(
+            "thermal_camera",
+            CheckLevel.FAIL,
+            audit.reason,
+            details,
+        )
+    if not audit.compatible:
+        return CheckResult(
+            "thermal_camera",
+            CheckLevel.FAIL,
+            f"{audit.reason}; no reviewed native TSR605 USB backend is bundled",
+            details,
         )
     return CheckResult(
         "thermal_camera",
-        CheckLevel.WARN,
-        f"driver configured as {settings.thermal.driver}; device probe not implemented",
+        CheckLevel.FAIL,
+        "SDK audit passed but live TSR605 USB probing is not implemented",
+        details,
     )
 
 

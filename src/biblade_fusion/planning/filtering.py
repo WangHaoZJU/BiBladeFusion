@@ -13,6 +13,10 @@ from numpy.typing import NDArray
 
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import AxisAlignedBoxConfig, ViewFilterConfig
+from biblade_fusion.diagnostics.performance_timing import (
+    performance_span,
+    performance_timed,
+)
 from biblade_fusion.perception.proxy import BilateralBladeProxy
 from biblade_fusion.planning.views import CandidateView
 
@@ -228,6 +232,7 @@ def _is_duplicate(
     )
 
 
+@performance_timed("planning.filter_candidate_views")
 def filter_candidate_views(
     candidates: tuple[CandidateView, ...],
     proxy: BilateralBladeProxy | BladeClearanceEnvelope,
@@ -305,7 +310,8 @@ def filter_candidate_views(
             reasons.append("robot endpoint reachability is not checked")
         else:
             try:
-                result = reachability_checker.check(candidate.base_t_left_ir)
+                with performance_span("planning.reachability_check"):
+                    result = reachability_checker.check(candidate.base_t_left_ir)
             except Exception as exc:
                 reasons.append(f"robot endpoint reachability check failed: {exc}")
             else:

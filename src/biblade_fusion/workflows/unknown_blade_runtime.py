@@ -33,6 +33,11 @@ from biblade_fusion.devices.depth_camera import RealSenseD435i
 from biblade_fusion.devices.robot import EliteArm
 from biblade_fusion.devices.robot.elite_rtsi_sampler import EliteRtsiProcessSampler
 from biblade_fusion.devices.thermal_camera import NullThermalCamera
+from biblade_fusion.diagnostics.performance_timing import (
+    activate_performance_timing,
+    performance_span,
+    try_create_performance_timing,
+)
 from biblade_fusion.diagnostics.supervised_scan import run_supervised_scan_readiness
 from biblade_fusion.diagnostics.types import CheckLevel, CheckResult
 from biblade_fusion.mapping import Es68D435iRobotDepthRenderer, OccupancyMapState
@@ -778,10 +783,38 @@ class UnknownBladeSupervisedRuntime:
             read_unknown_blade_experiment(self._experiment_handoff.root)
 
     def _append_coarse_checkpoint(self, generation: Path) -> None:
-        self._experiment_handoff.append_coarse_checkpoint(
-            coarse_generation=generation,
+        recorder = try_create_performance_timing(
+            transaction_kind="unknown_blade_coarse_checkpoint",
+            identity={"coarse_generation": str(generation.resolve())},
         )
-        self._verify_handoff_chain()
+        if recorder is None:
+            self._append_coarse_checkpoint_transaction(generation)
+            return
+        status = "failed"
+        error: str | None = None
+        try:
+            with activate_performance_timing(recorder):
+                self._append_coarse_checkpoint_transaction(generation)
+            status = "completed"
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            recorder.write_best_effort(
+                self._timeline_root.parent
+                / "performance_diagnostics"
+                / f"coarse_checkpoint_{generation.name}.json",
+                status=status,
+                error=error,
+            )
+
+    def _append_coarse_checkpoint_transaction(self, generation: Path) -> None:
+        with performance_span("experiment.checkpoint_append"):
+            self._experiment_handoff.append_coarse_checkpoint(
+                coarse_generation=generation,
+            )
+        with performance_span("experiment.checkpoint_full_verify"):
+            self._verify_handoff_chain()
 
     @property
     def snapshot(self) -> UnknownBladeRuntimeSnapshot:

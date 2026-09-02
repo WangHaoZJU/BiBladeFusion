@@ -226,6 +226,18 @@ def test_initial_status_is_published_atomically_and_read_only(tmp_path: Path) ->
     payload = json.loads((stored.root / trajectory.path).read_text(encoding="utf-8"))
     assert payload["motion_authorized"] is False
     assert payload["planned_servoj_joint_path_rad"] is None
+    diagnostic = json.loads(
+        (
+            bridge.timeline_root
+            / "performance_diagnostics"
+            / "snapshot_00000000_bootstrap_map_required.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert diagnostic["authority"] == "diagnostic_only_not_safety_or_science_authority"
+    assert diagnostic["status"] == "completed"
+    assert diagnostic["identity"]["snapshot_sequence"] == 0
+    assert diagnostic["spans"]["live.snapshot_publication"]["count"] == 1
+    assert diagnostic["spans"]["live.snapshot_commit"]["count"] == 1
 
 
 def test_approval_without_live_evidence_publishes_block_then_raises(tmp_path: Path) -> None:

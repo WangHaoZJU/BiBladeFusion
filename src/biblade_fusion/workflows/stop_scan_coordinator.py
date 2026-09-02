@@ -38,6 +38,11 @@ from biblade_fusion.core.settings import (
 )
 from biblade_fusion.devices.robot.base import RobotState, RobotStateSource
 from biblade_fusion.devices.robot.streaming import StreamServoJResult
+from biblade_fusion.diagnostics.performance_timing import (
+    activate_performance_timing,
+    performance_span,
+    try_create_performance_timing,
+)
 from biblade_fusion.mapping import OccupancyMapState, OccupancySnapshot
 from biblade_fusion.planning import CandidateStatus, EvaluatedCandidate
 from biblade_fusion.robotics import (
@@ -935,6 +940,58 @@ class GuardedSegmentSafetyFactory:
         proposal: SegmentProposal,
         generation: OccupancyGeneration,
     ) -> _PreparedSegmentExecution:
+        """Build one preflight and emit a detached, non-authoritative timing."""
+
+        if type(proposal) is not SegmentProposal or type(generation) is not OccupancyGeneration:
+            return self._prepare_transaction(proposal, generation)
+        recorder = try_create_performance_timing(
+            transaction_kind="stop_scan_segment_preflight",
+            identity={
+                "proposal_id": proposal.proposal_id,
+                "target_view_id": proposal.target_view_id,
+                "occupancy_generation_id": generation.generation_id,
+                "occupancy_binding": generation.binding.tuple,
+            },
+        )
+        if recorder is None:
+            return self._prepare_transaction(proposal, generation)
+        try:
+            diagnostic_id = hashlib.sha256(
+                f"{proposal.proposal_id}\0{generation.generation_id}".encode()
+            ).hexdigest()[:16]
+            diagnostic_path = (
+                generation.artifact_path.parent
+                / "performance_diagnostics"
+                / f"segment_preflight_{diagnostic_id}.json"
+            )
+        except Exception:
+            return self._prepare_transaction(proposal, generation)
+        status = "failed"
+        error: str | None = None
+        try:
+            with (
+                activate_performance_timing(recorder),
+                performance_span("stop_scan.segment_prepare"),
+                performance_span("planning.segment_preflight"),
+            ):
+                prepared = self._prepare_transaction(proposal, generation)
+            status = "completed"
+            return prepared
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            recorder.write_best_effort(
+                diagnostic_path,
+                status=status,
+                error=error,
+            )
+
+    def _prepare_transaction(
+        self,
+        proposal: SegmentProposal,
+        generation: OccupancyGeneration,
+    ) -> _PreparedSegmentExecution:
         if self._publisher.current.generation_id != generation.generation_id:
             raise StopScanBlocked("Cannot preflight a non-current occupancy generation")
         if proposal.occupancy_binding != generation.binding:
@@ -1385,6 +1442,54 @@ class StopScanCoordinator:
                 raise
             return result
 
+    def _select_next_with_timing(
+        self,
+        observation: PerceptionCycleResult,
+        generation: OccupancyGeneration,
+    ) -> NextViewSelection:
+        """Time fine/coarse candidate filtering on its real coordinator path."""
+
+        recorder = try_create_performance_timing(
+            transaction_kind="stop_scan_next_view_selection",
+            identity={
+                "cycle_index": self._cycle_index,
+                "view_id": observation.bundle.view_id,
+                "occupancy_generation_id": generation.generation_id,
+                "occupancy_binding": generation.binding.tuple,
+            },
+        )
+        if recorder is None:
+            return self._selector.select_next(observation, generation)
+        try:
+            diagnostic_path = (
+                generation.artifact_path.parent
+                / "performance_diagnostics"
+                / (
+                    f"next_view_selection_{self._cycle_index:08d}_"
+                    f"{generation.generation_id[:16]}.json"
+                )
+            )
+        except Exception:
+            return self._selector.select_next(observation, generation)
+        status = "failed"
+        error: str | None = None
+        try:
+            with activate_performance_timing(recorder), performance_span(
+                "planning.next_view_selection"
+            ):
+                selection = self._selector.select_next(observation, generation)
+            status = "completed"
+            return selection
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            recorder.write_best_effort(
+                diagnostic_path,
+                status=status,
+                error=error,
+            )
+
     def prepare_next_segment(self) -> PreparedSegment | None:
         with self._exclusive_operation():
             self._raise_if_stop_requested()
@@ -1399,7 +1504,7 @@ class StopScanCoordinator:
                 )
             self._transition(StopScanPhase.PLANNING, "next_view_selection_started", {})
             try:
-                selection = self._selector.select_next(self._observation, generation)
+                selection = self._select_next_with_timing(self._observation, generation)
                 if type(selection) is not NextViewSelection:
                     raise BladePlanningAssetError("Next-view selector returned an untyped decision")
                 self._validate_selection_run_binding(selection)

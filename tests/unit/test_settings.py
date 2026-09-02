@@ -32,6 +32,12 @@ def test_default_settings_load_safely() -> None:
     assert settings.robot.rtsi_frequency_hz == 125.0
     assert settings.robot.servoj_lookahead_time_s == 0.1
     assert settings.thermal.enabled is False
+    assert settings.thermal.model == "TSR605"
+    assert settings.thermal.transport == "usb"
+    assert settings.thermal.sdk_root is None
+    assert settings.thermal.serial_number is None
+    assert settings.thermal.expected_width is None
+    assert settings.thermal.expected_height is None
     assert settings.realsense.infrared_width == 1280
     assert settings.acquisition.max_bracket_ms == 250.0
     assert settings.foundation_stereo.device == "cuda"

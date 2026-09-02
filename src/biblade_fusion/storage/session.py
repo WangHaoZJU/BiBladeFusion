@@ -186,12 +186,25 @@ class SessionWriter:
         calibration = bundle.stereo.calibration
         thermal_payload = None
         if bundle.thermal is not None:
+            provenance = bundle.thermal.provenance
             thermal_payload = {
                 "monotonic_time_ns": bundle.thermal.monotonic_time_ns,
                 "device_time_ms": bundle.thermal.device_time_ms,
                 "temperature_file": "temperature_c.npy",
                 "raw_counts_file": (
                     "thermal_raw_counts.npy" if bundle.thermal.raw_counts is not None else None
+                ),
+                "provenance": (
+                    {
+                        "manufacturer": provenance.manufacturer,
+                        "model": provenance.model,
+                        "serial_number": provenance.serial_number,
+                        "transport": provenance.transport,
+                        "sdk_name": provenance.sdk_name,
+                        "sdk_version": provenance.sdk_version,
+                    }
+                    if provenance is not None
+                    else None
                 ),
             }
         return {

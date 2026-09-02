@@ -12,6 +12,8 @@ import biblade_fusion.workflows.unknown_blade_coarse as coarse_module
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     AxisAlignedBoxConfig,
+    CoarseReachabilityFallbackConfig,
+    PairedFinDiscoveryFallbackConfig,
     ViewFilterConfig,
     ViewPlanningConfig,
     load_settings,
@@ -45,6 +47,11 @@ class _Reachable:
         return ReachabilityResult(ReachabilityState.REACHABLE, "ok", np.zeros(6))
 
 
+class _Unreachable:
+    def check(self, _pose: PoseSE3) -> ReachabilityResult:
+        return ReachabilityResult(ReachabilityState.UNREACHABLE, "no endpoint IK")
+
+
 def _proxy() -> BilateralBladeProxy:
     return BilateralBladeProxy(
         PoseSE3.from_rotation_translation(
@@ -60,6 +67,32 @@ def _proxy() -> BilateralBladeProxy:
         190,
         150,
         1.0,
+    )
+
+
+def _attempt_09_proxy() -> BilateralBladeProxy:
+    """Proxy persisted by the real 2026-09-01 attempt-09 first view."""
+
+    return BilateralBladeProxy(
+        PoseSE3(
+            "base",
+            "proxy",
+            np.asarray(
+                [
+                    [0.0069772871, 0.8372570901, -0.5467649244, 0.5541443888],
+                    [-0.0548605531, 0.5462752589, 0.8358071914, 0.0833355409],
+                    [0.9984696476, 0.0241641594, 0.0497439064, 0.1910914094],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            ),
+        ),
+        np.asarray((0.32, 0.15, 0.0786093025)),
+        np.asarray((0.5523603162, 0.0840882321, 0.2062544096)),
+        np.asarray((0.0067804791, 0.0010448889, 0.0000533712)),
+        50483,
+        50483,
+        10252,
+        0.7855682271,
     )
 
 
@@ -96,6 +129,161 @@ def test_fin_discovery_generates_two_opposing_axes_on_both_sides() -> None:
         assert item.status.value == "endpoint_feasible"
     assert result.motion_authorized is False
     assert len(result.policy_sha256) == 64
+
+
+def _attempt_09_planning(
+    *paired_fallbacks: PairedFinDiscoveryFallbackConfig,
+    generic_fallback: bool = False,
+) -> ViewPlanningConfig:
+    return ViewPlanningConfig(
+        standoff_distance_m=0.37,
+        minimum_standoff_distance_m=0.32,
+        maximum_standoff_distance_m=0.40,
+        coarse_reachability_fallbacks=(
+            (
+                CoarseReachabilityFallbackConfig(
+                    distance_offset_m=-0.05,
+                    tilt_deg=63.4,
+                    azimuth_deg=50.7,
+                ),
+            )
+            if generic_fallback
+            else ()
+        ),
+        paired_fin_discovery_fallbacks=paired_fallbacks,
+    )
+
+
+def _attempt_09_front_pair() -> PairedFinDiscoveryFallbackConfig:
+    return PairedFinDiscoveryFallbackConfig(
+        side="front",
+        axis="major",
+        distance_offset_m=-0.05,
+        total_tilt_deg=63.4,
+        opposing_tilt_deg=34.5,
+        common_bias_sign=-1,
+    )
+
+
+def _attempt_09_back_pair() -> PairedFinDiscoveryFallbackConfig:
+    return PairedFinDiscoveryFallbackConfig(
+        side="back",
+        axis="major",
+        distance_offset_m=-0.05,
+        total_tilt_deg=63.4,
+        opposing_tilt_deg=15.0,
+        common_bias_sign=-1,
+    )
+
+
+def _attempt_09_filter() -> ViewFilterConfig:
+    return ViewFilterConfig(
+        workspace=AxisAlignedBoxConfig(
+            name="es68_d435i_camera_candidate",
+            minimum_m=(-0.22, -0.38, -0.05),
+            maximum_m=(0.65, 0.40, 0.87),
+        ),
+        camera_clearance_radius_m=0.05,
+        minimum_look_at_cosine=0.999,
+        minimum_incidence_cosine=0.40,
+        maximum_standoff_error_m=0.005,
+    )
+
+
+def test_attempt_09_generic_coarse_fallback_is_not_reinterpreted() -> None:
+    result = generate_fin_discovery_plan(
+        _attempt_09_proxy(),
+        (0.5835816837, 0.3280652719),
+        _attempt_09_planning(generic_fallback=True),
+        _attempt_09_filter(),
+        CoarseSciencePolicy(),
+        _Reachable(),
+    )
+
+    baseline = tuple(
+        item for item in result.filtered.candidates if "_fallback_" not in item.candidate.view_id
+    )
+    assert len(baseline) == 8
+    assert all(item.status.value == "rejected" for item in baseline)
+    assert all(
+        "camera leaves workspace es68_d435i_camera_candidate" in item.reasons
+        for item in baseline
+    )
+    assert len(result.filtered.candidates) == 8
+    assert not coarse_module._paired_discovery_ids(result, coarse_module.BladeSide.FRONT)
+    assert not coarse_module._paired_discovery_ids(result, coarse_module.BladeSide.BACK)
+    with pytest.raises(UnknownBladeCoarseError, match="exists on front"):
+        coarse_module._require_bilateral_discovery_pairs(result)  # noqa: SLF001
+
+
+def test_attempt_09_second_explicit_pair_candidate_fits_workspace() -> None:
+    result = generate_fin_discovery_plan(
+        _attempt_09_proxy(),
+        (0.5835816837, 0.3280652719),
+        _attempt_09_planning(_attempt_09_front_pair(), _attempt_09_back_pair()),
+        _attempt_09_filter(),
+        CoarseSciencePolicy(),
+        _Reachable(),
+    )
+
+    filtering = _attempt_09_filter()
+    assert filtering.workspace is not None
+    lower = (
+        np.asarray(filtering.workspace.minimum_m)
+        + filtering.camera_clearance_radius_m
+    )
+    upper = (
+        np.asarray(filtering.workspace.maximum_m)
+        - filtering.camera_clearance_radius_m
+    )
+    for side in (coarse_module.BladeSide.FRONT, coarse_module.BladeSide.BACK):
+        pairs = coarse_module._paired_discovery_ids(result, side)  # noqa: SLF001
+        assert len(pairs) == 1
+        for view_id in pairs[0]:
+            item = next(
+                candidate
+                for candidate in result.endpoint_feasible
+                if candidate.candidate.view_id == view_id
+            )
+            position = item.candidate.base_t_left_ir.translation_m
+            assert np.all(position >= lower)
+            assert np.all(position <= upper)
+            assert item.candidate.distance_policy == (
+                "explicit_paired_fin_discovery_fallback_v1"
+            )
+            assert item.joint_positions_rad is not None
+
+
+def test_fin_discovery_without_configured_fallback_remains_fail_closed() -> None:
+    result = generate_fin_discovery_plan(
+        _attempt_09_proxy(),
+        (0.5835816837, 0.3280652719),
+        _attempt_09_planning(),
+        _attempt_09_filter(),
+        CoarseSciencePolicy(),
+        _Reachable(),
+    )
+
+    assert len(result.filtered.candidates) == 8
+    assert not result.endpoint_feasible
+    with pytest.raises(UnknownBladeCoarseError, match="explicit paired fallback evaluation"):
+        coarse_module._require_bilateral_discovery_pairs(result)  # noqa: SLF001
+
+
+def test_bounded_fin_fallback_never_promotes_an_ik_failure() -> None:
+    result = generate_fin_discovery_plan(
+        _attempt_09_proxy(),
+        (0.5835816837, 0.3280652719),
+        _attempt_09_planning(_attempt_09_front_pair(), _attempt_09_back_pair()),
+        _attempt_09_filter(),
+        CoarseSciencePolicy(),
+        _Unreachable(),
+    )
+
+    assert not result.endpoint_feasible
+    assert all(item.status.value == "rejected" for item in result.filtered.candidates)
+    assert any("_fallback_" in item.candidate.view_id for item in result.filtered.candidates)
+    assert all(item.joint_positions_rad is None for item in result.filtered.candidates)
 
 
 def test_fin_discovery_never_promotes_geometry_only_to_endpoint_feasible() -> None:
@@ -226,7 +414,21 @@ def test_coarse_science_session_creates_proxy_plan_and_discovery_from_first_view
         return output
 
     monkeypatch.setattr(coarse_module, "write_view_plan", write_view_plan)
-    discovery = CoarseDiscoveryPlan(FilteredViewPlan((), ()), "a" * 64)
+    discovery = generate_fin_discovery_plan(
+        proxy,
+        planning.geometric_plan.footprint_m,
+        ViewPlanningConfig(standoff_distance_m=0.30),
+        ViewFilterConfig(
+            workspace=AxisAlignedBoxConfig(
+                name="cell",
+                minimum_m=(-1.0, -1.0, -0.5),
+                maximum_m=(1.0, 1.0, 1.5),
+            ),
+            minimum_incidence_cosine=0.95,
+        ),
+        CoarseSciencePolicy(),
+        _Reachable(),
+    )
     monkeypatch.setattr(
         coarse_module,
         "generate_fin_discovery_plan",
@@ -358,6 +560,14 @@ def test_engine_hook_requires_staging_and_appends_only_after_acceptance(
         SimpleNamespace(coarse_scan_view_path=prepared.coarse_view_path)  # type: ignore[arg-type]
     )
     assert accepted == accepted_generation
+    timing = json.loads(
+        (prepared.coarse_view_path.parent / "coarse_generation_timing.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert timing["status"] == "completed"
+    assert timing["identity"]["target_view_id"] == "operator_0"
+    assert "coarse.generation_accept" in timing["spans"]
     session.stage_operator_capture(operator_side=coarse_module.BladeSide.BACK)
     session.reject_cycle()
 

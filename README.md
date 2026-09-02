@@ -18,12 +18,17 @@ an append-only experiment checkpoint/completion chain, resumable fail-closed exe
 and a read-only live/replay supervisory console. The curved reconstruction
 chain is currently regression-verified on deterministic synthetic bilateral-blade data;
 real-blade accuracy and hardware thresholds still require recorded experiments. Thermal
-capture/fusion is not implemented beyond a disabled interface placeholder. Every ordinary
+capture/fusion is not implemented beyond a disabled, fail-closed TSR605 USB adapter
+boundary and raw-session contract; the supplied HCNetSDK exposes network login/preview
+APIs and is not accepted as a verified direct-USB radiometric binding. Every ordinary
 Elite-arm motion method remains sealed; the supervised path can reach the private driver
 capability only after a fresh map, both continuous proofs, an exact one-segment preflight
 and the operator's segment-specific confirmation. It remains disabled by default and has
 not been validated on the physical blade/ES68/D435i system. Software completion must not
 be interpreted as physical acceptance.
+
+See [TSR605 USB integration boundary](docs/tsr605-usb-integration.md) for the local SDK
+audit, the exact fail-closed state, and the vendor/hardware inputs still required.
 
 ## Bootstrap
 

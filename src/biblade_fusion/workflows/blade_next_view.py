@@ -35,6 +35,7 @@ from biblade_fusion.core.settings import (
     ViewFilterConfig,
     ViewPlanningConfig,
 )
+from biblade_fusion.diagnostics.performance_timing import performance_timed
 from biblade_fusion.perception.surface import (
     CurvedBladeSurface,
     SurfaceRegion,
@@ -726,6 +727,7 @@ class BladeCoverageNextViewSelector:
                     f"The {side.value} fin plan does not expose both physical faces"
                 )
 
+    @performance_timed("planning.blade_next_view_fk_filter")
     def _fk_verified_candidates(
         self,
         candidates: tuple[EvaluatedCandidate, ...],

@@ -19,7 +19,7 @@ from biblade_fusion.devices.depth_camera.base import (
     StereoFrame,
 )
 from biblade_fusion.devices.robot.base import RobotState
-from biblade_fusion.devices.thermal_camera.base import ThermalFrame
+from biblade_fusion.devices.thermal_camera.base import ThermalFrame, ThermalFrameProvenance
 
 
 class SessionFormatError(ValueError):
@@ -81,6 +81,35 @@ def _robot_state(payload: dict[str, Any]) -> RobotState:
         robot_mode=str(payload["robot_mode"]),
         safety_status=str(payload["safety_status"]),
         speed_scaling=float(payload["speed_scaling"]),
+    )
+
+
+def _thermal_provenance(payload: Any) -> ThermalFrameProvenance | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise SessionFormatError("Thermal provenance must be an object or null")
+    required = ("manufacturer", "model", "serial_number", "transport", "sdk_name")
+    for field_name in required:
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise SessionFormatError(
+                f"Thermal provenance {field_name} must be a non-empty string"
+            )
+    sdk_version = payload.get("sdk_version")
+    if sdk_version is not None and (
+        not isinstance(sdk_version, str) or not sdk_version.strip()
+    ):
+        raise SessionFormatError(
+            "Thermal provenance sdk_version must be a non-empty string or null"
+        )
+    return ThermalFrameProvenance(
+        manufacturer=payload["manufacturer"],
+        model=payload["model"],
+        serial_number=payload["serial_number"],
+        transport=payload["transport"],
+        sdk_name=payload["sdk_name"],
+        sdk_version=sdk_version,
     )
 
 
@@ -246,6 +275,7 @@ class SessionReader:
         thermal = None
         if thermal_data is not None:
             raw_file = thermal_data.get("raw_counts_file")
+            provenance_data = thermal_data.get("provenance")
             thermal = ThermalFrame(
                 monotonic_time_ns=int(thermal_data["monotonic_time_ns"]),
                 device_time_ms=(
@@ -257,6 +287,7 @@ class SessionReader:
                 raw_counts=(
                     self._array(view_path, str(raw_file)) if raw_file is not None else None
                 ),
+                provenance=_thermal_provenance(provenance_data),
             )
 
         robot_data = metadata["robot"]

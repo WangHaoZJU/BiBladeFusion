@@ -13,6 +13,7 @@ from biblade_fusion.devices.depth_camera.base import (
     StereoFrame,
 )
 from biblade_fusion.devices.robot.base import RobotState
+from biblade_fusion.devices.thermal_camera import ThermalFrame, ThermalFrameProvenance
 from biblade_fusion.storage import SessionFormatError, SessionReader, SessionWriter
 
 
@@ -28,7 +29,7 @@ def make_state(time_ns: int) -> RobotState:
     )
 
 
-def make_bundle() -> SynchronizedFrameBundle:
+def make_bundle(thermal: ThermalFrame | None = None) -> SynchronizedFrameBundle:
     intrinsics = CameraIntrinsics(4, 3, 100, 100, 2, 1.5, "none", ())
     calibration = StereoCalibrationSnapshot(
         intrinsics,
@@ -50,7 +51,7 @@ def make_bundle() -> SynchronizedFrameBundle:
         after,
         before,
         stereo,
-        None,
+        thermal,
         CaptureMetrics(100.0, 0.0, 0.0, 0.0, 50.0),
     )
 
@@ -112,6 +113,61 @@ def test_session_reader_round_trips_a_bundle(tmp_path: Path) -> None:
         make_bundle().stereo.calibration.left_t_depth.matrix,
     )
     np.testing.assert_allclose(loaded.selected_robot_state.base_t_tcp.matrix, np.eye(4))
+
+
+def test_session_round_trips_thermal_identity_and_raw_radiometry(tmp_path: Path) -> None:
+    settings = load_settings("configs/default.yaml")
+    thermal = ThermalFrame(
+        monotonic_time_ns=1_050_000_000,
+        device_time_ms=42.0,
+        temperature_c=np.full((2, 3), 26.5, dtype=np.float32),
+        raw_counts=np.full((2, 3), 1100, dtype=np.uint16),
+        provenance=ThermalFrameProvenance(
+            manufacturer="HIKMICRO",
+            model="TSR605",
+            serial_number="TSR605-UNIT-01",
+            transport="usb",
+            sdk_name="USB SDK",
+            sdk_version="test",
+        ),
+    )
+    with SessionWriter.create(tmp_path, settings, label="thermal") as writer:
+        view_path = writer.write_bundle(make_bundle(thermal))
+
+    metadata = json.loads((view_path / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["thermal"]["provenance"]["serial_number"] == "TSR605-UNIT-01"
+    loaded = SessionReader(writer.path).load_bundle("seed/front")
+
+    assert loaded.thermal is not None
+    assert loaded.thermal.provenance == thermal.provenance
+    np.testing.assert_array_equal(loaded.thermal.raw_counts, thermal.raw_counts)
+    np.testing.assert_array_equal(loaded.thermal.temperature_c, thermal.temperature_c)
+
+
+def test_reader_accepts_legacy_thermal_metadata_without_provenance(tmp_path: Path) -> None:
+    settings = load_settings("configs/default.yaml")
+    thermal = ThermalFrame(
+        monotonic_time_ns=1_050_000_000,
+        device_time_ms=None,
+        temperature_c=np.full((2, 3), 25.0, dtype=np.float32),
+    )
+    with SessionWriter.create(tmp_path, settings, label="legacy-thermal") as writer:
+        view_path = writer.write_bundle(make_bundle(thermal))
+
+    metadata_path = view_path / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["thermal"].pop("provenance")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    manifest_path = writer.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 2
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    loaded = SessionReader(writer.path).load_bundle("seed/front")
+
+    assert loaded.thermal is not None
+    assert loaded.thermal.provenance is None
+    np.testing.assert_array_equal(loaded.thermal.temperature_c, thermal.temperature_c)
 
 
 def test_schema3_session_reader_rejects_raw_array_tampering(tmp_path: Path) -> None:

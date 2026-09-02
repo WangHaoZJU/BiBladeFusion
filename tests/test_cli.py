@@ -753,6 +753,23 @@ def test_acquire_snapshot_exposes_temporary_emitter_override() -> None:
     assert "--no-emitter" in result.stdout
 
 
+def test_thermal_sdk_audit_command_is_exposed_and_fail_closed(tmp_path: Path) -> None:
+    (tmp_path / "HCNetSDK.h").write_bytes(b"NET_DVR_Login_V40 NET_DVR_RealPlay_V40")
+    (tmp_path / "libhcnetsdk.so").write_bytes(b"not loaded")
+
+    help_result = runner.invoke(app, ["thermal", "audit-sdk", "--help"])
+    result = runner.invoke(
+        app,
+        ["thermal", "audit-sdk", "--sdk-root", str(tmp_path), "--json"],
+    )
+
+    assert help_result.exit_code == 0
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["kind"] == "hikvision_device_network_sdk"
+    assert payload["compatible"] is False
+
+
 def test_emitter_override_does_not_mutate_loaded_settings() -> None:
     settings = load_settings("configs/default.yaml")
 

@@ -11,6 +11,7 @@ from numpy.typing import ArrayLike
 from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import MotionPreflightConfig
+from biblade_fusion.diagnostics.performance_timing import performance_timed
 from biblade_fusion.planning import CandidateStatus, FilteredViewPlan
 from biblade_fusion.robotics import (
     CollisionCheckStatus,
@@ -227,6 +228,7 @@ def preflight_view_sequence_motion(
     )
 
 
+@performance_timed("planning.endpoint_fk_consistency")
 def evaluate_endpoint_pose_consistency(
     joint_positions_rad: ArrayLike,
     target_base_t_tcp: ArrayLike,
@@ -317,6 +319,7 @@ def evaluate_endpoint_pose_consistency(
         )
 
 
+@performance_timed("planning.preflight_live_joint_segment")
 def preflight_live_joint_segment(
     start_joint_positions_rad: ArrayLike,
     goal_joint_positions_rad: ArrayLike,

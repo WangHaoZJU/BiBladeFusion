@@ -14,6 +14,7 @@ from numpy.typing import ArrayLike, NDArray
 
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
+from biblade_fusion.diagnostics.performance_timing import performance_timed
 from biblade_fusion.mapping.occupancy import (
     OccupancyGridSpec,
     OccupancyMapState,
@@ -132,6 +133,7 @@ class DepthRayIntegrator:
         self.config = config or DepthIntegrationConfig()
         self.mapping_context_hash = mapping_context_hash
 
+    @performance_timed("occupancy.depth_ray_integrator")
     def integrate(
         self,
         snapshot: OccupancySnapshot | None,

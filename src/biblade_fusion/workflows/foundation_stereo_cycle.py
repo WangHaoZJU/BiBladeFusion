@@ -28,6 +28,11 @@ from biblade_fusion.core.settings import (
     StopAndCaptureConfig,
 )
 from biblade_fusion.devices.robot.base import RobotState, RobotStateSource
+from biblade_fusion.diagnostics.performance_timing import (
+    activate_performance_timing,
+    performance_span,
+    try_create_performance_timing,
+)
 from biblade_fusion.perception.stereo import FoundationStereoBackend
 from biblade_fusion.robotics.stationarity import validate_stationary_trace
 from biblade_fusion.storage.blade_foreground import read_blade_foreground_mask
@@ -529,6 +534,47 @@ class FoundationStereoOccupancyCycleEngine:
         self,
         captured: CapturedStopScanView,
     ) -> PerceptionCycleResult:
+        """Infer and stage one cycle while emitting non-authoritative timings."""
+
+        recorder = try_create_performance_timing(
+            transaction_kind="foundation_stereo_occupancy_cycle",
+            identity={
+                "view_id": captured.bundle.view_id,
+                "sequence_index": captured.bundle.sequence_index,
+                "frame_number": captured.bundle.stereo.frame_number,
+                "purpose": captured.purpose.value,
+                "attempt_root": str(captured.cycle_root.resolve()),
+            },
+        )
+        if recorder is None:
+            return self._infer_and_update_transaction(captured)
+        status = "failed"
+        error: str | None = None
+        try:
+            with activate_performance_timing(recorder), performance_span(
+                "perception.cycle"
+            ):
+                result = self._infer_and_update_transaction(captured)
+            status = "completed"
+            return result
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            # This file is deliberately absent from every safety/science source
+            # record and hash chain.  Ordinary diagnostic failures cannot replace
+            # the transaction result; its small synchronous latency remains visible
+            # to the caller's conservative perception-duration gate.
+            recorder.write_best_effort(
+                captured.cycle_root / "performance_timing.json",
+                status=status,
+                error=error,
+            )
+
+    def _infer_and_update_transaction(
+        self,
+        captured: CapturedStopScanView,
+    ) -> PerceptionCycleResult:
         """Infer FoundationStereo and stage a reverified map candidate."""
 
         key = (captured.bundle.view_id, captured.bundle.sequence_index)
@@ -551,30 +597,33 @@ class FoundationStereoOccupancyCycleEngine:
                 self._science_authority.assert_current(
                     self._require_science_authority_settings()
                 )
-            observation = infer_rectified_stereo(
-                captured.bundle,
-                self._backend,
-                self._settings.stereo_rectification,
-            )
+            with performance_span("stereo.backend"):
+                observation = infer_rectified_stereo(
+                    captured.bundle,
+                    self._backend,
+                    self._settings.stereo_rectification,
+                )
             if self._science_authority is not None:
                 self._science_authority.assert_current(
                     self._require_science_authority_settings()
                 )
                 self._science_authority.assert_inference_observation(observation)
             stereo_path = captured.cycle_root / "stereo_inference"
-            write_stereo_inference(
-                stereo_path,
-                observation,
-                self._settings.foundation_stereo,
-                self._settings.stereo_rectification,
-                source_session=captured.raw_session_path,
-                source_stereo_calibration=(self._settings.realsense.stereo_calibration_path),
-            )
-            stored_stereo = read_stereo_inference(stereo_path)
-            verify_stereo_inference_source(
-                stored_stereo,
-                expected_session=captured.raw_session_path,
-            )
+            with performance_span("stereo.artifact_write"):
+                write_stereo_inference(
+                    stereo_path,
+                    observation,
+                    self._settings.foundation_stereo,
+                    self._settings.stereo_rectification,
+                    source_session=captured.raw_session_path,
+                    source_stereo_calibration=(self._settings.realsense.stereo_calibration_path),
+                )
+            with performance_span("stereo.artifact_readback"):
+                stored_stereo = read_stereo_inference(stereo_path)
+                verify_stereo_inference_source(
+                    stored_stereo,
+                    expected_session=captured.raw_session_path,
+                )
             if self._science_authority is not None:
                 self._science_authority.assert_stereo_artifact(stored_stereo)
                 self._science_authority.assert_current(
@@ -594,109 +643,127 @@ class FoundationStereoOccupancyCycleEngine:
             )
             prepared_current = None
             if self._coarse_science_preflighter is not None:
-                prepared_current = prepare_foundation_stereo_occupancy_frame(
-                    source.captured.bundle,
-                    source.stereo,
-                    self._hand_eye,
+                with performance_span("occupancy.current_frame_prepare"):
+                    prepared_current = prepare_foundation_stereo_occupancy_frame(
+                        source.captured.bundle,
+                        source.stereo,
+                        self._hand_eye,
+                        self._settings.occupancy,
+                        self._settings.acquisition,
+                        self._renderer,
+                        captured_at_utc=source.captured.captured_at_utc,
+                        source_stereo_metadata_sha256=source.stereo_metadata_sha256,
+                        source_session_manifest_sha256=source.session_manifest_sha256,
+                        source_session_view_metadata_sha256=(
+                            source.session_view_metadata_sha256
+                        ),
+                    )
+                with performance_span("coarse.foreground_preflight"):
+                    self._preflight_coarse_science(
+                        captured,
+                        stored_stereo.observation,
+                        stereo_path,
+                        prepared_current,
+                    )
+            with performance_span("occupancy.source_window_selection"):
+                candidates = self._fresh_rebuild_sources(source)
+            with performance_span("occupancy.source_window_rebuild"):
+                updates = (
+                    self._rebuild_updates(candidates)
+                    if prepared_current is None
+                    else self._rebuild_updates(
+                        candidates,
+                        prepared_current=prepared_current,
+                    )
+                )
+            occupancy_path = captured.cycle_root / "occupancy_mapping"
+            with performance_span("occupancy.artifact_write"):
+                write_occupancy_mapping(
+                    occupancy_path,
+                    updates,
                     self._settings.occupancy,
                     self._settings.acquisition,
-                    self._renderer,
-                    captured_at_utc=source.captured.captured_at_utc,
-                    source_stereo_metadata_sha256=source.stereo_metadata_sha256,
-                    source_session_manifest_sha256=source.session_manifest_sha256,
-                    source_session_view_metadata_sha256=(source.session_view_metadata_sha256),
+                    source_stereo_inferences=[item.stereo_path for item in candidates],
+                    source_sessions=[item.captured.raw_session_path for item in candidates],
+                    source_hand_eye=self._hand_eye.source_path,
                 )
-                self._preflight_coarse_science(
+            with performance_span("occupancy.artifact_readback"):
+                stored_mapping = read_occupancy_mapping(occupancy_path)
+            with performance_span("science.fine_assets"):
+                science = self._prepare_science_assets(
                     captured,
                     stored_stereo.observation,
                     stereo_path,
-                    prepared_current,
+                    updates[-1],
+                    occupancy_path,
                 )
-            candidates = self._fresh_rebuild_sources(source)
-            updates = (
-                self._rebuild_updates(candidates)
-                if prepared_current is None
-                else self._rebuild_updates(
-                    candidates,
-                    prepared_current=prepared_current,
+            with performance_span("coarse.scan_view_prepare"):
+                coarse_scan_view_path = self._prepare_coarse_science_asset(
+                    captured,
+                    stored_stereo.observation,
+                    stereo_path,
+                    updates[-1],
+                    occupancy_path,
                 )
-            )
-            occupancy_path = captured.cycle_root / "occupancy_mapping"
-            write_occupancy_mapping(
-                occupancy_path,
-                updates,
-                self._settings.occupancy,
-                self._settings.acquisition,
-                source_stereo_inferences=[item.stereo_path for item in candidates],
-                source_sessions=[item.captured.raw_session_path for item in candidates],
-                source_hand_eye=self._hand_eye.source_path,
-            )
-            stored_mapping = read_occupancy_mapping(occupancy_path)
-            science = self._prepare_science_assets(
-                captured,
-                stored_stereo.observation,
-                stereo_path,
-                updates[-1],
-                occupancy_path,
-            )
-            coarse_scan_view_path = self._prepare_coarse_science_asset(
-                captured,
-                stored_stereo.observation,
-                stereo_path,
-                updates[-1],
-                occupancy_path,
-            )
-            independent_trace = _ordered_unique_robot_states(sampler.finish())
+            with performance_span("stationarity.sampler_finish"):
+                independent_trace = _ordered_unique_robot_states(sampler.finish())
             sampler_finished = True
-            write_inference_stationarity_trace(
-                captured.cycle_root / "inference_stationarity_trace.json",
-                view_id=captured.bundle.view_id,
-                sequence_index=captured.bundle.sequence_index,
-                trace=independent_trace,
-                source_session_manifest=captured.raw_session_path / "manifest.json",
-                sampler_diagnostics=sampler.diagnostics,
-            )
+            with performance_span("stationarity.trace_write"):
+                write_inference_stationarity_trace(
+                    captured.cycle_root / "inference_stationarity_trace.json",
+                    view_id=captured.bundle.view_id,
+                    sequence_index=captured.bundle.sequence_index,
+                    trace=independent_trace,
+                    source_session_manifest=captured.raw_session_path / "manifest.json",
+                    sampler_diagnostics=sampler.diagnostics,
+                )
             capture_states = (
                 captured.bundle.robot_state_before,
                 captured.bundle.selected_robot_state,
                 captured.bundle.robot_state_after,
             )
-            self._validate_capture_binding(independent_trace, capture_states)
-            full_trace = _build_authoritative_stationarity_trace(
-                independent_trace,
-                capture_states,
-            )
-            stationarity_reference = full_trace[0]
-            state_trace = full_trace[1:]
-            stationarity = validate_stationary_trace(
-                stationarity_reference,
-                state_trace,
-                max_joint_delta_rad=self._settings.acquisition.max_joint_delta_rad,
-                max_tcp_translation_delta_m=(
-                    self._settings.acquisition.max_tcp_translation_delta_m
-                ),
-                max_tcp_rotation_delta_rad=(self._settings.acquisition.max_tcp_rotation_delta_rad),
-                maximum_robot_state_staleness_s=(
-                    self._settings.stop_and_capture.maximum_robot_state_staleness_s
-                ),
-            )
-            stored_stationarity = write_inference_stationarity(
-                captured.cycle_root / "inference_stationarity.json",
-                view_id=captured.bundle.view_id,
-                sequence_index=captured.bundle.sequence_index,
-                reference=stationarity_reference,
-                trace=state_trace,
-                evidence=stationarity,
-                source_session_manifest=captured.raw_session_path / "manifest.json",
-                max_joint_delta_rad=self._settings.acquisition.max_joint_delta_rad,
-                max_tcp_translation_delta_m=(
-                    self._settings.acquisition.max_tcp_translation_delta_m
-                ),
-                max_tcp_rotation_delta_rad=(self._settings.acquisition.max_tcp_rotation_delta_rad),
-                maximum_robot_state_staleness_s=(
-                    self._settings.stop_and_capture.maximum_robot_state_staleness_s
-                ),
-            )
+            with performance_span("stationarity.validation"):
+                self._validate_capture_binding(independent_trace, capture_states)
+                full_trace = _build_authoritative_stationarity_trace(
+                    independent_trace,
+                    capture_states,
+                )
+                stationarity_reference = full_trace[0]
+                state_trace = full_trace[1:]
+                stationarity = validate_stationary_trace(
+                    stationarity_reference,
+                    state_trace,
+                    max_joint_delta_rad=self._settings.acquisition.max_joint_delta_rad,
+                    max_tcp_translation_delta_m=(
+                        self._settings.acquisition.max_tcp_translation_delta_m
+                    ),
+                    max_tcp_rotation_delta_rad=(
+                        self._settings.acquisition.max_tcp_rotation_delta_rad
+                    ),
+                    maximum_robot_state_staleness_s=(
+                        self._settings.stop_and_capture.maximum_robot_state_staleness_s
+                    ),
+                )
+            with performance_span("stationarity.authority_write_readback"):
+                stored_stationarity = write_inference_stationarity(
+                    captured.cycle_root / "inference_stationarity.json",
+                    view_id=captured.bundle.view_id,
+                    sequence_index=captured.bundle.sequence_index,
+                    reference=stationarity_reference,
+                    trace=state_trace,
+                    evidence=stationarity,
+                    source_session_manifest=captured.raw_session_path / "manifest.json",
+                    max_joint_delta_rad=self._settings.acquisition.max_joint_delta_rad,
+                    max_tcp_translation_delta_m=(
+                        self._settings.acquisition.max_tcp_translation_delta_m
+                    ),
+                    max_tcp_rotation_delta_rad=(
+                        self._settings.acquisition.max_tcp_rotation_delta_rad
+                    ),
+                    maximum_robot_state_staleness_s=(
+                        self._settings.stop_and_capture.maximum_robot_state_staleness_s
+                    ),
+                )
         except BaseException as exc:
             if not sampler_finished:
                 try:
@@ -1064,7 +1131,8 @@ class FoundationStereoOccupancyCycleEngine:
             )
         from biblade_fusion.storage.coarse_scan import read_coarse_scan_view
 
-        read_coarse_scan_view(path)
+        with performance_span("coarse.scan_view_readback"):
+            read_coarse_scan_view(path)
         return path
 
     def _preflight_coarse_science(
@@ -1297,43 +1365,51 @@ class FoundationStereoOccupancyCycleEngine:
         previous = None
         previous_evidence_hash = None
         for index, source in enumerate(sources):
-            if prepared_current is not None and index == len(sources) - 1:
-                identity = (
-                    prepared_current.bundle.view_id,
-                    prepared_current.bundle.sequence_index,
-                    prepared_current.stereo.rectified.source_frame_number,
-                )
-                expected = (
-                    source.captured.bundle.view_id,
-                    source.captured.bundle.sequence_index,
-                    source.stereo.rectified.source_frame_number,
-                )
-                if identity != expected:
-                    raise FoundationStereoCycleError(
-                        "Prepared occupancy frame differs from current rebuild source"
+            span_name = (
+                "occupancy.current_source_integration"
+                if index == len(sources) - 1
+                else "occupancy.historical_source_replay"
+            )
+            with performance_span(span_name):
+                if prepared_current is not None and index == len(sources) - 1:
+                    identity = (
+                        prepared_current.bundle.view_id,
+                        prepared_current.bundle.sequence_index,
+                        prepared_current.stereo.rectified.source_frame_number,
                     )
-                update = integrate_prepared_foundation_stereo_occupancy(
-                    previous,
-                    prepared_current,
-                    self._settings.occupancy,
-                    self._renderer,
-                    previous_evidence_hash=previous_evidence_hash,
-                )
-            else:
-                update = integrate_foundation_stereo_occupancy(
-                    previous,
-                    source.captured.bundle,
-                    source.stereo,
-                    self._hand_eye,
-                    self._settings.occupancy,
-                    self._settings.acquisition,
-                    self._renderer,
-                    captured_at_utc=source.captured.captured_at_utc,
-                    source_stereo_metadata_sha256=source.stereo_metadata_sha256,
-                    source_session_manifest_sha256=source.session_manifest_sha256,
-                    source_session_view_metadata_sha256=(source.session_view_metadata_sha256),
-                    previous_evidence_hash=previous_evidence_hash,
-                )
+                    expected = (
+                        source.captured.bundle.view_id,
+                        source.captured.bundle.sequence_index,
+                        source.stereo.rectified.source_frame_number,
+                    )
+                    if identity != expected:
+                        raise FoundationStereoCycleError(
+                            "Prepared occupancy frame differs from current rebuild source"
+                        )
+                    update = integrate_prepared_foundation_stereo_occupancy(
+                        previous,
+                        prepared_current,
+                        self._settings.occupancy,
+                        self._renderer,
+                        previous_evidence_hash=previous_evidence_hash,
+                    )
+                else:
+                    update = integrate_foundation_stereo_occupancy(
+                        previous,
+                        source.captured.bundle,
+                        source.stereo,
+                        self._hand_eye,
+                        self._settings.occupancy,
+                        self._settings.acquisition,
+                        self._renderer,
+                        captured_at_utc=source.captured.captured_at_utc,
+                        source_stereo_metadata_sha256=source.stereo_metadata_sha256,
+                        source_session_manifest_sha256=source.session_manifest_sha256,
+                        source_session_view_metadata_sha256=(
+                            source.session_view_metadata_sha256
+                        ),
+                        previous_evidence_hash=previous_evidence_hash,
+                    )
             updates.append(update)
             previous = update.snapshot
             previous_evidence_hash = update.evidence.quality_evidence_hash

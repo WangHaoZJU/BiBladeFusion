@@ -92,6 +92,28 @@ class ThermalConfig(BaseModel):
 
     enabled: bool = False
     driver: str | None = None
+    model: str = "TSR605"
+    transport: Literal["usb"] = "usb"
+    sdk_root: Path | None = None
+    serial_number: str | None = None
+    capture_timeout_ms: int = Field(default=5000, gt=0, le=60000)
+    expected_width: int | None = Field(default=None, gt=0)
+    expected_height: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_expected_shape(self) -> Self:
+        if (self.expected_width is None) != (self.expected_height is None):
+            raise ValueError(
+                "Thermal expected_width and expected_height must be configured together"
+            )
+        for label, value in (
+            ("driver", self.driver),
+            ("model", self.model),
+            ("serial_number", self.serial_number),
+        ):
+            if value is not None and not value.strip():
+                raise ValueError(f"Thermal {label} must be non-empty when configured")
+        return self
 
 
 class AcquisitionConfig(BaseModel):
@@ -363,6 +385,30 @@ class CoarseReachabilityFallbackConfig(BaseModel):
     azimuth_deg: float = Field(ge=-180.0, le=180.0)
 
 
+class PairedFinDiscoveryFallbackConfig(BaseModel):
+    """One explicit target-centred opposing pair for fin discovery.
+
+    This is deliberately separate from ``CoarseReachabilityFallbackConfig``: one
+    entry names one blade side and proxy axis, the exact total obliquity, the exact
+    signed opposing component on each member, and the shared orthogonal bias sense.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    side: Literal["front", "back"]
+    axis: Literal["major", "minor"]
+    distance_offset_m: float = Field(ge=-0.08, le=0.08)
+    total_tilt_deg: float = Field(gt=0.0, le=75.0)
+    opposing_tilt_deg: float = Field(gt=0.0, lt=45.0)
+    common_bias_sign: Literal[-1, 1]
+
+    @model_validator(mode="after")
+    def validate_exact_pair_components(self) -> Self:
+        if self.opposing_tilt_deg > self.total_tilt_deg:
+            raise ValueError("Paired fin opposing tilt cannot exceed total tilt")
+        return self
+
+
 class ViewPlanningConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -385,6 +431,7 @@ class ViewPlanningConfig(BaseModel):
     edge_margin_m: float = Field(default=0.005, ge=0.0)
     maximum_candidates: int = Field(default=200, ge=2, le=10000)
     coarse_reachability_fallbacks: tuple[CoarseReachabilityFallbackConfig, ...] = ()
+    paired_fin_discovery_fallbacks: tuple[PairedFinDiscoveryFallbackConfig, ...] = ()
 
     @model_validator(mode="after")
     def validate_adaptive_standoff(self) -> Self:
@@ -398,14 +445,18 @@ class ViewPlanningConfig(BaseModel):
                 bounds[0] <= self.standoff_distance_m <= bounds[1]
             ):
                 raise ValueError("Baseline standoff distance must lie inside adaptive bounds")
-        if self.coarse_reachability_fallbacks and (
+        bounded_fallbacks = (
+            *self.coarse_reachability_fallbacks,
+            *self.paired_fin_discovery_fallbacks,
+        )
+        if bounded_fallbacks and (
             bounds[0] is None or bounds[1] is None or self.standoff_distance_m is None
         ):
             raise ValueError(
-                "Coarse reachability fallbacks require baseline and bounded standoff distances"
+                "Coarse fallbacks require baseline and bounded standoff distances"
             )
         if self.standoff_distance_m is not None and bounds[0] is not None and bounds[1] is not None:
-            for fallback in self.coarse_reachability_fallbacks:
+            for fallback in bounded_fallbacks:
                 distance = self.standoff_distance_m + fallback.distance_offset_m
                 if not bounds[0] <= distance <= bounds[1]:
                     raise ValueError(

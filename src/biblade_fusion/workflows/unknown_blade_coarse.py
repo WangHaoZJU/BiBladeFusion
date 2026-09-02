@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from math import cos, radians, sin
+from math import cos, radians, sin, sqrt
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,7 +26,18 @@ import numpy as np
 
 from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
-from biblade_fusion.core.settings import AppSettings, ViewFilterConfig, ViewPlanningConfig
+from biblade_fusion.core.settings import (
+    AppSettings,
+    PairedFinDiscoveryFallbackConfig,
+    ViewFilterConfig,
+    ViewPlanningConfig,
+)
+from biblade_fusion.diagnostics.performance_timing import (
+    PerformanceTimingRecorder,
+    activate_performance_timing,
+    performance_span,
+    try_create_performance_timing,
+)
 from biblade_fusion.perception.bootstrap_foreground import (
     BootstrapForegroundConfig,
     BootstrapForegroundResult,
@@ -321,6 +334,85 @@ def _look_at_pose(
     )
 
 
+_DISCOVERY_VIEW_ID = re.compile(
+    r"^(front|back)_fin_discovery_(major|minor)_(negative|positive)"
+    r"(?:_paired_fallback_(\d+))?$"
+)
+
+
+def _discovery_view_identity(
+    view_id: str,
+) -> tuple[BladeSide, str, str, str] | None:
+    match = _DISCOVERY_VIEW_ID.fullmatch(view_id)
+    if match is None:
+        return None
+    side_name, axis, sign_name, fallback_index = match.groups()
+    family = "baseline" if fallback_index is None else f"paired_fallback_{fallback_index}"
+    return BladeSide(side_name), axis, sign_name, family
+
+
+def _explicit_fin_discovery_pair(
+    *,
+    proxy: BilateralBladeProxy,
+    axes: np.ndarray,
+    entry: PairedFinDiscoveryFallbackConfig,
+    entry_index: int,
+    baseline_standoff_m: float,
+    geometric_footprint_m: tuple[float, float],
+) -> tuple[CandidateView, CandidateView]:
+    """Materialize exactly one separately configured opposing fallback pair."""
+
+    side = BladeSide(entry.side)
+    major, minor, front_normal = axes.T
+    signed_axis, common_axis = (major, minor) if entry.axis == "major" else (minor, major)
+    normal = front_normal if side is BladeSide.FRONT else -front_normal
+    target = proxy.center_m + normal * float(proxy.extents_m[2]) / 2.0
+    distance = baseline_standoff_m + entry.distance_offset_m
+    total_tilt = radians(entry.total_tilt_deg)
+    signed_component = sin(radians(entry.opposing_tilt_deg))
+    total_tangent = sin(total_tilt)
+    common_component = entry.common_bias_sign * sqrt(
+        max(0.0, total_tangent * total_tangent - signed_component * signed_component)
+    )
+    normal_component = cos(total_tilt)
+    footprint_scale = distance / baseline_standoff_m
+    footprint = tuple(float(value * footprint_scale) for value in geometric_footprint_m)
+    extents = (float(proxy.extents_m[0]), float(proxy.extents_m[1]))
+    candidates: list[CandidateView] = []
+    for sign_name, sign in (("negative", -1.0), ("positive", 1.0)):
+        view_id = (
+            f"{side.value}_fin_discovery_{entry.axis}_{sign_name}_"
+            f"paired_fallback_{entry_index:02d}"
+        )
+        direction = (
+            normal_component * normal
+            + sign * signed_component * signed_axis
+            + common_component * common_axis
+        )
+        if not np.isclose(np.linalg.norm(direction), 1.0, rtol=0.0, atol=1e-9):
+            raise UnknownBladeCoarseError("Explicit fin-discovery direction is not unit")
+        position = target + distance * direction
+        patch = SurfacePatch(view_id, side, 0, 0, target, normal, extents)
+        candidates.append(
+            CandidateView(
+                view_id,
+                patch,
+                _look_at_pose(
+                    view_id=view_id,
+                    position_m=position,
+                    target_m=target,
+                    preferred_x=common_axis,
+                ),
+                distance,
+                footprint,
+                projection_fraction=normal_component,
+                visibility_fraction=normal_component,
+                distance_policy="explicit_paired_fin_discovery_fallback_v1",
+            )
+        )
+    return candidates[0], candidates[1]
+
+
 def generate_fin_discovery_plan(
     proxy: BilateralBladeProxy,
     geometric_footprint_m: tuple[float, float],
@@ -358,15 +450,7 @@ def generate_fin_discovery_plan(
                     + normal * standoff * cos(angle)
                     + direction * lateral_sign * standoff * sin(angle)
                 )
-                patch = SurfacePatch(
-                    view_id,
-                    side,
-                    0,
-                    0,
-                    target,
-                    normal,
-                    extents,
-                )
+                patch = SurfacePatch(view_id, side, 0, 0, target, normal, extents)
                 candidates.append(
                     CandidateView(
                         view_id,
@@ -389,10 +473,46 @@ def generate_fin_discovery_plan(
         reachability_checker,
         deduplicate=False,
     )
+    evaluated = list(filtered.candidates)
+
+    # Generic normal-view fallbacks have different semantics and are intentionally
+    # ignored here. Each entry below names one exact side/axis opposing pair.
+    for fallback_index, fallback in enumerate(
+        planning_config.paired_fin_discovery_fallbacks,
+        start=1,
+    ):
+        side = BladeSide(fallback.side)
+        interim = CoarseDiscoveryPlan(FilteredViewPlan(tuple(evaluated), ()), "pending")
+        if _paired_discovery_ids(interim, side):
+            continue
+        if fallback.opposing_tilt_deg + 1e-12 < policy.discovery_tilt_deg:
+            raise UnknownBladeCoarseError(
+                "Paired fin-discovery fallback "
+                f"{fallback_index} opposing_tilt_deg={fallback.opposing_tilt_deg} "
+                f"is below policy discovery_tilt_deg={policy.discovery_tilt_deg}"
+            )
+        pair = _explicit_fin_discovery_pair(
+            proxy=proxy,
+            axes=axes,
+            entry=fallback,
+            entry_index=fallback_index,
+            baseline_standoff_m=standoff,
+            geometric_footprint_m=geometric_footprint_m,
+        )
+        checked = filter_candidate_views(
+            pair,
+            proxy,
+            filter_config,
+            reachability_checker,
+            deduplicate=False,
+        )
+        evaluated.extend(checked.candidates)
+    filtered = FilteredViewPlan(tuple(evaluated), ())
     canonical = json.dumps(
         {
-            "algorithm": "bilateral_two_axis_paired_oblique_fin_discovery_v1",
+            "algorithm": "explicit_bilateral_paired_oblique_fin_discovery_v2",
             "policy": asdict(policy),
+            "view_planning": planning_config.model_dump(mode="json"),
             "view_filter": filter_config.model_dump(mode="json"),
             "candidate_poses": {
                 item.candidate.view_id: item.candidate.base_t_left_ir.matrix.tolist()
@@ -548,13 +668,17 @@ def _prepare_unknown_blade_coarse_view(
         or identity != integration_identity
     ):
         raise UnknownBladeCoarseError("Coarse cycle source identities differ")
-    foreground = preflight_foreground or bootstrap_blade_foreground(
-        stereo.rectified.left_ir,
-        stereo.depth_m,
-        integration_valid_mask,
-        foreground_config,
-        seed,
-    )
+    if preflight_foreground is None:
+        with performance_span("coarse.foreground"):
+            foreground = bootstrap_blade_foreground(
+                stereo.rectified.left_ir,
+                stereo.depth_m,
+                integration_valid_mask,
+                foreground_config,
+                seed,
+            )
+    else:
+        foreground = preflight_foreground
     if foreground.config != foreground_config or foreground.seed != seed:
         raise UnknownBladeCoarseError("Coarse foreground differs from its staged policy")
     if foreground.valid_mask_content_sha256 != array_content_sha256(
@@ -563,44 +687,47 @@ def _prepare_unknown_blade_coarse_view(
         integration_valid_mask
     ):
         raise UnknownBladeCoarseError("Coarse foreground is not integration-mask bound")
-    reconstructed = reconstruct_foundation_stereo_view(
-        captured.bundle,
-        stereo,
-        foreground.mask,
-        hand_eye,
-        settings.point_cloud,
-        kinematics_config=settings.kinematics,
-        hand_eye_config=settings.hand_eye,
-    )
+    with performance_span("coarse.reconstructed_view"):
+        reconstructed = reconstruct_foundation_stereo_view(
+            captured.bundle,
+            stereo,
+            foreground.mask,
+            hand_eye,
+            settings.point_cloud,
+            kinematics_config=settings.kinematics,
+            hand_eye_config=settings.hand_eye,
+        )
     effective_side = _resolve_operator_bootstrap_side(
         reconstructed.base_t_projection_camera,
         side_proxy,
         target_side,
     )
     reconstructed_path = captured.cycle_root / "coarse_reconstructed_view"
-    write_reconstructed_view(
-        reconstructed_path,
-        reconstructed,
-        foreground.mask,
-        hand_eye,
-        settings.point_cloud,
-        settings.kinematics,
-        settings.hand_eye,
-        source_session=captured.raw_session_path,
-        source_stereo_inference=stereo_inference_path,
-    )
+    with performance_span("coarse.reconstructed_view_write"):
+        write_reconstructed_view(
+            reconstructed_path,
+            reconstructed,
+            foreground.mask,
+            hand_eye,
+            settings.point_cloud,
+            settings.kinematics,
+            settings.hand_eye,
+            source_session=captured.raw_session_path,
+            source_stereo_inference=stereo_inference_path,
+        )
     coarse_view_path = captured.cycle_root / "coarse_scan_view"
-    write_coarse_scan_view(
-        coarse_view_path,
-        foreground,
-        reconstructed_view=reconstructed_path,
-        source_stereo_inference=stereo_inference_path,
-        source_occupancy_mapping=occupancy_mapping_path,
-        target_view_id=target_view_id,
-        target_kind=target_kind,
-        target_side=effective_side,
-        proxy_config=settings.proxy_model,
-    )
+    with performance_span("coarse.scan_view_write"):
+        write_coarse_scan_view(
+            coarse_view_path,
+            foreground,
+            reconstructed_view=reconstructed_path,
+            source_stereo_inference=stereo_inference_path,
+            source_occupancy_mapping=occupancy_mapping_path,
+            target_view_id=target_view_id,
+            target_kind=target_kind,
+            target_side=effective_side,
+            proxy_config=settings.proxy_model,
+        )
     return PreparedCoarseScienceView(
         coarse_view_path.resolve(),
         reconstructed_path.resolve(),
@@ -634,9 +761,10 @@ def append_coarse_scan_generation(
     initialization_root = Path(source_initialization).resolve()
     plan_root = Path(source_view_plan).resolve()
     discovery_root = Path(source_discovery_plan).resolve()
-    initialization = read_initialization(initialization_root)
-    plan = read_view_plan(plan_root)
-    current = read_coarse_scan_view(new_view)
+    with performance_span("coarse.generation_source_read"):
+        initialization = read_initialization(initialization_root)
+        plan = read_view_plan(plan_root)
+        current = read_coarse_scan_view(new_view)
     if current.proxy_config != settings.proxy_model:
         raise UnknownBladeCoarseError(
             "Coarse view was not filtered with the active blade-envelope policy"
@@ -657,7 +785,8 @@ def append_coarse_scan_generation(
             settings.coverage,
         )
     else:
-        previous = read_coarse_scan_generation(previous_generation)
+        with performance_span("coarse.generation_previous_read"):
+            previous = read_coarse_scan_generation(previous_generation)
         expected_initialization = Path(
             str(previous.metadata["sources"]["initialization"]["root"])
         ).resolve()
@@ -675,7 +804,8 @@ def append_coarse_scan_generation(
             raise UnknownBladeCoarseError("Coarse view was already accepted")
         views = (*tuple(item.root for item in previous.views), current.root)
         previous_coverage = previous.coverage_path
-        ledger = read_coverage_ledger(previous.coverage_path).ledger
+        with performance_span("coarse.coverage_previous_read"):
+            ledger = read_coverage_ledger(previous.coverage_path).ledger
     source = current.reconstructed.metadata["source"]
     observation_id = coverage_observation_id(
         source["session"],
@@ -683,35 +813,38 @@ def append_coarse_scan_generation(
         current.reconstructed.view.source_sequence_index,
         current.reconstructed.view.source_frame_number,
     )
-    ledger = update_coverage(
-        ledger,
-        plan.result.geometric_plan,
-        initialization.observation.proxy,
-        current.support_cloud,
-        current.reconstructed.view.base_t_projection_camera,
-        observation_id,
-    )
+    with performance_span("coarse.coverage_update"):
+        ledger = update_coverage(
+            ledger,
+            plan.result.geometric_plan,
+            initialization.observation.proxy,
+            current.support_cloud,
+            current.reconstructed.view.base_t_projection_camera,
+            observation_id,
+        )
     output = Path(output_dir)
     coverage_path = output.with_name(f"{output.name}_coverage")
     coverage_created = False
     try:
-        write_coverage_ledger(
-            coverage_path,
-            ledger,
-            source_plan=plan_root,
-            source_initialization=initialization_root,
-            previous_ledger=previous_coverage,
-        )
+        with performance_span("coarse.coverage_write"):
+            write_coverage_ledger(
+                coverage_path,
+                ledger,
+                source_plan=plan_root,
+                source_initialization=initialization_root,
+                previous_ledger=previous_coverage,
+            )
         coverage_created = True
-        return write_coarse_scan_generation(
-            output,
-            views=views,
-            coverage=coverage_path,
-            source_initialization=initialization_root,
-            source_view_plan=plan_root,
-            source_discovery_plan=discovery_root,
-            previous_generation=previous_generation,
-        )
+        with performance_span("coarse.generation_write"):
+            return write_coarse_scan_generation(
+                output,
+                views=views,
+                coverage=coverage_path,
+                source_initialization=initialization_root,
+                source_view_plan=plan_root,
+                source_discovery_plan=discovery_root,
+                previous_generation=previous_generation,
+            )
     except Exception:
         if coverage_created:
             shutil.rmtree(coverage_path, ignore_errors=True)
@@ -719,10 +852,14 @@ def append_coarse_scan_generation(
 
 
 def _candidate_kind(candidate_id: str) -> CoarseTargetKind:
-    prefix = candidate_id.split("_fin_discovery_", 1)
-    if len(prefix) != 2:
+    identity = _discovery_view_identity(candidate_id)
+    if identity is None:
+        if "_fin_discovery_" in candidate_id:
+            raise UnknownBladeCoarseError(
+                f"Malformed fin-discovery candidate identity: {candidate_id!r}"
+            )
         return "proxy_normal"
-    axis, sign_name = prefix[1].rsplit("_", 1)
+    _, axis, sign_name, _ = identity
     return f"fin_discovery_{axis}_{sign_name}"  # type: ignore[return-value]
 
 
@@ -761,16 +898,50 @@ def _paired_discovery_ids(
     discovery: CoarseDiscoveryPlan,
     side: BladeSide,
 ) -> tuple[tuple[str, str], ...]:
-    feasible = {item.candidate.view_id for item in discovery.endpoint_feasible}
-    pairs = []
-    for axis in ("major", "minor"):
-        pair = (
-            f"{side.value}_fin_discovery_{axis}_negative",
-            f"{side.value}_fin_discovery_{axis}_positive",
-        )
-        if set(pair) <= feasible:
-            pairs.append(pair)
-    return tuple(pairs)
+    families: dict[tuple[str, str], dict[str, str]] = {}
+    for item in discovery.endpoint_feasible:
+        identity = _discovery_view_identity(item.candidate.view_id)
+        if identity is None or identity[0] is not side:
+            continue
+        _, axis, sign_name, family = identity
+        families.setdefault((axis, family), {})[sign_name] = item.candidate.view_id
+    return tuple(
+        (members["negative"], members["positive"])
+        for members in families.values()
+        if set(members) == {"negative", "positive"}
+    )
+
+
+def _missing_discovery_pair_error(
+    discovery: CoarseDiscoveryPlan,
+    side: BladeSide,
+) -> UnknownBladeCoarseError:
+    candidates = [
+        item
+        for item in discovery.filtered.candidates
+        if item.candidate.patch.side is side
+        and _discovery_view_identity(item.candidate.view_id) is not None
+    ]
+    reasons = Counter(reason for item in candidates for reason in item.reasons)
+    reason_summary = ", ".join(
+        f"{reason} ({count})"
+        for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))
+    )
+    if not reason_summary:
+        reason_summary = "no endpoint supplied both measured-workspace and IK evidence"
+    return UnknownBladeCoarseError(
+        f"No endpoint-feasible opposing fin-discovery pair exists on {side.value} "
+        f"after explicit paired fallback evaluation; tested {len(candidates)} endpoints; "
+        f"rejections: {reason_summary}. Automatic motion remains disabled. Start a new "
+        "attempt after changing blade placement, or add only a measured "
+        "paired_fin_discovery_fallbacks entry; do not widen workspace or bypass IK."
+    )
+
+
+def _require_bilateral_discovery_pairs(discovery: CoarseDiscoveryPlan) -> None:
+    for side in (BladeSide.FRONT, BladeSide.BACK):
+        if not _paired_discovery_ids(discovery, side):
+            raise _missing_discovery_pair_error(discovery, side)
 
 
 def _select_candidate(
@@ -788,9 +959,7 @@ def _select_candidate(
     for side in (BladeSide.FRONT, BladeSide.BACK):
         pairs = _paired_discovery_ids(discovery, side)
         if not pairs:
-            raise UnknownBladeCoarseError(
-                f"No endpoint-feasible opposing fin-discovery pair exists on {side.value}"
-            )
+            raise _missing_discovery_pair_error(discovery, side)
         if not any(set(pair) <= verified for pair in pairs):
             for pair in pairs:
                 for view_id in pair:
@@ -983,8 +1152,7 @@ def finalize_coarse_generation(
             return CoarsePhaseTransition(
                 phase,
                 tuple(
-                    f"{side.value} fin lacks two-face coarse evidence"
-                    for side in missing_fin_sides
+                    f"{side.value} fin lacks two-face coarse evidence" for side in missing_fin_sides
                 ),
                 generation.root,
             )
@@ -1052,8 +1220,7 @@ def _assert_reusable_coarse_model(
         if support is None:
             raise ValueError("existing coarse model lacks per-view blade-envelope provenance")
         actual_support_sources = tuple(
-            Path(str(record["path"])).resolve()
-            for record in support["source_coarse_views"]
+            Path(str(record["path"])).resolve() for record in support["source_coarse_views"]
         )
         if actual_support_sources != source_coarse_views:
             raise ValueError("source coarse-view support sequence differs")
@@ -1437,18 +1604,17 @@ class CoarseScienceSession:
                     )
                 seed = provider(captured, image_path)
             if seed.mode != "hard_roi":
-                raise UnknownBladeCoarseError(
-                    "Operator bootstrap requires seed mode hard_roi"
-                )
+                raise UnknownBladeCoarseError("Operator bootstrap requires seed mode hard_roi")
             self._pending_seed = seed
 
-        foreground = bootstrap_blade_foreground(
-            stereo.rectified.left_ir,
-            stereo.depth_m,
-            prepared_occupancy.self_mask.integration_valid_mask,
-            self._foreground_config,
-            seed,
-        )
+        with performance_span("coarse.foreground"):
+            foreground = bootstrap_blade_foreground(
+                stereo.rectified.left_ir,
+                stereo.depth_m,
+                prepared_occupancy.self_mask.integration_valid_mask,
+                self._foreground_config,
+                seed,
+            )
         if annotation_root is not None:
             _write_bootstrap_annotation_response(annotation_root, foreground)
         self._pending_foreground = foreground
@@ -1522,7 +1688,19 @@ class CoarseScienceSession:
             or result.coarse_scan_view_path != prepared.coarse_view_path
         ):
             raise UnknownBladeCoarseError("Accepted cycle does not match the pending coarse asset")
-        generation = self.accept_prepared_view(prepared)
+        recorder = try_create_performance_timing(
+            transaction_kind="coarse_generation_accept",
+            identity={
+                "target_view_id": prepared.target_view_id,
+                "target_kind": prepared.target_kind,
+                "target_side": prepared.target_side.value,
+                "coarse_scan_view": str(prepared.coarse_view_path),
+            },
+        )
+        if recorder is None:
+            generation = self.accept_prepared_view(prepared)
+        else:
+            generation = self._accept_prepared_view_with_timing(recorder, prepared)
         self._pending_prepared = None
         self._pending_selection = None
         self._pending_operator_side = None
@@ -1530,6 +1708,33 @@ class CoarseScienceSession:
         self._pending_seed_provider = None
         self._pending_foreground = None
         self._operator_capture_staged = False
+        return generation
+
+    def _accept_prepared_view_with_timing(
+        self,
+        recorder: PerformanceTimingRecorder,
+        prepared: PreparedCoarseScienceView,
+    ) -> Path:
+        """Observe generation acceptance without expanding the public result contract."""
+
+        status = "failed"
+        error: str | None = None
+        try:
+            with (
+                activate_performance_timing(recorder),
+                performance_span("coarse.generation_accept"),
+            ):
+                generation = self.accept_prepared_view(prepared)
+            status = "completed"
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            recorder.write_best_effort(
+                prepared.coarse_view_path.parent / "coarse_generation_timing.json",
+                status=status,
+                error=error,
+            )
         return generation
 
     def reject_cycle(self) -> None:
@@ -1557,17 +1762,20 @@ class CoarseScienceSession:
     def accept_prepared_view(self, prepared: PreparedCoarseScienceView) -> Path:
         """Append a prepared view, creating all proxy assets on the first call."""
 
-        stored = read_coarse_scan_view(prepared.coarse_view_path)
+        with performance_span("coarse.scan_view_readback"):
+            stored = read_coarse_scan_view(prepared.coarse_view_path)
         if stored.target_view_id != prepared.target_view_id:
             raise UnknownBladeCoarseError("Prepared coarse-view identity changed")
         if self._generation is None and self._initialization is None:
-            self._initialize_from_first_view(stored)
+            with performance_span("coarse.first_view_initialization"):
+                self._initialize_from_first_view(stored)
         assert self._initialization is not None
         assert self._view_plan is not None
         assert self._discovery_path is not None
         index = 0
         if self._generation is not None:
-            index = read_coarse_scan_generation(self._generation).generation_index + 1
+            with performance_span("coarse.generation_head_read"):
+                index = read_coarse_scan_generation(self._generation).generation_index + 1
         output = self._output_root / "generations" / f"{index:06d}"
         generation = append_coarse_scan_generation(
             output,
@@ -1588,11 +1796,12 @@ class CoarseScienceSession:
                 "First coarse view was not filtered with the active blade-envelope policy"
             )
         support = stored.proxy_support
-        proxy = build_bilateral_proxy(
-            view.base_cloud.points_m[support.mask],
-            view.base_t_projection_camera,
-            self._settings.proxy_model,
-        )
+        with performance_span("coarse.proxy_build"):
+            proxy = build_bilateral_proxy(
+                view.base_cloud.points_m[support.mask],
+                view.base_t_projection_camera,
+                self._settings.proxy_model,
+            )
         observation = InitialObservation(
             view.source_view_id,
             view.planning_intrinsics,
@@ -1613,50 +1822,59 @@ class CoarseScienceSession:
         source = stored.reconstructed.metadata["source"]
         created: list[Path] = []
         try:
-            write_initialization(
-                initialization,
-                observation,
-                stored.foreground.mask,
-                self._hand_eye,
-                self._settings.point_cloud,
-                self._settings.proxy_model,
-                self._settings.kinematics,
-                self._settings.hand_eye,
-                source_session=source["session"],
-                source_stereo_inference=source["stereo_inference"],
-            )
+            with performance_span("coarse.initialization_write"):
+                write_initialization(
+                    initialization,
+                    observation,
+                    stored.foreground.mask,
+                    self._hand_eye,
+                    self._settings.point_cloud,
+                    self._settings.proxy_model,
+                    self._settings.kinematics,
+                    self._settings.hand_eye,
+                    source_session=source["session"],
+                    source_stereo_inference=source["stereo_inference"],
+                )
             created.append(initialization)
-            planning = plan_initial_observation(
-                observation,
-                self._settings.view_planning,
-                self._settings.view_filter,
-                self._reachability,
-            )
-            write_view_plan(
-                view_plan,
-                planning,
-                self._settings.view_planning,
-                self._settings.view_filter,
-                source_initialization=initialization,
-                source_kinematics=self._source_kinematics,
-                joint_zero_offsets_rad=self._settings.kinematics.joint_zero_offsets_rad,
-            )
+            with performance_span("coarse.initial_plan_candidate_filter"):
+                planning = plan_initial_observation(
+                    observation,
+                    self._settings.view_planning,
+                    self._settings.view_filter,
+                    self._reachability,
+                )
+            with performance_span("coarse.view_plan_write"):
+                write_view_plan(
+                    view_plan,
+                    planning,
+                    self._settings.view_planning,
+                    self._settings.view_filter,
+                    source_initialization=initialization,
+                    source_kinematics=self._source_kinematics,
+                    joint_zero_offsets_rad=self._settings.kinematics.joint_zero_offsets_rad,
+                )
             created.append(view_plan)
-            discovery = generate_fin_discovery_plan(
-                proxy,
-                planning.geometric_plan.footprint_m,
-                self._settings.view_planning,
-                self._settings.view_filter,
-                self._policy,
-                self._reachability,
-            )
-            discovery_path = _write_discovery_plan_asset(
-                discovery_output,
-                discovery,
-                source_initialization=initialization,
-                source_view_plan=view_plan,
-                source_kinematics=self._source_kinematics,
-            )
+            with performance_span("coarse.fin_discovery_candidate_filter"):
+                discovery = generate_fin_discovery_plan(
+                    proxy,
+                    planning.geometric_plan.footprint_m,
+                    self._settings.view_planning,
+                    self._settings.view_filter,
+                    self._policy,
+                    self._reachability,
+                )
+            # This policy depends only on the first proxy, measured workspace and
+            # offline IK. Fail now instead of spending two more long bootstrap
+            # cycles before discovering that automatic coarse motion cannot start.
+            _require_bilateral_discovery_pairs(discovery)
+            with performance_span("coarse.discovery_plan_write"):
+                discovery_path = _write_discovery_plan_asset(
+                    discovery_output,
+                    discovery,
+                    source_initialization=initialization,
+                    source_view_plan=view_plan,
+                    source_kinematics=self._source_kinematics,
+                )
             created.append(discovery_output)
         except Exception:
             for path in reversed(created):

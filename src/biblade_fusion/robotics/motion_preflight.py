@@ -11,6 +11,7 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from biblade_fusion.devices.robot.streaming import ServoJStream, ServoJStreamConfig
+from biblade_fusion.diagnostics.performance_timing import performance_timed
 from biblade_fusion.robotics.occupancy_collision import (
     JointPathOccupancyCollisionReport,
     OccupancyRobotCollisionChecker,
@@ -272,6 +273,7 @@ def validate_preflight_servoj_contract(
     return expected_stream
 
 
+@performance_timed("planning.preflight_linear_joint_motion")
 def preflight_linear_joint_motion(
     start_joint_positions_rad: ArrayLike,
     goal_joint_positions_rad: ArrayLike,

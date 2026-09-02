@@ -32,7 +32,11 @@ from biblade_fusion.calibration import (
 from biblade_fusion.core.settings import load_settings
 from biblade_fusion.devices.depth_camera import RealSenseD435i, list_realsense_devices
 from biblade_fusion.devices.robot import EliteReadOnlyRobot
-from biblade_fusion.devices.thermal_camera import NullThermalCamera
+from biblade_fusion.devices.thermal_camera import (
+    ThermalCameraConfigurationError,
+    audit_tsr605_usb_sdk,
+    create_thermal_camera,
+)
 from biblade_fusion.diagnostics import CheckLevel, run_doctor
 from biblade_fusion.mapping import Es68D435iRobotDepthRenderer, OccupancyMapState
 from biblade_fusion.perception.stereo import (
@@ -126,6 +130,7 @@ app = typer.Typer(
 )
 robot_app = typer.Typer(help="Safe Elite ES68 state tools.", no_args_is_help=True)
 camera_app = typer.Typer(help="Intel RealSense D435i tools.", no_args_is_help=True)
+thermal_app = typer.Typer(help="Fail-closed TSR605 thermal-camera tools.", no_args_is_help=True)
 acquire_app = typer.Typer(help="Synchronized read-only acquisition.", no_args_is_help=True)
 calibration_app = typer.Typer(
     help="Calibration acquisition and offline solving tools.",
@@ -156,6 +161,7 @@ scan_app = typer.Typer(
 )
 app.add_typer(robot_app, name="robot")
 app.add_typer(camera_app, name="camera")
+app.add_typer(thermal_app, name="thermal")
 app.add_typer(acquire_app, name="acquire")
 app.add_typer(calibration_app, name="calibration")
 app.add_typer(stereo_app, name="stereo")
@@ -174,6 +180,38 @@ app.add_typer(scan_app, name="scan")
 @app.callback()
 def main() -> None:
     """BiBladeFusion command group."""
+
+
+@thermal_app.command("audit-sdk")
+def thermal_audit_sdk(
+    sdk_root: Annotated[
+        Path,
+        typer.Option(
+            "--sdk-root",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Candidate vendor SDK directory; native libraries are never loaded.",
+        ),
+    ],
+    output_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON."),
+    ] = False,
+) -> None:
+    """Classify an SDK tree without connecting to a camera."""
+
+    audit = audit_tsr605_usb_sdk(sdk_root)
+    if output_json:
+        typer.echo(json.dumps(audit.as_dict(), indent=2))
+    else:
+        typer.echo(f"SDK kind: {audit.kind.value}")
+        typer.echo(f"Compatible: {'yes' if audit.compatible else 'no'}")
+        typer.echo(f"Reason: {audit.reason}")
+        for item in audit.evidence:
+            typer.echo(f"Evidence: {item}")
+    if not audit.compatible:
+        raise typer.Exit(code=1)
 
 
 @scan_app.command("doctor")
@@ -1184,8 +1222,13 @@ def acquire_snapshot(
         settings.robot = type(settings.robot).model_validate(
             {**settings.robot.model_dump(), "robot_ip": robot_ip}
         )
-    thermal = NullThermalCamera()
+    try:
+        thermal = create_thermal_camera(settings.thermal)
+    except ThermalCameraConfigurationError as exc:
+        typer.echo(f"Thermal configuration blocked: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     with (
+        thermal,
         SessionWriter.create(settings.project.data_root, settings, label=view_id) as session,
         EliteReadOnlyRobot(settings.robot) as robot,
         RealSenseD435i(settings.realsense) as camera,

@@ -1,5 +1,114 @@
 # Development log
 
+## 2026-09-01 — Phase 0 performance timing and attempt-09 baseline
+
+- Added bounded aggregate timing across stereo, occupancy integration and readback,
+  coarse reconstruction/generation, live supervision, IK/FK filtering and segment
+  preflight. The diagnostic path is explicitly outside safety, science and motion
+  authority; it neither changes gate outcomes nor suppresses operation failures.
+- Benchmarked the immutable attempt-09 assets without writing into the experiment.
+  Cold 3 / warm 5 artifact readback took about `5.085/4.998 s` wall p50. Replaying
+  one real occupancy source showed Python `DepthRayIntegrator` DDA at
+  `17.587/17.669 s` wall p50 and `19.982/20.104 s` CPU p50; all replayed snapshots
+  matched the persisted snapshots exactly. A three-source scaling smoke measured
+  about `58.4–58.7 s` wall inside the integrator.
+- Profiling located the measured offline single-core hotspot in per-pixel
+  Amanatides-Woo/DDA traversal, repeated bounds checks and Python set/list updates.
+  Source review also found that the same immutable source window can be replayed by
+  rebuild, writer validation and strict reader validation. No replay, validation,
+  occupancy representation or safety semantic was removed in this phase.
+- Phase 0 remains incomplete until a new attended hardware run records the online
+  spans for FoundationStereo CUDA, production semantic readback, coarse generation,
+  live publication, IK/FK filtering and segment preflight. Until those measurements
+  exist, compiled DDA, contribution caching, concurrency and octree changes remain
+  proposals rather than authorized implementation work.
+- Reproduction commands, input identity, p50/p95 resource measurements, caveats and
+  the next-run acceptance checklist are recorded in
+  `docs/phase0-performance-baseline-2026-09-01.md`.
+
+## 2026-09-01 — attempt-09 fin-discovery reachability diagnosis
+
+- Replayed the exact attempt-09 proxy, camera-candidate workspace and ES68 KDL seed.
+  The original eight 15-degree fin-discovery endpoints were not rejected because of
+  a front-side IK defect: all four front endpoints had IK solutions but their 50 mm
+  camera clearance spheres left `es68_d435i_camera_candidate`; all four back endpoints
+  also left that workspace and had no KDL solution.
+- Added a separate `paired_fin_discovery_fallbacks` schema. It does not reinterpret the
+  existing single-pose `coarse_reachability_fallbacks`: one new entry explicitly names
+  one side, one proxy axis, exact distance/total/opposing angles and common-bias sense.
+  Both concrete members independently pass the unchanged workspace and Elite IK filters
+  before either can form an endpoint-feasible pair. Missing IK, missing workspace
+  evidence, or only one reachable member still blocks.
+- The exact diagnostic-only YAML shape used for the attempt-09 replay was:
+
+  ```yaml
+  view_planning:
+    paired_fin_discovery_fallbacks:
+      - side: front
+        axis: major
+        distance_offset_m: -0.05
+        total_tilt_deg: 63.4
+        opposing_tilt_deg: 34.5
+        common_bias_sign: -1
+      - side: back
+        axis: major
+        distance_offset_m: -0.05
+        total_tilt_deg: 63.4
+        opposing_tilt_deg: 15.0
+        common_bias_sign: -1
+  ```
+
+  These values are candidates for attended segment preflight, not deployed defaults.
+- No paired fallback is enabled by default or in `configs/local.yaml`. With the current
+  deployment configuration, attempt-09 therefore remains safely blocked. The bilateral
+  feasibility gate now runs immediately after the first proxy is created and reports its
+  per-reason diagnostics after the first bootstrap instead of wasting two more long
+  captures and failing only after `MAP_READY`.
+- A read-only, in-memory dry run of two explicitly declared candidate pairs produced
+  workspace-valid front/back poses and concrete `EliteCs68IkChecker` KDL solutions for
+  the attempt-09 assets. The exact source hashes, candidate values, four joint solutions
+  and statuses are recorded in `docs/attempt-09-fin-discovery-kdl-dry-run.json`. This is
+  diagnostic evidence, not physical acceptance or motion authority; the values require
+  attended measurement and ordinary segment collision preflight before configuration.
+  Reproduce the native-plugin call without a robot connection or experiment-artifact
+  writes via `.venv/bin/python -B scripts/reproduce_attempt_09_fin_discovery_kdl.py`.
+  The replay binds the persisted first-view seed
+  `[3.920504, -1.805604, 1.632554, -1.567073, -2.428674, 0.032375]` rad.
+  Runtime constructs its checker from the process-start joints before the operator's
+  manual reposition. A future run's start seed can differ, and there is no attempt-09
+  evidence that it equals this first-view seed. The four diagnostic solutions are not
+  cached or assumed reachable: every endpoint is solved again fail-closed during the
+  attended run.
+- Regression coverage uses a copied attempt-09 proxy and explicit in-test configuration.
+  It proves the legacy generic fallback is ignored, explicitly paired geometry can fit
+  the measured workspace, and no-fallback and IK-failure paths remain fail-closed.
+  Targeted result: 77 tests passed.
+
+## 2026-09-01 — TSR605 USB integration boundary
+
+- Audited the supplied `Proj1/HCNetSDK` headers, libraries, examples and documentation
+  without loading native code. The package exposes Hikvision network login/preview and
+  network-channel thermometry APIs. It contains no reviewed direct-USB TSR605 enumeration,
+  open-by-serial or radiometric-frame binding; USB-RNDIS/network-over-USB behavior remains
+  unverified rather than assumed impossible.
+- Added a non-connecting `bbf thermal audit-sdk` classifier. It identifies this HCNetSDK
+  package as the Device Network SDK and exits nonzero, preventing USB configuration from
+  silently loading a network ABI.
+- Added explicit TSR605 USB configuration, model/serial/shape validation, typed adapter
+  errors and an injected `Tsr605UsbBackend` seam for a future implementation based on the
+  correct official SDK. No vendor functions or raw-count conversion formula were guessed.
+- Wired standalone synchronized snapshot composition through the fail-closed thermal
+  factory. Disabled sessions continue to use `NullThermalCamera`; enabling TSR605 now
+  stops before robot/camera/session startup until a reviewed backend exists.
+- Extended schema-3 thermal metadata with optional camera/transport/SDK provenance while
+  retaining read compatibility with legacy thermal metadata that lacks provenance.
+  Temperature matrices and optional raw counts remain immutable `.npy` evidence.
+- Kept unknown-blade motion and fusion out of scope. Thermal remains forbidden there
+  until thermal intrinsics/extrinsics, radiometric acceptance and a collision model for
+  the complete D435i+TSR605 payload exist.
+- Validation: 92 targeted configuration, adapter, diagnostic, acquisition, storage and
+  CLI tests passed; targeted Ruff checks passed. No live USB capture claim is recorded.
+
 ## 2026-09-01 — placement-bound coarse support envelope
 
 - Kept the operator hard ROI as the immutable source cloud and added a separate

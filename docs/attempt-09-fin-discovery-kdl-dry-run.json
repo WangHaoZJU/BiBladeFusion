@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "biblade_fusion.diagnostic.fin_discovery_kdl_dry_run",
+  "created_at_local": "2026-09-01T23:06:25+08:00",
+  "diagnostic_only": true,
+  "configuration_enabled": false,
+  "motion_authorized": false,
+  "checker": {
+    "python_class": "biblade_fusion.planning.elite_ik.EliteCs68IkChecker",
+    "vendor_solver": "ELITE::KdlKinematicsPlugin",
+    "native_execution": {
+      "python_binding_path": ".venv/lib/python3.12/site-packages/elite_cs_sdk/elite_cs_sdk_python.so",
+      "python_binding_sha256": "a4d2b71e56268e3aa3988cdb2e5df05bef64fb5b32165759f2b8c99f052c3d1a",
+      "plugin_path": ".venv/lib/python3.12/site-packages/elite_cs_sdk/libelite_kdl_kinematics.so",
+      "plugin_sha256": "1903d0b5146242baacf6e7ae5ba7feab653b71e6007ecdb76c518a2ee8ebf89e",
+      "class_loader_created": true
+    }
+  },
+  "reproduction": {
+    "command": ".venv/bin/python -B scripts/reproduce_attempt_09_fin_discovery_kdl.py",
+    "robot_connection": false,
+    "experiment_artifact_writes": false
+  },
+  "sources": {
+    "attempt_09_initialization_metadata": {
+      "path": "data/experiments/blade-placement-20260901-01-attempt-09/coarse_science/initialization/metadata.json",
+      "sha256": "4513bace3d63ac6c361e8e1b41ca66128124621c0f2ac611e12b3d10608c5a66"
+    },
+    "kinematics": {
+      "path": "data/calibrations/es68_mdh_gpu_host_20260830.yaml",
+      "sha256": "e8454a1b6c0ade50c988370232533d8287a5266ef50f3f122b4e8e03c584ed45"
+    },
+    "hand_eye": {
+      "path": "data/calibrations/es68_left_ir_hand_eye_active.yaml",
+      "sha256": "a80ebfe72d4911cd15a6c3907a1908803eb60f7e27c2e65eb1fc8d2594b35c2d"
+    },
+    "flange_tcp": {
+      "path": "src/biblade_fusion/robotics/resources/elite_cs/config/es68/lab_tcp_offset.json",
+      "sha256": "6ba234e817d682d45f442a99752d1583e33740373356d34285c277dd43fc81d7"
+    }
+  },
+  "camera_center_workspace_after_clearance_m": {
+    "minimum": [-0.17, -0.33, 0.0],
+    "maximum": [0.6, 0.35, 0.82],
+    "camera_clearance_radius_m": 0.05
+  },
+  "diagnostic_seed_joint_positions_rad": [
+    3.920504430640083,
+    -1.8056044142801877,
+    1.6325544778320202,
+    -1.567072688588145,
+    -2.4286741353131167,
+    0.03237478026075902
+  ],
+  "in_memory_candidate_configuration": [
+    {
+      "side": "front",
+      "axis": "major",
+      "distance_offset_m": -0.05,
+      "total_tilt_deg": 63.4,
+      "opposing_tilt_deg": 34.5,
+      "common_bias_sign": -1
+    },
+    {
+      "side": "back",
+      "axis": "major",
+      "distance_offset_m": -0.05,
+      "total_tilt_deg": 63.4,
+      "opposing_tilt_deg": 15.0,
+      "common_bias_sign": -1
+    }
+  ],
+  "coarse_science_policy": {
+    "discovery_tilt_deg": 15.0,
+    "minimum_total_views": 6,
+    "minimum_views_per_side": 3,
+    "maximum_attempts_per_candidate": 2,
+    "require_complete_proxy_coverage": true,
+    "maximum_discovery_translation_error_m": 0.02,
+    "maximum_discovery_rotation_error_deg": 5.0
+  },
+  "policy_sha256": "0ff9a13ddcf54e8e6d7a78eeeaec055b61fbd5838453df8f20166776cdd81973",
+  "evaluated_candidate_count": 12,
+  "endpoint_feasible_count": 4,
+  "rejection_reason_counts": {
+    "Elite KDL found no endpoint IK solution (KinematicError.NO_SOLUTION)": 4,
+    "camera leaves workspace es68_d435i_camera_candidate": 8
+  },
+  "results": [
+    {
+      "view_id": "front_fin_discovery_major_negative_paired_fallback_01",
+      "status": "endpoint_feasible",
+      "camera_position_m": [0.267678, 0.124941, 0.013851],
+      "workspace_margin_m": [0.332322, 0.225059, 0.013851],
+      "joint_positions_rad": [3.188041, -0.467742, 2.61416, -2.73598, -4.64895, -0.675715]
+    },
+    {
+      "view_id": "front_fin_discovery_major_positive_paired_fallback_01",
+      "status": "endpoint_feasible",
+      "camera_position_m": [0.270207, 0.105054, 0.375797],
+      "workspace_margin_m": [0.329793, 0.244946, 0.375797],
+      "joint_positions_rad": [2.999168, -2.502891, 2.463514, -2.487453, -1.412767, -2.440821]
+    },
+    {
+      "view_id": "back_fin_discovery_major_negative_paired_fallback_02",
+      "status": "endpoint_feasible",
+      "camera_position_m": [0.424091, -0.214343, 0.092695],
+      "workspace_margin_m": [0.175909, 0.115657, 0.092695],
+      "joint_positions_rad": [2.138003, -0.461517, 1.725325, -3.802145, -5.722942, -0.011169]
+    },
+    {
+      "view_id": "back_fin_discovery_major_positive_paired_fallback_02",
+      "status": "endpoint_feasible",
+      "camera_position_m": [0.425246, -0.22343, 0.258086],
+      "workspace_margin_m": [0.174754, 0.10657, 0.258086],
+      "joint_positions_rad": [2.12597, -1.280892, 1.595617, -0.729945, -0.54812, -3.187233]
+    }
+  ],
+  "limitations": [
+    "The paired fallback values were supplied only through an in-memory model copy.",
+    "No local or default runtime configuration was changed.",
+    "The diagnostic uses the persisted first-view joint seed; a future runtime uses the process-start joints captured before manual reposition, with no evidence that the two seeds are equal, and must solve every endpoint again fail-closed.",
+    "Endpoint IK does not prove a collision-free trajectory or authorize motion.",
+    "The candidate pair requires attended physical measurement and ordinary segment preflight before configuration."
+  ]
+}

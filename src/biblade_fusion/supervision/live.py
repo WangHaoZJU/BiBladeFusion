@@ -23,6 +23,12 @@ from uuid import uuid4
 import numpy as np
 from numpy.typing import NDArray
 
+from biblade_fusion.diagnostics.performance_timing import (
+    activate_performance_timing,
+    performance_span,
+    performance_timed,
+    try_create_performance_timing,
+)
 from biblade_fusion.mapping import OccupancyMapState
 from biblade_fusion.mapping import OccupancySnapshot as MapSnapshot
 from biblade_fusion.robotics import (
@@ -241,6 +247,7 @@ class LiveCollisionGeometry:
             raise ValueError("Live collision geometry identity/parts are incomplete")
         object.__setattr__(self, "manifest_path", manifest)
 
+    @performance_timed("live.collision_geometry")
     def base_mesh(
         self,
         joint_positions_rad: Sequence[float],
@@ -395,6 +402,7 @@ def _display_key_rank(key: tuple[int, int, int]) -> bytes:
     return hashlib.sha256(f"{key[0]},{key[1]},{key[2]}".encode("ascii")).digest()
 
 
+@performance_timed("live.voxel_conversion")
 def _display_voxel_representatives(
     points: NDArray[np.float64],
     *,
@@ -473,6 +481,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+@performance_timed("live.asset_binding")
 def _asset(
     name: str,
     logical_name: str,
@@ -487,6 +496,7 @@ def _asset(
     return _AssetSource(name, logical_name, kind, source, _sha256(source), version)
 
 
+@performance_timed("live.voxel_conversion")
 def _voxel_centres(
     indices: frozenset[tuple[int, int, int]],
     snapshot: MapSnapshot,
@@ -885,6 +895,45 @@ class LiveSupervisionBridge:
             self._existing_session_id = identity
 
     def observe_perception(self, result: PerceptionCycleResult) -> None:
+        """Time one ingest without changing the callback's typed contract."""
+
+        if type(result) is not PerceptionCycleResult:
+            # Preserve the original validation path without inspecting an
+            # untrusted protocol substitute for diagnostic identity.
+            self._observe_perception_transaction(result)
+            return
+        recorder = try_create_performance_timing(
+            transaction_kind="live_perception_ingest",
+            identity={
+                "view_id": result.bundle.view_id,
+                "sequence_index": result.bundle.sequence_index,
+                "frame_number": result.bundle.stereo.frame_number,
+            },
+        )
+        if recorder is None:
+            self._observe_perception_transaction(result)
+            return
+        status = "failed"
+        error: str | None = None
+        try:
+            with activate_performance_timing(recorder), performance_span(
+                "live.perception_ingest"
+            ):
+                self._observe_perception_transaction(result)
+            status = "completed"
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            recorder.write_best_effort(
+                self._root
+                / "performance_diagnostics"
+                / f"perception_{result.bundle.sequence_index:08d}.json",
+                status=status,
+                error=error,
+            )
+
+    def _observe_perception_transaction(self, result: PerceptionCycleResult) -> None:
         """Verify and copy one coordinator-accepted stopped perception result."""
 
         if type(result) is not PerceptionCycleResult:
@@ -1095,6 +1144,52 @@ class LiveSupervisionBridge:
         self.publish_status(status)
 
     def publish_status(
+        self,
+        status: ExperimentStatusSnapshot,
+    ) -> StoredSupervisorySnapshot:
+        """Time one synchronous publication without changing fail-closed behavior."""
+
+        if type(status) is not ExperimentStatusSnapshot:
+            return self._publish_status_transaction(status)
+        # Capture the append-only sequence before publication advances it so the
+        # best-effort diagnostic remains bound to the snapshot it timed.
+        diagnostic_sequence = self._next_sequence
+        recorder = try_create_performance_timing(
+            transaction_kind="live_snapshot_publication",
+            identity={
+                "run_id": status.run_id,
+                "phase": status.phase,
+                "disposition": status.disposition.value,
+                "snapshot_sequence": diagnostic_sequence,
+            },
+        )
+        if recorder is None:
+            return self._publish_status_transaction(status)
+        timing_status = "failed"
+        error: str | None = None
+        try:
+            with activate_performance_timing(recorder), performance_span(
+                "live.snapshot_publication"
+            ):
+                stored = self._publish_status_transaction(status)
+            timing_status = "completed"
+            return stored
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            recorder.write_best_effort(
+                self._root
+                / "performance_diagnostics"
+                / (
+                    f"snapshot_{diagnostic_sequence:08d}_"
+                    f"{_safe_token(status.phase)}.json"
+                ),
+                status=timing_status,
+                error=error,
+            )
+
+    def _publish_status_transaction(
         self,
         status: ExperimentStatusSnapshot,
     ) -> StoredSupervisorySnapshot:

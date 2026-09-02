@@ -14,6 +14,7 @@ from uuid import uuid4
 import numpy as np
 from numpy.typing import ArrayLike
 
+from biblade_fusion.diagnostics.performance_timing import performance_timed
 from biblade_fusion.supervision.snapshot import (
     ArrayReference,
     AssetRecord,
@@ -77,6 +78,7 @@ class AtomicSupervisorySnapshotWriter:
         if not self._committed:
             shutil.rmtree(self.temporary, ignore_errors=True)
 
+    @performance_timed("live.asset_array_write")
     def write_array(
         self,
         name: str,
@@ -122,6 +124,7 @@ class AtomicSupervisorySnapshotWriter:
         self._references[name] = reference
         return reference
 
+    @performance_timed("live.asset_file_write")
     def write_asset(
         self,
         name: str,
@@ -176,6 +179,7 @@ class AtomicSupervisorySnapshotWriter:
         self._assets[name] = record
         return record
 
+    @performance_timed("live.snapshot_commit")
     def commit(self, snapshot: SupervisorySnapshot) -> StoredSupervisorySnapshot:
         """Validate and atomically publish a snapshot using every written array."""
 
