@@ -7,6 +7,40 @@ from biblade_fusion.diagnostics import supervised_scan
 from biblade_fusion.diagnostics.types import CheckLevel
 
 
+def test_elite_sdk_readiness_fails_before_hardware_when_module_is_missing(
+    monkeypatch,
+) -> None:
+    settings = load_settings("configs/default.yaml")
+
+    def missing(_name: str):
+        raise ModuleNotFoundError("missing wheel")
+
+    monkeypatch.setattr(supervised_scan, "import_module", missing)
+    result = supervised_scan._elite_sdk_check(settings)
+
+    assert result.level is CheckLevel.FAIL
+    assert "missing wheel" in result.message
+    assert result.details["hardware_connection_attempted"] is False
+
+
+def test_cuda_ray_backend_readiness_fails_when_cuda_is_unavailable(monkeypatch) -> None:
+    settings = load_settings("configs/default.yaml")
+    settings.occupancy.ray_integration_backend = "cuda"
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: False,
+            device_count=lambda: 0,
+        )
+    )
+    monkeypatch.setattr(supervised_scan, "import_module", lambda _name: torch)
+
+    result = supervised_scan._ray_integration_backend_check(settings)
+
+    assert result.level is CheckLevel.FAIL
+    assert "is_available" in result.message
+    assert result.details["backend"] == "cuda"
+
+
 def test_bootstrap_policy_requires_explicit_static_free_acceptance() -> None:
     settings = load_settings("configs/default.yaml")
     settings.robot.motion_enabled = True

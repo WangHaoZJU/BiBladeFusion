@@ -256,6 +256,13 @@ def test_occupancy_requires_multiple_free_observations() -> None:
         OccupancyConfig(minimum_free_observations=1)
 
 
+def test_occupancy_ray_integration_backend_is_explicit() -> None:
+    assert OccupancyConfig().ray_integration_backend == "cpu"
+    assert OccupancyConfig(ray_integration_backend="cuda").ray_integration_backend == "cuda"
+    with pytest.raises(ValidationError, match="ray_integration_backend"):
+        OccupancyConfig(ray_integration_backend="automatic")
+
+
 def test_static_free_acceptance_is_all_or_nothing_and_within_workspace() -> None:
     from biblade_fusion.core.settings import AxisAlignedBoxConfig
 

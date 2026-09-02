@@ -486,6 +486,9 @@ occupancy:
   minimum_depth_m: 0.15
   maximum_depth_m: 1.5
   integration_stride: 2
+  # CPU remains the portable default. CUDA is fail-closed and requires the
+  # pinned FoundationStereo PyTorch runtime on the acquisition host.
+  ray_integration_backend: cpu
   free_space_margin_m: 0.01
   obstacle_inflation_m: 0.01
   # Null means the published generation remains current until the next accepted

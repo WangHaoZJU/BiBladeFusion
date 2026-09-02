@@ -6,6 +6,10 @@ import pytest
 import biblade_fusion.mapping.integrator as integrator_module
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
+from biblade_fusion.diagnostics.performance_timing import (
+    PerformanceTimingRecorder,
+    activate_performance_timing,
+)
 from biblade_fusion.mapping.integrator import (
     DepthIntegrationConfig,
     DepthIntegrationError,
@@ -89,6 +93,118 @@ def test_large_ray_batch_cooperatively_releases_the_gil(
 
     assert snapshot.sequence == 1
     assert sleeps == [0, 0]
+
+
+def test_cuda_backend_fails_closed_when_cuda_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _UnavailableCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class _TorchWithoutCuda:
+        cuda = _UnavailableCuda()
+
+    monkeypatch.setattr(integrator_module, "_torch_module", _TorchWithoutCuda)
+    mapper = DepthRayIntegrator(
+        OccupancyGridSpec(0.5, (0.0, 0.0, 0.0), (2, 2, 8)),
+        DepthIntegrationConfig(
+            minimum_depth_m=0.1,
+            maximum_depth_m=3.0,
+            pixel_stride=1,
+            minimum_valid_rays=1,
+            free_space_margin_m=0.0,
+            ray_integration_backend="cuda",
+        ),
+        mapping_context_hash=CONTEXT_HASH,
+    )
+
+    with pytest.raises(DepthIntegrationError, match="cuda.is_available.*false"):
+        mapper.integrate(
+            None,
+            [[1.25]],
+            intrinsics(),
+            pose(),
+            source_view_id="cuda-unavailable",
+            observed_at_utc=NOW,
+        )
+
+
+def test_cuda_backend_dispatch_and_timing_are_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    def fake_cuda(base_points, _origin, _grid, _margin):
+        calls.append(len(base_points))
+        occupied = {(0, 0, 3)}
+        return set(occupied), set(), occupied
+
+    monkeypatch.setattr(integrator_module, "_integrate_rays_cuda", fake_cuda)
+    monkeypatch.setattr(
+        integrator_module,
+        "_integrate_rays_cpu",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("CUDA selection must not execute the CPU backend")
+        ),
+    )
+    mapper = DepthRayIntegrator(
+        OccupancyGridSpec(0.5, (0.0, 0.0, 0.0), (2, 2, 8)),
+        DepthIntegrationConfig(
+            minimum_depth_m=0.1,
+            maximum_depth_m=3.0,
+            pixel_stride=1,
+            minimum_valid_rays=1,
+            free_space_margin_m=0.0,
+            ray_integration_backend="cuda",
+        ),
+        mapping_context_hash=CONTEXT_HASH,
+    )
+    recorder = PerformanceTimingRecorder(transaction_kind="cuda-dispatch-test")
+
+    with activate_performance_timing(recorder):
+        snapshot = mapper.integrate(
+            None,
+            [[1.25]],
+            intrinsics(),
+            pose(),
+            source_view_id="cuda-dispatch",
+            observed_at_utc=NOW,
+        )
+
+    spans = recorder.payload(status="completed")["spans"]
+    assert calls == [1]
+    assert snapshot.occupied_indices == frozenset({(0, 0, 3)})
+    assert "occupancy.cuda_ray_integration" in spans
+    assert "occupancy.cpu_ray_integration" not in spans
+
+
+def test_cuda_ray_sets_match_cpu_when_cuda_is_available() -> None:
+    try:
+        torch = integrator_module._torch_module()
+    except DepthIntegrationError:
+        pytest.skip("pinned PyTorch runtime is not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    grid = OccupancyGridSpec(0.1, (-0.4, -0.4, -0.4), (12, 11, 13))
+    origin = np.asarray([-0.55, -0.05, 0.02], dtype=np.float64)
+    hits = np.asarray(
+        [
+            [0.35, -0.05, 0.02],
+            [0.2, 0.3, 0.4],
+            [0.2, -0.3, -0.2],
+            [0.8, 0.5, 0.6],
+            [-0.4, 0.1, 0.1],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    cpu = integrator_module._integrate_rays_cpu(hits, origin, grid, 0.01)
+    cuda = integrator_module._integrate_rays_cuda(hits, origin, grid, 0.01)
+
+    assert cuda == cpu
 
 
 def test_one_depth_view_keeps_traversed_segment_unknown() -> None:

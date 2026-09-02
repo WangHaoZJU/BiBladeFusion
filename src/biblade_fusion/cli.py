@@ -251,6 +251,13 @@ def scan_doctor(
             ),
         ),
     ] = False,
+    ray_integration_backend: Annotated[
+        str | None,
+        typer.Option(
+            "--ray-integration-backend",
+            help="Override occupancy ray traversal with exactly 'cpu' or 'cuda'.",
+        ),
+    ] = None,
 ) -> None:
     """Audit all pre-acceptance scan prerequisites without touching hardware."""
 
@@ -260,6 +267,11 @@ def scan_doctor(
         raise typer.Exit(code=2)
     try:
         settings = load_settings(config)
+        if ray_integration_backend is not None:
+            normalized_backend = ray_integration_backend.strip().lower()
+            if normalized_backend not in {"cpu", "cuda"}:
+                raise ValueError("--ray-integration-backend must be 'cpu' or 'cuda'")
+            settings.occupancy.ray_integration_backend = normalized_backend  # type: ignore[assignment]
         if normalized_mode == "unknown":
             from biblade_fusion.workflows.unknown_blade_runtime import (
                 unknown_blade_runtime_readiness,
@@ -390,6 +402,16 @@ def scan_run_unknown(
             help="Optional first physical side label; only 'front' is valid initially.",
         ),
     ] = None,
+    ray_integration_backend: Annotated[
+        str | None,
+        typer.Option(
+            "--ray-integration-backend",
+            help=(
+                "Override occupancy ray traversal with exactly 'cpu' or 'cuda'; "
+                "CUDA errors fail closed without CPU fallback."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """MOTION-CAPABLE: run the attended unknown-blade coarse-to-fine console."""
 
@@ -452,6 +474,15 @@ def scan_run_unknown(
                 raise ValueError("--first-side may only be 'front'")
             initial_side = BladeSide.FRONT
         settings = load_settings(config)
+        if ray_integration_backend is not None:
+            normalized_backend = ray_integration_backend.strip().lower()
+            if normalized_backend not in {"cpu", "cuda"}:
+                raise ValueError("--ray-integration-backend must be 'cpu' or 'cuda'")
+            settings.occupancy.ray_integration_backend = normalized_backend  # type: ignore[assignment]
+        typer.echo(
+            "Occupancy ray integration backend: "
+            f"{settings.occupancy.ray_integration_backend}"
+        )
         if experimental:
             typer.echo(
                 "EXPERIMENTAL: science/timing release acceptance is bypassed; outputs may be "

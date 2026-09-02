@@ -108,11 +108,16 @@ git log -1 --oneline
 
 安装/核对目标依赖：
 
+普通 `git pull` 后不要仅为代码更新执行 `uv sync`。若环境确实需要重建，必须用下列脚本并
+传入 eiai 上实际的 Elite SDK wheel；脚本在 locked extras 之后最后安装私有 wheel：
+
 ```bash
-uv sync --extra foundation-stereo --extra tsdf-open3d
-uv run python -c "import open3d; print(open3d.__version__)"
-uv run bbf camera list
-uv run bbf stereo doctor --config configs/local.yaml
+./scripts/bootstrap-gpu.sh \
+  /absolute/path/to/elite_cs_sdk-1.0.0-cp312-cp312-linux_x86_64.whl \
+  configs/local.yaml
+/usr/bin/env -u PYTHONPATH .venv/bin/python -c "import open3d; print(open3d.__version__)"
+/usr/bin/env -u PYTHONPATH .venv/bin/bbf camera list
+/usr/bin/env -u PYTHONPATH .venv/bin/bbf stereo doctor --config configs/local.yaml
 ```
 
 - [ ] Open3D可以导入。

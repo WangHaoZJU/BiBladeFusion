@@ -1,5 +1,30 @@
 # Development log
 
+## 2026-09-02 — deterministic CUDA occupancy DDA
+
+- Added an explicit `cpu`/`cuda` occupancy ray-integration backend and an explicit
+  `--ray-integration-backend` override to both `scan doctor` and `scan run-unknown`.
+  `configs/default.yaml` remains portable CPU; eiai activation is visible in the command
+  and the selected backend is bound into the occupancy mapping context.
+- Preserved the existing scalar float64 endpoint and DDA-state construction. The CUDA
+  backend uses PyTorch to advance rays in parallel and performs idempotent per-source free
+  bitmap writes; the unchanged merge retains one vote per physical source, occupied-wins,
+  fixed source order, exact tie tolerance and all existing map authority rules.
+- Added fail-closed CUDA handling with no CPU fallback. The supervised scan doctor now
+  catches both a missing proprietary Elite SDK wheel and an unavailable selected CUDA DDA
+  runtime before capture/output reservation. Production diagnostics distinguish
+  `occupancy.cuda_ray_integration` from the CPU span.
+- Added an immutable no-hardware equivalence diagnostic for eiai. It requires stored/CPU
+  and CPU/CUDA snapshot equality for each source and records device identity, CUDA Event
+  time, wall time and peak allocation. Local unit/static checks exercise dispatch,
+  configuration, doctor and failure behavior; exact CUDA execution remains an eiai gate
+  because this development host has no PyTorch/CUDA device.
+- Repository-wide validation reported `1156 passed, 3 skipped`; one skip is the deliberate
+  real-CUDA equality test on this non-CUDA host and two are the existing optional Open3D
+  renderer tests. Ruff and `git diff --check` passed.
+- Detailed implementation and eiai acceptance commands are recorded in
+  `docs/cuda-ray-integration-2026-09-02.md`.
+
 ## 2026-09-02 — three-frame cumulative replay de-dup and GPU boundary
 
 - Corrected the performance scope from “first bootstrap frame” to the complete three-frame

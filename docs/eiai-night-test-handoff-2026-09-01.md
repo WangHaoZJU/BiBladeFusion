@@ -266,11 +266,16 @@ unknown doctor 必须失败。这是安全设计，不是需要删除的错误�
 
 建议依次执行：
 
+普通 `git pull` 后不要仅为代码更新执行 `uv sync`。若环境确实需要重建，使用仓库脚本并传入
+eiai 上实际的 Elite SDK wheel；脚本会在所有 locked extras 之后最后安装该私有 wheel：
+
 ```bash
-uv sync --extra foundation-stereo --extra tsdf-open3d
-uv run python -c "import open3d; print(open3d.__version__)"
-uv run bbf camera list
-uv run bbf stereo doctor --config configs/local.yaml
+./scripts/bootstrap-gpu.sh \
+  /absolute/path/to/elite_cs_sdk-1.0.0-cp312-cp312-linux_x86_64.whl \
+  configs/local.yaml
+/usr/bin/env -u PYTHONPATH .venv/bin/python -c "import open3d; print(open3d.__version__)"
+/usr/bin/env -u PYTHONPATH .venv/bin/bbf camera list
+/usr/bin/env -u PYTHONPATH .venv/bin/bbf stereo doctor --config configs/local.yaml
 ```
 
 确认：

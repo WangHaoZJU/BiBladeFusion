@@ -1145,7 +1145,19 @@ def _validate_context_configuration(
     acquisition_config: AcquisitionConfig,
 ) -> _PoseReplayContract:
     payload = context.to_payload()
-    if payload.get("occupancy_contract") != occupancy_config.model_dump(mode="json"):
+    expected_occupancy = occupancy_config.model_dump(mode="json")
+    # Schema-7 artifacts written before the CUDA backend selector omit this field.
+    # Pydantic correctly supplies the historical CPU behavior, but comparison must
+    # retain the exact old payload shape so an immutable pre-change artifact is not
+    # mistaken for tampering. New artifacts set and hash-bind the field explicitly.
+    context_occupancy = payload.get("occupancy_contract")
+    if (
+        isinstance(context_occupancy, Mapping)
+        and "ray_integration_backend" not in context_occupancy
+        and occupancy_config.ray_integration_backend == "cpu"
+    ):
+        expected_occupancy.pop("ray_integration_backend")
+    if context_occupancy != expected_occupancy:
         raise ValueError("Mapping context occupancy configuration mismatch")
     if payload.get("acquisition_contract") != acquisition_config.model_dump(mode="json"):
         raise ValueError("Mapping context acquisition configuration mismatch")
@@ -1505,6 +1517,7 @@ def _validate_replayed_mapping(
             minimum_free_observations=config.minimum_free_observations,
             minimum_free_view_translation_m=(config.minimum_free_view_translation_m),
             minimum_free_view_direction_deg=(config.minimum_free_view_direction_deg),
+            ray_integration_backend=config.ray_integration_backend,
         ),
         mapping_context_hash=update.mapping_context.content_hash,
     ).integrate(

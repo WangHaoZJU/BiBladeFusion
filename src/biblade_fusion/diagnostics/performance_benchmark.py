@@ -287,6 +287,7 @@ def _replay_latest_rays(
                     minimum_free_observations=occupancy.minimum_free_observations,
                     minimum_free_view_translation_m=(occupancy.minimum_free_view_translation_m),
                     minimum_free_view_direction_deg=(occupancy.minimum_free_view_direction_deg),
+                    ray_integration_backend=occupancy.ray_integration_backend,
                 ),
                 mapping_context_hash=decoded.context.content_hash,
             )

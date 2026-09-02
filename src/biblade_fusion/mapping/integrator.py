@@ -8,13 +8,18 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib import import_module
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
-from biblade_fusion.diagnostics.performance_timing import performance_timed
+from biblade_fusion.diagnostics.performance_timing import (
+    performance_span,
+    performance_timed,
+)
 from biblade_fusion.mapping.occupancy import (
     OccupancyGridSpec,
     OccupancyMapState,
@@ -42,6 +47,7 @@ class DepthIntegrationConfig:
     minimum_free_observations: int = 3
     minimum_free_view_translation_m: float = 0.02
     minimum_free_view_direction_deg: float = 5.0
+    ray_integration_backend: Literal["cpu", "cuda"] = "cpu"
 
     def __post_init__(self) -> None:
         minimum = float(self.minimum_depth_m)
@@ -77,6 +83,9 @@ class DepthIntegrationConfig:
             )
         view_translation = float(self.minimum_free_view_translation_m)
         view_direction = float(self.minimum_free_view_direction_deg)
+        backend = str(self.ray_integration_backend).strip().lower()
+        if backend not in {"cpu", "cuda"}:
+            raise ValueError("ray_integration_backend must be 'cpu' or 'cuda'")
         if not math.isfinite(view_translation) or view_translation <= 0.0:
             raise ValueError(
                 "minimum_free_view_translation_m must be finite and positive"
@@ -109,6 +118,7 @@ class DepthIntegrationConfig:
             "minimum_free_view_direction_deg",
             view_direction,
         )
+        object.__setattr__(self, "ray_integration_backend", backend)
 
 
 class DepthRayIntegrator:
@@ -178,33 +188,22 @@ class DepthRayIntegrator:
         base_points = base_t_camera.transform_points(camera_points)
         camera_origin = base_t_camera.translation_m
 
-        observed_indices: set[VoxelIndex] = set()
-        new_free: set[VoxelIndex] = set()
-        new_occupied: set[VoxelIndex] = set()
-        for ray_number, hit_point in enumerate(base_points, start=1):
-            if ray_number % _COOPERATIVE_YIELD_RAY_BATCH == 0:
-                # The safety sampler shares this interpreter.  Explicitly release
-                # the GIL during the long deterministic ray loop so controller
-                # feedback remains observable while the stopped map is rebuilt.
-                time.sleep(0)
-            hit_index = _world_to_index(hit_point, self.grid)
-            if hit_index is not None:
-                new_occupied.add(hit_index)
-                observed_indices.add(hit_index)
-
-            direction = hit_point - camera_origin
-            ray_length = float(np.linalg.norm(direction))
-            if ray_length <= self.config.free_space_margin_m:
-                continue
-            free_end = hit_point - (
-                direction / ray_length * self.config.free_space_margin_m
-            )
-            for index in _ray_voxel_indices(camera_origin, free_end, self.grid):
-                if not _index_in_bounds(index, self.grid.grid_shape):
-                    continue
-                observed_indices.add(index)
-                if index != hit_index:
-                    new_free.add(index)
+        if self.config.ray_integration_backend == "cuda":
+            with performance_span("occupancy.cuda_ray_integration"):
+                observed_indices, new_free, new_occupied = _integrate_rays_cuda(
+                    base_points,
+                    camera_origin,
+                    self.grid,
+                    self.config.free_space_margin_m,
+                )
+        else:
+            with performance_span("occupancy.cpu_ray_integration"):
+                observed_indices, new_free, new_occupied = _integrate_rays_cpu(
+                    base_points,
+                    camera_origin,
+                    self.grid,
+                    self.config.free_space_margin_m,
+                )
 
         if not observed_indices:
             raise DepthIntegrationError("No valid depth ray intersects the occupancy grid")
@@ -412,6 +411,212 @@ class DepthRayIntegrator:
         return depth, selected_v, selected_u
 
 
+@dataclass(frozen=True, slots=True)
+class _RayTraversalState:
+    current: VoxelIndex
+    target: VoxelIndex
+    step: VoxelIndex
+    t_max: tuple[float, float, float]
+    t_delta: tuple[float, float, float]
+    maximum_steps: int
+
+
+def _ray_endpoint(
+    hit_point: NDArray[np.float64],
+    camera_origin: NDArray[np.float64],
+    grid: OccupancyGridSpec,
+    free_space_margin_m: float,
+) -> tuple[VoxelIndex | None, NDArray[np.float64] | None]:
+    """Return the occupied endpoint and the conservative free-segment endpoint."""
+
+    hit_index = _world_to_index(hit_point, grid)
+    direction = hit_point - camera_origin
+    ray_length = float(np.linalg.norm(direction))
+    if ray_length <= free_space_margin_m:
+        return hit_index, None
+    return (
+        hit_index,
+        hit_point - direction / ray_length * free_space_margin_m,
+    )
+
+
+def _integrate_rays_cpu(
+    base_points: NDArray[np.float64],
+    camera_origin: NDArray[np.float64],
+    grid: OccupancyGridSpec,
+    free_space_margin_m: float,
+) -> tuple[set[VoxelIndex], set[VoxelIndex], set[VoxelIndex]]:
+    """Preserve the original deterministic Python DDA implementation."""
+
+    observed_indices: set[VoxelIndex] = set()
+    new_free: set[VoxelIndex] = set()
+    new_occupied: set[VoxelIndex] = set()
+    for ray_number, hit_point in enumerate(base_points, start=1):
+        if ray_number % _COOPERATIVE_YIELD_RAY_BATCH == 0:
+            # The safety sampler shares this interpreter. Explicitly release the
+            # GIL during the long deterministic CPU ray loop.
+            time.sleep(0)
+        hit_index, free_end = _ray_endpoint(
+            hit_point,
+            camera_origin,
+            grid,
+            free_space_margin_m,
+        )
+        if hit_index is not None:
+            new_occupied.add(hit_index)
+            observed_indices.add(hit_index)
+        if free_end is None:
+            continue
+        for index in _ray_voxel_indices(camera_origin, free_end, grid):
+            if not _index_in_bounds(index, grid.grid_shape):
+                continue
+            observed_indices.add(index)
+            if index != hit_index:
+                new_free.add(index)
+    return observed_indices, new_free, new_occupied
+
+
+def _torch_module() -> Any:
+    try:
+        return import_module("torch")
+    except Exception as exc:
+        raise DepthIntegrationError(
+            "CUDA ray integration requires the pinned PyTorch runtime"
+        ) from exc
+
+
+def _integrate_rays_cuda(
+    base_points: NDArray[np.float64],
+    camera_origin: NDArray[np.float64],
+    grid: OccupancyGridSpec,
+    free_space_margin_m: float,
+) -> tuple[set[VoxelIndex], set[VoxelIndex], set[VoxelIndex]]:
+    """Traverse all free-space segments on CUDA with exact occupancy semantics.
+
+    CPU preparation intentionally uses the same scalar endpoint and DDA-state
+    construction as ``_ray_voxel_indices``. CUDA advances those states and performs
+    idempotent writes into a per-source dense bitmap. The bitmap is converted back to
+    a set before the unchanged occupied-wins merge.
+    """
+
+    torch = _torch_module()
+    try:
+        if not bool(torch.cuda.is_available()):
+            raise DepthIntegrationError(
+                "CUDA ray integration was requested but torch.cuda.is_available() is false"
+            )
+        device = torch.device("cuda")
+        states: list[_RayTraversalState] = []
+        traversal_hits: list[VoxelIndex | None] = []
+        new_occupied: set[VoxelIndex] = set()
+        for ray_number, hit_point in enumerate(base_points, start=1):
+            if ray_number % _COOPERATIVE_YIELD_RAY_BATCH == 0:
+                time.sleep(0)
+            hit_index, free_end = _ray_endpoint(
+                hit_point,
+                camera_origin,
+                grid,
+                free_space_margin_m,
+            )
+            if hit_index is not None:
+                new_occupied.add(hit_index)
+            if free_end is None:
+                continue
+            states.append(_ray_traversal_state(camera_origin, free_end, grid))
+            traversal_hits.append(hit_index)
+
+        if not states:
+            return set(new_occupied), set(), new_occupied
+
+        current_host = np.asarray([state.current for state in states], dtype=np.int64)
+        target_host = np.asarray([state.target for state in states], dtype=np.int64)
+        step_host = np.asarray([state.step for state in states], dtype=np.int64)
+        t_max_host = np.asarray([state.t_max for state in states], dtype=np.float64)
+        t_delta_host = np.asarray([state.t_delta for state in states], dtype=np.float64)
+        maximum_steps_host = np.asarray(
+            [state.maximum_steps for state in states],
+            dtype=np.int64,
+        )
+        no_hit = np.iinfo(np.int64).min
+        hit_host = np.asarray(
+            [
+                hit_index if hit_index is not None else (no_hit, no_hit, no_hit)
+                for hit_index in traversal_hits
+            ],
+            dtype=np.int64,
+        )
+
+        with torch.inference_mode():
+            current = torch.from_numpy(current_host).to(device=device)
+            target = torch.from_numpy(target_host).to(device=device)
+            step = torch.from_numpy(step_host).to(device=device)
+            t_max = torch.from_numpy(t_max_host).to(device=device)
+            t_delta = torch.from_numpy(t_delta_host).to(device=device)
+            maximum_steps = torch.from_numpy(maximum_steps_host).to(device=device)
+            hit = torch.from_numpy(hit_host).to(device=device)
+            shape = torch.tensor(grid.grid_shape, dtype=torch.int64, device=device)
+            voxel_count = math.prod(grid.grid_shape)
+            free_bitmap = torch.zeros(voxel_count, dtype=torch.bool, device=device)
+
+            def mark_free(indices: Any, rows: Any) -> None:
+                in_bounds = torch.all((indices >= 0) & (indices < shape), dim=1)
+                differs_from_hit = torch.any(indices != hit, dim=1)
+                selected = rows & in_bounds & differs_from_hit
+                linear = (
+                    (indices[:, 0] * grid.grid_shape[1] + indices[:, 1])
+                    * grid.grid_shape[2]
+                    + indices[:, 2]
+                )
+                free_bitmap.index_fill_(0, linear[selected], True)
+
+            all_rows = torch.ones(current.shape[0], dtype=torch.bool, device=device)
+            mark_free(current, all_rows)
+            unreached = torch.any(current != target, dim=1)
+            maximum_iterations = int(maximum_steps_host.max(initial=0))
+            for iteration in range(maximum_iterations):
+                stepping = unreached & (iteration < maximum_steps)
+                next_t = torch.min(t_max, dim=1).values
+                tolerance = 1e-12 * torch.maximum(
+                    torch.ones_like(next_t),
+                    torch.abs(next_t),
+                )
+                advance = stepping[:, None] & (
+                    t_max <= next_t[:, None] + tolerance[:, None]
+                )
+                current = current + step * advance
+                t_max = torch.where(advance, t_max + t_delta, t_max)
+                mark_free(current, stepping)
+                reached_now = torch.all(current == target, dim=1)
+                unreached = unreached & ~reached_now
+
+            torch.cuda.synchronize(device)
+            if bool(torch.any(unreached).item()):
+                raise DepthIntegrationError(
+                    "CUDA voxel ray traversal failed to reach one or more endpoints"
+                )
+            free_linear = (
+                torch.nonzero(free_bitmap, as_tuple=False)
+                .flatten()
+                .to(device="cpu")
+                .numpy()
+            )
+
+        yz = grid.grid_shape[1] * grid.grid_shape[2]
+        z_count = grid.grid_shape[2]
+        new_free = {
+            (int(linear // yz), int((linear % yz) // z_count), int(linear % z_count))
+            for linear in free_linear
+        }
+        observed = new_free | new_occupied
+        return observed, new_free, new_occupied
+    except DepthIntegrationError:
+        raise
+    except Exception as exc:
+        raise DepthIntegrationError(
+            f"CUDA ray integration failed closed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def _world_to_index(point_m: Sequence[float], grid: OccupancyGridSpec) -> VoxelIndex | None:
     index = tuple(
         math.floor((float(point_m[axis]) - grid.origin_m[axis]) / grid.voxel_size_m)
@@ -431,23 +636,49 @@ def _ray_voxel_indices(
 ) -> list[VoxelIndex]:
     """Traverse a finite segment with deterministic Amanatides-Woo DDA."""
 
+    state = _ray_traversal_state(start_m, end_m, grid)
+    current = list(state.current)
+    target = list(state.target)
+    result: list[VoxelIndex] = [(current[0], current[1], current[2])]
+    if current == target:
+        return result
+    step = list(state.step)
+    t_max = list(state.t_max)
+    t_delta = list(state.t_delta)
+    for _ in range(state.maximum_steps):
+        next_t = min(t_max)
+        tolerance = 1e-12 * max(1.0, abs(next_t))
+        for axis in range(3):
+            if t_max[axis] <= next_t + tolerance:
+                current[axis] += step[axis]
+                t_max[axis] += t_delta[axis]
+        index = (current[0], current[1], current[2])
+        result.append(index)
+        if current == target:
+            return result
+    raise DepthIntegrationError("Voxel ray traversal failed to reach its endpoint")
+
+
+def _ray_traversal_state(
+    start_m: Sequence[float],
+    end_m: Sequence[float],
+    grid: OccupancyGridSpec,
+) -> _RayTraversalState:
+    """Construct the scalar float64 state shared by CPU and CUDA DDA."""
+
     start = np.asarray(start_m, dtype=np.float64)
     end = np.asarray(end_m, dtype=np.float64)
     if start.shape != (3,) or end.shape != (3,) or not np.isfinite((start, end)).all():
         raise DepthIntegrationError("Ray endpoints must be finite three-vectors")
     delta = end - start
-    current = [
+    current = tuple(
         math.floor((start[axis] - grid.origin_m[axis]) / grid.voxel_size_m)
         for axis in range(3)
-    ]
-    target = [
+    )
+    target = tuple(
         math.floor((end[axis] - grid.origin_m[axis]) / grid.voxel_size_m)
         for axis in range(3)
-    ]
-    result: list[VoxelIndex] = [(current[0], current[1], current[2])]
-    if current == target:
-        return result
-
+    )
     step = [0, 0, 0]
     t_max = [math.inf, math.inf, math.inf]
     t_delta = [math.inf, math.inf, math.inf]
@@ -464,16 +695,13 @@ def _ray_voxel_indices(
             t_max[axis] = (boundary - start[axis]) / component
             t_delta[axis] = -grid.voxel_size_m / component
 
-    maximum_steps = sum(abs(target[axis] - current[axis]) for axis in range(3)) + 3
-    for _ in range(maximum_steps):
-        next_t = min(t_max)
-        tolerance = 1e-12 * max(1.0, abs(next_t))
-        for axis in range(3):
-            if t_max[axis] <= next_t + tolerance:
-                current[axis] += step[axis]
-                t_max[axis] += t_delta[axis]
-        index = (current[0], current[1], current[2])
-        result.append(index)
-        if current == target:
-            return result
-    raise DepthIntegrationError("Voxel ray traversal failed to reach its endpoint")
+    return _RayTraversalState(
+        current=current,
+        target=target,
+        step=(step[0], step[1], step[2]),
+        t_max=(t_max[0], t_max[1], t_max[2]),
+        t_delta=(t_delta[0], t_delta[1], t_delta[2]),
+        maximum_steps=(
+            sum(abs(target[axis] - current[axis]) for axis in range(3)) + 3
+        ),
+    )

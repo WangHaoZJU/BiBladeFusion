@@ -1058,6 +1058,7 @@ class OccupancyConfig(BaseModel):
     minimum_depth_m: float = Field(default=0.15, gt=0.0)
     maximum_depth_m: float = Field(default=1.5, gt=0.0)
     integration_stride: int = Field(default=2, ge=1, le=16)
+    ray_integration_backend: Literal["cpu", "cuda"] = "cpu"
     free_space_margin_m: float = Field(default=0.01, ge=0.0, le=0.10)
     obstacle_inflation_m: float = Field(default=0.01, ge=0.0, le=0.20)
     # ``None`` makes map authority generation-driven: the last successfully

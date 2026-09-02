@@ -831,6 +831,7 @@ def integrate_prepared_foundation_stereo_occupancy(
             minimum_free_observations=occupancy_config.minimum_free_observations,
             minimum_free_view_translation_m=(occupancy_config.minimum_free_view_translation_m),
             minimum_free_view_direction_deg=(occupancy_config.minimum_free_view_direction_deg),
+            ray_integration_backend=occupancy_config.ray_integration_backend,
         ),
         mapping_context_hash=prepared.mapping_context.content_hash,
     )

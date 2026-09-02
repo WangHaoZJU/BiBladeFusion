@@ -65,6 +65,7 @@ def test_supervised_scan_preparation_commands_are_exposed() -> None:
     assert "--placement-id" in runtime_help.stdout
     assert "--output" in runtime_help.stdout
     assert "--resume" in runtime_help.stdout
+    assert "--ray-integration-backend" in runtime_help.stdout
 
 
 def test_motion_envelope_commissioning_command_is_exposed() -> None:
@@ -162,6 +163,51 @@ def test_unknown_scan_cli_forwards_identity_and_output_without_hidden_motion(
         ),
         ("console",),
     ]
+
+
+def test_unknown_scan_cli_explicitly_selects_cuda_ray_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected: list[str] = []
+
+    @contextmanager
+    def fake_open(settings, **_kwargs):
+        selected.append(settings.occupancy.ray_integration_backend)
+        yield object()
+
+    monkeypatch.setattr(
+        unknown_runtime_module,
+        "open_production_unknown_blade_runtime",
+        fake_open,
+    )
+    monkeypatch.setattr(
+        unknown_runtime_module,
+        "run_unknown_blade_operator_console",
+        lambda _runtime: 0,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "run-unknown",
+            "--config",
+            "configs/default.yaml",
+            "--output",
+            str(tmp_path / "cuda-run"),
+            "--operator-id",
+            "operator-7",
+            "--placement-id",
+            "blade-placement-cuda",
+            "--ray-integration-backend",
+            "cuda",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert selected == ["cuda"]
+    assert "Occupancy ray integration backend: cuda" in result.stdout
 
 
 def test_unknown_scan_cli_requires_physical_placement_identity_for_new_run(
@@ -406,6 +452,39 @@ def test_unknown_scan_doctor_can_audit_experimental_scope(
 
     assert result.exit_code == 0
     assert calls == [False]
+
+
+def test_unknown_scan_doctor_explicitly_selects_cuda_ray_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected: list[str] = []
+    monkeypatch.setattr(
+        unknown_runtime_module,
+        "unknown_blade_runtime_readiness",
+        lambda settings, *, require_release_acceptance: selected.append(
+            settings.occupancy.ray_integration_backend
+        )
+        or (),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "doctor",
+            "--mode",
+            "unknown",
+            "--experimental",
+            "--config",
+            "configs/default.yaml",
+            "--ray-integration-backend",
+            "cuda",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert selected == ["cuda"]
 
 
 def test_static_free_acceptance_recording_command_is_exposed() -> None:
