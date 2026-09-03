@@ -1295,6 +1295,15 @@ class LiveSupervisionBridge:
         )
         requirements: list[str] = []
         approval_phase = status.disposition is ExperimentDisposition.WAITING_APPROVAL
+        bootstrap_mapping_ready = bool(
+            approval_phase
+            and status.phase == "bootstrap_motion_ready"
+            and state is not None
+            and state.occupancy.map_state is OccupancyMapState.MAPPING
+            and prepared is not None
+            and prepared.ready_for_approval
+            and prepared.proposal.bootstrap_mapping_prefix
+        )
         motion_relevant_phase = approval_phase or status.phase in {
             "map_ready",
             "planning",
@@ -1304,7 +1313,10 @@ class LiveSupervisionBridge:
         if motion_relevant_phase:
             if state is None:
                 requirements.append("live_perception_unavailable")
-            elif state.occupancy.map_state is not OccupancyMapState.MAP_READY:
+            elif (
+                state.occupancy.map_state is not OccupancyMapState.MAP_READY
+                and not bootstrap_mapping_ready
+            ):
                 requirements.append("live_occupancy_not_map_ready")
             if self._collision_geometry is None:
                 requirements.append("live_collision_mesh_unavailable")
@@ -1337,13 +1349,17 @@ class LiveSupervisionBridge:
             map_snapshot = state.occupancy
             occupancy_state = {
                 OccupancyMapState.UNMAPPED: "UNREADY",
-                OccupancyMapState.MAPPING: "UNREADY",
+                OccupancyMapState.MAPPING: (
+                    "BOOTSTRAP_READY" if bootstrap_mapping_ready else "UNREADY"
+                ),
                 OccupancyMapState.MAP_READY: "READY",
                 OccupancyMapState.STALE: "STALE",
             }[map_snapshot.map_state]
             occupancy_version = map_snapshot.version
             occupancy_content_hash = (
-                map_snapshot.content_hash if occupancy_state in {"READY", "STALE"} else None
+                map_snapshot.content_hash
+                if occupancy_state in {"BOOTSTRAP_READY", "READY", "STALE"}
+                else None
             )
             voxel_size = map_snapshot.voxel_size_m
             bounds_min = map_snapshot.origin_m

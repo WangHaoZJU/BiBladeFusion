@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,7 @@ from biblade_fusion.supervision.snapshot import (
     discover_supervisory_snapshots,
     load_snapshot_array,
 )
+from biblade_fusion.workflows.stop_scan_coordinator import PreparedSegment
 
 
 def _status(
@@ -205,6 +207,39 @@ def _inject_verified_display_state(bridge: LiveSupervisionBridge) -> None:
     bridge._sampled_actual_joints = [(0.0,) * 6]
 
 
+def _inject_bootstrap_mapping_plan(
+    bridge: LiveSupervisionBridge,
+    *,
+    bootstrap_mapping_prefix: bool,
+) -> None:
+    _inject_verified_display_state(bridge)
+    assert bridge._perception is not None
+    bridge._perception = replace(
+        bridge._perception,
+        occupancy=replace(
+            bridge._perception.occupancy,
+            map_state=OccupancyMapState.MAPPING,
+            quality_evidence_hash=None,
+            state_reason="unit-test bootstrap mapping prefix",
+            content_hash="",
+        ),
+    )
+    bridge.observe_prepared_segment(
+        PreparedSegment(
+            proposal=SimpleNamespace(
+                proposal_id="4" * 64,
+                bootstrap_mapping_prefix=bootstrap_mapping_prefix,
+            ),
+            preflight=SimpleNamespace(
+                ready_for_approval=True,
+                servoj_stream=None,
+                start_joint_positions_rad=(0.0,) * 6,
+                goal_joint_positions_rad=(0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+            ),
+        )
+    )
+
+
 def test_initial_status_is_published_atomically_and_read_only(tmp_path: Path) -> None:
     bridge = _bridge(tmp_path)
 
@@ -256,6 +291,49 @@ def test_approval_without_live_evidence_publishes_block_then_raises(tmp_path: Pa
     assert stored.snapshot.safety.system_state == "BLOCKED"
     assert "live_perception_unavailable" in stored.snapshot.safety.blocking_reasons
     assert stored.snapshot.plan.state == "PREFLIGHT_FAILED"
+
+
+def test_bootstrap_mapping_prefix_can_publish_external_approval_snapshot(
+    tmp_path: Path,
+) -> None:
+    bridge = _bridge(tmp_path)
+    _inject_bootstrap_mapping_plan(bridge, bootstrap_mapping_prefix=True)
+
+    stored = bridge.publish_status(
+        _status(
+            tmp_path / "run",
+            phase="bootstrap_motion_ready",
+            disposition=ExperimentDisposition.WAITING_APPROVAL,
+            cycle_index=1,
+        )
+    )
+
+    assert stored.snapshot.occupancy.state == "BOOTSTRAP_READY"
+    assert stored.snapshot.occupancy.content_sha256 is not None
+    assert stored.snapshot.safety.system_state == "READY_FOR_EXTERNAL_APPROVAL"
+    assert stored.snapshot.plan.state == "READY_FOR_EXTERNAL_APPROVAL"
+    assert stored.snapshot.safety.blocking_reasons == ()
+
+
+def test_mapping_without_bootstrap_prefix_still_fails_closed_at_approval(
+    tmp_path: Path,
+) -> None:
+    bridge = _bridge(tmp_path)
+    _inject_bootstrap_mapping_plan(bridge, bootstrap_mapping_prefix=False)
+
+    with pytest.raises(LiveSupervisionError, match="live_occupancy_not_map_ready"):
+        bridge.publish_status(
+            _status(
+                tmp_path / "run",
+                phase="bootstrap_motion_ready",
+                disposition=ExperimentDisposition.WAITING_APPROVAL,
+                cycle_index=1,
+            )
+        )
+
+    stored = discover_supervisory_snapshots(bridge.timeline_root).snapshots[-1]
+    assert stored.snapshot.occupancy.state == "UNREADY"
+    assert stored.snapshot.safety.system_state == "BLOCKED"
 
 
 def test_map_ready_without_observer_wiring_fails_closed_before_planning(

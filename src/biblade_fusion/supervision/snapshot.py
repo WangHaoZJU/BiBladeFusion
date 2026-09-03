@@ -113,7 +113,7 @@ class RobotSceneSnapshot(_FrozenModel):
 
 class OccupancySnapshot(_FrozenModel):
     frame_id: str = Field(min_length=1)
-    state: Literal["UNREADY", "READY", "STALE", "FAILED"]
+    state: Literal["UNREADY", "BOOTSTRAP_READY", "READY", "STALE", "FAILED"]
     version: str = Field(min_length=1)
     content_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     voxel_size_m: float = Field(gt=0.0)
@@ -135,8 +135,10 @@ class OccupancySnapshot(_FrozenModel):
             raise ValueError("occupancy bounds must be finite")
         if np.any(upper <= lower):
             raise ValueError("occupancy bounds_max_m must exceed bounds_min_m")
-        if self.state in {"READY", "STALE"} and self.content_sha256 is None:
-            raise ValueError("READY/STALE occupancy requires content_sha256")
+        if self.state in {"BOOTSTRAP_READY", "READY", "STALE"} and self.content_sha256 is None:
+            raise ValueError(
+                "BOOTSTRAP_READY/READY/STALE occupancy requires content_sha256"
+            )
         for field_name in (
             "occupied_centres_m",
             "inflated_centres_m",
@@ -355,8 +357,13 @@ class SupervisorySnapshot(_FrozenModel):
             raise ValueError("occupancy must be expressed in robot base_frame")
         if self.reconstruction.frame_id != self.robot.base_frame:
             raise ValueError("reconstruction must be expressed in robot base_frame")
-        if self.occupancy.state != "READY" and self.system_can_be_ready:
-            raise ValueError("non-READY occupancy cannot accompany a ready/executing system")
+        if (
+            self.occupancy.state not in {"BOOTSTRAP_READY", "READY"}
+            and self.system_can_be_ready
+        ):
+            raise ValueError(
+                "non-motion-eligible occupancy cannot accompany a ready/executing system"
+            )
         return self
 
     @property
