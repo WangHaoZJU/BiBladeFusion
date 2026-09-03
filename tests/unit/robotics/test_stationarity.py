@@ -358,8 +358,33 @@ def test_timeout_cannot_truncate_the_required_settle_window() -> None:
     source = StateSource([_state(index * 0.25) for index in range(3)])
     fake_time = FakeTime()
 
-    with pytest.raises(StationarityTimeoutError, match="timed out"):
+    with pytest.raises(StationarityTimeoutError, match="robot_mode='IDLE'.*goal_error="):
         _wait(source, fake_time, settle_time_s=1.0, timeout_s=0.5)
+
+
+def test_timeout_reports_last_running_controller_state() -> None:
+    states = [
+        replace(
+            _state(index * 0.25, joint=0.02),
+            robot_mode="RUNNING",
+            runtime_state="PLAYING",
+            actual_joint_velocity_rad_s=np.full(6, 0.003),
+            target_joint_velocity_rad_s=np.full(6, 0.002),
+            actual_tcp_velocity=np.array([0.001, 0.0, 0.0, 0.0, 0.002, 0.0]),
+        )
+        for index in range(3)
+    ]
+    source = StateSource(states)
+    fake_time = FakeTime()
+
+    with pytest.raises(
+        StationarityTimeoutError,
+        match=(
+            "runtime_state='PLAYING'.*controller_stopped=False.*"
+            "actual_joint_speed_max=0.003"
+        ),
+    ):
+        _wait(source, fake_time, settle_time_s=0.25, timeout_s=0.5)
 
 
 def test_clock_progress_cannot_substitute_for_robot_state_time_coverage() -> None:

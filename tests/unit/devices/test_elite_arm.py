@@ -564,6 +564,31 @@ def test_guarded_enable_requires_capability_and_preserves_stop_latch() -> None:
     assert [name for name, _ in sdk.driver.calls] == ["writeIdle"]
 
 
+def test_guarded_enable_defers_reverse_session_until_approved_resume() -> None:
+    arm, sdk = connected_arm()
+    arm.stop()
+    generation = arm.stop_generation
+    sdk.driver.connected = False
+
+    arm._guarded_enable_for_servoj_control(
+        expected_stop_generation=generation,
+        capability=_GUARDED_MOTION_CAPABILITY,
+    )
+
+    assert not any(name == "sendExternalControlScript" for name, _ in sdk.driver.calls)
+    assert arm.stop_snapshot == (generation, True)
+
+    arm._guarded_resume_servoj_control(
+        expected_stop_generation=generation,
+        capability=_GUARDED_MOTION_CAPABILITY,
+    )
+
+    assert [
+        name for name, _ in sdk.driver.calls if name == "sendExternalControlScript"
+    ] == ["sendExternalControlScript"]
+    assert arm.stop_snapshot == (generation, False)
+
+
 def test_stop_requests_reverse_idle_and_dashboard_program_stop() -> None:
     arm, sdk = enabled_arm()
 
@@ -1013,6 +1038,25 @@ def test_prepare_servoj_stream_primes_with_long_hold_timeout() -> None:
 
     write = next(value for name, value in sdk.driver.calls if name == "writeServoj")
     assert write[1] == 3000
+
+
+def test_guarded_endpoint_settle_reuses_holorobot_hold_before_stop() -> None:
+    arm, sdk = enabled_arm()
+    target = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5)
+
+    evidence = arm._guarded_settle_servoj_endpoint(
+        target,
+        expected_stop_generation=arm.stop_generation,
+        capability=_GUARDED_MOTION_CAPABILITY,
+    )
+
+    assert evidence["settled"] is True
+    assert evidence["sample_count"] == 3
+    assert evidence["final_tracking_error_rad"] == pytest.approx(0.0)
+    hold_writes = [call for call in sdk.driver.calls if call[0] == "writeServoj"]
+    assert len(hold_writes) == 3
+    assert all(call[1][1] == 3000 for call in hold_writes)
+    assert not any(call[0] == "writeIdle" for call in sdk.driver.calls)
 
 
 def test_stream_servoj_writes_every_command_with_short_timeout() -> None:

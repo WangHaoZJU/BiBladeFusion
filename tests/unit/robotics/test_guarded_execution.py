@@ -228,6 +228,28 @@ class FakeGuardedArm:
             raise self.stream_exception
         return StreamServoJResult(ok=True, commands_sent=len(stream.commands))
 
+    def _guarded_settle_servoj_endpoint(
+        self,
+        joint_positions_rad,
+        *,
+        expected_stop_generation: int,
+        capability: object,
+        deadline_exceeded=None,
+    ):
+        assert capability is not None
+        assert deadline_exceeded is None or deadline_exceeded() is False
+        if self._stop_generation != expected_stop_generation or self.stopped:
+            raise RobotMotionInterruptedError("stop generation changed before settle")
+        self.events.append("endpoint_settle")
+        assert len(tuple(joint_positions_rad)) == 6
+        return {
+            "settled": True,
+            "duration_s": 0.04,
+            "sample_count": 3,
+            "maximum_tracking_error_rad": 0.001,
+            "final_tracking_error_rad": 0.001,
+        }
+
     def stop(self) -> None:
         self.events.append("stop")
         self._stop_generation += 1
@@ -358,6 +380,7 @@ def test_execute_revalidates_and_consumes_one_shot_permit(
         "read_state",
         "prepare",
         "stream",
+        "endpoint_settle",
         "stop",
     ]
     assert arm.resumed is True
@@ -615,7 +638,7 @@ def test_execute_never_reports_success_when_same_arm_stop_fails(
         executor.execute(clear_preflight, permit)
 
     assert raised.value is original
-    assert arm.events[-3:] == ["prepare", "stream", "stop"]
+    assert arm.events[-4:] == ["prepare", "stream", "endpoint_settle", "stop"]
     assert arm.stopped is True
 
 
@@ -734,6 +757,8 @@ def test_execute_checks_cancellation_in_required_order(
         "prepare",
         "cancel_check",
         "stream",
+        "endpoint_settle",
+        "cancel_check",
         "stop",
     ]
 

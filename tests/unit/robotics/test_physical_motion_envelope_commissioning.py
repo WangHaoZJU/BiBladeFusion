@@ -89,7 +89,7 @@ def test_prepare_is_hardware_free_and_prints_candidate_bound_prompt(
         "read_commissioning_trial_candidate",
         lambda _path: stored,
     )
-    monkeypatch.setattr(commissioning, "Cs68PinocchioCollisionChecker", FakeChecker)
+    monkeypatch.setattr(commissioning, "Es68PinocchioCollisionChecker", FakeChecker)
     monkeypatch.setattr(
         commissioning,
         "preflight_linear_joint_motion",

@@ -390,6 +390,52 @@ def _controller_stopped_for_stationarity(state: RobotState) -> bool:
     return runtime_state in _BOOTSTRAP_STOPPED_RUNTIME_STATES
 
 
+def _stationarity_timeout_context(
+    state: RobotState,
+    *,
+    goal_error_rad: float,
+    stable_sample_count: int,
+) -> str:
+    """Summarize the last accepted feedback sample for one-shot diagnosis."""
+
+    parts = [
+        f"robot_mode={state.robot_mode!r}",
+        f"runtime_state={state.runtime_state!r}",
+        f"controller_stopped={_controller_stopped_for_stationarity(state)}",
+        f"goal_error={goal_error_rad:.9g} rad",
+        f"stable_samples={stable_sample_count}",
+    ]
+    if state.actual_joint_velocity_rad_s is not None:
+        parts.append(
+            "actual_joint_speed_max="
+            f"{float(np.max(np.abs(state.actual_joint_velocity_rad_s))):.9g} rad/s"
+        )
+    if state.target_joint_velocity_rad_s is not None:
+        parts.append(
+            "target_joint_speed_max="
+            f"{float(np.max(np.abs(state.target_joint_velocity_rad_s))):.9g} rad/s"
+        )
+    if state.actual_tcp_velocity is not None:
+        parts.extend(
+            (
+                "actual_tcp_linear_speed="
+                f"{float(np.linalg.norm(state.actual_tcp_velocity[:3])):.9g} m/s",
+                "actual_tcp_angular_speed="
+                f"{float(np.linalg.norm(state.actual_tcp_velocity[3:])):.9g} rad/s",
+            )
+        )
+    if state.target_tcp_velocity is not None:
+        parts.extend(
+            (
+                "target_tcp_linear_speed="
+                f"{float(np.linalg.norm(state.target_tcp_velocity[:3])):.9g} m/s",
+                "target_tcp_angular_speed="
+                f"{float(np.linalg.norm(state.target_tcp_velocity[3:])):.9g} rad/s",
+            )
+        )
+    return ", ".join(parts)
+
+
 def _validate_state_contract(state: RobotState) -> None:
     timestamp = state.monotonic_time_ns
     if isinstance(timestamp, bool) or not isinstance(timestamp, (int, np.integer)) or timestamp < 0:
@@ -556,7 +602,14 @@ def wait_until_settled(
     if now < started_at:
         raise StationarityError("monotonic clock moved backwards during initial read")
     if now > deadline:
-        raise StationarityTimeoutError("stationarity timed out during initial state read")
+        raise StationarityTimeoutError(
+            "stationarity timed out during initial state read; "
+            + _stationarity_timeout_context(
+                previous_state,
+                goal_error_rad=_goal_error_rad(previous_state, goal),
+                stable_sample_count=0,
+            )
+        )
 
     goal_error = _goal_error_rad(previous_state, goal)
     stable_states: list[RobotState] = []
@@ -608,7 +661,12 @@ def wait_until_settled(
         if remaining <= 0.0:
             raise StationarityTimeoutError(
                 "stationarity timed out before a bounded sampled settled window was "
-                f"observed; last goal error was {goal_error:.9g} rad"
+                f"observed; last goal error was {goal_error:.9g} rad; "
+                + _stationarity_timeout_context(
+                    previous_state,
+                    goal_error_rad=goal_error,
+                    stable_sample_count=len(stable_states),
+                )
             )
         sleep_duration = min(poll_period, remaining)
         try:
@@ -625,7 +683,12 @@ def wait_until_settled(
             raise StationarityError("monotonic clock did not advance while waiting")
         if wake_time > deadline:
             raise StationarityTimeoutError(
-                "stationarity timed out before the next robot-state sample"
+                "stationarity timed out before the next robot-state sample; "
+                + _stationarity_timeout_context(
+                    previous_state,
+                    goal_error_rad=goal_error,
+                    stable_sample_count=len(stable_states),
+                )
             )
 
         current_state = _read_settling_state(state_source)
@@ -633,7 +696,14 @@ def wait_until_settled(
         if sampled_at < wake_time:
             raise StationarityError("monotonic clock moved backwards during state read")
         if sampled_at > deadline:
-            raise StationarityTimeoutError("stationarity timed out during robot-state sampling")
+            raise StationarityTimeoutError(
+                "stationarity timed out during robot-state sampling; "
+                + _stationarity_timeout_context(
+                    current_state,
+                    goal_error_rad=_goal_error_rad(current_state, goal),
+                    stable_sample_count=len(stable_states),
+                )
+            )
         _require_nondecreasing_state_time(previous_state, current_state)
         feedback_states.append(current_state)
         feedback_sample_times.append(sampled_at)

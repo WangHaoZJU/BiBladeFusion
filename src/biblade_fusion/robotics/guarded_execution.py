@@ -196,6 +196,15 @@ class GuardedArm(Protocol):
         deadline_exceeded: Callable[[], bool] | None = None,
     ) -> StreamServoJResult: ...
 
+    def _guarded_settle_servoj_endpoint(
+        self,
+        joint_positions_rad: tuple[float, float, float, float, float, float],
+        *,
+        expected_stop_generation: int,
+        capability: object,
+        deadline_exceeded: Callable[[], bool] | None = None,
+    ) -> dict[str, float | int | bool]: ...
+
     def _guarded_deadline_stop(
         self,
         *,
@@ -662,6 +671,32 @@ class GuardedEliteExecutor:
                 deadline_exceeded=deadline_exceeded,
             )
             require_budget("during ServoJ streaming")
+            if result.ok:
+                endpoint_settle = self._arm._guarded_settle_servoj_endpoint(
+                    stream.commands[-1],
+                    expected_stop_generation=permit.stop_generation,
+                    capability=_GUARDED_MOTION_CAPABILITY,
+                    deadline_exceeded=deadline_exceeded,
+                )
+                require_budget("during ServoJ endpoint settling")
+                self._raise_if_cancellation_requested(
+                    cancellation_requested,
+                    stage="after_servoj_endpoint_settle",
+                )
+                self._require_unchanged_stop_generation(
+                    permit.stop_generation,
+                    stage="after_servoj_endpoint_settle",
+                )
+                result = replace(
+                    result,
+                    timing_summary={
+                        **dict(result.timing_summary or {}),
+                        **{
+                            f"endpoint_settle_{key}": value
+                            for key, value in endpoint_settle.items()
+                        },
+                    },
+                )
         except BaseException as operation_error:
             # Driver preparation may already have primed ServoJ before failing,
             # while a streaming backend may raise instead of returning an abort

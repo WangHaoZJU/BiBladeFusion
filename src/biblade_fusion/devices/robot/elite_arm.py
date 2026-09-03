@@ -52,6 +52,14 @@ from biblade_fusion.devices.robot.streaming import (
 _TRAJECTORY_RESULT_SUCCESS = 0
 _SERVOJ_STREAM_TIMEOUT_MS = 500
 _SERVOJ_HOLD_TIMEOUT_MS = 3000
+# Keep these values aligned with HoloRobot's ``ServoJStreamConfig`` defaults at
+# the pinned provenance commit.  They are intentionally execution-local rather
+# than part of BiBladeFusion's accepted ServoJ stream contract: endpoint holding
+# repeats the already approved final command and does not introduce a new path.
+_SERVOJ_ENDPOINT_SETTLE_TIMEOUT_S = 2.0
+_SERVOJ_ENDPOINT_SETTLE_TOLERANCE_RAD = 0.005
+_SERVOJ_ENDPOINT_SETTLE_SAMPLE_PERIOD_S = 0.02
+_SERVOJ_ENDPOINT_SETTLE_REQUIRED_SAMPLES = 3
 _MOTION_SAFE_SAFETY_MODES = {1, 2}  # NORMAL, REDUCED
 
 _OUTPUT_RECIPE = [
@@ -672,23 +680,43 @@ class EliteArm:
             self._raise_for_safety()
             if self._driver is None:
                 raise RobotNotEnabledError("EliteDriver is unavailable")
-            self._ensure_driver_reverse_connected()
-            self._raise_if_execution_deadline(
-                deadline_exceeded,
-                stage="during approved ServoJ recovery",
-            )
-            # Compare-and-clear only after every non-motion prerequisite.  stop()
-            # never takes _motion_lock, so a newer stop can win while recovery is
-            # waiting on reverse-control setup.
+            # Starting the external-control task while the local stop latch is
+            # still set creates an idle reverse session that times out before the
+            # later path revalidation can use it.  HoloRobot instead establishes
+            # the session as part of the transition into active control.  Clear
+            # the already approved latch atomically, then connect once and recheck
+            # the generation before any ServoJ command is allowed.
             with self._stop_lock:
                 if self._stop_generation != expected_stop_generation or not self._stopped:
                     raise RobotMotionInterruptedError(
                         "Elite stop latch changed during approved ServoJ recovery"
                     )
-                # The generation comparison and latch clear are one atomic state
-                # transition with respect to stop().  Clearing outside this lock
-                # could otherwise overwrite a concurrently latched newer stop.
                 self._stopped = False
+            try:
+                self._ensure_driver_reverse_connected()
+                self._raise_if_execution_deadline(
+                    deadline_exceeded,
+                    stage="during approved ServoJ recovery",
+                )
+                with self._stop_lock:
+                    if (
+                        self._stop_generation != expected_stop_generation
+                        or self._stopped
+                    ):
+                        raise RobotMotionInterruptedError(
+                            "Elite stop latch changed during approved ServoJ recovery"
+                        )
+            except BaseException:
+                # Fail closed without overwriting a newer concurrent stop.  The
+                # executor will additionally request the physical controller stop.
+                with self._stop_lock:
+                    if (
+                        self._stop_generation == expected_stop_generation
+                        and not self._stopped
+                    ):
+                        self._stop_generation += 1
+                        self._stopped = True
+                raise
 
     def _guarded_enable_for_servoj_control(
         self,
@@ -762,12 +790,9 @@ class EliteArm:
                 stage="after speed scaling",
             )
             require_exact_latch("after speed scaling")
-            self._wait_driver_connected()
-            self._raise_if_execution_deadline(
-                deadline_exceeded,
-                stage="after reverse connection",
-            )
-            require_exact_latch("after reverse connection")
+            # Do not start the reverse-control program while the approved stop
+            # latch is intentionally held.  It is opened exactly once by
+            # _guarded_resume_servoj_control after post-enable revalidation.
             with self._stop_lock:
                 if self._stop_generation != expected_stop_generation or not self._stopped:
                     raise RobotMotionInterruptedError(
@@ -884,6 +909,76 @@ class EliteArm:
                 timeout_ms=timeout_ms,
                 expected_stop_generation=expected_stop_generation,
             )
+
+    def _guarded_settle_servoj_endpoint(
+        self,
+        joint_positions_rad: Sequence[float],
+        *,
+        expected_stop_generation: int,
+        capability: object,
+        deadline_exceeded: Callable[[], bool] | None = None,
+    ) -> dict[str, float | int | bool]:
+        """Hold and verify the approved endpoint before ending external control.
+
+        This is the capability-gated BiBladeFusion adaptation of HoloRobot's
+        ``_settle_servoj_endpoint``.  Stopping the Dashboard task before this
+        feedback loop tears down the reverse-control session precisely when the
+        final setpoint still needs to be held.  The loop therefore repeats only
+        the already approved final command, reads the persistent RTSI connection,
+        and requires three consecutive in-tolerance samples before ``stop()`` may
+        end the controller task.
+        """
+
+        require_guarded_motion_capability(capability)
+        target = self._validated_joint_vector(joint_positions_rad)
+        started = self._stream_time()
+        deadline = started + _SERVOJ_ENDPOINT_SETTLE_TIMEOUT_S
+        consecutive = 0
+        sample_count = 0
+        maximum_error = 0.0
+        final_error = float("inf")
+
+        while self._stream_time() < deadline:
+            self._raise_if_execution_deadline(
+                deadline_exceeded,
+                stage="during ServoJ endpoint settling",
+            )
+            self._guarded_write_servoj_hold(
+                target,
+                timeout_ms=_SERVOJ_HOLD_TIMEOUT_MS,
+                expected_stop_generation=expected_stop_generation,
+                capability=capability,
+            )
+            actual = self._validated_joint_vector(self._read_actual_joint_positions())
+            final_error = max(
+                abs(command - measured)
+                for command, measured in zip(target, actual, strict=True)
+            )
+            maximum_error = max(maximum_error, final_error)
+            sample_count += 1
+            if final_error <= _SERVOJ_ENDPOINT_SETTLE_TOLERANCE_RAD:
+                consecutive += 1
+            else:
+                consecutive = 0
+            if consecutive >= _SERVOJ_ENDPOINT_SETTLE_REQUIRED_SAMPLES:
+                return {
+                    "settled": True,
+                    "duration_s": self._stream_time() - started,
+                    "sample_count": sample_count,
+                    "maximum_tracking_error_rad": maximum_error,
+                    "final_tracking_error_rad": final_error,
+                }
+            remaining = deadline - self._stream_time()
+            if remaining > 0.0:
+                self._sleep(
+                    min(_SERVOJ_ENDPOINT_SETTLE_SAMPLE_PERIOD_S, remaining)
+                )
+
+        raise RobotCommandError(
+            "ServoJ endpoint settling timed out before controller stop "
+            f"(samples={sample_count}, final_error={final_error:.9g} rad, "
+            f"tolerance={_SERVOJ_ENDPOINT_SETTLE_TOLERANCE_RAD:.9g} rad)"
+        )
 
     def stream_servoj(
         self,

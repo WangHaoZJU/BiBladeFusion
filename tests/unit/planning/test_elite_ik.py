@@ -7,6 +7,7 @@ from biblade_fusion.calibration import Cs68KinematicsModel, HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import KinematicsConfig
 from biblade_fusion.planning import EliteCs68IkChecker, ReachabilityState
+from biblade_fusion.planning.collision import cs68_mdh_joint_origins
 from biblade_fusion.robotics import load_es68_flange_t_tcp
 
 
@@ -108,3 +109,35 @@ def test_elite_ik_passes_rpy_orientation_expected_by_vendor_plugin() -> None:
         [0.0, 0.0, np.pi / 2.0],
         atol=1e-12,
     )
+
+
+def test_default_elite_ik_uses_holorobot_mdh_solver_without_sdk_plugin() -> None:
+    model = Cs68KinematicsModel(
+        np.arange(6) * 0.1,
+        np.arange(6) * 0.01,
+        np.arange(6) * 0.02,
+        "unit-test",
+    )
+    tcp_t_left_ir = PoseSE3.from_rotation_translation(
+        "tcp", "left_ir", np.eye(3), [0.1, 0, 0]
+    )
+    hand_eye = HandEyeCalibration(
+        tcp_t_left_ir,
+        "test",
+        20,
+        0.001,
+        0.2,
+        Path("hand_eye.yaml"),
+        flange_t_left_ir=load_es68_flange_t_tcp().compose(tcp_t_left_ir),
+    )
+    joints = np.zeros(6)
+    _, base_t_flange = cs68_mdh_joint_origins(model, joints)
+    camera_pose = base_t_flange.compose(hand_eye.require_flange_primary())
+    ik = EliteCs68IkChecker(model, hand_eye, joints, KinematicsConfig())
+
+    result = ik.check(camera_pose)
+
+    assert result.state is ReachabilityState.REACHABLE
+    assert "HoloRobot MDH" in result.message
+    np.testing.assert_allclose(result.joint_positions_rad, joints, atol=1e-12)
+    assert ik._loader is None
