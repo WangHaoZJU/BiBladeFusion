@@ -1295,9 +1295,11 @@ class LiveSupervisionBridge:
         )
         requirements: list[str] = []
         approval_phase = status.disposition is ExperimentDisposition.WAITING_APPROVAL
+        # The coordinator has already transitioned from BOOTSTRAP_MOTION_READY to
+        # WAITING_APPROVAL when this callback runs.  Bind the exception to the
+        # detached, preflight-clear proposal instead of the no-longer-current phase.
         bootstrap_mapping_ready = bool(
             approval_phase
-            and status.phase == "bootstrap_motion_ready"
             and state is not None
             and state.occupancy.map_state is OccupancyMapState.MAPPING
             and prepared is not None

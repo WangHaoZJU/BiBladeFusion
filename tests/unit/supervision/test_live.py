@@ -207,11 +207,7 @@ def _inject_verified_display_state(bridge: LiveSupervisionBridge) -> None:
     bridge._sampled_actual_joints = [(0.0,) * 6]
 
 
-def _inject_bootstrap_mapping_plan(
-    bridge: LiveSupervisionBridge,
-    *,
-    bootstrap_mapping_prefix: bool,
-) -> None:
+def _inject_bootstrap_mapping_state(bridge: LiveSupervisionBridge) -> None:
     _inject_verified_display_state(bridge)
     assert bridge._perception is not None
     bridge._perception = replace(
@@ -224,6 +220,15 @@ def _inject_bootstrap_mapping_plan(
             content_hash="",
         ),
     )
+    bridge._prepared = None
+    bridge._planned_joint_path = None
+
+
+def _inject_bootstrap_mapping_plan(
+    bridge: LiveSupervisionBridge,
+    *,
+    bootstrap_mapping_prefix: bool,
+) -> None:
     bridge.observe_prepared_segment(
         PreparedSegment(
             proposal=SimpleNamespace(
@@ -293,16 +298,29 @@ def test_approval_without_live_evidence_publishes_block_then_raises(tmp_path: Pa
     assert stored.snapshot.plan.state == "PREFLIGHT_FAILED"
 
 
-def test_bootstrap_mapping_prefix_can_publish_external_approval_snapshot(
+def test_bootstrap_mapping_callback_sequence_can_publish_external_approval_snapshot(
     tmp_path: Path,
 ) -> None:
     bridge = _bridge(tmp_path)
+    _inject_bootstrap_mapping_state(bridge)
+
+    before_planning = bridge.publish_status(
+        _status(
+            tmp_path / "run",
+            phase="bootstrap_motion_ready",
+            disposition=ExperimentDisposition.READY,
+            cycle_index=1,
+        )
+    )
+    assert before_planning.snapshot.occupancy.state == "UNREADY"
+    assert before_planning.snapshot.safety.system_state == "BLOCKED"
+
     _inject_bootstrap_mapping_plan(bridge, bootstrap_mapping_prefix=True)
 
     stored = bridge.publish_status(
         _status(
             tmp_path / "run",
-            phase="bootstrap_motion_ready",
+            phase="waiting_approval",
             disposition=ExperimentDisposition.WAITING_APPROVAL,
             cycle_index=1,
         )
@@ -319,13 +337,14 @@ def test_mapping_without_bootstrap_prefix_still_fails_closed_at_approval(
     tmp_path: Path,
 ) -> None:
     bridge = _bridge(tmp_path)
+    _inject_bootstrap_mapping_state(bridge)
     _inject_bootstrap_mapping_plan(bridge, bootstrap_mapping_prefix=False)
 
     with pytest.raises(LiveSupervisionError, match="live_occupancy_not_map_ready"):
         bridge.publish_status(
             _status(
                 tmp_path / "run",
-                phase="bootstrap_motion_ready",
+                phase="waiting_approval",
                 disposition=ExperimentDisposition.WAITING_APPROVAL,
                 cycle_index=1,
             )
