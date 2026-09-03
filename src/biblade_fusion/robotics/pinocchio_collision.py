@@ -141,8 +141,8 @@ class SweptMeshProofEvidence:
     minimum_certificate_margin_m: float | None
     termination_reason: str
     evidence_sha256: str
-    schema: str = "biblade_fusion.swept_mesh_proof.v2"
-    method: str = "adaptive_midpoint_fcl_lipschitz_tracking_envelope_sweep"
+    schema: str = "biblade_fusion.swept_mesh_proof.v3"
+    method: str = "adaptive_fcl_relative_motion_tracking_box_sweep"
 
     def _payload(self) -> dict[str, Any]:
         return {
@@ -168,8 +168,8 @@ class SweptMeshProofEvidence:
 
     @property
     def integrity_valid(self) -> bool:
-        if self.schema != "biblade_fusion.swept_mesh_proof.v2" or self.method != (
-            "adaptive_midpoint_fcl_lipschitz_tracking_envelope_sweep"
+        if self.schema != "biblade_fusion.swept_mesh_proof.v3" or self.method != (
+            "adaptive_fcl_relative_motion_tracking_box_sweep"
         ):
             return False
         digests = (
@@ -435,6 +435,10 @@ class Cs68PinocchioCollisionChecker:
     continuous_swept_volume_supported: bool = True
     collision_backend_versions: dict[str, str] = field(default_factory=dict)
     _geometry_motion_coefficients_cache: tuple[tuple[float, ...], ...] | None = field(
+        default=None,
+        repr=False,
+    )
+    _pair_motion_coefficients_cache: tuple[tuple[float, ...], ...] | None = field(
         default=None,
         repr=False,
     )
@@ -711,11 +715,13 @@ class Cs68PinocchioCollisionChecker:
         """Prove a complete linear joint sweep using conservative interval bounds.
 
         The Python hpp-fcl binding used by this project has no continuous-collision
-        API.  For each interval this routine evaluates exact FCL separation at the
-        midpoint and subtracts a serial-chain Lipschitz displacement bound for both
-        geometries.  An interval is certified only when the remaining margin is
-        positive.  Otherwise it is bisected.  Exhausting a configured limit returns
-        ``UNKNOWN``; clear samples alone can never yield a clear report.
+        API.  Each commanded-path interval plus the accepted tracking-error box is
+        bounded in joint space.  Exact FCL separation at the cell centre must exceed
+        a serial-chain Lipschitz bound on relative pair motion.  A failed certificate
+        adaptively splits either path time or one tracking-error dimension.  Common
+        ancestor motion cancels for self-collision pairs but never for fixed
+        environment geometry.  Exhausting a configured limit returns ``UNKNOWN``;
+        clear samples alone can never yield a clear report.
         """
 
         start = np.asarray(start_joint_positions_rad, dtype=np.float64)
@@ -829,21 +835,21 @@ class Cs68PinocchioCollisionChecker:
                 proof_evidence=evidence,
             )
 
-        checked_fractions: dict[float, CollisionCheckResult] = {}
+        checked_configurations: dict[bytes, CollisionCheckResult] = {}
 
-        def evaluate(fraction: float) -> CollisionCheckResult:
+        def evaluate(configuration: NDArray[np.float64]) -> CollisionCheckResult:
             nonlocal evaluated
-            key = float(fraction)
-            cached = checked_fractions.get(key)
+            key = np.asarray(configuration, dtype="<f8").tobytes()
+            cached = checked_configurations.get(key)
             if cached is not None:
                 return cached
-            result = self.check(start + key * (end - start))
-            checked_fractions[key] = result
+            result = self.check(configuration)
+            checked_configurations[key] = result
             evaluated += 1
             return result
 
         for endpoint_fraction in (0.0, 1.0):
-            endpoint_result = evaluate(endpoint_fraction)
+            endpoint_result = evaluate(start + endpoint_fraction * (end - start))
             if endpoint_result.status is not CollisionCheckStatus.CLEAR:
                 return finish_nonclear(
                     endpoint_result,
@@ -855,16 +861,58 @@ class Cs68PinocchioCollisionChecker:
                     ),
                 )
 
-        intervals: list[tuple[float, float, int]] = [
-            (index / segment_count, (index + 1) / segment_count, 0)
+        pair_coefficients = np.asarray(
+            self._pair_motion_coefficients(),
+            dtype=np.float64,
+        )
+        zero_error_center = np.zeros(6, dtype=np.float64)
+        cells: list[
+            tuple[
+                float,
+                float,
+                NDArray[np.float64],
+                NDArray[np.float64],
+                int,
+            ]
+        ] = [
+            (
+                index / segment_count,
+                (index + 1) / segment_count,
+                zero_error_center.copy(),
+                accepted_uncertainty.copy(),
+                0,
+            )
             for index in range(segment_count)
         ]
-        while intervals:
-            lower_fraction, upper_fraction, depth = intervals.pop()
+        while cells:
+            (
+                lower_fraction,
+                upper_fraction,
+                error_center,
+                error_half_width,
+                depth,
+            ) = cells.pop()
             deepest = max(deepest, depth)
             midpoint_fraction = (lower_fraction + upper_fraction) / 2.0
-            midpoint_result = evaluate(midpoint_fraction)
+            path_midpoint = start + midpoint_fraction * (end - start)
+            cell_center = path_midpoint + error_center
+            midpoint_result = evaluate(cell_center)
             if midpoint_result.status is not CollisionCheckStatus.CLEAR:
+                midpoint_result = CollisionCheckResult(
+                    status=midpoint_result.status,
+                    blocking_reasons=midpoint_result.blocking_reasons,
+                    pairs=midpoint_result.pairs,
+                    diagnostics={
+                        **midpoint_result.diagnostics,
+                        "swept_mesh_cell_center_joint_positions_rad": cell_center.tolist(),
+                        "swept_mesh_path_fraction_interval": [
+                            float(lower_fraction),
+                            float(upper_fraction),
+                        ],
+                        "swept_mesh_tracking_error_center_rad": error_center.tolist(),
+                        "swept_mesh_tracking_error_half_width_rad": error_half_width.tolist(),
+                    },
+                )
                 return finish_nonclear(
                     midpoint_result,
                     fraction=midpoint_fraction,
@@ -874,18 +922,16 @@ class Cs68PinocchioCollisionChecker:
                         else "checker_error"
                     ),
                 )
-            lower = start + lower_fraction * (end - start)
-            upper = start + upper_fraction * (end - start)
-            midpoint = start + midpoint_fraction * (end - start)
+            path_half_width = np.abs((upper_fraction - lower_fraction) * (end - start)) / 2.0
+            maximum_deviation = path_half_width + error_half_width
             try:
-                slacks = self._pair_clearance_slacks(midpoint)
-                maximum_deviation = np.abs(upper - lower) / 2.0 + accepted_uncertainty
+                slacks = self._pair_clearance_slacks(cell_center)
                 pair_margins: list[float] = []
                 for pair_index, slack in enumerate(slacks):
-                    pair = self.geometry_model.collisionPairs[pair_index]
-                    displacement = self.geometry_displacement_bound_m(
-                        int(pair.first), maximum_deviation
-                    ) + self.geometry_displacement_bound_m(int(pair.second), maximum_deviation)
+                    displacement = self.pair_displacement_bound_m(
+                        pair_index,
+                        maximum_deviation,
+                    )
                     pair_margins.append(slack - displacement - tolerance)
             except (TypeError, ValueError, RuntimeError) as exc:
                 unknown = CollisionCheckResult(
@@ -908,31 +954,121 @@ class Cs68PinocchioCollisionChecker:
                     )
                 certified += 1
                 continue
-            joint_span = float(np.max(np.abs(upper - lower)))
-            if depth >= depth_limit or joint_span <= minimum_span:
+            limiting_pair_index = int(np.argmin(pair_margins))
+            limiting_slack = float(slacks[limiting_pair_index])
+            limiting_displacement = self.pair_displacement_bound_m(
+                limiting_pair_index,
+                maximum_deviation,
+            )
+            limiting_details: dict[str, Any] = {
+                "pair_index": limiting_pair_index,
+                "links": list(self.pair_links[limiting_pair_index]),
+                "geometries": list(self.pair_geometries[limiting_pair_index]),
+                "clearance_slack_m": limiting_slack,
+                "relative_displacement_bound_m": limiting_displacement,
+                "certificate_margin_m": float(pair_margins[limiting_pair_index]),
+                "cell_center_joint_positions_rad": cell_center.tolist(),
+                "maximum_joint_deviation_rad": maximum_deviation.tolist(),
+                "path_fraction_interval": [
+                    float(lower_fraction),
+                    float(upper_fraction),
+                ],
+                "tracking_error_center_rad": error_center.tolist(),
+                "tracking_error_half_width_rad": error_half_width.tolist(),
+                "subdivision_depth": depth,
+            }
+
+            coefficients = pair_coefficients[limiting_pair_index]
+            path_contribution = float(np.dot(coefficients, path_half_width))
+            error_contributions = coefficients * error_half_width
+            split_options: list[tuple[float, str, int | None]] = []
+            path_joint_span = float(
+                np.max(np.abs((upper_fraction - lower_fraction) * (end - start)))
+            )
+            if path_joint_span > minimum_span and path_contribution > 0.0:
+                split_options.append((path_contribution, "path", None))
+            for joint_index, contribution in enumerate(error_contributions):
+                if (
+                    2.0 * float(error_half_width[joint_index]) > minimum_span
+                    and float(contribution) > 0.0
+                ):
+                    split_options.append((float(contribution), "error", joint_index))
+
+            if depth >= depth_limit or not split_options:
+                geometries = self.pair_geometries[limiting_pair_index]
                 unknown = CollisionCheckResult(
                     status=CollisionCheckStatus.UNKNOWN,
-                    blocking_reasons=("continuous_swept_mesh_unproven:subdivision_limit",),
-                    diagnostics=diagnostics,
+                    blocking_reasons=(
+                        "continuous_swept_mesh_unproven:subdivision_limit:"
+                        f"pair={geometries[0]}|{geometries[1]}:"
+                        f"margin_m={pair_margins[limiting_pair_index]:.9f}",
+                    ),
+                    diagnostics={
+                        **diagnostics,
+                        "swept_mesh_limiting_pair": limiting_details,
+                    },
                 )
                 return finish_nonclear(
                     unknown,
                     fraction=midpoint_fraction,
                     reason="subdivision_limit",
                 )
-            intervals.append((midpoint_fraction, upper_fraction, depth + 1))
-            intervals.append((lower_fraction, midpoint_fraction, depth + 1))
+            _, split_kind, split_joint = max(split_options, key=lambda item: item[0])
+            if split_kind == "path":
+                cells.append(
+                    (
+                        midpoint_fraction,
+                        upper_fraction,
+                        error_center.copy(),
+                        error_half_width.copy(),
+                        depth + 1,
+                    )
+                )
+                cells.append(
+                    (
+                        lower_fraction,
+                        midpoint_fraction,
+                        error_center.copy(),
+                        error_half_width.copy(),
+                        depth + 1,
+                    )
+                )
+                continue
+
+            assert split_joint is not None
+            child_half_width = error_half_width.copy()
+            child_half_width[split_joint] /= 2.0
+            center_delta = np.zeros(6, dtype=np.float64)
+            center_delta[split_joint] = child_half_width[split_joint]
+            cells.append(
+                (
+                    lower_fraction,
+                    upper_fraction,
+                    error_center + center_delta,
+                    child_half_width.copy(),
+                    depth + 1,
+                )
+            )
+            cells.append(
+                (
+                    lower_fraction,
+                    upper_fraction,
+                    error_center - center_delta,
+                    child_half_width.copy(),
+                    depth + 1,
+                )
+            )
 
         evidence = issue_evidence("all_intervals_certified")
         clear = CollisionCheckResult(
             status=CollisionCheckStatus.CLEAR,
-                diagnostics={
-                    **diagnostics,
-                    "continuous_swept_volume_verified": True,
-                    "continuous_sweep_backend": evidence.method,
-                    "motion_envelope_acceptance_id": acceptance_id,
-                    "motion_envelope_metadata_sha256": envelope_metadata_sha256,
-                    "accepted_joint_uncertainty_rad": list(accepted_uncertainty_tuple),
+            diagnostics={
+                **diagnostics,
+                "continuous_swept_volume_verified": True,
+                "continuous_sweep_backend": evidence.method,
+                "motion_envelope_acceptance_id": acceptance_id,
+                "motion_envelope_metadata_sha256": envelope_metadata_sha256,
+                "accepted_joint_uncertainty_rad": list(accepted_uncertainty_tuple),
                 "swept_mesh_proof_evidence_sha256": evidence.evidence_sha256,
                 "swept_mesh_termination_reason": evidence.termination_reason,
                 "certified_interval_count": certified,
@@ -1036,15 +1172,56 @@ class Cs68PinocchioCollisionChecker:
         self._geometry_motion_coefficients_cache = result
         return result
 
+    def _pair_motion_coefficients(self) -> tuple[tuple[float, ...], ...]:
+        """Return conservative relative-motion bounds for every collision pair.
+
+        A joint that is an ancestor of both robot geometries applies the same
+        rigid transform to both of them, so it cannot change their separation.
+        Its contribution therefore cancels exactly for a self-collision pair.
+        Environment geometry is fixed in the base frame and has no ancestors, so
+        robot/environment pairs retain the complete absolute robot-motion bound.
+        """
+
+        cached = self._pair_motion_coefficients_cache
+        if cached is not None:
+            return cached
+        geometry_coefficients = np.asarray(
+            self._geometry_motion_coefficients(),
+            dtype=np.float64,
+        )
+        rows: list[tuple[float, ...]] = []
+        for pair_index, pair in enumerate(self.geometry_model.collisionPairs):
+            first = geometry_coefficients[int(pair.first)]
+            second = geometry_coefficients[int(pair.second)]
+            geometries = self.pair_geometries[pair_index]
+            environment_pair = any(name.startswith("environment::") for name in geometries)
+            coefficients = first + second
+            if not environment_pair:
+                shared_ancestors = (first > 0.0) & (second > 0.0)
+                coefficients = np.where(shared_ancestors, 0.0, coefficients)
+            if not np.isfinite(coefficients).all() or np.any(coefficients < 0.0):
+                raise ValueError("invalid ES68 collision-pair motion coefficients")
+            rows.append(tuple(float(value) for value in coefficients))
+        result = tuple(rows)
+        self._pair_motion_coefficients_cache = result
+        return result
+
     @property
     def geometry_motion_bound_contract_sha256(self) -> str:
         return _canonical_sha256(
             {
-                "schema": "biblade_fusion.es68_geometry_motion_bound.v1",
-                "derivation": "serial_revolute_chain_triangle_inequality",
+                "schema": "biblade_fusion.es68_geometry_motion_bound.v2",
+                "derivation": (
+                    "serial_revolute_chain_triangle_inequality_with_"
+                    "common_ancestor_rigid_motion_cancellation"
+                ),
                 "geometry_names": [str(item.name) for item in self.geometry_model.geometryObjects],
                 "coefficients_m_per_rad": [
                     list(row) for row in self._geometry_motion_coefficients()
+                ],
+                "collision_pair_geometries": [list(pair) for pair in self.pair_geometries],
+                "pair_relative_coefficients_m_per_rad": [
+                    list(row) for row in self._pair_motion_coefficients()
                 ],
             }
         )
@@ -1068,6 +1245,29 @@ class Cs68PinocchioCollisionChecker:
         bound = float(np.dot(np.asarray(coefficients[index]), deviations))
         if not math.isfinite(bound) or bound < 0.0:
             raise ValueError("computed geometry displacement bound is invalid")
+        return bound
+
+    def pair_displacement_bound_m(
+        self,
+        pair_index: int,
+        maximum_joint_deviation_rad: Sequence[float],
+    ) -> float:
+        """Bound separation change for one pair over a joint-space box."""
+
+        deviations = np.asarray(maximum_joint_deviation_rad, dtype=np.float64)
+        if (
+            deviations.shape != (6,)
+            or not np.isfinite(deviations).all()
+            or np.any(deviations < 0.0)
+        ):
+            raise ValueError("maximum_joint_deviation_rad must be a finite non-negative six-vector")
+        coefficients = self._pair_motion_coefficients()
+        index = int(pair_index)
+        if not 0 <= index < len(coefficients):
+            raise ValueError("collision pair index is outside the collision model")
+        bound = float(np.dot(np.asarray(coefficients[index]), deviations))
+        if not math.isfinite(bound) or bound < 0.0:
+            raise ValueError("computed collision-pair displacement bound is invalid")
         return bound
 
     def _finding(

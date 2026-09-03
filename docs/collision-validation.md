@@ -99,17 +99,23 @@ rotation thresholds. The controller MDH used by IK and the packaged ES68 chain a
 different representations; this endpoint gate checks their result, not an invalid
 assumption that their source-file hashes should match.
 
-The mesh checker certifies the complete linear joint interval by combining exact
-midpoint FCL separation with conservative serial-chain displacement bounds for both
-geometries. Inconclusive intervals are bisected; a collision witness returns `BLOCKED`,
-whereas a numerical or subdivision limit returns `UNKNOWN`. The independent occupancy
+The mesh checker certifies the complete linear joint interval by combining exact FCL
+separation with conservative serial-chain displacement bounds. For a robot self-collision
+pair, motion from joints shared by both geometries is cancelled because it applies the
+same rigid transform and cannot change their separation. Robot-to-environment checks keep
+the complete absolute robot-motion bound. Each commanded-path interval is combined with
+the accepted tracking-error box; an inconclusive cell is adaptively split either in path
+time or along the error dimension contributing most to the limiting pair. This prevents
+tracking uncertainty from becoming an irreducible proof floor without weakening the
+accepted envelope. A collision witness returns `BLOCKED`, whereas a numerical or
+subdivision limit returns `UNKNOWN` together with the limiting geometry pair, exact
+clearance slack, displacement bound, and certificate margin. The independent occupancy
 checker places each original URDF collision STL at the midpoint and measures it directly
-against dangerous voxel boxes. An interval passes only when every exact distance exceeds
-clearance, accepted tracking uncertainty, and maximum interval displacement. A schema-5
-preflight becomes approval-eligible only when both integrity-bound proofs are clear for
-the exact segment and all occupancy semantic/freshness gates pass. Its artifact binds the
-view plan, optional coverage-order proposal, initialization, occupancy, proof evidence,
-and motion-model inputs by SHA-256 and fully re-derives the report when read.
+against dangerous voxel boxes. A schema-5 preflight becomes approval-eligible only when
+both integrity-bound proofs are clear for the exact segment and all occupancy
+semantic/freshness gates pass. Its artifact binds the view plan, optional coverage-order
+proposal, initialization, occupancy, proof evidence, and motion-model inputs by SHA-256
+and fully re-derives the report when read.
 
 The original `validate-path` artifact remains for compatibility and for comparing the
 conservative capsule model with the mesh model. Both standalone safety commands remain

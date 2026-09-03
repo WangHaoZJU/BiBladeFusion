@@ -181,16 +181,118 @@ def test_pinocchio_clear_path_has_integrity_bound_continuous_proof() -> None:
     assert report.proof_evidence.minimum_certificate_margin_m is not None
     assert report.proof_evidence.minimum_certificate_margin_m > 0.0
     assert report.result.diagnostics["continuous_sweep_backend"] == (
-        "adaptive_midpoint_fcl_lipschitz_tracking_envelope_sweep"
+        "adaptive_fcl_relative_motion_tracking_box_sweep"
     )
 
 
+def test_self_collision_pair_bound_cancels_common_ancestor_motion() -> None:
+    checker = Cs68PinocchioCollisionChecker.from_resources()
+    pair_index = checker.pair_links.index(("wrist_1_link", "wrist_3_link"))
+    pair = checker.geometry_model.collisionPairs[pair_index]
+    deviation = (0.02,) * 6
+
+    absolute_bound = checker.geometry_displacement_bound_m(
+        int(pair.first), deviation
+    ) + checker.geometry_displacement_bound_m(int(pair.second), deviation)
+    relative_bound = checker.pair_displacement_bound_m(pair_index, deviation)
+    coefficients = checker._pair_motion_coefficients()[pair_index]
+
+    assert coefficients[:4] == pytest.approx((0.0,) * 4)
+    assert relative_bound > 0.0
+    assert relative_bound < absolute_bound
+
+
+def test_environment_pair_bound_retains_absolute_robot_motion() -> None:
+    checker = Cs68PinocchioCollisionChecker.from_resources(
+        environment_obstacles=(
+            CollisionObstacleConfig(
+                name="far",
+                minimum_m=(10.0, 10.0, 10.0),
+                maximum_m=(11.0, 11.0, 11.0),
+            ),
+        ),
+    )
+    pair_index = next(
+        index
+        for index, geometries in enumerate(checker.pair_geometries)
+        if any(name.startswith("environment::") for name in geometries)
+    )
+    pair = checker.geometry_model.collisionPairs[pair_index]
+    deviation = (0.02,) * 6
+
+    absolute_bound = checker.geometry_displacement_bound_m(
+        int(pair.first), deviation
+    ) + checker.geometry_displacement_bound_m(int(pair.second), deviation)
+
+    assert checker.pair_displacement_bound_m(pair_index, deviation) == pytest.approx(absolute_bound)
+
+
+def test_tracking_error_box_is_subdivided_instead_of_becoming_a_fixed_floor() -> None:
+    checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+        Es68D435iCollisionResources.packaged_template(),
+        minimum_clearance_m=0.01,
+    )
+    measured_first_view_joints = (
+        3.7294016957032246,
+        -1.982535364175026,
+        2.0464796841372563,
+        -2.189910131300226,
+        -2.3942590974776885,
+        0.04317535171214368,
+    )
+    accepted_tracking_error = (
+        0.023921648606234358,
+        0.0023597103910613093,
+        0.008431400738262651,
+        0.0032522917774432947,
+        0.028725210605739182,
+        0.023866973509621525,
+    )
+
+    report = checker.check_path(
+        measured_first_view_joints,
+        measured_first_view_joints,
+        maximum_joint_step_rad=0.02,
+        maximum_joint_path_deviation_rad=accepted_tracking_error,
+        motion_envelope_acceptance_id="a" * 64,
+        motion_envelope_metadata_sha256="b" * 64,
+    )
+
+    assert report.status is CollisionCheckStatus.CLEAR
+    assert report.continuous_swept_volume_evidence_valid is True
+    assert report.proof_evidence is not None
+    assert report.proof_evidence.deepest_subdivision > 0
+    assert report.proof_evidence.evaluated_configuration_count > 3
+
+
 def test_pinocchio_swept_proof_limit_returns_unknown_not_sampled_clear() -> None:
-    report = Cs68PinocchioCollisionChecker.from_resources().check_path(
-        (0.0,) * 6,
-        (0.02, 0.0, 0.0, 0.0, 0.0, 0.0),
+    checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+        Es68D435iCollisionResources.packaged_template(),
+        minimum_clearance_m=0.01,
+    )
+    joints = (
+        3.7294016957032246,
+        -1.982535364175026,
+        2.0464796841372563,
+        -2.189910131300226,
+        -2.3942590974776885,
+        0.04317535171214368,
+    )
+    report = checker.check_path(
+        joints,
+        joints,
         maximum_joint_step_rad=0.02,
         maximum_subdivision_depth=0,
+        maximum_joint_path_deviation_rad=(
+            0.023921648606234358,
+            0.0023597103910613093,
+            0.008431400738262651,
+            0.0032522917774432947,
+            0.028725210605739182,
+            0.023866973509621525,
+        ),
+        motion_envelope_acceptance_id="a" * 64,
+        motion_envelope_metadata_sha256="b" * 64,
     )
 
     assert report.status is CollisionCheckStatus.UNKNOWN
@@ -198,6 +300,10 @@ def test_pinocchio_swept_proof_limit_returns_unknown_not_sampled_clear() -> None
     assert report.proof_evidence is not None
     assert report.proof_evidence.termination_reason == "subdivision_limit"
     assert "unproven:subdivision_limit" in report.result.blocking_reasons[0]
+    limiting = report.result.diagnostics["swept_mesh_limiting_pair"]
+    assert limiting["certificate_margin_m"] <= 0.0
+    assert len(limiting["links"]) == 2
+    assert len(limiting["geometries"]) == 2
 
 
 def test_pinocchio_swept_proof_tampering_invalidates_certificate() -> None:
