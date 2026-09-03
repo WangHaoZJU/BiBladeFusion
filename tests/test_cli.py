@@ -298,6 +298,72 @@ def test_unknown_scan_cli_rejects_non_hard_operator_seed_before_runtime(
     assert "requires --bootstrap-seed-mode hard_roi" in result.stderr
 
 
+def test_unknown_scan_cli_accepts_xanylabeling_hard_roi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polygon = tmp_path / "left_rectified.json"
+    polygon.write_text(
+        json.dumps(
+            {
+                "shapes": [
+                    {
+                        "label": "blade",
+                        "shape_type": "polygon",
+                        "points": [[10, 10], [20, 10], [20, 20]],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = []
+
+    @contextmanager
+    def fake_open(_settings, **_kwargs):
+        yield object()
+
+    def fake_console(_runtime, **kwargs) -> int:
+        captured.append(kwargs["initial_bootstrap_seed"])
+        return 0
+
+    monkeypatch.setattr(
+        unknown_runtime_module,
+        "open_production_unknown_blade_runtime",
+        fake_open,
+    )
+    monkeypatch.setattr(
+        unknown_runtime_module,
+        "run_unknown_blade_operator_console",
+        fake_console,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "run-unknown",
+            "--config",
+            "configs/default.yaml",
+            "--output",
+            str(tmp_path / "new-run"),
+            "--operator-id",
+            "operator-7",
+            "--placement-id",
+            "blade-placement-7",
+            "--bootstrap-seed-mode",
+            "hard_roi",
+            "--bootstrap-polygon",
+            str(polygon),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    assert captured[0].mode == "hard_roi"
+    assert captured[0].vertices_uv == ((10.0, 10.0), (20.0, 10.0), (20.0, 20.0))
+
+
 def test_unknown_scan_cli_forwards_explicit_resume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -438,6 +438,7 @@ def scan_run_unknown(
         from biblade_fusion.perception.bootstrap_foreground import BootstrapSeed
         from biblade_fusion.planning import BladeSide
         from biblade_fusion.workflows.unknown_blade_runtime import (
+            _read_hard_roi_seed,
             open_production_unknown_blade_runtime,
             run_unknown_blade_operator_console,
         )
@@ -458,15 +459,11 @@ def scan_run_unknown(
                 vertices_uv=((values[0], values[1]), (values[2], values[3])),
             )
         elif bootstrap_polygon is not None:
-            payload = json.loads(bootstrap_polygon.read_text(encoding="utf-8"))
-            vertices = payload.get("vertices_uv") if isinstance(payload, dict) else payload
-            if not isinstance(vertices, list):
-                raise ValueError("Bootstrap polygon must be a vertex array or contain vertices_uv")
-            seed = BootstrapSeed(
-                kind="polygon",
-                mode=normalized_seed_mode,  # type: ignore[arg-type]
-                vertices_uv=tuple((float(vertex[0]), float(vertex[1])) for vertex in vertices),
-            )
+            if normalized_seed_mode != "hard_roi":
+                raise ValueError(
+                    "Unknown-blade operator bootstrap requires --bootstrap-seed-mode hard_roi"
+                )
+            seed = _read_hard_roi_seed(bootstrap_polygon)
         if seed is not None and seed.mode != "hard_roi":
             raise ValueError(
                 "Unknown-blade operator bootstrap requires --bootstrap-seed-mode hard_roi"
