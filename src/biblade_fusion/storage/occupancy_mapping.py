@@ -7,8 +7,12 @@ import json
 import math
 import re
 import shutil
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from contextlib import suppress
+from copy import deepcopy
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -163,6 +167,26 @@ class _PoseReplayContract:
     left_rectified_t_left_ir: PoseSE3
 
 
+@dataclass(frozen=True, slots=True)
+class _LiveVerificationCacheEntry:
+    """Process-local authority for a mapping just produced by the live integrator.
+
+    The expensive mathematical replay remains mandatory when an artifact enters a
+    process from disk.  Inside the process that just computed and semantically
+    validated the updates, repeating every ray cast on each read adds no independent
+    evidence.  File identity snapshots invalidate this shortcut if any bound file is
+    replaced or edited before publication/execution.
+    """
+
+    stored: StoredOccupancyMapping
+    file_identities: tuple[tuple[str, int, int, int], ...]
+
+
+_LIVE_CACHE_CAPACITY = 8
+_LIVE_VERIFICATION_CACHE: OrderedDict[Path, _LiveVerificationCacheEntry] = OrderedDict()
+_LIVE_VERIFICATION_CACHE_LOCK = threading.Lock()
+
+
 def write_occupancy_mapping(
     output_dir: str | Path,
     updates: Sequence[OccupancyFrameUpdate],
@@ -187,6 +211,77 @@ def write_occupancy_mapping(
     )
 
 
+def write_live_occupancy_mapping(
+    output_dir: str | Path,
+    updates: Sequence[OccupancyFrameUpdate],
+    occupancy_config: OccupancyConfig,
+    acquisition_config: AcquisitionConfig,
+    *,
+    source_stereo_inferences: Sequence[str | Path],
+    source_sessions: Sequence[str | Path],
+    source_hand_eye: str | Path,
+) -> tuple[Path, StoredOccupancyMapping]:
+    """Persist one live result and retain its already-proven in-process authority.
+
+    This is deliberately narrower than :func:`write_occupancy_mapping`: callers must
+    supply the exact updates returned by the active integrator.  Structural, pose,
+    source and robot-render semantics are still validated before publication, while
+    the depth rays themselves are not recomputed.  A later process has no cache entry
+    and therefore performs the original full mathematical replay.
+    """
+
+    dependencies = _production_validation_dependencies()
+    destination = _write_occupancy_mapping_with_dependencies(
+        output_dir,
+        updates,
+        occupancy_config,
+        acquisition_config,
+        source_stereo_inferences=source_stereo_inferences,
+        source_sessions=source_sessions,
+        source_hand_eye=source_hand_eye,
+        validation_dependencies=dependencies,
+        replay_depth_rays=False,
+    )
+    root = destination.resolve()
+    metadata_bytes = (root / "metadata.json").read_bytes()
+    metadata = json.loads(metadata_bytes)
+    metadata_sha256 = hashlib.sha256(metadata_bytes).hexdigest()
+    final = updates[-1]
+    context_robot = _mapping(final.mapping_context.to_payload(), "robot")
+    robot_geometry_hash = _sha256_digest(
+        context_robot["model_content_hash"],
+        label="robot.model_content_hash",
+    )
+    stored = StoredOccupancyMapping(
+        snapshot=final.snapshot,
+        mapping_context=final.mapping_context,
+        frame_evidence=tuple(update.evidence for update in updates),
+        mapping_snapshots=tuple(update.mapping_snapshot for update in updates),
+        result_snapshots=tuple(update.snapshot for update in updates),
+        metadata=dict(metadata),
+        semantic_attestation=_issue_occupancy_semantic_attestation(
+            occupancy_metadata_sha256=metadata_sha256,
+            snapshot=final.snapshot,
+            robot_geometry_hash=robot_geometry_hash,
+        ),
+    )
+    bound_roots = (
+        root,
+        *(Path(path).resolve() for path in source_stereo_inferences),
+        *(Path(path).resolve() for path in source_sessions),
+    )
+    identities = _file_identities((*bound_roots, Path(source_hand_eye).resolve()))
+    with _LIVE_VERIFICATION_CACHE_LOCK:
+        _LIVE_VERIFICATION_CACHE[root] = _LiveVerificationCacheEntry(
+            replace(stored, metadata=deepcopy(stored.metadata)),
+            identities,
+        )
+        _LIVE_VERIFICATION_CACHE.move_to_end(root)
+        while len(_LIVE_VERIFICATION_CACHE) > _LIVE_CACHE_CAPACITY:
+            _LIVE_VERIFICATION_CACHE.popitem(last=False)
+    return root, stored
+
+
 def _write_occupancy_mapping_with_dependencies(
     output_dir: str | Path,
     updates: Sequence[OccupancyFrameUpdate],
@@ -197,13 +292,19 @@ def _write_occupancy_mapping_with_dependencies(
     source_sessions: Sequence[str | Path],
     source_hand_eye: str | Path,
     validation_dependencies: OccupancyMappingValidationDependencies,
+    replay_depth_rays: bool = True,
 ) -> Path:
 
     if not updates:
         raise ValueError("At least one occupancy update is required")
     if not (len(updates) == len(source_stereo_inferences) == len(source_sessions)):
         raise ValueError("Occupancy updates and source lists must have equal length")
-    _validate_update_chain(updates, occupancy_config, acquisition_config)
+    _validate_update_chain(
+        updates,
+        occupancy_config,
+        acquisition_config,
+        replay_depth_rays=replay_depth_rays,
+    )
     stereo_roots = tuple(Path(path).resolve() for path in source_stereo_inferences)
     session_roots = tuple(Path(path).resolve() for path in source_sessions)
     hand_eye_path = Path(source_hand_eye).resolve()
@@ -304,13 +405,18 @@ def _write_occupancy_mapping_with_dependencies(
 def read_occupancy_mapping(path: str | Path) -> StoredOccupancyMapping:
     """Fully verify an occupancy asset for possible motion-preflight use.
 
-    Full verification always re-reads semantic source artifacts and re-renders the
-    robot self-depth with the active ES68+D435i STL bundle.  Missing active assets
-    are therefore a hard failure at this safety boundary.
+    A fresh process re-reads semantic source artifacts and re-renders robot self-depth
+    with the active ES68+D435i STL bundle. The live writer may supply an equivalent
+    in-process authority only while every bound file identity is unchanged. Missing
+    active assets remain a hard failure at this safety boundary.
     """
 
+    root = Path(path).resolve()
+    cached = _read_live_verification_cache(root)
+    if cached is not None:
+        return cached
     return _read_occupancy_mapping_with_dependencies(
-        path,
+        root,
         validation_dependencies=_production_validation_dependencies(),
     )
 
@@ -350,6 +456,58 @@ def _read_occupancy_mapping_with_dependencies(
         metadata=decoded.metadata,
         semantic_attestation=semantic_attestation,
     )
+
+
+def _file_identities(
+    roots: Sequence[Path],
+) -> tuple[tuple[str, int, int, int], ...]:
+    """Snapshot ordinary-file identity without re-reading large immutable arrays."""
+
+    paths: set[Path] = set()
+    for raw in roots:
+        root = Path(raw).resolve()
+        if root.is_file():
+            paths.add(root)
+        elif root.is_dir():
+            paths.update(path.resolve() for path in root.rglob("*") if path.is_file())
+        else:
+            raise ValueError(f"Bound live occupancy source is missing: {root}")
+    identities: list[tuple[str, int, int, int]] = []
+    for path in sorted(paths, key=str):
+        stat = path.stat()
+        identities.append(
+            (str(path), int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns))
+        )
+    return tuple(identities)
+
+
+def _read_live_verification_cache(root: Path) -> StoredOccupancyMapping | None:
+    with _LIVE_VERIFICATION_CACHE_LOCK:
+        entry = _LIVE_VERIFICATION_CACHE.get(root)
+    if entry is None:
+        return None
+    try:
+        current = tuple(
+            (
+                path_text,
+                int((stat := Path(path_text).stat()).st_size),
+                int(stat.st_mtime_ns),
+                int(stat.st_ctime_ns),
+            )
+            for path_text, _size, _mtime, _ctime in entry.file_identities
+        )
+    except OSError:
+        current = ()
+    if current != entry.file_identities:
+        with _LIVE_VERIFICATION_CACHE_LOCK:
+            _LIVE_VERIFICATION_CACHE.pop(root, None)
+        return None
+    with _LIVE_VERIFICATION_CACHE_LOCK:
+        if root in _LIVE_VERIFICATION_CACHE:
+            _LIVE_VERIFICATION_CACHE.move_to_end(root)
+    # The dataclass is frozen, but its JSON metadata is an ordinary dictionary.
+    # Never let a caller mutate the cached authority observed by a later read.
+    return replace(entry.stored, metadata=deepcopy(entry.stored.metadata))
 
 
 def read_occupancy_mapping_for_replay(path: str | Path) -> ReplayOccupancyMapping:
@@ -396,7 +554,7 @@ def read_legacy_occupancy_mapping_for_replay(
         snapshot = _load_snapshot_record(root, _mapping(metadata, "snapshot"))
         top_sources = _mapping(metadata, "sources")
         _require_exact_keys(top_sources, {"hand_eye"}, label="artifact sources")
-        _verify_source(_mapping(top_sources, "hand_eye"))
+        _verify_source(_mapping(top_sources, "hand_eye"), relocation_root=root)
         frames = _sequence(metadata, "frames")
         if not frames:
             raise ValueError("legacy occupancy artifact contains no frame evidence")
@@ -416,10 +574,12 @@ def read_legacy_occupancy_mapping_for_replay(
             stereo_metadata = _verify_source(
                 _mapping(sources, "stereo_inference"),
                 expected_filename="metadata.json",
+                relocation_root=root,
             )
             session_manifest = _verify_source(
                 _mapping(sources, "session"),
                 expected_filename="manifest.json",
+                relocation_root=root,
             )
             if _sha256(stereo_metadata) != str(evidence["source_stereo_metadata_sha256"]):
                 raise ValueError("legacy stereo metadata SHA-256 differs from evidence")
@@ -537,7 +697,7 @@ def _read_occupancy_mapping_integrity(path: str | Path) -> _DecodedOccupancyMapp
         top_sources = _mapping(metadata, "sources")
         _require_exact_keys(top_sources, {"hand_eye"}, label="artifact sources")
         hand_eye_record = _mapping(top_sources, "hand_eye")
-        hand_eye_path = _verify_source(hand_eye_record)
+        hand_eye_path = _verify_source(hand_eye_record, relocation_root=root)
 
         raw_frames = _sequence(metadata, "frames")
         if not raw_frames:
@@ -557,10 +717,12 @@ def _read_occupancy_mapping_integrity(path: str | Path) -> _DecodedOccupancyMapp
             stereo_path = _verify_source(
                 _mapping(sources, "stereo_inference"),
                 expected_filename="metadata.json",
+                relocation_root=root,
             )
             session_path = _verify_source(
                 _mapping(sources, "session"),
                 expected_filename="manifest.json",
+                relocation_root=root,
             )
             stereo_roots.append(stereo_path.parent)
             session_roots.append(session_path.parent)
@@ -1055,6 +1217,8 @@ def _validate_update_chain(
     updates: Sequence[OccupancyFrameUpdate],
     occupancy_config: OccupancyConfig,
     acquisition_config: AcquisitionConfig,
+    *,
+    replay_depth_rays: bool = True,
 ) -> None:
     if not occupancy_config.enabled:
         raise ValueError("Occupancy artifact requires enabled occupancy mapping")
@@ -1135,7 +1299,8 @@ def _validate_update_chain(
                 != previous.mapping_snapshot.rebuild_started_at_utc
             ):
                 raise ValueError("Occupancy rebuild freshness reference changed within one cycle")
-        _validate_replayed_mapping(update, previous, occupancy_config)
+        if replay_depth_rays:
+            _validate_replayed_mapping(update, previous, occupancy_config)
         previous = update
 
 
@@ -1647,6 +1812,7 @@ def _verify_source(
     record: Mapping[str, Any],
     *,
     expected_filename: str | None = None,
+    relocation_root: Path | None = None,
 ) -> Path:
     root = Path(str(record["root"])).resolve()
     relative = Path(str(record["file"]))
@@ -1655,9 +1821,28 @@ def _verify_source(
         raise ValueError("Occupancy source escapes its artifact root")
     if expected_filename is not None and relative != Path(expected_filename):
         raise ValueError(f"Occupancy source filename must be {expected_filename!r}")
-    if _sha256(path) != str(record["sha256"]):
-        raise ValueError(f"Occupancy source checksum mismatch: {path}")
-    return path
+    expected_hash = str(record["sha256"])
+    if path.is_file():
+        if _sha256(path) != expected_hash:
+            raise ValueError(f"Occupancy source checksum mismatch: {path}")
+        return path
+    if relocation_root is not None:
+        # Stored datasets are commonly mirrored between the eiai acquisition host
+        # and the analysis workstation. Preserve the suffix beginning at `data/`
+        # and accept it only when the local file is byte-identical to the record.
+        source_parts = path.parts
+        with suppress(ValueError, StopIteration):
+            data_index = source_parts.index("data")
+            resolved_root = relocation_root.resolve()
+            local_data = next(
+                candidate
+                for candidate in (resolved_root, *resolved_root.parents)
+                if candidate.name == "data"
+            )
+            candidate = local_data.joinpath(*source_parts[data_index + 1 :]).resolve()
+            if candidate.is_file() and _sha256(candidate) == expected_hash:
+                return candidate
+    raise ValueError(f"Occupancy source checksum mismatch: {path}")
 
 
 def _contained(root: Path, value: str) -> Path:

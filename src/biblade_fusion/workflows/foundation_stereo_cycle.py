@@ -41,9 +41,9 @@ from biblade_fusion.storage.inference_stationarity import (
     write_inference_stationarity,
     write_inference_stationarity_trace,
 )
+from biblade_fusion.storage.occupancy_mapping import read_occupancy_mapping
 from biblade_fusion.storage.occupancy_mapping import (
-    read_occupancy_mapping,
-    write_occupancy_mapping,
+    write_live_occupancy_mapping as write_occupancy_mapping,
 )
 from biblade_fusion.storage.reconstructed_view import read_reconstructed_view
 from biblade_fusion.storage.science_authority import ScienceAcceptanceAuthority
@@ -156,6 +156,7 @@ class _PendingPerceptionCommit:
     inference_stationarity_path: Path
     inference_stationarity_sha256: str
     sources: tuple[_VerifiedSource, ...]
+    updates: tuple[OccupancyFrameUpdate, ...]
     blade_foreground_path: Path | None
     reconstructed_view_path: Path | None
     coverage_path: Path | None
@@ -270,6 +271,7 @@ class FoundationStereoOccupancyCycleEngine:
         self._robot_state_sampler_factory = robot_state_sampler_factory
         self._utc_clock = utc_clock
         self._sources: list[_VerifiedSource] = []
+        self._updates: list[OccupancyFrameUpdate] = []
         # A logical (view_id, sequence) becomes occupied only at successful commit.
         # Every physical attempt is written below its own UUID root and is retained
         # even when capture/inference is cancelled or fails.
@@ -357,6 +359,11 @@ class FoundationStereoOccupancyCycleEngine:
                     "Cannot fork a perception engine with a pending transaction"
                 )
             sources = tuple(self._sources)
+            updates = tuple(self._updates)
+        if len(updates) != len(sources):
+            raise FoundationStereoCycleError(
+                "Committed occupancy update prefix differs from its source window"
+            )
         if not sources:
             raise FoundationStereoCycleError(
                 "Cannot fork fine science before a committed coarse source exists"
@@ -419,6 +426,9 @@ class FoundationStereoOccupancyCycleEngine:
             verified_sources[:-1]
             if replace_latest_source_on_first_capture
             else verified_sources
+        )
+        forked._updates = list(
+            updates[:-1] if replace_latest_source_on_first_capture else updates
         )
         return forked
 
@@ -678,7 +688,7 @@ class FoundationStereoOccupancyCycleEngine:
                 )
             occupancy_path = captured.cycle_root / "occupancy_mapping"
             with performance_span("occupancy.artifact_write"):
-                write_occupancy_mapping(
+                written_mapping = write_occupancy_mapping(
                     occupancy_path,
                     updates,
                     self._settings.occupancy,
@@ -687,8 +697,19 @@ class FoundationStereoOccupancyCycleEngine:
                     source_sessions=[item.captured.raw_session_path for item in candidates],
                     source_hand_eye=self._hand_eye.source_path,
                 )
-            with performance_span("occupancy.artifact_readback"):
-                stored_mapping = read_occupancy_mapping(occupancy_path)
+                if isinstance(written_mapping, tuple):
+                    occupancy_path, stored_mapping = written_mapping
+                else:
+                    # Compatibility for injected/test storage adapters that still
+                    # implement the historical path-only writer contract.  The
+                    # production alias above always returns the already-verified
+                    # live mapping and therefore avoids an immediate ray replay.
+                    occupancy_path = Path(written_mapping or occupancy_path).resolve()
+                    stored_mapping = read_occupancy_mapping(occupancy_path)
+            # ``stored_mapping`` is the motion-grade authority produced by this
+            # exact live integration transaction.  Subsequent semantic readers in
+            # this process use its immutable cache entry instead of replaying every
+            # depth ray; a new process still performs the complete disk replay.
             with performance_span("science.fine_assets"):
                 science = self._prepare_science_assets(
                     captured,
@@ -814,6 +835,7 @@ class FoundationStereoOccupancyCycleEngine:
                 inference_stationarity_path=result.inference_stationarity_path,
                 inference_stationarity_sha256=(result.inference_stationarity_sha256),
                 sources=candidates,
+                updates=updates,
                 blade_foreground_path=result.blade_foreground_path,
                 reconstructed_view_path=result.reconstructed_view_path,
                 coverage_path=result.coverage_path,
@@ -914,6 +936,7 @@ class FoundationStereoOccupancyCycleEngine:
                 before_commit=before_commit,
             )
             self._sources = list(pending.sources)
+            self._updates = list(pending.updates)
             self._accepted_coverage_path = pending.accepted_coverage_path_after_commit
             self._capture_roots[key] = pending.cycle_root
             self._pending_commit = None
@@ -1302,7 +1325,7 @@ class FoundationStereoOccupancyCycleEngine:
                 suffix_start = index
             previous_monotonic_ns = captured_monotonic_ns
         continuous = retained[suffix_start:]
-        # A short segment can end too close to its preceding stopped frame to add
+        # A viewpoint motion can end too close to its preceding stopped frame to add
         # an independent FREE vote.  Replace conflicting older viewpoints instead
         # of rejecting the whole mandatory capture or counting duplicate evidence.
         independent = tuple(
@@ -1361,10 +1384,27 @@ class FoundationStereoOccupancyCycleEngine:
         *,
         prepared_current: PreparedOccupancyFrame | None = None,
     ) -> tuple[OccupancyFrameUpdate, ...]:
-        updates: list[OccupancyFrameUpdate] = []
-        previous = None
-        previous_evidence_hash = None
-        for index, source in enumerate(sources):
+        prefix_is_unchanged = (
+            len(sources) == len(self._sources) + 1
+            and len(self._updates) == len(self._sources)
+            and all(
+                source is accepted
+                for source, accepted in zip(
+                    sources[:-1],
+                    self._sources,
+                    strict=True,
+                )
+            )
+        )
+        updates: list[OccupancyFrameUpdate] = (
+            list(self._updates) if prefix_is_unchanged else []
+        )
+        previous = updates[-1].snapshot if updates else None
+        previous_evidence_hash = (
+            updates[-1].evidence.quality_evidence_hash if updates else None
+        )
+        start_index = len(updates)
+        for index, source in enumerate(sources[start_index:], start=start_index):
             span_name = (
                 "occupancy.current_source_integration"
                 if index == len(sources) - 1

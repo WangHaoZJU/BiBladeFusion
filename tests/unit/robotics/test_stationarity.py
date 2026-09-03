@@ -266,6 +266,44 @@ def test_wait_until_settled_allows_playing_to_transition_to_stopped() -> None:
     assert evidence.duration_s == pytest.approx(0.5)
 
 
+def test_stop_latched_settling_uses_pose_window_despite_playing_velocity_noise() -> None:
+    states = [
+        replace(
+            _bootstrap_state(index * 0.25, actual_joint_velocity_rad_s=0.01),
+            robot_mode="RUNNING",
+            runtime_state="PLAYING",
+        )
+        for index in range(3)
+    ]
+    source = BootstrapStateSource(states)
+    fake_time = FakeTime()
+
+    evidence = wait_until_settled(
+        source,
+        np.zeros(6),
+        settle_time_s=0.5,
+        timeout_s=1.0,
+        poll_period_s=0.25,
+        max_joint_delta_rad=0.001,
+        max_tcp_translation_delta_m=0.001,
+        max_tcp_rotation_delta_rad=0.001,
+        goal_tolerance_rad=0.01,
+        maximum_robot_state_staleness_s=0.25,
+        maximum_stopped_actual_joint_velocity_rad_s=0.001,
+        maximum_stopped_target_joint_velocity_rad_s=0.001,
+        maximum_stopped_actual_tcp_linear_velocity_m_s=0.001,
+        maximum_stopped_actual_tcp_angular_velocity_rad_s=0.001,
+        maximum_stopped_target_tcp_linear_velocity_m_s=0.001,
+        maximum_stopped_target_tcp_angular_velocity_rad_s=0.001,
+        require_stop_latch=True,
+        monotonic_clock=fake_time.monotonic,
+        sleeper=fake_time.sleep,
+    )
+
+    assert evidence.sample_count == 3
+    assert evidence.duration_s == pytest.approx(0.5)
+
+
 def test_wait_until_settled_still_rejects_unsafe_transition_state() -> None:
     state = replace(
         _state(0.0),
@@ -721,7 +759,7 @@ def test_trace_rejects_one_post_reference_sample() -> None:
 @pytest.mark.parametrize(
     ("field_name", "value", "message"),
     [
-        ("robot_mode", "RUNNING", "runtime_state=STOPPED"),
+        ("robot_mode", "RUNNING", "requires an RTSI runtime_state"),
         ("safety_status", "PROTECTIVE_STOP", "NORMAL or REDUCED"),
     ],
 )
@@ -754,6 +792,24 @@ def test_trace_accepts_powered_mode_only_with_stopped_runtime(
     trace = [
         replace(_state(0.1), robot_mode=robot_mode, runtime_state="STOPPED"),
         replace(_state(0.2), robot_mode=robot_mode, runtime_state="STOPPED"),
+    ]
+
+    evidence = validate_stationary_trace(
+        reference,
+        trace,
+        max_joint_delta_rad=0.001,
+        max_tcp_translation_delta_m=0.001,
+        max_tcp_rotation_delta_rad=0.001,
+    )
+
+    assert evidence.sample_count == 3
+
+
+def test_trace_accepts_stable_powered_playing_samples_after_stop_latch_gate() -> None:
+    reference = replace(_state(0.0), robot_mode="RUNNING", runtime_state="PLAYING")
+    trace = [
+        replace(_state(0.1), robot_mode="RUNNING", runtime_state="PLAYING"),
+        replace(_state(0.2), robot_mode="RUNNING", runtime_state="PLAYING"),
     ]
 
     evidence = validate_stationary_trace(

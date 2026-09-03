@@ -440,6 +440,8 @@ class AdaptiveIkViewSearchConfig(BaseModel):
     roll_samples_deg: tuple[float, ...] = (0.0, 45.0, -45.0, 90.0)
     maximum_generated_candidates: int = Field(default=512, ge=1, le=10000)
     maximum_ik_feasible_candidates: int = Field(default=8, ge=1, le=100)
+    maximum_ik_attempts_per_family: int = Field(default=32, ge=1, le=1000)
+    maximum_search_duration_s: float = Field(default=1.5, gt=0.0, le=60.0)
 
     @model_validator(mode="after")
     def validate_pose_samples(self) -> Self:
@@ -676,9 +678,9 @@ class SurfaceQualityConfig(BaseModel):
 class FineFinalizationConfig(BaseModel):
     """Terminal gates for the immutable fine multi-view reconstruction.
 
-    Coverage of the schema-5 reference is necessary but is deliberately not a
-    completion condition.  These gates are evaluated against a newly fused fine
-    cloud and its bilateral TSDF mesh before a fine run may report completion.
+    These gates evaluate the downstream fused cloud and bilateral TSDF mesh.
+    Measurement completion is governed by the surface-coverage ledger; reconstruction
+    QA only becomes a blocking gate when explicitly requested by deployment policy.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -690,6 +692,7 @@ class FineFinalizationConfig(BaseModel):
     require_watertight_mesh: Literal[True] = True
     require_two_face_fin_per_side: Literal[True] = True
     require_fin_regions_complete: Literal[True] = True
+    block_measurement_completion_on_reconstruction_qa: bool = False
 
 
 SurfaceRegionName = Literal[
@@ -773,6 +776,7 @@ class NextViewSelectionConfig(BaseModel):
     require_two_observed_fin_faces_per_side: bool = True
     exclude_already_captured_candidate_ids: bool = True
     use_joint_travel_only_as_tiebreak: bool = True
+    maximum_adaptive_fine_families: int = Field(default=4, ge=0, le=32)
     scientific_gain: ScientificGainConfig = Field(default_factory=ScientificGainConfig)
     maximum_reacquisition_attempts_per_patch: int = Field(default=3, ge=0, le=8)
     reacquisition_perturbations: tuple[ReacquisitionPerturbationConfig, ...] = (
@@ -1069,11 +1073,14 @@ class CoarseScienceConfig(BaseModel):
 
 
 class StopAndCaptureConfig(BaseModel):
-    """Fail-closed receding-horizon motion/perception coordination settings.
+    """Fail-closed viewpoint-motion/perception coordination settings.
 
-    The feature remains disabled until the workcell-specific segment bound has been
-    measured and configured.  Native RealSense depth is deliberately not selectable:
-    this coordinator has one scientific/safety depth backend, FoundationStereo.
+    ``maximum_segment_joint_delta_rad`` is retained only so reviewed deployment files
+    from the early receding-horizon implementation remain loadable.  It no longer
+    truncates a planned viewpoint motion: ``motion_preflight.maximum_joint_step_rad``
+    controls internal trajectory sampling and continuous collision proof instead.
+    Native RealSense depth is deliberately not selectable; this coordinator has one
+    scientific/safety depth backend, FoundationStereo.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1085,8 +1092,21 @@ class StopAndCaptureConfig(BaseModel):
         default=None,
         gt=0.0,
         le=0.5,
+        description=(
+            "Deprecated compatibility field; never split a viewpoint motion or trigger "
+            "intermediate capture. Use motion_preflight.maximum_joint_step_rad for "
+            "collision/trajectory discretization."
+        ),
     )
-    maximum_ranked_preflight_candidates: int = Field(default=3, ge=1, le=8)
+    maximum_ranked_preflight_candidates: int = Field(
+        default=3,
+        ge=1,
+        le=100,
+        description=(
+            "Deprecated compatibility field. All science-ranked endpoint candidates "
+            "are preflighted until a continuously safe path is found."
+        ),
+    )
     allow_single_view_bootstrap_motion: bool = False
     settle_timeout_s: float = Field(default=15.0, gt=0.0, le=300.0)
     settle_poll_period_s: float = Field(default=0.05, gt=0.0, le=1.0)
@@ -1131,11 +1151,6 @@ class StopAndCaptureConfig(BaseModel):
         ):
             raise ValueError(
                 "Runtime-timing acceptance path and identity must be configured together"
-            )
-        if self.enabled and self.maximum_segment_joint_delta_rad is None:
-            raise ValueError(
-                "Enabled stop-and-capture coordination requires a measured "
-                "maximum_segment_joint_delta_rad"
             )
         if self.settle_poll_period_s > self.settle_timeout_s:
             raise ValueError("settle_poll_period_s must not exceed settle_timeout_s")

@@ -454,10 +454,10 @@ def _validate_state_contract(state: RobotState) -> None:
         else state.runtime_state.strip().upper()
     )
     if robot_mode in _POWERED_STATIONARY_ROBOT_MODES:
-        if runtime_state not in _BOOTSTRAP_STOPPED_RUNTIME_STATES:
+        if not runtime_state:
             raise StationarityError(
-                "stationarity in powered robot_mode RUNNING requires "
-                f"runtime_state=STOPPED, got {state.runtime_state!r}"
+                "stationarity in powered robot_mode RUNNING requires an RTSI "
+                "runtime_state"
             )
     elif robot_mode not in _STATIONARY_ROBOT_MODES:
         raise StationarityError(
@@ -508,6 +508,7 @@ def wait_until_settled(
     maximum_stopped_actual_tcp_angular_velocity_rad_s: float | None = None,
     maximum_stopped_target_tcp_linear_velocity_m_s: float | None = None,
     maximum_stopped_target_tcp_angular_velocity_rad_s: float | None = None,
+    require_stop_latch: bool = False,
     monotonic_clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> StationarityEvidence:
@@ -520,7 +521,10 @@ def wait_until_settled(
     a residual risk.  A sampled motion or goal-tolerance violation resets the
     candidate window; clock rollback and timeout fail immediately.  Passing
     ``None`` as the goal disables only the goal gate and records a finite zero goal
-    error.
+    error. ``require_stop_latch`` is the stop-and-capture mode: the driver's exact
+    stop generation must remain latched for the full window, so a still-PLAYING
+    external-control task label and noisy instantaneous velocity estimates do not
+    override direct bounded pose evidence. Unpowered bootstrap remains stricter.
     """
 
     goal = (
@@ -567,8 +571,33 @@ def wait_until_settled(
             for value in optional_velocity_limits
         )
     )
+    if type(require_stop_latch) is not bool:
+        raise ValueError("require_stop_latch must be a boolean")
+    expected_stop_generation = (
+        _read_stop_snapshot(state_source)[0] if require_stop_latch else None
+    )
+
+    def stop_latch_gate() -> bool:
+        if expected_stop_generation is None:
+            return False
+        generation, stopped = _read_stop_snapshot(state_source)
+        if generation != expected_stop_generation or not stopped:
+            raise StationarityError(
+                "robot stop generation/latch changed while stationarity was sampled"
+            )
+        return True
+
+    def controller_gate(state: RobotState) -> bool:
+        if expected_stop_generation is not None:
+            return stop_latch_gate()
+        return _controller_stopped_for_stationarity(state)
 
     def velocity_gate(state: RobotState) -> bool:
+        if require_stop_latch:
+            # Stop-and-capture stores the velocity channels for diagnosis, but its
+            # acceptance evidence is the unchanged stop latch plus bounded sampled
+            # joint/TCP pose. Tiny differentiated-velocity noise is not motion.
+            return True
         if velocity_limits is None:
             return True
         if any(
@@ -619,7 +648,7 @@ def wait_until_settled(
     feedback_states = [previous_state]
     feedback_sample_times = [now]
     if (
-        _controller_stopped_for_stationarity(previous_state)
+        controller_gate(previous_state)
         and goal_error <= goal_tolerance
         and velocity_gate(previous_state)
     ):
@@ -714,7 +743,7 @@ def wait_until_settled(
         )
 
         goal_error = _goal_error_rad(current_state, goal)
-        controller_stopped = _controller_stopped_for_stationarity(current_state)
+        controller_stopped = controller_gate(current_state)
         if stable_states and stable_started_at is not None:
             candidate_states = (*stable_states, current_state)
             deltas = _maximum_trace_deltas(candidate_states)
@@ -751,12 +780,9 @@ def wait_until_settled(
         now = sampled_at
 
 
-def _bootstrap_stop_snapshot(
-    source: StopLatchedRobotStateSource,
-    expected_generation: int,
-) -> None:
+def _read_stop_snapshot(source: RobotStateSource) -> tuple[int, bool]:
     try:
-        snapshot = source.stop_snapshot
+        snapshot = source.stop_snapshot  # type: ignore[attr-defined]
     except Exception as exc:
         raise StationarityError(
             f"robot stop snapshot read failed: {type(exc).__name__}: {exc}"
@@ -768,7 +794,14 @@ def _bootstrap_stop_snapshot(
         or type(snapshot[1]) is not bool
     ):
         raise StationarityError("robot stop snapshot must be an (integer, boolean) tuple")
-    if snapshot != (expected_generation, True):
+    return snapshot
+
+
+def _bootstrap_stop_snapshot(
+    source: StopLatchedRobotStateSource,
+    expected_generation: int,
+) -> None:
+    if _read_stop_snapshot(source) != (expected_generation, True):
         raise StationarityError(
             "bootstrap stop generation/latch changed while safe state was being proved"
         )

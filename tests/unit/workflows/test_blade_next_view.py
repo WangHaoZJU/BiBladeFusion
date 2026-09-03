@@ -12,10 +12,13 @@ import biblade_fusion.workflows.blade_next_view as blade_next_view_module
 from biblade_fusion.calibration import HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
+    AdaptiveIkViewSearchConfig,
     AxisAlignedBoxConfig,
+    FineFinalizationConfig,
     KinematicsConfig,
     MotionPreflightConfig,
     NextViewSelectionConfig,
+    PointCloudConfig,
     SurfaceQualityConfig,
     ViewFilterConfig,
     ViewPlanningConfig,
@@ -30,7 +33,18 @@ from biblade_fusion.perception.surface import (
     SurfaceRegion,
     generate_reacquisition_view,
 )
-from biblade_fusion.planning import ReachabilityResult, ReachabilityState
+from biblade_fusion.planning import (
+    CandidateMetrics,
+    CandidateStatus,
+    EvaluatedCandidate,
+    ReachabilityResult,
+    ReachabilityState,
+)
+from biblade_fusion.planning.adaptive_view_search import (
+    AdaptiveCandidateAttempt,
+    AdaptiveViewSearchResult,
+    CandidatePoseParameters,
+)
 from biblade_fusion.planning.surface_coverage import (
     SurfaceCoverageLedger,
     SurfacePatchEvidence,
@@ -552,6 +566,9 @@ def _selector(
     view_filter: ViewFilterConfig | None = None,
     coverage_reader: Any | None = None,
     fine_finalizer: Any | None = None,
+    finalization_config: FineFinalizationConfig | None = None,
+    view_planning_config: ViewPlanningConfig | None = None,
+    point_cloud_config: PointCloudConfig | None = None,
 ) -> BladeCoverageNextViewSelector:
     final_root = tmp_path / "final_reconstruction"
     final_root.mkdir(exist_ok=True)
@@ -577,6 +594,9 @@ def _selector(
                 "e" * 64,
             )
         ),
+        finalization_config=finalization_config,
+        view_planning_config=view_planning_config,
+        point_cloud_config=point_cloud_config,
     )
     state.metadata["reacquisition_policy"] = {
         "id_schema": REACQUISITION_VIEW_ID_SCHEMA,
@@ -782,7 +802,7 @@ def test_only_complete_coverage_returns_a_targetless_decision(tmp_path: Path) ->
     assert decision.final_reconstruction_metadata_sha256 == "e" * 64
 
 
-def test_complete_coverage_blocks_when_terminal_reconstruction_fails(
+def test_complete_measurement_defers_nonblocking_terminal_reconstruction_failure(
     tmp_path: Path,
 ) -> None:
     patches = (
@@ -819,8 +839,29 @@ def test_complete_coverage_blocks_when_terminal_reconstruction_fails(
         fine_finalizer=fail_finalization,
     )
 
+    decision = selector.select_next(_observation(state), object())
+
+    assert decision.coverage_complete is True
+    assert decision.final_reconstruction_path is None
+    assert "terminal reconstruction QA deferred" in " | ".join(decision.diagnostics)
+
+    strict_selector = _selector(
+        tmp_path,
+        state,
+        _selection_config(SurfaceRegion.SURFACE),
+        factory=lambda _seed: pytest.fail("terminal failure must not initialize IK"),
+        fk_model=_WrongFk(),
+        fine_finalizer=fail_finalization,
+        finalization_config=FineFinalizationConfig(
+            block_measurement_completion_on_reconstruction_qa=True
+        ),
+    )
     with pytest.raises(BladePlanningAssetError, match="terminal reconstruction failed"):
-        selector.select_next(_observation(state), object())
+        strict_selector.select_next(_observation(state), object())
+
+    strict_selector._fine_finalizer = None
+    with pytest.raises(BladePlanningAssetError, match="strict reconstruction QA"):
+        strict_selector.select_next(_observation(state), object())
 
 
 def test_current_stationary_joint_trace_is_the_dynamic_ik_seed(tmp_path: Path) -> None:
@@ -858,6 +899,94 @@ def test_current_stationary_joint_trace_is_the_dynamic_ik_seed(tmp_path: Path) -
 
     np.testing.assert_array_equal(factory.seeds[0], first_seed)
     np.testing.assert_array_equal(factory.seeds[1], second_seed)
+
+
+def test_fine_nbv_adapts_distance_or_angle_when_nominal_ik_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch = _patch(
+        "front_surface",
+        BladeSide.FRONT,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, 0.01),
+        normal=(0.0, 0.0, 1.0),
+    )
+    back = _patch(
+        "back_surface",
+        BladeSide.BACK,
+        SurfaceRegion.SURFACE,
+        center=(0.0, 0.0, -0.01),
+        normal=(0.0, 0.0, -1.0),
+    )
+    state = _stored_generation(
+        tmp_path,
+        (patch, back),
+        complete_patch_ids=frozenset({back.patch_id}),
+    )
+    nominal = next(
+        candidate
+        for candidate in state.view_plan.candidates
+        if candidate.patch.patch_id == patch.patch_id
+    )
+    adaptive = replace(
+        nominal,
+        view_id=f"{nominal.view_id}_adaptive_0001",
+        standoff_distance_m=0.29,
+        distance_policy="adaptive_ik_aware_pose_family_v1",
+    )
+    joints = np.full(6, 0.2)
+    evaluated = EvaluatedCandidate(
+        adaptive,
+        CandidateStatus.ENDPOINT_FEASIBLE,
+        CandidateMetrics(1.0, 1.0, 1.0, 0.29, 0.0, 0.29, 1.0),
+        (),
+        joints,
+    )
+    attempt = AdaptiveCandidateAttempt(
+        CandidatePoseParameters(0.29, 0.0, 0.0, 0.0, 1),
+        evaluated,
+        (joints,),
+        0,
+    )
+    calls: list[str] = []
+
+    def search(candidate, *_args, **_kwargs):
+        calls.append(candidate.view_id)
+        return AdaptiveViewSearchResult(candidate.view_id, (attempt,), (attempt,), False)
+
+    monkeypatch.setattr(
+        blade_next_view_module,
+        "search_adaptive_candidate_family",
+        search,
+    )
+
+    class AdaptiveFk:
+        @staticmethod
+        def base_t_flange(_joint_positions_rad: np.ndarray) -> PoseSE3:
+            return PoseSE3("base", "flange", adaptive.base_t_left_ir.matrix)
+
+    selector = _selector(
+        tmp_path,
+        state,
+        _selection_config(SurfaceRegion.SURFACE),
+        factory=_UnreachableFactory(),
+        fk_model=AdaptiveFk(),
+        view_planning_config=ViewPlanningConfig(
+            standoff_distance_m=0.25,
+            adaptive_ik_view_search=AdaptiveIkViewSearchConfig(enabled=True),
+        ),
+        point_cloud_config=PointCloudConfig(
+            minimum_depth_m=0.15,
+            maximum_depth_m=1.0,
+        ),
+    )
+
+    decision = selector.select_next(_observation(state), object())
+
+    assert calls == [nominal.view_id]
+    assert decision.target is not None
+    assert decision.target.view_id == adaptive.view_id
 
 
 def test_incomplete_but_unreachable_raises_typed_planning_block(

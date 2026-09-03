@@ -1,13 +1,14 @@
 # eiai unknown-blade experiment runbook
 
-Last reviewed: 2026-09-03
+Last reviewed: 2026-09-04
 
 Scope: supervised experimental single-view bootstrap through active planning
 
 Workcell: ES68 + D435i, placement-dependent blade/fixture geometry
 
-This runbook records operator commands and evidence collection. The permit/recovery fix
-is offline-verified but still requires one physical validation. Check
+This runbook records operator commands and evidence collection. The complete 2026-09-04
+control/mapping/planning regression is offline-verified but still requires one physical
+validation. Check
 `docs/CURRENT_STATE.md` before starting a run.
 
 ## 1. Identity rules
@@ -182,18 +183,19 @@ The normal transition is:
 bootstrap_motion_ready
   -> waiting_approval
   -> exact EXECUTE token entered
-  -> permit-bound power/brake preparation and revalidation
+  -> permit consumed, then permit-bound power/brake preparation and one path revalidation
   -> one reverse-control session opened at approved resume
   -> one ServoJ segment
   -> final approved endpoint held until RTSI joint feedback converges
-  -> stopped/stationary confirmation
+  -> HoloRobot-compatible writeIdle stop latch and sampled stationary confirmation
   -> next capture
 ```
 
 Paste the entire exact token, including `EXECUTE`, once. After Enter, a short preparation
 interval is expected while the driver connects, controller state is established, and the
-bound path is checked. It must not spend an unbounded period repeating work that was
-already proven, and it must not allow the permit to expire before the segment begins.
+bound path is checked once. Permit lifetime is checked when the token is consumed; elapsed
+enable/recovery time cannot retroactively expire an already consumed permit. A separately
+configured measured segment-duration watchdog may still stop a genuinely overlong move.
 
 Keep a hand on the physical emergency stop. Abort on unexpected physical motion, cable
 pull, loss of visibility, or approach to the blade/fixture that disagrees with the
@@ -204,8 +206,11 @@ KDL warnings. KDL output is expected only from an explicitly requested historica
 reproduction path.
 
 For the first post-fix run, observe the reverse-port lines after approval. There should
-be one group of ports 50002/50003/50004 connecting before the stream, not an unused
-connect/close group followed by a second connection.
+be one group of ports 50002/50003/50004 connecting before the stream. Normal segment
+completion sends `writeIdle(0)` and deliberately does not call Dashboard `stopProgram`,
+so it must not create the former close/reconnect cycle. A sampled RTSI `runtime_state`
+may remain `PLAYING`; the unchanged stop generation/latch plus bounded joint/TCP samples
+is the stop-and-capture authority.
 
 ## 6. Read-only live supervision
 
@@ -267,8 +272,8 @@ Stop and diagnose before another physical attempt when any of these occurs:
 - configuration or immutable acceptance hash mismatch;
 - collision checker is not fully hash-bound;
 - occupancy lifecycle is inconsistent with the documented bootstrap prefix;
-- permit expires during enable or post-recovery revalidation;
-- controller remains `PLAYING` after a requested stop;
+- a permit is already expired before it is consumed;
+- the stop generation/latch changes during the stationary window;
 - stationarity cannot obtain fresh RTSI samples;
 - robot, blade, fixture, or camera moved relative to reused evidence;
 - the expected path or camera pose is inconsistent with the physical scene.

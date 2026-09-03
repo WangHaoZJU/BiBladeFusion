@@ -35,6 +35,7 @@ def _empty_engine(coarse_settings):
     engine._pending_sampler = None
     engine._pending_commit = None
     engine._sources = []
+    engine._updates = []
     engine._utc_clock = lambda: datetime(2026, 8, 29, 1, 0, tzinfo=UTC)
     engine._acquirer = object()
     engine._state_source = object()
@@ -104,6 +105,8 @@ def test_fine_fork_copies_only_reverified_committed_sources(
         session_view_metadata_sha256="c" * 64,
     )
     engine._sources = [source]
+    update = object()
+    engine._updates = [update]
     hashes = {
         (stereo / "metadata.json").resolve(): "a" * 64,
         (session / "manifest.json").resolve(): "b" * 64,
@@ -147,6 +150,7 @@ def test_fine_fork_copies_only_reverified_committed_sources(
 
     assert forked._sources == [source]
     assert forked._sources is not engine._sources
+    assert forked._updates == [update]
     assert constructed["reference_coarse_model"] == tmp_path / "reference"
     assert constructed["accepted_coverage_path"] is None
     assert verified == [(stereo.resolve(), session.resolve())]
@@ -171,6 +175,7 @@ def test_fine_fork_rejects_changed_committed_source_hash(
             session_view_metadata_sha256="c" * 64,
         )
     ]
+    engine._updates = [object()]
     monkeypatch.setattr(cycle_module, "_sha256", lambda _path: "f" * 64)
 
     with pytest.raises(FoundationStereoCycleError, match="evidence changed"):
@@ -203,6 +208,8 @@ def test_fine_fork_reverifies_and_retains_committed_sources_until_replacement(
         session_view_metadata_sha256="c" * 64,
     )
     engine._sources = [source]
+    update = object()
+    engine._updates = [update]
     hashes = {
         (stereo / "metadata.json").resolve(): "a" * 64,
         (session / "manifest.json").resolve(): "b" * 64,
@@ -235,6 +242,7 @@ def test_fine_fork_reverifies_and_retains_committed_sources_until_replacement(
     )
 
     assert forked._sources == [source]
+    assert forked._updates == [update]
     assert verified == [(stereo.resolve(), session.resolve())]
 
 
@@ -259,6 +267,8 @@ def test_production_fine_fork_replaces_latest_coarse_view_with_bootstrap(
         for _ in range(3)
     ]
     engine._sources = sources
+    updates = [object() for _ in sources]
+    engine._updates = updates
     hashes = {
         (stereo / "metadata.json").resolve(): "a" * 64,
         (session / "manifest.json").resolve(): "b" * 64,
@@ -297,3 +307,4 @@ def test_production_fine_fork_replaces_latest_coarse_view_with_bootstrap(
     )
 
     assert forked._sources == sources[:-1]
+    assert forked._updates == updates[:-1]

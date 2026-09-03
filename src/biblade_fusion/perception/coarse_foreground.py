@@ -27,7 +27,7 @@ from biblade_fusion.perception.bootstrap_foreground import (
 )
 
 PROJECTED_COARSE_FOREGROUND_ALGORITHM = (
-    "accumulated_blade_projection_base_envelope_v1"
+    "accumulated_blade_projection_depth_band_base_envelope_v2"
 )
 
 
@@ -108,6 +108,7 @@ class ProjectedCoarseForegroundDiagnostics:
     reference_point_count: int
     projected_reference_pixel_count: int
     eligible_projected_pixel_count: int
+    predicted_depth_consistent_pixel_count: int
     base_envelope_pixel_count: int
     mask_pixel_count: int
     mask_fraction: float
@@ -289,7 +290,10 @@ def projected_coarse_blade_foreground(
         & (pixels_v < intrinsics.height)
     )
     projected = np.zeros(expected_shape, dtype=np.uint8)
-    projected[pixels_v[inside_image], pixels_u[inside_image]] = 1
+    projected_u = pixels_u[inside_image]
+    projected_v = pixels_v[inside_image]
+    projected_z = camera_z[inside_image]
+    projected[projected_v, projected_u] = 1
     radius = config.projected_reference_dilation_px
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
@@ -301,6 +305,35 @@ def projected_coarse_blade_foreground(
         raise BootstrapForegroundError(
             "Projected accepted-blade support is below its pixel minimum"
         )
+
+    # A dilated 2-D projection alone can include a fixture or table region that
+    # happens to lie inside the conservative blade AABB.  Carry the projected
+    # reference depth through the same neighbourhood so each current pixel must
+    # also agree with a locally predicted surface band.  The configured depth
+    # jump remains deliberately loose enough for newly exposed thin fins.
+    finite_fill = float(config.maximum_depth_m + config.maximum_neighbour_depth_jump_m + 1.0)
+    projected_depth_min = np.full(expected_shape, finite_fill, dtype=np.float32)
+    projected_depth_max = np.full(expected_shape, -finite_fill, dtype=np.float32)
+    np.minimum.at(
+        projected_depth_min,
+        (projected_v, projected_u),
+        projected_z.astype(np.float32),
+    )
+    np.maximum.at(
+        projected_depth_max,
+        (projected_v, projected_u),
+        projected_z.astype(np.float32),
+    )
+    local_depth_min = cv2.erode(projected_depth_min, kernel)
+    local_depth_max = cv2.dilate(projected_depth_max, kernel)
+    depth_tolerance = float(config.maximum_neighbour_depth_jump_m)
+    predicted_depth_consistent = (
+        projected_reference
+        & (local_depth_min < finite_fill)
+        & (local_depth_max > -finite_fill)
+        & (depth >= local_depth_min - depth_tolerance)
+        & (depth <= local_depth_max + depth_tolerance)
+    )
 
     eligible_projected = depth_valid & projected_reference
     rows, columns = np.nonzero(eligible_projected)
@@ -321,8 +354,10 @@ def projected_coarse_blade_foreground(
     lower = np.asarray(guide.blade_envelope_min_m, dtype=np.float64)
     upper = np.asarray(guide.blade_envelope_max_m, dtype=np.float64)
     inside_envelope = np.all((points_base >= lower) & (points_base <= upper), axis=1)
+    inside_predicted_depth = predicted_depth_consistent[rows, columns]
+    selected = inside_envelope & inside_predicted_depth
     mask = np.zeros(expected_shape, dtype=np.bool_)
-    mask[rows[inside_envelope], columns[inside_envelope]] = True
+    mask[rows[selected], columns[selected]] = True
     mask_count = int(np.count_nonzero(mask))
     mask_fraction = mask_count / mask.size
     projected_match_fraction = mask_count / eligible_projected_count
@@ -345,7 +380,10 @@ def projected_coarse_blade_foreground(
         reference_point_count=len(reference),
         projected_reference_pixel_count=projected_count,
         eligible_projected_pixel_count=eligible_projected_count,
-        base_envelope_pixel_count=mask_count,
+        predicted_depth_consistent_pixel_count=int(
+            np.count_nonzero(eligible_projected & predicted_depth_consistent)
+        ),
+        base_envelope_pixel_count=int(np.count_nonzero(inside_envelope)),
         mask_pixel_count=mask_count,
         mask_fraction=mask_fraction,
         projected_match_fraction=projected_match_fraction,

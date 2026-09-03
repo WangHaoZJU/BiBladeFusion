@@ -30,6 +30,7 @@ from biblade_fusion.core.settings import (
     MotionPreflightConfig,
     MultiViewFusionConfig,
     NextViewSelectionConfig,
+    PointCloudConfig,
     SurfaceQualityConfig,
     TSDFConfig,
     ViewFilterConfig,
@@ -42,12 +43,14 @@ from biblade_fusion.perception.surface import (
     generate_reacquisition_view,
 )
 from biblade_fusion.planning import (
+    AdaptiveViewSearchConfig,
     BladeClearanceEnvelope,
     CandidateStatus,
     EliteCs68IkChecker,
     EvaluatedCandidate,
     ReachabilityChecker,
     filter_candidate_views,
+    search_adaptive_candidate_family,
 )
 from biblade_fusion.planning.scientific_gain import (
     ExpectedScientificGain,
@@ -147,6 +150,8 @@ def _selection_policy_payload(
     fusion_config: MultiViewFusionConfig | None,
     tsdf_config: TSDFConfig | None,
     finalization_config: FineFinalizationConfig | None,
+    view_planning_config: ViewPlanningConfig | None = None,
+    point_cloud_config: PointCloudConfig | None = None,
 ) -> dict[str, object]:
     return {
         "algorithm": _SELECTOR_ALGORITHM,
@@ -154,6 +159,14 @@ def _selection_policy_payload(
         "surface_quality": surface_quality_config.model_dump(mode="json"),
         "view_filter": view_filter_config.model_dump(mode="json"),
         "kinematics": kinematics_config.model_dump(mode="json"),
+        "adaptive_fine_view_search": (
+            {
+                "view_planning": view_planning_config.model_dump(mode="json"),
+                "point_cloud": point_cloud_config.model_dump(mode="json"),
+            }
+            if view_planning_config is not None and point_cloud_config is not None
+            else {"enabled": False}
+        ),
         "motion_endpoint_gate": {
             "maximum_translation_error_m": motion_config.maximum_endpoint_translation_error_m,
             "maximum_rotation_error_deg": motion_config.maximum_endpoint_rotation_error_deg,
@@ -205,6 +218,8 @@ def production_selection_policy_payload(
         fusion_config=settings.multi_view_fusion,
         tsdf_config=settings.tsdf,
         finalization_config=settings.fine_finalization,
+        view_planning_config=settings.view_planning,
+        point_cloud_config=settings.point_cloud,
     )
 
 
@@ -274,6 +289,8 @@ class BladeCoverageNextViewSelector:
         fusion_config: MultiViewFusionConfig | None = None,
         tsdf_config: TSDFConfig | None = None,
         finalization_config: FineFinalizationConfig | None = None,
+        view_planning_config: ViewPlanningConfig | None = None,
+        point_cloud_config: PointCloudConfig | None = None,
     ) -> None:
         self._hand_eye = hand_eye
         self._flange_t_left_ir = hand_eye.require_flange_primary()
@@ -291,6 +308,21 @@ class BladeCoverageNextViewSelector:
         )
         self._motion_config = MotionPreflightConfig.model_validate(
             motion_config.model_dump(mode="json")
+        )
+        self._view_planning_config = (
+            ViewPlanningConfig.model_validate(view_planning_config.model_dump(mode="json"))
+            if view_planning_config is not None
+            else None
+        )
+        self._point_cloud_config = (
+            PointCloudConfig.model_validate(point_cloud_config.model_dump(mode="json"))
+            if point_cloud_config is not None
+            else None
+        )
+        self._finalization_config = (
+            FineFinalizationConfig.model_validate(finalization_config.model_dump(mode="json"))
+            if finalization_config is not None
+            else None
         )
         self._expected_reference_root = Path(expected_reference_root).resolve()
         self._expected_reference_sha256 = str(expected_reference_sha256)
@@ -357,6 +389,8 @@ class BladeCoverageNextViewSelector:
             fusion_config=fusion_config,
             tsdf_config=tsdf_config,
             finalization_config=finalization_config,
+            view_planning_config=self._view_planning_config,
+            point_cloud_config=self._point_cloud_config,
         )
         self._policy_sha256 = _canonical_sha256(self._policy_payload)
 
@@ -425,6 +459,8 @@ class BladeCoverageNextViewSelector:
             fusion_config=settings.multi_view_fusion,
             tsdf_config=settings.tsdf,
             finalization_config=settings.fine_finalization,
+            view_planning_config=settings.view_planning,
+            point_cloud_config=settings.point_cloud,
         )
 
     @property
@@ -495,7 +531,13 @@ class BladeCoverageNextViewSelector:
             raise BladePlanningAssetError(
                 "This cycle's reconstructed view has no matching fine-coverage successor"
             )
-        if observed is None and observation.bundle.view_id in candidate_ids:
+        if observed is None and (
+            observation.bundle.view_id in candidate_ids
+            or self._is_adaptive_candidate_capture_id(
+                observation.bundle.view_id,
+                state,
+            )
+        ):
             raise BladePlanningAssetError(
                 "A captured planned fine candidate lacks its reconstructed view and "
                 "fine-coverage successor"
@@ -521,6 +563,22 @@ class BladeCoverageNextViewSelector:
                 "Fine-view and reacquisition candidate IDs are not globally unique"
             )
         return set(all_ids)
+
+    def _is_adaptive_candidate_capture_id(
+        self,
+        view_id: str,
+        state: StoredSurfaceCoverageGeneration,
+    ) -> bool:
+        planning = self._view_planning_config
+        if planning is None:
+            return False
+        maximum = planning.adaptive_ik_view_search.maximum_generated_candidates
+        for candidate in state.view_plan.candidates:
+            prefix = f"{candidate.view_id}_adaptive_"
+            if view_id.startswith(prefix):
+                suffix = view_id.removeprefix(prefix)
+                return suffix.isdigit() and int(suffix) < maximum
+        return False
 
     @staticmethod
     def _reacquisition_standoff_bounds(
@@ -821,6 +879,65 @@ class BladeCoverageNextViewSelector:
             item.candidate.view_id,
         )
 
+    def _adaptive_fine_candidates(
+        self,
+        *,
+        rejected: tuple[EvaluatedCandidate, ...],
+        state: StoredSurfaceCoverageGeneration,
+        checker: ReachabilityChecker,
+        current_joints: NDArray[np.float64],
+        captured: set[str],
+    ) -> tuple[tuple[EvaluatedCandidate, ...], dict[str, PoseSE3]]:
+        """Search physical distance/angle alternatives for rejected fine poses."""
+
+        planning = self._view_planning_config
+        point_cloud = self._point_cloud_config
+        family_limit = self._selection_config.maximum_adaptive_fine_families
+        if (
+            planning is None
+            or point_cloud is None
+            or not planning.adaptive_ik_view_search.enabled
+            or family_limit == 0
+        ):
+            return (), {}
+        policy = planning.adaptive_ik_view_search
+        search_config = AdaptiveViewSearchConfig(
+            minimum_optical_distance_m=point_cloud.minimum_depth_m,
+            maximum_optical_distance_m=point_cloud.maximum_depth_m,
+            distance_step_m=policy.distance_step_m,
+            maximum_distance_expansions=policy.maximum_distance_expansions,
+            tilt_samples_deg=policy.tilt_samples_deg,
+            azimuth_samples_deg=policy.azimuth_samples_deg,
+            roll_samples_deg=policy.roll_samples_deg,
+            maximum_generated_candidates=policy.maximum_generated_candidates,
+            maximum_ik_feasible_candidates=min(2, policy.maximum_ik_feasible_candidates),
+            maximum_ik_attempts_per_family=min(24, policy.maximum_ik_attempts_per_family),
+            maximum_search_duration_s=min(1.5, policy.maximum_search_duration_s),
+            sampling_order="distance_major",
+            ranking_mode="surface_quality",
+        )
+        accepted: list[EvaluatedCandidate] = []
+        projections: dict[str, PoseSE3] = {}
+        envelope = _surface_envelope(state.surface)
+        left_ir_t_left_rectified = state.view_plan.left_rectified_t_left_ir.inverse()
+        for rejected_candidate in rejected[:family_limit]:
+            search = search_adaptive_candidate_family(
+                rejected_candidate.candidate,
+                envelope,
+                self._view_filter_config,
+                (checker,),
+                current_joints,
+                search_config,
+            )
+            for attempt in search.ranked_feasible:
+                item = attempt.evaluated
+                if item.candidate.view_id in captured:
+                    continue
+                accepted.append(item)
+                raw = PoseSE3("base", "left_ir", item.candidate.base_t_left_ir.matrix)
+                projections[item.candidate.view_id] = raw.compose(left_ir_t_left_rectified)
+        return tuple(accepted), projections
+
     def select_next(
         self,
         observation: PerceptionCycleResult,
@@ -877,16 +994,49 @@ class BladeCoverageNextViewSelector:
         if not incomplete_patch_ids:
             self._pending_selection = None
             if self._fine_finalizer is None:
-                raise BladePlanningAssetError(
-                    "Fine coverage passed, but no terminal reconstruction finalizer "
-                    "is configured"
+                if (
+                    self._finalization_config is not None
+                    and self._finalization_config.block_measurement_completion_on_reconstruction_qa
+                ):
+                    raise BladePlanningAssetError(
+                        "Fine coverage passed, but strict reconstruction QA has no "
+                        "terminal finalizer"
+                    )
+                return NextViewSelection(
+                    None,
+                    state.generation_id,
+                    reference_sha256,
+                    self._policy_sha256,
+                    len(required_patch_ids),
+                    0,
+                    True,
+                    (*base_diagnostics, "measurement coverage complete; finalizer unconfigured"),
                 )
             try:
                 final = self._fine_finalizer(state)
             except Exception as exc:
-                raise BladePlanningAssetError(
-                    f"Fine coverage passed but terminal reconstruction failed: {exc}"
-                ) from exc
+                if (
+                    self._finalization_config is not None
+                    and self._finalization_config.block_measurement_completion_on_reconstruction_qa
+                ):
+                    raise BladePlanningAssetError(
+                        f"Fine coverage passed but terminal reconstruction failed: {exc}"
+                    ) from exc
+                return NextViewSelection(
+                    None,
+                    state.generation_id,
+                    reference_sha256,
+                    self._policy_sha256,
+                    len(required_patch_ids),
+                    0,
+                    True,
+                    (
+                        *base_diagnostics,
+                        "measurement coverage complete",
+                        "terminal reconstruction QA deferred: "
+                        f"{type(exc).__name__}:{exc}",
+                    ),
+                )
             if type(final) is not FinalFineCompletionEvidence:
                 raise BladePlanningAssetError(
                     "Fine terminal finalizer returned untyped completion evidence"
@@ -1011,8 +1161,27 @@ class BladeCoverageNextViewSelector:
             raise BladePlanningAssetError(
                 f"Fine candidate geometry is inconsistent: {exc}"
             ) from exc
-        feasible, fk_rejections = self._fk_verified_candidates(
+        nominal_feasible, nominal_fk_rejections = self._fk_verified_candidates(
             filtered.endpoint_feasible
+        )
+        rejected_for_adaptation = tuple(
+            item
+            for item in filtered.candidates
+            if item.status is not CandidateStatus.ENDPOINT_FEASIBLE
+        )
+        adaptive, adaptive_projection_poses = self._adaptive_fine_candidates(
+            rejected=rejected_for_adaptation,
+            state=state,
+            checker=checker,
+            current_joints=current_joints,
+            captured=captured,
+        )
+        adaptive_feasible, adaptive_fk_rejections = self._fk_verified_candidates(adaptive)
+        feasible = (*nominal_feasible, *adaptive_feasible)
+        fk_rejections = (*nominal_fk_rejections, *adaptive_fk_rejections)
+        projection_poses.update(adaptive_projection_poses)
+        attempt_by_view_id.update(
+            {item.candidate.view_id: -1 for item in adaptive_feasible}
         )
         if not feasible:
             filter_reasons = tuple(

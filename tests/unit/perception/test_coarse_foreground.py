@@ -145,6 +145,45 @@ def test_projected_foreground_keeps_disconnected_fin_support(tmp_path: Path) -> 
     assert not np.any(result.mask[12:18])
 
 
+def test_projected_foreground_uses_local_depth_band_inside_conservative_aabb(
+    tmp_path: Path,
+) -> None:
+    reference_pixels = np.asarray(
+        [(u, v) for v in range(10, 20) for u in range(13, 27)],
+        dtype=np.int64,
+    )
+    intrinsics, reference, guide, config = _case(
+        tmp_path,
+        reference_pixels=reference_pixels,
+        dilation_px=2,
+        minimum_match_fraction=0.1,
+    )
+    depth = np.full((30, 40), np.nan, dtype=np.float64)
+    depth[10:20, 13:27] = 1.0
+    depth[15, 11] = 0.90  # Inside the broad AABB, but not the predicted surface band.
+    depth[15, 28] = 1.025  # A newly exposed fin remains within the loose 30 mm band.
+
+    result = projected_coarse_blade_foreground(
+        np.zeros(depth.shape, dtype=np.uint16),
+        depth,
+        np.isfinite(depth),
+        config,
+        intrinsics=intrinsics,
+        base_t_left_rectified=PoseSE3.identity("base", "left_rectified"),
+        reference_points_base_m=reference,
+        guide=guide,
+    )
+
+    assert result.projected_reference_mask[15, 11]
+    assert result.projected_reference_mask[15, 28]
+    assert not result.mask[15, 11]
+    assert result.mask[15, 28]
+    assert (
+        result.diagnostics.predicted_depth_consistent_pixel_count
+        < result.diagnostics.eligible_projected_pixel_count
+    )
+
+
 def test_projected_foreground_stops_when_current_depth_disagrees_with_envelope(
     tmp_path: Path,
 ) -> None:

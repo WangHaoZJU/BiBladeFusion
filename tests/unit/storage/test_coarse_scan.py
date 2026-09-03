@@ -449,6 +449,7 @@ def test_projected_coarse_view_binds_exact_predecessor_generation(
             reference_point_count=100,
             projected_reference_pixel_count=projected_count,
             eligible_projected_pixel_count=projected_count,
+            predicted_depth_consistent_pixel_count=mask_count,
             base_envelope_pixel_count=mask_count,
             mask_pixel_count=mask_count,
             mask_fraction=mask_count / mask.size,

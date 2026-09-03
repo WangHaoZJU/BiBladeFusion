@@ -108,8 +108,6 @@ def _policy_check(settings: AppSettings) -> CheckResult:
         missing.append("robot.motion_enabled")
     if not settings.stop_and_capture.enabled:
         missing.append("stop_and_capture.enabled")
-    if settings.stop_and_capture.maximum_segment_joint_delta_rad is None:
-        missing.append("stop_and_capture.maximum_segment_joint_delta_rad")
     if not settings.occupancy.enabled:
         missing.append("occupancy.enabled")
     if settings.occupancy.workspace_bounds_min_m is None:

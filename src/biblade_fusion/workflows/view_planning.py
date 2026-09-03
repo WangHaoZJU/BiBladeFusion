@@ -58,14 +58,16 @@ def plan_initial_observation(
         observation.planning_intrinsics,
         planning_config,
     )
+    adaptive_policy = planning_config.adaptive_ik_view_search
+    # Adaptive search already begins at the nominal pose.  Geometry-only filtering
+    # here avoids solving that same IK once before, then again inside its family.
     filtered = filter_candidate_views(
         geometric.candidates,
         observation.proxy,
         filter_config,
-        reachability_checker,
+        None if adaptive_policy.enabled else reachability_checker,
     )
     adaptive_trace = None
-    adaptive_policy = planning_config.adaptive_ik_view_search
     if adaptive_policy.enabled:
         if reachability_checker is None:
             raise ValueError("Adaptive IK view search requires an endpoint IK checker")
@@ -80,9 +82,13 @@ def plan_initial_observation(
             azimuth_samples_deg=adaptive_policy.azimuth_samples_deg,
             roll_samples_deg=adaptive_policy.roll_samples_deg,
             maximum_generated_candidates=adaptive_policy.maximum_generated_candidates,
-            maximum_ik_feasible_candidates=(
-                adaptive_policy.maximum_ik_feasible_candidates
+            # A regular surface patch needs one feasible endpoint; requesting all
+            # eight alternatives multiplied IK work without changing the plan.
+            maximum_ik_feasible_candidates=1,
+            maximum_ik_attempts_per_family=(
+                adaptive_policy.maximum_ik_attempts_per_family
             ),
+            maximum_search_duration_s=adaptive_policy.maximum_search_duration_s,
         )
         geometric_candidates = list(geometric.candidates)
         evaluations = list(filtered.candidates)

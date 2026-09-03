@@ -232,12 +232,13 @@ def test_scientific_gain_weights_are_normalized() -> None:
     assert config.coverage_weight + config.quality_recovery_weight == pytest.approx(1.0)
 
 
-def test_ranked_path_preflight_budget_is_small_and_bounded() -> None:
+def test_legacy_ranked_path_preflight_limit_is_parseable_but_bounded() -> None:
     assert StopAndCaptureConfig().maximum_ranked_preflight_candidates == 3
     with pytest.raises(ValidationError, match="greater than or equal to 1"):
         StopAndCaptureConfig(maximum_ranked_preflight_candidates=0)
-    with pytest.raises(ValidationError, match="less than or equal to 8"):
-        StopAndCaptureConfig(maximum_ranked_preflight_candidates=9)
+    assert StopAndCaptureConfig(maximum_ranked_preflight_candidates=100)
+    with pytest.raises(ValidationError, match="less than or equal to 100"):
+        StopAndCaptureConfig(maximum_ranked_preflight_candidates=101)
 
 
 def test_enabled_occupancy_requires_measured_bounds_and_self_mask() -> None:
@@ -323,9 +324,9 @@ def test_static_free_acceptance_is_all_or_nothing_and_within_workspace() -> None
     assert accepted.accepted_static_free_aabbs == (volume,)
 
 
-def test_enabled_stop_and_capture_requires_measured_short_segment_bound() -> None:
-    with pytest.raises(ValidationError, match="maximum_segment_joint_delta_rad"):
-        StopAndCaptureConfig(enabled=True)
+def test_enabled_stop_and_capture_does_not_require_legacy_motion_truncation() -> None:
+    configured = StopAndCaptureConfig(enabled=True)
+    assert configured.maximum_segment_joint_delta_rad is None
 
 
 def test_science_acceptance_path_and_identity_are_atomic() -> None:

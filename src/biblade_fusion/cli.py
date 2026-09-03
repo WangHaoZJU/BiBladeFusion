@@ -2409,6 +2409,8 @@ def plan_search_view(
             roll_samples_deg=policy.roll_samples_deg,
             maximum_generated_candidates=policy.maximum_generated_candidates,
             maximum_ik_feasible_candidates=policy.maximum_ik_feasible_candidates,
+            maximum_ik_attempts_per_family=policy.maximum_ik_attempts_per_family,
+            maximum_search_duration_s=policy.maximum_search_duration_s,
         )
         result = search_adaptive_candidate_family(
             nominal,

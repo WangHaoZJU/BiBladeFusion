@@ -432,15 +432,14 @@ class EliteArm:
         # backend locally eligible for another unreviewed command.
         self._latch_stop()
         try:
-            # Serialize only the current reverse-transport call, never the full
-            # motion stream.  writeIdle ends ServoJ, while Dashboard stopProgram
-            # transitions the controller task from PLAYING to STOPPED.  Both are
-            # required before the caller can prove stationarity through RTSI.
+            # Match HoloRobot's proven normal segment-boundary semantics: writeIdle
+            # ends ServoJ without tearing down the reverse-control program.  The
+            # local stop latch plus sampled pose stability is the capture boundary;
+            # Dashboard stopProgram is reserved for bootstrap and deadline faults.
             with self._command_io_lock:
                 if self._driver is not None and self._driver.isRobotConnected():
                     accepted = self._driver.writeIdle(0)
                     stop_transport = "writeIdle"
-                    self._request_dashboard_task_stop(context="guarded stop")
                 else:
                     # Bootstrap is intentionally unpowered and may have no reverse
                     # EliteDriver session yet.  An already-STOPPED Dashboard task
@@ -457,29 +456,6 @@ class EliteArm:
             raise RobotCommandError("failed to stop Elite arm") from exc
         if accepted is False:
             raise RobotCommandError(f"{stop_transport} rejected stop command")
-
-    def _request_dashboard_task_stop(self, *, context: str) -> None:
-        """Request a task stop without claiming the asynchronous RTSI postcondition."""
-
-        status_fn = getattr(self._dashboard, "runningStatus", None)
-        stop_program = getattr(self._dashboard, "stopProgram", None)
-        if stop_program is None:
-            raise RobotCommandError(f"Dashboard does not expose stopProgram for {context}")
-        if status_fn is not None:
-            try:
-                before = _enum_label(status_fn()).strip().upper()
-            except Exception as exc:
-                raise RobotCommandError(
-                    f"Dashboard task-status query failed for {context}"
-                ) from exc
-            if before in {"STOPPED", "3"}:
-                return
-        try:
-            accepted = stop_program()
-        except Exception as exc:
-            raise RobotCommandError(f"Dashboard {context} command failed") from exc
-        if accepted is False:
-            raise RobotCommandError(f"Dashboard rejected {context}")
 
     def _guarded_deadline_stop(self, *, capability: object) -> None:
         """Latch motion off and request Dashboard stop outside ServoJ's I/O lock.

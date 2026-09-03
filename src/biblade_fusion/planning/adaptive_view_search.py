@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from math import cos, radians, sin
+from time import monotonic
 from typing import Literal
 
 import numpy as np
@@ -58,6 +59,8 @@ class AdaptiveViewSearchConfig:
     roll_samples_deg: tuple[float, ...] = (0.0, 45.0, -45.0, 90.0)
     maximum_generated_candidates: int = 512
     maximum_ik_feasible_candidates: int = 8
+    maximum_ik_attempts_per_family: int = 32
+    maximum_search_duration_s: float = 1.5
     sampling_order: Literal["tilt_major", "distance_major"] = "tilt_major"
     ranking_mode: Literal["surface_quality", "fin_discovery"] = "surface_quality"
     require_attempted_per_tilt: bool = False
@@ -85,6 +88,10 @@ class AdaptiveViewSearchConfig:
             raise ValueError("maximum_generated_candidates must be positive")
         if self.maximum_ik_feasible_candidates < 1:
             raise ValueError("maximum_ik_feasible_candidates must be positive")
+        if self.maximum_ik_attempts_per_family < 1:
+            raise ValueError("maximum_ik_attempts_per_family must be positive")
+        if not np.isfinite(self.maximum_search_duration_s) or self.maximum_search_duration_s <= 0:
+            raise ValueError("maximum_search_duration_s must be finite and positive")
         object.__setattr__(self, "tilt_samples_deg", tilts)
         object.__setattr__(self, "azimuth_samples_deg", azimuths)
         object.__setattr__(self, "roll_samples_deg", rolls)
@@ -174,7 +181,14 @@ def evaluate_multi_seed_ik(
         )
         return MultiSeedIkEvaluation(result, (), None, (result.message,))
 
-    outcomes = tuple(checker.check(pose) for checker in checkers)
+    outcomes_list: list[ReachabilityResult] = []
+    for checker in checkers:
+        check_all = getattr(checker, "check_all", None)
+        if callable(check_all):
+            outcomes_list.extend(check_all(pose))
+        else:
+            outcomes_list.append(checker.check(pose))
+    outcomes = tuple(outcomes_list)
     messages = tuple(outcome.message for outcome in outcomes)
     solutions = tuple(
         outcome.joint_positions_rad
@@ -318,32 +332,39 @@ def generate_adaptive_candidate_family(
             for distance_index, distance in enumerate(distances)
             for tilt in config.tilt_samples_deg
         )
+    # Explore pose directions and optical distances before spending work on
+    # alternate wrist rolls.  The old inner-roll order could burn four expensive
+    # IK solves at each nearly identical direction and reach useful back-side
+    # distances only after hundreds of attempts.
+    directional_parameters = []
     for tilt, distance_index, distance in parameter_order:
         azimuths = (0.0,) if tilt == 0.0 else config.azimuth_samples_deg
         for azimuth in azimuths:
-            for roll in config.roll_samples_deg:
-                parameters = CandidatePoseParameters(
-                    distance,
-                    tilt,
-                    azimuth,
-                    roll,
-                    distance_index,
-                )
-                family.append(
-                    (
+            directional_parameters.append((tilt, distance_index, distance, azimuth))
+    for roll in config.roll_samples_deg:
+        for tilt, distance_index, distance, azimuth in directional_parameters:
+            parameters = CandidatePoseParameters(
+                distance,
+                tilt,
+                azimuth,
+                roll,
+                distance_index,
+            )
+            family.append(
+                (
+                    parameters,
+                    _candidate_from_parameters(
+                        nominal,
                         parameters,
-                        _candidate_from_parameters(
-                            nominal,
-                            parameters,
-                            tangent_x,
-                            tangent_y,
-                            sequence_index,
-                        ),
-                    )
+                        tangent_x,
+                        tangent_y,
+                        sequence_index,
+                    ),
                 )
-                sequence_index += 1
-                if len(family) >= config.maximum_generated_candidates:
-                    return tuple(family)
+            )
+            sequence_index += 1
+            if len(family) >= config.maximum_generated_candidates:
+                return tuple(family)
     return tuple(family)
 
 
@@ -384,6 +405,8 @@ def search_adaptive_candidate_family(
     ik_checkers: Sequence[ReachabilityChecker],
     current_joint_positions_rad: ArrayLike,
     config: AdaptiveViewSearchConfig | None = None,
+    *,
+    monotonic_clock=monotonic,
 ) -> AdaptiveViewSearchResult:
     """Find endpoint-IK alternatives; no collision, path, or motion is authorized."""
 
@@ -395,7 +418,14 @@ def search_adaptive_candidate_family(
     attempts = []
     feasible = []
     attempted_tilts: set[float] = set()
+    search_started = float(monotonic_clock())
+    ik_attempts = 0
     for parameters, candidate in family:
+        if (
+            ik_attempts >= policy.maximum_ik_attempts_per_family
+            or float(monotonic_clock()) - search_started >= policy.maximum_search_duration_s
+        ):
+            break
         attempted_tilts.add(parameters.tilt_deg)
         geometry = filter_candidate_views(
             (candidate,),
@@ -403,11 +433,11 @@ def search_adaptive_candidate_family(
             filter_config,
             None,
             deduplicate=False,
-            workspace_mode="advisory",
         ).candidates[0]
         if geometry.status is CandidateStatus.REJECTED:
             attempt = AdaptiveCandidateAttempt(parameters, geometry)
         else:
+            ik_attempts += 1
             ik = evaluate_multi_seed_ik(
                 candidate.base_t_left_ir,
                 ik_checkers,
@@ -419,7 +449,6 @@ def search_adaptive_candidate_family(
                 filter_config,
                 _PrecomputedReachabilityChecker(ik.result),
                 deduplicate=False,
-                workspace_mode="advisory",
             ).candidates[0]
             attempt = AdaptiveCandidateAttempt(
                 parameters,

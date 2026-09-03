@@ -7,17 +7,17 @@ roll, incidence tilt and azimuth, and camera distance. Distance is bounded only 
 configured stereo-depth limits; the ideal standoff is evaluated first and deviations are
 penalized during ranking.
 
-The search order is deliberately measurement-first: ideal pose, wrist-roll alternatives,
-normal-incidence distance expansion across the physical depth range, then increasing
-incidence tilt and azimuth. Every candidate continues to look at the same surface target.
+The search order is deliberately measurement-first: ideal pose, normal-incidence distance
+expansion, then increasing incidence tilt and azimuth; wrist-roll alternatives are tried
+only after those distance/direction samples. Every candidate continues to look at the
+same surface target. A family is bounded by both 32 IK attempts and 1.5 seconds by default.
 Each configured IK seed is evaluated, all successful solutions are retained, and the
 solution with the smallest maximum and total joint change from the current posture is
 preferred among candidates with the same geometric score.
 
-Static camera-workspace bounds are advisory in this diagnostic because the current bounds
-describe previously commissioned camera centres and can reject an IK-solvable pose merely
-for lying outside that empirical box. Blade/camera clearance and configured forbidden
-volumes remain hard geometric rejections. This does not weaken the production motion
+The configured camera workspace is the declared physical outer boundary and is a hard
+candidate rejection. Blade/camera clearance and configured forbidden volumes are also
+hard geometric rejections. This does not replace the production motion
 boundary: endpoint collision, swept-path collision, trajectory feasibility, and operator
 authorization are not performed, and every report explicitly stores
 `motion_authorized: false`.
@@ -82,12 +82,25 @@ clearance and pair availability remain hard gates. The selected gain components 
 stored in the coordinator decision diagnostics; safety occupancy and swept-path proofs
 remain downstream vetoes and contribute no positive science gain.
 
-Both coarse discovery and fine NBV now retain their deterministic science-ranked
-endpoint queues. The stop-scan coordinator hard-preflights up to three endpoints in
-that unchanged order and accepts the first collision-free path. A blocked endpoint is
+Both coarse discovery and fine NBV retain their deterministic science-ranked endpoint
+queues. The stop-scan coordinator hard-preflights the complete bounded queue in that
+unchanged order and accepts the first collision-free straight joint-space path. A blocked endpoint is
 audited and skipped; no occupancy value is fed back into discovery gain, and no
 collision threshold is relaxed. Asset, map-binding, or timing failures remain terminal
 for the cycle rather than being misclassified as candidate-specific path vetoes.
+
+Fine NBV uses the same bounded pose-family fallback. A nominal curved-surface candidate
+is tried first; if workspace/geometry/IK rejects it, up to four highest-priority incomplete
+patch families search physical stereo distances and incidence directions. Every returned
+solution is independently replayed through ES68 FK before science ranking. Thus a fixed
+fine standoff or incidence angle cannot terminate an otherwise measurable patch.
+
+One NBV endpoint is now one operator-approved motion and one stopped capture. The legacy
+`stop_and_capture.maximum_segment_joint_delta_rad` and
+`maximum_ranked_preflight_candidates` keys remain parseable only for old reviewed config
+files and are ignored. `motion_preflight.maximum_joint_step_rad` still controls internal
+ServoJ interpolation and continuous collision proof; it never creates an intermediate
+view, FoundationStereo inference, or occupancy rebuild.
 
 ## Evidence-gated motion after one initial view
 

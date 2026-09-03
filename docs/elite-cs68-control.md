@@ -40,12 +40,12 @@ All of the following are mandatory:
    reports `motion_authorized: false`.
 3. The operator must type the exact preflight-hash confirmation returned by
    `GuardedEliteExecutor.approval_prompt()` in the same process.
-4. The resulting permit expires, is valid only once, and is bound to the exact start,
+4. The resulting permit expires before consumption, is valid only once, and is bound to the exact start,
    goal, ES68+D435i model contract, occupancy sequence/hash/freshness horizon, and full
    ServoJ runtime/command stream.
 5. Immediately before sending commands, the executor compares live joints with the
-   preflight start, confirms the occupancy identity and remaining freshness, and repeats
-   both Pinocchio/FCL and occupancy path validation.
+   preflight start, confirms the occupancy identity and remaining freshness, and reuses
+   the hash-bound continuous proofs already produced for that unchanged path.
 
 `bbf safety preflight-path` requires `--occupancy`, persists and re-verifies the
 mesh/occupancy contracts for an ordered view sequence, and never connects to the robot.
@@ -55,13 +55,15 @@ and standalone preflight commands remain non-moving.
 The only public closed-loop physical-motion composition is the default-off, interactive
 `bbf scan run-unknown` runtime. It first requires `scan doctor --mode unknown`, opens one
 ES68 and one D435i, and accepts explicit operator-positioned `c` captures until a live
-`MAP_READY` generation exists. It then prepares one bounded segment at a time. The
+`MAP_READY` generation exists. It then prepares one complete viewpoint motion at a time. The
 operator must paste the exact current preflight token; the one-shot permit is consumed
 before the private capability may perform any power/brake preparation. That preparation
 does not clear the stop latch or transmit a trajectory. Joint state, occupancy identity,
-freshness, both continuous proofs, stop generation and permit expiry are checked again
+freshness, both continuous proofs and stop generation are checked again
 before the compare-and-clear resume and ServoJ transport. Every successful segment ends
-with an acknowledged stop and one capture.
+with endpoint convergence, HoloRobot-compatible `writeIdle`, a stop-latched sampled-pose
+window, and one capture. Permit expiry is enforced at exact consumption, not again after
+bounded controller recovery has begun.
 
 Before a measured motion envelope exists, `bbf commission motion-envelope-trial` is the
 only narrower hardware-commissioning exception. Its dry-run is hardware-free. Execution

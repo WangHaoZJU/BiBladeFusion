@@ -3,7 +3,7 @@
 The runtime keeps the two different authorities deliberately separate:
 
 * an operator triggers the initial stopped observations while space is UNKNOWN;
-* after a verified MAP_READY generation, every short segment still requires the
+* after a verified MAP_READY generation, every complete viewpoint motion still requires the
   exact preflight fingerprint printed by the guarded executor.
 
 There is no unattended-motion API in this module.  The interactive console is a
@@ -1110,7 +1110,7 @@ class UnknownBladeSupervisedRuntime:
         return self.snapshot
 
     def execute_exact_approval(self, confirmation: str) -> UnknownBladeRuntimeSnapshot:
-        """Execute one prepared short segment, then automatically stop and capture."""
+        """Execute one prepared viewpoint motion, then automatically stop and capture."""
 
         self._require_started()
         expected = self._active_runner.approval_prompt()
@@ -1813,6 +1813,7 @@ def _finalize_production_runtime(
                 maximum_stopped_target_tcp_angular_velocity_rad_s=(
                     motion_envelope.maximum_stopped_target_tcp_angular_velocity_rad_s
                 ),
+                require_stop_latch=True,
             )
         except BaseException as exc:
             stop_errors.append(exc)

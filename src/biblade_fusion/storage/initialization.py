@@ -131,6 +131,56 @@ def _source_record(path: Path) -> dict[str, Any]:
     }
 
 
+def _relocation_candidates(root: Path, configured: Path | None) -> tuple[Path, ...]:
+    """Resolve a recorded project-relative source after an artifact is copied."""
+
+    if configured is None:
+        return ()
+    if configured.is_absolute():
+        return (configured.resolve(),)
+    candidates = [Path.cwd() / configured]
+    resolved_root = root.resolve()
+    candidates.extend(parent / configured for parent in (resolved_root, *resolved_root.parents))
+    unique: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in unique:
+            unique.append(resolved)
+    return tuple(unique)
+
+
+def _resolve_source_record(
+    record: Any,
+    *,
+    label: str,
+    fallbacks: tuple[Path, ...] = (),
+) -> Path:
+    """Verify the recorded path, or relocate only to byte-identical evidence."""
+
+    if not isinstance(record, dict):
+        raise TypeError(f"{label} source record must be an object")
+    original = Path(str(record["path"])).resolve()
+    expected_hash = str(record["sha256"])
+    expected_size = int(record["size_bytes"])
+    if original.exists():
+        if (
+            not original.is_file()
+            or original.stat().st_size != expected_size
+            or _sha256(original) != expected_hash
+        ):
+            raise ValueError(f"{label} changed: {original}")
+        return original
+    for candidate in fallbacks:
+        resolved = candidate.resolve()
+        if (
+            resolved.is_file()
+            and resolved.stat().st_size == expected_size
+            and _sha256(resolved) == expected_hash
+        ):
+            return resolved
+    raise FileNotFoundError(f"{label} is missing and no byte-identical relocation was found")
+
+
 def _pose_authority_payload(authority: AuthoritativeRobotPose) -> dict[str, Any]:
     return {
         "method": "joints_to_packaged_es68_fk_v1",
@@ -487,6 +537,33 @@ def read_initialization(path: str | Path) -> StoredInitialization:
             proxy_support_mask=observation_proxy_support_mask,
         )
         hand_eye_data = metadata["hand_eye"]
+        processing = metadata.get("processing", {})
+        kinematics_config = None
+        hand_eye_config = None
+        if authoritative_schema:
+            kinematics_config = KinematicsConfig.model_validate(processing["kinematics"])
+            hand_eye_config = HandEyeConfig.model_validate(processing["hand_eye_gate"])
+            resources = Es68ModelResources.packaged()
+            packaged_assets = {
+                "model": resources.kinematics_yaml,
+                "joint_limits": resources.joint_limits_yaml,
+                "flange_tcp": resources.tcp_offset_json,
+            }
+            for name, record in metadata["kinematics_assets"].items():
+                packaged = packaged_assets.get(str(name))
+                _resolve_source_record(
+                    record,
+                    label=f"initialization kinematics asset {name}",
+                    fallbacks=(packaged,) if packaged is not None else (),
+                )
+            source_record = hand_eye_data["source"]
+            hand_eye_source_path = _resolve_source_record(
+                source_record,
+                label="initialization hand-eye source",
+                fallbacks=_relocation_candidates(root, hand_eye_config.calibration_path),
+            )
+        else:
+            hand_eye_source_path = Path(str(hand_eye_data["source_path"]))
         hand_eye = HandEyeCalibration(
             tcp_t_left_ir=PoseSE3("tcp", "left_ir", hand_eye_data["tcp_T_left_ir"]),
             method=str(hand_eye_data["method"]),
@@ -505,13 +582,7 @@ def read_initialization(path: str | Path) -> StoredInitialization:
                 if hand_eye_data.get("rotation_rmse_deg") is not None
                 else None
             ),
-            source_path=Path(
-                str(
-                    hand_eye_data["source"]["path"]
-                    if authoritative_schema
-                    else hand_eye_data["source_path"]
-                )
-            ),
+            source_path=hand_eye_source_path,
             rotation_span_deg=(
                 float(hand_eye_data["rotation_span_deg"])
                 if hand_eye_data.get("rotation_span_deg") is not None
@@ -535,23 +606,8 @@ def read_initialization(path: str | Path) -> StoredInitialization:
         )
         pose_authority = None
         if authoritative_schema:
-            for record in metadata["kinematics_assets"].values():
-                asset_path = Path(str(record["path"])).resolve()
-                if (
-                    _sha256(asset_path) != str(record["sha256"])
-                    or asset_path.stat().st_size != int(record["size_bytes"])
-                ):
-                    raise ValueError(f"initialization kinematics asset changed: {asset_path}")
-            source_record = hand_eye_data["source"]
-            source_path = Path(str(source_record["path"])).resolve()
-            if (
-                _sha256(source_path) != str(source_record["sha256"])
-                or source_path.stat().st_size != int(source_record["size_bytes"])
-            ):
-                raise ValueError("initialization hand-eye source changed")
-            processing = metadata["processing"]
-            kinematics_config = KinematicsConfig.model_validate(processing["kinematics"])
-            hand_eye_config = HandEyeConfig.model_validate(processing["hand_eye_gate"])
+            assert kinematics_config is not None
+            assert hand_eye_config is not None
             loaded_hand_eye = _verified_source_hand_eye(hand_eye, hand_eye_config)
             hand_eye = loaded_hand_eye
             authority_data = metadata["pose_authority"]

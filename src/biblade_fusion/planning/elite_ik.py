@@ -9,6 +9,7 @@ candidate generation no longer loads the noisy SDK plugin.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,6 @@ from biblade_fusion.calibration import Cs68KinematicsModel, HandEyeCalibration
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import KinematicsConfig
 from biblade_fusion.devices.robot.conversions import se3_to_elite_kdl_pose
-from biblade_fusion.planning.collision import cs68_mdh_joint_origins
 from biblade_fusion.planning.filtering import ReachabilityResult, ReachabilityState
 from biblade_fusion.robotics import Es68KinematicModel, load_es68_flange_t_tcp
 
@@ -41,6 +41,75 @@ _HOLOROBOT_IK_PRESET_SEEDS: tuple[tuple[float, ...], ...] = (
     (0.1, -0.2, 0.3, -0.4, 0.5, -0.6),
     (0.0, -1.0, 1.0, -1.0, 0.0, 0.0),
 )
+
+_JOINT_AXIS_Z = np.array((0.0, 0.0, 1.0), dtype=np.float64)
+
+
+def _rot_x4(angle: float) -> NDArray[np.float64]:
+    cosine, sine = math.cos(angle), math.sin(angle)
+    result = np.eye(4, dtype=np.float64)
+    result[1:3, 1:3] = ((cosine, -sine), (sine, cosine))
+    return result
+
+
+def _rot_z4(angle: float) -> NDArray[np.float64]:
+    cosine, sine = math.cos(angle), math.sin(angle)
+    result = np.eye(4, dtype=np.float64)
+    result[:2, :2] = ((cosine, -sine), (sine, cosine))
+    return result
+
+
+def _forward_pose_and_jacobian(
+    model: Cs68KinematicsModel,
+    joints: NDArray[np.float64],
+) -> tuple[PoseSE3, NDArray[np.float64]]:
+    """HoloRobot analytic segment Jacobian for the Elite fixed-MDH chain."""
+
+    transform = np.eye(4, dtype=np.float64)
+    axes: list[NDArray[np.float64]] = []
+    origins: list[NDArray[np.float64]] = []
+    for alpha, a, d, joint in zip(
+        model.dh_alpha_rad,
+        model.dh_a_m,
+        model.dh_d_m,
+        joints,
+        strict=True,
+    ):
+        translation = np.eye(4, dtype=np.float64)
+        translation[:3, 3] = (a, 0.0, d)
+        transform = transform @ _rot_x4(float(alpha)) @ translation
+        axes.append(transform[:3, :3] @ _JOINT_AXIS_Z)
+        origins.append(transform[:3, 3].copy())
+        transform = transform @ _rot_z4(float(joint))
+    endpoint = transform[:3, 3]
+    jacobian = np.zeros((6, 6), dtype=np.float64)
+    for index, (origin, axis) in enumerate(zip(origins, axes, strict=True)):
+        jacobian[:3, index] = np.cross(axis, endpoint - origin)
+        jacobian[3:, index] = axis
+    return PoseSE3("base", "flange", transform), jacobian
+
+
+def _nearest_equivalent_joints(
+    solution: ArrayLike,
+    reference: ArrayLike,
+    limits: tuple[tuple[float, float], ...],
+) -> NDArray[np.float64]:
+    """Choose the valid 2-pi representation nearest the current robot posture."""
+
+    values = _joint_seed(solution)
+    near = _joint_seed(reference)
+    result = values.copy()
+    period = 2.0 * math.pi
+    for index, (minimum, maximum) in enumerate(limits):
+        shifts = range(
+            math.ceil((minimum - values[index]) / period),
+            math.floor((maximum - values[index]) / period) + 1,
+        )
+        candidates = [float(values[index] + shift * period) for shift in shifts]
+        if candidates:
+            result[index] = min(candidates, key=lambda item: abs(item - near[index]))
+    result.setflags(write=False)
+    return result
 
 
 def _so3_error(target: NDArray[np.float64], current: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -84,24 +153,64 @@ class _HoloRobotMdhIkSolver:
     def __init__(self, model: Cs68KinematicsModel) -> None:
         self._model = model
         self._joint_limits = Es68KinematicModel.from_resources().joint_limit_pairs()
+        self._cache: OrderedDict[
+            tuple[float, ...], tuple[NDArray[np.float64], ...]
+        ] = OrderedDict()
 
     def solve(
         self,
         target_base_t_flange: PoseSE3,
         seed: NDArray[np.float64],
     ) -> NDArray[np.float64] | None:
+        solutions = self.solve_all(target_base_t_flange, seed)
+        return solutions[0] if solutions else None
+
+    def solve_all(
+        self,
+        target_base_t_flange: PoseSE3,
+        seed: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], ...]:
+        key = tuple(round(float(value), 9) for value in target_base_t_flange.matrix.ravel())
+        key += tuple(round(float(value), 6) for value in seed)
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            return cached
         candidates = (seed, *(_joint_seed(value) for value in _HOLOROBOT_IK_PRESET_SEEDS))
         seen: set[tuple[float, ...]] = set()
+        solutions: list[NDArray[np.float64]] = []
         for candidate in candidates:
             initial = self._clamp(candidate)
-            key = tuple(round(float(value), 6) for value in initial)
-            if key in seen:
+            seed_key = tuple(round(float(value), 6) for value in initial)
+            if seed_key in seen:
                 continue
-            seen.add(key)
+            seen.add(seed_key)
             solution = self._solve_single(target_base_t_flange, initial)
             if solution is not None:
-                return solution
-        return None
+                normalized = _nearest_equivalent_joints(
+                    solution,
+                    seed,
+                    self._joint_limits,
+                )
+                if not any(
+                    np.allclose(normalized, item, atol=1e-5, rtol=0.0)
+                    for item in solutions
+                ):
+                    solutions.append(normalized)
+        result = tuple(
+            sorted(
+                solutions,
+                key=lambda item: (
+                    float(np.max(np.abs(item - seed))),
+                    float(np.sum(np.abs(item - seed))),
+                ),
+            )
+        )
+        self._cache[key] = result
+        self._cache.move_to_end(key)
+        while len(self._cache) > 1024:
+            self._cache.popitem(last=False)
+        return result
 
     def _solve_single(
         self,
@@ -113,9 +222,8 @@ class _HoloRobotMdhIkSolver:
         rotation_tolerance_rad: float = 1e-3,
     ) -> NDArray[np.float64] | None:
         joints = seed.copy()
-        epsilon = 1e-6
         for _ in range(max_iterations):
-            _, current_pose = cs68_mdh_joint_origins(self._model, joints)
+            current_pose, jacobian = _forward_pose_and_jacobian(self._model, joints)
             position_error = target.translation_m - current_pose.translation_m
             rotation_error = _so3_error(target.rotation, current_pose.rotation)
             if (
@@ -123,18 +231,6 @@ class _HoloRobotMdhIkSolver:
                 and np.linalg.norm(rotation_error) < rotation_tolerance_rad
             ):
                 return joints
-            jacobian = np.zeros((6, 6), dtype=np.float64)
-            for joint_index in range(6):
-                perturbed = joints.copy()
-                perturbed[joint_index] += epsilon
-                _, perturbed_pose = cs68_mdh_joint_origins(self._model, perturbed)
-                jacobian[:3, joint_index] = (
-                    perturbed_pose.translation_m - current_pose.translation_m
-                ) / epsilon
-                jacobian[3:, joint_index] = _so3_error(
-                    perturbed_pose.rotation,
-                    current_pose.rotation,
-                ) / epsilon
             error = np.concatenate((position_error, rotation_error))
             try:
                 delta = _damped_least_squares_step(
@@ -269,4 +365,41 @@ class EliteCs68IkChecker:
             ReachabilityState.REACHABLE,
             "Elite KDL endpoint IK solution found; collision and trajectory remain unchecked",
             joints,
+        )
+
+    def check_all(self, base_t_left_ir: PoseSE3) -> tuple[ReachabilityResult, ...]:
+        """Return distinct nearby numerical solutions for motion-aware ranking."""
+
+        if self._uses_vendor_solver:
+            return (self.check(base_t_left_ir),)
+        if base_t_left_ir.parent_frame != "base" or not base_t_left_ir.child_frame.endswith(
+            "left_ir"
+        ):
+            return (self.check(base_t_left_ir),)
+        canonical = PoseSE3("base", "left_ir", base_t_left_ir.matrix)
+        target = canonical.compose(self._flange_t_left_ir.inverse())
+        try:
+            solutions = self._solver.solve_all(target, self._near)
+        except Exception as exc:
+            return (
+                ReachabilityResult(
+                    ReachabilityState.UNKNOWN,
+                    f"HoloRobot analytic MDH IK call failed: {exc}",
+                ),
+            )
+        if not solutions:
+            return (
+                ReachabilityResult(
+                    ReachabilityState.UNREACHABLE,
+                    "HoloRobot analytic MDH IK found no endpoint solution",
+                ),
+            )
+        return tuple(
+            ReachabilityResult(
+                ReachabilityState.REACHABLE,
+                "HoloRobot analytic MDH endpoint IK solution found; collision and "
+                "trajectory remain unchecked",
+                solution,
+            )
+            for solution in solutions
         )

@@ -434,10 +434,11 @@ def test_execute_revalidation_is_bounded_by_geometric_legs_not_servoj_ticks(
 
     assert clear_preflight.servoj_stream is not None
     assert len(clear_preflight.servoj_stream.commands) > 2
-    # Before enable, after enable, and after control recovery: only the live-start
-    # bridge is new geometry, independent of the number of 4 ms ServoJ commands.
-    assert len(mesh_calls) == 3
-    assert len(occupancy_calls) == 3
+    # Before and after enable: control recovery sends no joint command, so its
+    # unchanged start state reuses the second exact robust path proof instead of
+    # leaving the reverse socket idle for a third identical sweep.
+    assert len(mesh_calls) == 2
+    assert len(occupancy_calls) == 2
     assert all(
         calls[0][1] == clear_preflight.start_joint_positions_rad
         for calls in (mesh_calls, occupancy_calls)
@@ -861,7 +862,7 @@ def test_execute_non_boolean_cancellation_result_fails_closed(
     assert arm.resumed is False
 
 
-def test_execute_rechecks_permit_expiry_after_revalidation(
+def test_consumed_permit_is_not_a_wall_clock_gate_during_revalidation(
     checker, occupancy_checker, clear_preflight
 ) -> None:
     arm = FakeGuardedArm()
@@ -879,15 +880,15 @@ def test_execute_rechecks_permit_expiry_after_revalidation(
         confirmation=executor.approval_prompt(clear_preflight),
     )
 
-    with pytest.raises(RobotCommandError, match="post-recovery revalidation"):
-        executor.execute(clear_preflight, permit)
+    result = executor.execute(clear_preflight, permit)
 
-    assert arm.prepared is False
-    assert arm.streamed is False
+    assert result.ok
+    assert arm.prepared is True
+    assert arm.streamed is True
     assert arm.stopped is True
 
 
-def test_execute_rechecks_permit_expiry_after_servoj_prepare(
+def test_consumed_permit_is_not_a_wall_clock_gate_during_servoj_prepare(
     checker, occupancy_checker, clear_preflight
 ) -> None:
     arm = FakeGuardedArm()
@@ -904,11 +905,11 @@ def test_execute_rechecks_permit_expiry_after_servoj_prepare(
         confirmation=executor.approval_prompt(clear_preflight),
     )
 
-    with pytest.raises(RobotCommandError, match="ServoJ preparation"):
-        executor.execute(clear_preflight, permit)
+    result = executor.execute(clear_preflight, permit)
 
+    assert result.ok
     assert arm.prepared is True
-    assert arm.streamed is False
+    assert arm.streamed is True
 
 
 def test_execution_budget_expires_during_control_recovery(

@@ -1,4 +1,4 @@
-# FoundationStereo单后端停—算—规划—短移协调器
+# FoundationStereo单后端停—算—规划—整视点协调器
 
 ## 1. 目的与当前边界
 
@@ -8,11 +8,11 @@
 显式stop并取得有界间隔的停稳采样证据
   → 采集一组双目红外图
   → FoundationStereo推理
-  → 从新鲜视图窗口全量重建安全占用图
-  → 选择一个下一视点
-  → 只预检通向该视点的一小段
-  → 操作员批准这一段
-  → 冻结本段占用图并执行
+  → 增量追加当前帧到安全占用图（窗口替换时才全量重建）
+  → 生成并按科学增益排序下一视点候选
+  → 依次预检通向候选的完整关节直线路径
+  → 操作员批准第一个可证明安全的完整视点运动
+  → 冻结本代占用图并执行
   → 显式stop并验证停稳
   → 在新的停稳点重新采集
 ```
@@ -25,15 +25,15 @@ SHA-256的语义复验；仅在metadata中写一个后端名称不能通过。
 
 库级协调、资产事务、失败关闭状态机、两项连续扫掠证明及受监督组合入口均已实现。默认配置
 仍令`robot.motion_enabled=false`、`stop_and_capture.enabled=false`、
-`occupancy.enabled=false`，短段关节上限、工作空间和静态自由区验收也没有填写。因此未经审查
+`occupancy.enabled=false`，工作空间和静态自由区验收也没有填写。因此未经审查
 的默认配置必定在非运动doctor阶段失败。本页描述软件合同，不构成真机放行声明。
 
 主要实现位于：
 
-- `biblade_fusion.workflows.stop_scan_coordinator`：状态机、短段提议、地图冻结、逐段批准和
+- `biblade_fusion.workflows.stop_scan_coordinator`：状态机、完整视点提议、地图冻结、逐视点批准和
   执行后停稳；
 - `biblade_fusion.workflows.foundation_stereo_cycle`：单视图采集、FoundationStereo推理、
-  新鲜窗口全量占用重建、可选精扫科学资产事务及完整语义复验；
+  新帧增量占用更新/必要时窗口重建、可选精扫科学资产事务及完整语义复验；
 - `biblade_fusion.workflows.fine_science`：固定粗模型投影mask、精扫重建和覆盖代际准备；
 - `biblade_fusion.storage.blade_foreground`：来源绑定、写一次的叶片前景数字资产；
 - `biblade_fusion.robotics.stationarity`：停稳窗口和感知计算区间的有界间隔静止采样证据；
@@ -44,15 +44,15 @@ SHA-256的语义复验；仅在metadata中写一个后端名称不能通过。
 
 FoundationStereo可能需要较长GPU推理时间，并且左右一致性检查需要额外推理。协调器不把
 它放入ServoJ控制回路，也不要求它以视频帧率更新地图。机器人只在“有界离散静止采样门已
-通过”的状态下进行采集和推理；这句话不表示软件已经获得连续静止证明。一旦开始某个短段，
+通过”的状态下进行采集和推理；这句话不表示软件已经获得连续静止证明。一旦开始某个视点运动，
 使用的是已经发布并冻结的不可变占用图。
 
 因此，FoundationStereo延迟直接增加视点之间的等待时间，但不进入ServoJ时序环。每次采集
 前协调器先对同一台ES68调用`stop()`并等待停稳；独立只读采样线程在相机曝光前启动，持续
-覆盖相机采集、原始数据关闭、FoundationStereo推理、占用全量重建及其首次语义读取，最后
+覆盖相机采集、原始数据关闭、FoundationStereo推理、占用更新及其首次语义验证，最后
 再取一个结束状态。采样结束后，软件才把该轨迹写入stationarity资产并由协调器独立复验、
 提交；因此证据不声称覆盖这些后续文件操作。采集bracket状态也按时间合入该轨迹。若任一
-已采样状态的关节、TCP平移或TCP旋转超过阈值，控制器状态不是`IDLE`，安全状态不是
+已采样状态的关节、TCP平移或TCP旋转超过阈值，运行态字段缺失，安全状态不是
 `NORMAL/REDUCED`，或状态时间戳/采样间隔不满足新鲜度限制，本次感知结果不能发布为新的
 安全地图。
 
@@ -80,7 +80,7 @@ FoundationStereo可能需要较长GPU推理时间，并且左右一致性检查�
 非空且不大于占用图契约允许的上限。这些只是组装前置条件；启用YAML不等于运动已经获准，
 连续扫掠证明等第7节条件仍会独立阻断。
 
-## 3. 启动阶段：至少三个操作员引导的独立视角
+## 3. 启动阶段：一个人工视角与受约束的自动补图
 
 默认占用契约要求：
 
@@ -89,14 +89,16 @@ FoundationStereo可能需要较长GPU推理时间，并且左右一致性检查�
 - 新视角相对于每个已接收视角，至少满足相机中心平移或光轴转角中的一个独立性阈值；默认
   阈值分别为20 mm和5°。
 
-所以系统不能从单个初始视角直接宣称拥有可运动地图。`start()`首先进入
-`BOOTSTRAP_MAP_REQUIRED`。操作员必须用已经单独确认安全的方式，把机器人置于至少三个
-几何独立的停稳姿态并逐次调用采集；此启动阶段不由协调器自动移动机械臂。重复命名、几何
-不独立或者已经超出新鲜窗口的图像不能用来凑足数量。
+所以系统不能从单个初始视角直接宣称整个目标柱已经由传感器观测为自由空间。`start()`首先进入
+`BOOTSTRAP_MAP_REQUIRED`。操作员在唯一的初始视角绘制叶片polygon；若reviewed配置启用
+`allow_single_view_bootstrap_motion`，协调器可以在不把UNKNOWN伪装成FREE的前提下，只借用
+哈希绑定的静态自由区证明完成下一视点运动。后续停稳视角自动补充第二、第三个独立FREE票，
+地图达到完整`MAP_READY`后不再需要该bootstrap前缀。若此配置未启用，仍需人工补足视角。
+重复命名或几何不独立的图像不能用来凑足数量。
 
-每次bootstrap采集后，若来源不足，地图保持`MAPPING`，协调器继续处于
-`BOOTSTRAP_MAP_REQUIRED`。只有完整语义读取器复验得到新鲜`MAP_READY`资产，协调器才进入
-`MAP_READY`。
+每次bootstrap采集后，若来源不足，地图保持`MAPPING`。只有单视角bootstrap运动合同成立时
+才进入`BOOTSTRAP_MOTION_READY`；否则继续处于`BOOTSTRAP_MAP_REQUIRED`。完整语义验证得到
+新鲜`MAP_READY`资产后，协调器进入普通`MAP_READY`。
 
 此外，机器人自遮罩留下的体素仍是`UNKNOWN`，而`UNKNOWN`必须阻塞运动。最终真机放行前
 仍需解决捕获位姿下机器人自体素/自由壳的严格证明问题，不能直接把自遮罩区域标记为
@@ -135,7 +137,7 @@ cycles/<sequence>_<view>/
 manifest、完整状态序列和采集before/selected/after状态，然后才允许发布占用generation。
 
 协调器从状态机而不是视图名称调用方推导typed `CapturePurpose`。操作员引导建图为
-`BOOTSTRAP`；中间短段后的`transit_*`为`TRANSIT`；到达正式参考候选为`CANDIDATE`；
+`BOOTSTRAP`；到达正式参考候选为`CANDIDATE`；历史`TRANSIT`仅用于读取旧运行资产；
 `MOTION_BLOCKED`状态下额外采集为`SAFETY_REFRESH`。capture对象和perception结果必须携带同一
 purpose，跨边界漂移直接失败。
 
@@ -150,7 +152,7 @@ purpose，跨边界漂移直接失败。
 `base_T_left_rectified`重新生成像素索引与base系点云；恢复代际的整条非空历史均须满足这一
 约束，legacy schema 2不能进入在线精扫连续性。独立
 `BladeCoverageNextViewSelector`随后从真实曲面质量、raw/rectified相机链和当前停稳关节产生
-候选，并把选择策略、参考粗模型和代际哈希绑定到短段提议。详细契约见
+候选，并把选择策略、参考粗模型和代际哈希绑定到视点运动提议。详细契约见
 `docs/coverage-next-view-selector.md`。
 
 这条分支仍默认关闭。受监督composition root只会在粗扫完成schema-5并独立读回后创建新的
@@ -164,8 +166,9 @@ purpose，跨边界漂移直接失败。
 1. **候选阶段**：在新的周期目录中关闭单视图raw session，写入stereo、occupancy、
    stationarity以及purpose要求的可选mask/reconstruction/coverage资产。此时它们没有进入
    后续source window，也没有改变当前publisher或accepted coverage；
-2. **验证与提交阶段**：从磁盘重新读取候选资产，而不是继续信任内存返回对象。完整语义读取
-   必须复验raw来源、FoundationStereo运行时与校准、占用更新链、自遮罩/FK、静止轨迹、配置
+2. **验证与提交阶段**：重新验证候选资产，而不是继续信任未经约束的返回对象。在线占用可以
+   使用文件身份不变的进程内强类型权威；恢复/跨进程路径必须从磁盘完整读取。语义验证必须
+   复验raw来源、FoundationStereo运行时与校准、占用更新链、自遮罩/FK、静止轨迹、配置
    身份、科学资产代际和全部哈希。随后在协调器独占区内再次检查operator stop锁存、当前地图
    generation、capture purpose和预期周期身份均未变化，并在线性化决定后通过publisher事务
    接受对应source window及科学代际，再原子暴露新安全generation；接受异常时先前已接受的
@@ -194,8 +197,10 @@ publisher或感知提交返回。如果stop在线性化点之后、事务提交�
 ## 5. 源帧保留与generation替换
 
 每获得一帧新的FoundationStereo资产，周期引擎维护最多
-`occupancy.maximum_source_views`帧的滚动来源窗口，并从`previous_snapshot=None`开始按时间
-顺序重新积分。与当前帧不满足独立视角门槛的旧帧会被当前帧替换，不能重复贡献`FREE`票；若配置了
+`occupancy.maximum_source_views`帧的滚动来源窗口。窗口是原前缀加一个新独立视角时，已验证
+的更新链直接复用，只积分当前帧；只有旧视角被替换、窗口滑动、来源断档或恢复证据不匹配时，
+才从`previous_snapshot=None`按时间顺序全量重建。与当前帧不满足独立视角门槛的旧帧会被当前帧
+替换，不能重复贡献`FREE`票；若配置了
 `stop_and_capture.maximum_operator_reposition_interval_s`，相邻采集间隔超过该值时才丢弃
 此前的前缀。`occupancy.maximum_map_age_s`不再用于删除源帧。
 
@@ -207,8 +212,10 @@ publisher或感知提交返回。如果stop在线性化点之后、事务提交�
 - 每次发布的地图都是具有完整来源链的新一代不可变资产；
 - 预检、批准和执行绑定同一个明确generation；失败的新帧不能提前撤销当前generation。
 
-新的占用资产写完后，系统通过完整语义读取器重新验证原始session、用户双目标定、
-FoundationStereo来源与配置、手眼标定、ES68 FK、机器人深度渲染、自遮罩和体素积分。只有
+在线写入先对内存中的更新链和全部来源/渲染语义做完整校验，再用文件身份绑定的进程内验证缓存
+避免立刻从磁盘重复射线投射；跨进程读取、文件身份变化或恢复运行仍执行完整射线重放。系统验证
+原始session、用户双目标定、FoundationStereo来源与配置、手眼标定、ES68 FK、机器人深度渲染、
+自遮罩和体素积分。只有
 得到`full_semantic_verified_for_motion_preflight`的`StoredOccupancyMapping`才可构造
 `OccupancyGeneration`。
 
@@ -216,12 +223,12 @@ FoundationStereo来源与配置、手眼标定、ES68 FK、机器人深度渲染
 generation原子发布时间起算。默认的代际驱动策略仍会在每次授权、执行和freeze边界重验当前
 publisher绑定，不能把旧generation跨越一次成功的新发布继续使用。
 
-## 6. 下一视点与短段运动
+## 6. 下一视点与完整视点运动
 
 协调器每次只向`NextViewSelector`请求一个下一目标。具体selector只使用累积精扫曲面账本
 判断完成和排序，短时安全占用generation不参与科学得分；占用图只在后续预检中否决不安全
-短段。目标必须已经具有端点可达的ES68关节解和对应`base_T_tcp`，并通过独立标定FK回代。
-IK seed来自本次停稳感知轨迹的最新关节状态；协调器随后再读取实时关节作为短段真实起点，
+路径。目标必须已经具有端点可达的ES68关节解和对应`base_T_tcp`，并通过独立标定FK回代。
+IK seed来自本次停稳感知轨迹的最新关节状态；协调器随后再读取实时关节作为运动真实起点，
 不复用初始化姿态。
 
 覆盖尚未完成但没有工作空间/IK/FK均可接受的未使用候选时，selector抛出
@@ -229,29 +236,25 @@ IK seed来自本次停稳感知轨迹的最新关节状态；协调器随后再�
 全部必需主表面、四边界、鳍片双面、鳍片根部和自由边分区均通过覆盖率、RMSE、法向一致性
 门限时，才产生带固定参考和策略哈希的`coverage_complete`事件。
 
-若目标与当前状态的最大单关节差值超过实测配置
-`maximum_segment_joint_delta_rad`，协调器沿关节直线方向按比例截断，只提出一个中间短段。
-中间段用独立的`transit_*`视图ID，并在段后强制重新停稳、重新采集和重新规划。到达最终
-目标的短段才应用目标TCP的FK一致性门限；中间段仍必须通过相同的网格和占用安全检查。
-`transit_*`周期允许只刷新安全占用并引用上一周期已验证的不可变精扫代际；正式候选ID的
-采集则必须在当前周期内同时提交叶片重建和覆盖后继代际。这样短段重规划不会清空或伪增科学
-覆盖，而正式精扫漏产资产也不会静默重试。跨周期selector同时钉住粗模型metadata哈希，并
-要求transit精确保持generation路径/ID、科学后继精确指向前一代；另一运行的自洽coverage
-不能通过这条连续性门。
+协调器不再用`maximum_segment_joint_delta_rad`把一个视点切成多个中间采集点；该键只为旧配置
+保留并被运行时忽略。每个候选从当前实测关节到目标IK解形成一条完整关节直线，由连续网格与
+占用碰撞器证明整条路径。`motion_preflight.maximum_joint_step_rad`仍控制内部轨迹离散与连续
+证明的区间宽度，但不会触发中间FoundationStereo、占用重建或NBV重规划。当前没有RRT/OMPL
+绕障器，因此一条直线路径被否决后，协调器按科学排名继续预检其余有界候选，而不是搜索同一
+端点的弯曲路径。
 
 每个`SegmentProposal`哈希绑定：
 
 - 当前实测起点关节；
-- 本段终点关节和最终目标关节；
-- 目标视点与段后采集ID；
-- 是否到达最终目标；
+- 目标视点的终点关节和TCP；
+- 段后采集ID；
 - 当前占用generation的完整身份。
 
-关节距离只决定是否把目标拆成更短的段，不代替端点可达性、碰撞检查或覆盖优先级。
+关节距离只影响运动时间与轨迹采样，不代替端点可达性、碰撞检查或覆盖优先级。
 
 ## 7. 预检、人工批准与地图冻结
 
-每个短段单独调用live joint segment预检。其占用证据绑定：
+每个完整候选路径单独调用live joint segment预检。其占用证据绑定：
 
 - map sequence和content hash；
 - mapping-context与quality-evidence hash；
@@ -259,8 +262,9 @@ IK seed来自本次停稳感知轨迹的最新关节状态；协调器随后再�
 - occupancy metadata、语义验证器和attestation hash。
 
 只有预检`ready_for_approval=true`时才创建`GuardedEliteExecutor`并进入
-`WAITING_APPROVAL`。每一段都要求操作员输入该段精确preflight fingerprint对应的确认文本；
-批准是短时、一次性的，不能跨段复用。
+`WAITING_APPROVAL`。每个视点都要求操作员输入该路径精确preflight fingerprint对应的确认文本；
+批准是一次性的，不能跨视点复用。有效期只限制操作员批准前证据可以等待多久；批准被精确消费
+后，受控上电/恢复耗时不会反向使许可失效。
 
 `prepare_next_segment()`只向调用方返回不含执行器、且与内部审批证据深拷贝隔离的摘要，
 真实执行器和权威preflight保留在协调器私有状态中，因此调用方修改摘要不能影响后续审批与
@@ -272,9 +276,9 @@ bracket、感知采样、安全工厂和执行器必须绑定同一个机器人�
 
 授权和执行期间，`OccupancyGenerationPublisher.freeze()`禁止发布新地图，并验证冻结前后
 generation未改变。执行器还会复核当前占用身份、实时起点、精确ServoJ流、运行配置和碰撞
-结果。一次性许可消费后，执行器才可通过私有capability清除上一段的stop锁；恢复后会再次
-核对实时起点、完整轨迹、占用新鲜度、许可时效和异步停止锁，首个ServoJ命令前再检查一次。
-公开`enable()`不能清除该stop锁。地图一旦更新、许可过期或停止请求到达，旧预检和旧批准
+结果。一次性许可消费后，执行器才可通过私有capability清除上一运动的stop锁；恢复后会再次
+核对实时起点、完整轨迹、占用新鲜度和异步停止锁，首个ServoJ命令前再检查一次。
+公开`enable()`不能清除该stop锁。地图一旦更新、许可在消费前过期或停止请求到达，旧预检和旧批准
 都不能继续使用。
 
 异步`stop()`先在独立锁内递增停止代次并锁止，随后才通过短时命令I/O门发送`writeIdle`；它
@@ -301,18 +305,19 @@ generation未改变。执行器还会复核当前占用身份、实时起点、�
 
 ## 8. 执行后stop与有界间隔停稳采样证据
 
-每个通过两项连续证明并获得本段精确批准的短段，仍必须按以下顺序收尾：
+每个通过两项连续证明并获得精确批准的视点运动，仍必须按以下顺序收尾：
 
 1. 在一次性许可内受控恢复，并执行精确绑定的ServoJ命令流；
-2. 执行器对同一机械臂显式调用`stop()`，只有stop成功才返回；
+2. 执行器在最终点反馈收敛后对同一机械臂调用`stop()`；正常路径只发送HoloRobot同款
+   `writeIdle(0)`并锁存stop generation，不关闭Dashboard程序或reverse session；
 3. 进入`SETTLING`；
-4. 验证实际关节到达本段目标容差；
+4. 验证实际关节到达视点目标容差；
 5. 在完整`settle_time_s`窗口内检查任意样本对之间的最大关节、TCP平移和TCP旋转变化；
 6. 进入`AWAITING_CAPTURE`，只接受协调器指定的段后采集ID。
 
 停稳检查不是简单sleep。它同时要求本地单调时钟、host状态时间和控制器时间覆盖配置窗口，
 限制相邻状态的最大时间间隔，并计算已采样状态中任意样本对的最大变化。因此它能检出已被
-采到的慢漂移和移出—返回行为；等待超时、时钟倒退、反馈冻结、控制器非`IDLE`、状态读取
+采到的慢漂移和移出—返回行为；等待超时、时钟倒退、反馈冻结、stop锁存变化、状态读取
 失败、终点误差或运动阈值超限都会失败关闭。
 
 这仍是离散采样证据，不是数学意义上的连续静止证明：若机械臂在两个状态样本之间运动并在
@@ -320,10 +325,12 @@ generation未改变。执行器还会复核当前占用身份、实时起点、�
 未观测区间，并不会把该区间变成连续轨迹证明；host时间和controller时间都覆盖完整窗口也只
 能排除长期旧反馈，不能恢复样本之间的运动。`maximum_robot_state_staleness_s=0.25`是待实测
 的保守占位值，不是论文结论。真机放行前必须测得RTSI最坏采样间隔，核验`writeIdle`后的程序
-状态，并用控制器实际关节速度/序列信息或“速度上界×最大采样间隔”界证明未观测运动不会
+状态。普通段后窗口允许`runtime_state=PLAYING`，但要求stop锁存全程不变、实际关节/TCP与
+目标位姿保持在阈值内；瞬时速度字段只作为诊断。bootstrap仍严格要求Dashboard `STOPPED`。
+应继续用控制器实际关节速度/序列信息或“速度上界×最大采样间隔”界证明未观测运动不会
 越过允许阈值；否则该证据只能作为感知有效性门，而不能单独作为人员安全功能。
 
-若执行、stop或停稳的任何一步异常，协调器再次尝试stop并进入`ABORTED`；不会自动重发该段。
+若执行、stop或停稳的任何一步异常，协调器再次尝试stop并进入`ABORTED`；不会自动重发该运动。
 
 ## 9. 运行事件链
 
@@ -367,7 +374,7 @@ IDLE
 主要失败状态：
 
 - 感知、来源验证或地图发布异常：`FAILED`；
-- 地图非新鲜`MAP_READY`、下一段不可证明安全：`MOTION_BLOCKED`；
+- 地图非新鲜`MAP_READY`、所有候选路径均不可证明安全：`MOTION_BLOCKED`；
 - 执行、stop或执行后停稳异常：`ABORTED`；
 - 操作员主动中止：`ABORTED`；
 - 任一运行事件持久化失败：不可逆`FAILED`，清除待审批段且本协调器实例不得恢复；
@@ -376,6 +383,6 @@ IDLE
 - 精扫代际、固定参考、FoundationStereo来源或选择策略语义不一致：`FAILED`。
 
 生产放行前仍要完成：最终ES68+D435i STL尺度/装配与自遮罩真机验收、连续证明的已知安全/
-已知碰撞轨迹验证、FoundationStereo/CUDA实测、地图年龄与短段关节上限测量、RTSI采样/
+已知碰撞轨迹验证、FoundationStereo/CUDA实测、RTSI采样/
 未观测运动边界验收、在线叶片mask/分区/重建质量验证，以及受控硬件验收。完成这些条件前，应把
 `MOTION_BLOCKED`视为正确结果，而不是需要绕开的程序错误；硬件急停仍是最终安全边界。

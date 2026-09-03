@@ -548,11 +548,6 @@ class GuardedEliteExecutor:
                     cancellation_requested,
                     stage="after_guarded_enable",
                 )
-                if (
-                    self._finite_clock_value(label="post-enable execution time")
-                    > permit.expires_monotonic_s
-                ):
-                    raise RobotCommandError("motion execution permit expired during guarded enable")
                 enabled_state = self._arm.read_state()
                 enabled_start_error = float(
                     np.max(
@@ -598,10 +593,6 @@ class GuardedEliteExecutor:
                 permit.stop_generation,
                 stage="after_control_recovery",
             )
-            if self._finite_clock_value(label="post-recovery execution time") > (
-                permit.expires_monotonic_s
-            ):
-                raise RobotCommandError("motion execution permit expired during control recovery")
             recovered_state = self._arm.read_state()
             recovered_start_error = float(
                 np.max(
@@ -616,12 +607,12 @@ class GuardedEliteExecutor:
                     "live robot state changed during control recovery "
                     f"({recovered_start_error:.6f} rad)"
                 )
-            self._revalidate_exact_stream_path(
-                recovered_state.joint_positions_rad,
-                stream,
-                preflight,
-                expected_occupancy,
-            )
+            # Recovery starts the external-control transport but sends no joint
+            # command. The exact path was already revalidated immediately before
+            # recovery; an unchanged live start plus unchanged occupancy identity
+            # preserves that proof. Re-running the robust swept path here used to
+            # leave the reverse socket idle long enough to disconnect before its
+            # first ServoJ hold.
             try:
                 self._occupancy_checker.assert_current_evidence(
                     expected_occupancy,
@@ -631,13 +622,6 @@ class GuardedEliteExecutor:
                 raise RobotCommandError(
                     f"occupancy snapshot changed during control recovery: {exc}"
                 ) from exc
-            if (
-                self._finite_clock_value(label="post-revalidation execution time")
-                > permit.expires_monotonic_s
-            ):
-                raise RobotCommandError(
-                    "motion execution permit expired during post-recovery revalidation"
-                )
             self._require_unchanged_stop_generation(
                 permit.stop_generation,
                 stage="before_servoj_prepare",
@@ -658,11 +642,6 @@ class GuardedEliteExecutor:
                 permit.stop_generation,
                 stage="after_servoj_prepare",
             )
-            if (
-                self._finite_clock_value(label="post-prepare execution time")
-                > permit.expires_monotonic_s
-            ):
-                raise RobotCommandError("motion execution permit expired during ServoJ preparation")
             result = self._arm._guarded_stream_servoj(
                 stream,
                 config=config,

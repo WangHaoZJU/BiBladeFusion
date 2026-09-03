@@ -195,6 +195,34 @@ def test_initialization_artifact_round_trip(tmp_path: Path) -> None:
         read_initialization(output)
 
 
+def test_initialization_reader_relocates_byte_identical_external_sources(
+    tmp_path: Path,
+) -> None:
+    hand_eye, authority = authoritative_inputs(tmp_path)
+    output = tmp_path / "initialization"
+    write_initialization(
+        output,
+        make_observation(authority),
+        np.ones((2, 2), dtype=bool),
+        hand_eye,
+        PointCloudConfig(minimum_valid_points=3),
+        ProxyModelConfig(estimated_thickness_m=0.01),
+        KinematicsConfig(),
+        HandEyeConfig(calibration_path=Path("he.yaml")),
+        source_session=tmp_path / "session",
+    )
+    metadata_path = output / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["hand_eye"]["source"]["path"] = "/retired-host/he.yaml"
+    for name, record in metadata["kinematics_assets"].items():
+        record["path"] = f"/retired-host/{name}"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    stored = read_initialization(output)
+
+    assert stored.hand_eye.source_path == hand_eye.source_path.resolve()
+
+
 def test_initialization_persists_proxy_support_diagnostics(tmp_path: Path) -> None:
     hand_eye, authority = authoritative_inputs(tmp_path)
     proxy_config = ProxyModelConfig(

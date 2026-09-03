@@ -60,7 +60,7 @@ class SupervisedExperimentBlocked(StopScanBlocked):
 
 @dataclass(frozen=True, slots=True)
 class OperatorApproval:
-    """Explicit approval for exactly the currently prepared short segment."""
+    """Explicit approval for exactly the currently prepared viewpoint motion."""
 
     operator_id: str
     confirmation: str
@@ -453,7 +453,7 @@ class SupervisedExperimentRunner:
         """Advance one non-motion state-machine action and then return.
 
         This method never executes a robot segment.  A map-ready step performs exactly
-        one next-view selection and one short-segment preflight, stopping at approval.
+        one next-view selection and one complete-path preflight, stopping at approval.
         """
 
         with self._exclusive_operation():

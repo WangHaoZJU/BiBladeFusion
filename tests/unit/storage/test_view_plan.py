@@ -8,6 +8,7 @@ import pytest
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     AdaptiveIkViewSearchConfig,
+    AxisAlignedBoxConfig,
     PointCloudConfig,
     ViewFilterConfig,
     ViewPlanningConfig,
@@ -117,7 +118,14 @@ def test_adaptive_search_trace_and_candidate_policy_survive_storage(tmp_path: Pa
             maximum_ik_feasible_candidates=1,
         ),
     )
-    filtering = ViewFilterConfig(camera_clearance_radius_m=0.01)
+    filtering = ViewFilterConfig(
+        workspace=AxisAlignedBoxConfig(
+            name="test_workspace",
+            minimum_m=(-0.5, -0.5, -0.5),
+            maximum_m=(0.5, 0.5, 0.5),
+        ),
+        camera_clearance_radius_m=0.01,
+    )
     result = plan_initial_observation(
         observation,
         planning,

@@ -153,21 +153,94 @@ rule that no motion command precedes approval.
 
 Date: 2026-09-03
 
-Status: accepted; offline verified, physical verification pending
+Status: superseded in part by D014; offline verified, physical verification pending
 
 Reuse HoloRobot's endpoint-hold feedback policy: repeat only the already approved final
 setpoint, sample the persistent RTSI joint state, and require three consecutive samples
-within `0.005 rad` inside `2 s`. Only then send `writeIdle` and request Dashboard STOPPED.
-This is convergence of the commanded segment, not an arbitrary post-motion delay.
+within `0.005 rad` inside `2 s`. Only then send `writeIdle`. Normal segment completion no
+longer requests Dashboard STOPPED; see D014. This is convergence of the commanded segment,
+not an arbitrary post-motion delay.
 
 ## D013 — Default candidate IK is HoloRobot MDH/DLS
 
 Date: 2026-09-03
 
-Status: accepted; offline verified
+Status: superseded in part by D019; offline verified
 
 Candidate reachability uses the calibrated controller MDH chain, finite-difference world
 Jacobian, damped least-squares update, ES68 limits, and multi-seed strategy adapted from
 HoloRobot. The vendor KDL solver remains injectable for historical reproduction but is
 not the normal online candidate path. Expected unreachable candidates are returned as
 data and no longer flood the hardware console with KDL warnings.
+
+## D014 — Normal segment stop is the HoloRobot `writeIdle` boundary
+
+Date: 2026-09-04
+
+Status: accepted; offline verified, physical verification pending
+
+After endpoint feedback convergence, normal execution sends `writeIdle(0)` and latches a
+new immutable stop generation. It does not call Dashboard `stopProgram`, so the reverse
+session remains available and does not reconnect solely to stop. The following stationary
+window accepts a sampled `RUNNING/PLAYING` controller only while the stop generation is
+unchanged and joint/TCP pose remains within threshold. Bootstrap and independent deadline
+fault stops retain the stronger Dashboard path.
+
+## D015 — One NBV is one complete motion and one capture
+
+Date: 2026-09-04
+
+Status: accepted; offline verified, physical verification pending
+
+The coordinator no longer converts `maximum_segment_joint_delta_rad=0.02` into artificial
+intermediate captures. It proves and executes the complete joint-linear path to a viewpoint;
+`motion_preflight.maximum_joint_step_rad` remains only an internal interpolation/proof
+interval. The complete bounded science-ranked queue receives the same hard path veto, rather
+than stopping after an arbitrary top three. Curved obstacle-avoiding planning is explicitly
+outside the current implementation.
+
+## D016 — Live occupancy reuses verified work without weakening disk replay
+
+Date: 2026-09-04
+
+Status: accepted; offline verified
+
+An appended independent source reuses the committed update prefix and integrates only the
+new frame. Replacement, sliding, discontinuous, or mismatched windows still rebuild from
+scratch. A file-identity-bound in-process cache lets the live writer hand the already fully
+validated mapping to the coordinator without immediately raycasting it again; fresh
+processes and changed files retain full semantic and ray replay.
+
+## D017 — Measurement coverage and reconstruction QA are separate gates
+
+Date: 2026-09-04
+
+Status: accepted; offline verified
+
+Active measurement completes when required blade-side, boundary, and fin regions satisfy
+the coverage contract. Downstream mesh/watertight reconstruction QA is recorded but does
+not block further measurement by default. Deployments may opt into strict reconstruction
+blocking. Fine NBV applies the same bounded adaptive distance/incidence fallback used in
+coarse discovery when a nominal pose is unreachable.
+
+## D018 — Synchronized absolute paths relocate only by content identity
+
+Date: 2026-09-04
+
+Status: accepted; offline verified
+
+Initialization and occupancy artifacts copied between the vale and eiai checkouts may
+resolve a missing historical absolute path under the active project only when the candidate
+file has the exact recorded size and SHA-256. Existing-but-different files and ambiguous
+content continue to fail closed.
+
+## D019 — Candidate IK uses an analytic fixed-MDH Jacobian
+
+Date: 2026-09-04
+
+Status: accepted; offline verified
+
+The D013 solver contract remains, but its finite-difference Jacobian is replaced by the
+analytic world geometric Jacobian derived from the calibrated fixed-MDH chain. This removes
+six FK perturbations per iteration while retaining DLS, joint limits, multiple seeds,
+nearest equivalent joint wrapping, FK replay, and bounded search time.

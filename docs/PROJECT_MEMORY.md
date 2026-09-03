@@ -2,7 +2,7 @@
 
 Status: authoritative research contract
 
-Last reviewed: 2026-09-03
+Last reviewed: 2026-09-04
 
 ## 1. Research goal
 
@@ -37,7 +37,8 @@ The target workflow starts from one operator-selected initial view:
    evidence independently of the blade proxy.
 6. Coarse next-best-view selection ranks adaptive candidates by expected new blade/fin
    information. IK, workspace, collision, and continuous-path checks veto invalid
-   candidates.
+   candidates. One selected NBV produces one complete viewpoint motion and one capture;
+   trajectory interpolation is not a reason to reconstruct intermediate views.
 7. During the single-view prefix, motion may use only UNKNOWN voxels wholly covered by
    an immutable accepted-static-free region. This does not claim that the map is ready.
 8. New stopped views are captured. From the second view onward, the blade ROI is produced
@@ -46,7 +47,8 @@ The target workflow starts from one operator-selected initial view:
 9. After the required independent evidence exists, a map generation becomes `MAP_READY`
    and ordinary online NBV continues.
 10. The system crosses sides as needed, observes both blade faces and opposing fin faces,
-    performs fine acquisition, and produces the final geometry model.
+    and completes acquisition from its coverage ledger. Final mesh/watertight QA and
+    thermal mapping are downstream results, not default motion gates.
 
 The present implementation may still expose intermediate operator approvals. Those are
 experimental control points, not the desired scientific workflow.

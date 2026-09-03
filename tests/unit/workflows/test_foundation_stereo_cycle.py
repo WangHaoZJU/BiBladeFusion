@@ -354,6 +354,52 @@ def _window_source(
     )
 
 
+def test_rebuild_updates_reuses_committed_prefix_and_integrates_only_new_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _ = _capture_engine(tmp_path)
+    first = _window_source(
+        tmp_path,
+        sequence_index=0,
+        monotonic_time_ns=1_000_000_000,
+        captured_at_utc=datetime(2026, 9, 4, 0, 0, tzinfo=UTC),
+    )
+    second = _window_source(
+        tmp_path,
+        sequence_index=1,
+        monotonic_time_ns=2_000_000_000,
+        captured_at_utc=datetime(2026, 9, 4, 0, 0, 1, tzinfo=UTC),
+    )
+    first_update = SimpleNamespace(
+        snapshot=object(),
+        evidence=SimpleNamespace(quality_evidence_hash="a" * 64),
+    )
+    engine._sources = [first]  # noqa: SLF001
+    engine._updates = [first_update]  # noqa: SLF001
+    calls: list[tuple[object, str]] = []
+
+    def integrate(previous, bundle, *_args, previous_evidence_hash, **_kwargs):
+        calls.append((previous, previous_evidence_hash))
+        assert bundle is second.captured.bundle
+        return SimpleNamespace(
+            snapshot=object(),
+            evidence=SimpleNamespace(quality_evidence_hash="b" * 64),
+        )
+
+    monkeypatch.setattr(
+        cycle_module,
+        "integrate_foundation_stereo_occupancy",
+        integrate,
+    )
+
+    updates = engine._rebuild_updates((first, second))  # noqa: SLF001
+
+    assert updates[0] is first_update
+    assert len(updates) == 2
+    assert calls == [(first_update.snapshot, "a" * 64)]
+
+
 def test_source_window_uses_monotonic_capture_gap_not_wall_clock(tmp_path: Path) -> None:
     engine, _ = _capture_engine(tmp_path)
     stop = engine._settings.stop_and_capture.model_copy(  # noqa: SLF001
@@ -1111,6 +1157,7 @@ def _engine_with_pending_transaction(
         inference_stationarity_path=stationarity_path,
         inference_stationarity_sha256=stationarity_sha256,
         sources=("proposed-source",),
+        updates=(),
         blade_foreground_path=blade_foreground_path,
         reconstructed_view_path=reconstructed_view_path,
         coverage_path=coverage_path,

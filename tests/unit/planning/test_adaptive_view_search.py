@@ -1,6 +1,7 @@
 import json
 
 import numpy as np
+import pytest
 
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import AxisAlignedBoxConfig, ViewFilterConfig
@@ -30,6 +31,19 @@ def make_proxy() -> BilateralBladeProxy:
         100,
         1.0,
     )
+
+
+def wide_workspace_filter(**updates: float) -> ViewFilterConfig:
+    values: dict[str, object] = {
+        "workspace": AxisAlignedBoxConfig(
+            name="physical_outer_boundary",
+            minimum_m=(-2.0, -2.0, -2.0),
+            maximum_m=(2.0, 2.0, 2.0),
+        ),
+        "camera_clearance_radius_m": 0.01,
+    }
+    values.update(updates)
+    return ViewFilterConfig(**values)
 
 
 def make_nominal() -> CandidateView:
@@ -70,7 +84,7 @@ class RollSensitiveChecker:
         return ReachabilityResult(ReachabilityState.UNREACHABLE, "nominal wrist branch fails")
 
 
-def test_family_starts_at_ideal_then_changes_roll_before_tilt_or_distance() -> None:
+def test_family_starts_at_ideal_then_explores_distance_before_wrist_roll() -> None:
     config = AdaptiveViewSearchConfig(
         distance_step_m=0.05,
         maximum_distance_expansions=1,
@@ -84,8 +98,8 @@ def test_family_starts_at_ideal_then_changes_roll_before_tilt_or_distance() -> N
     first_parameters, first = family[0]
     second_parameters, second = family[1]
     assert first_parameters == first_parameters.__class__(0.30, 0.0, 0.0, 0.0, 0)
-    assert second_parameters.roll_deg == 45.0
-    assert second_parameters.distance_m == first_parameters.distance_m
+    assert second_parameters.roll_deg == 0.0
+    assert second_parameters.distance_m == pytest.approx(0.25)
     assert second_parameters.tilt_deg == 0.0
     np.testing.assert_allclose(first.base_t_left_ir.translation_m, [0.0, 0.0, 0.31])
     for candidate in (first, second):
@@ -112,7 +126,7 @@ def test_multi_seed_ik_keeps_all_solutions_and_selects_nearest_current() -> None
     np.testing.assert_allclose(evaluation.result.joint_positions_rad, near)
 
 
-def test_search_recovers_roll_sensitive_ik_outside_advisory_workspace() -> None:
+def test_search_never_escapes_configured_outer_workspace() -> None:
     narrow = AxisAlignedBoxConfig(
         name="empirical_camera_centres",
         minimum_m=(-0.05, -0.05, -0.05),
@@ -136,10 +150,12 @@ def test_search_recovers_roll_sensitive_ik_outside_advisory_workspace() -> None:
     )
 
     assert len(result.attempts) == 2
-    assert len(result.ranked_feasible) == 1
-    assert result.recommended is not None
-    assert result.recommended.parameters.roll_deg == 45.0
-    assert "advisory workspace" in " ".join(result.recommended.evaluated.reasons)
+    assert len(result.ranked_feasible) == 0
+    assert result.recommended is None
+    assert all(
+        "leaves workspace" in " ".join(attempt.evaluated.reasons)
+        for attempt in result.attempts
+    )
     assert result.motion_authorized is False
 
 
@@ -158,7 +174,7 @@ def test_fin_search_samples_every_tilt_at_nominal_distance_and_prefers_45_deg() 
     result = search_adaptive_candidate_family(
         make_nominal(),
         make_proxy(),
-        ViewFilterConfig(camera_clearance_radius_m=0.01, minimum_incidence_cosine=0.4),
+        wide_workspace_filter(minimum_incidence_cosine=0.4),
         (FixedChecker(np.zeros(6)),),
         np.zeros(6),
         config,
@@ -186,7 +202,7 @@ def test_report_is_json_serializable_and_explicitly_non_executable() -> None:
     result = search_adaptive_candidate_family(
         make_nominal(),
         make_proxy(),
-        ViewFilterConfig(camera_clearance_radius_m=0.01),
+        wide_workspace_filter(),
         (FixedChecker(np.zeros(6)),),
         np.zeros(6),
         config,

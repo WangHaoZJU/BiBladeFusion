@@ -1,4 +1,4 @@
-"""Serial FoundationStereo stop-and-capture coordination for one short motion leg.
+"""Serial FoundationStereo stop-and-capture coordination for one viewpoint motion.
 
 This module deliberately exposes no raw robot command.  It composes the existing
 full semantic occupancy reader, one-leg preflight, guarded executor, and stationarity
@@ -1320,8 +1320,6 @@ class StopScanCoordinator:
                 raise StopScanBlocked("Stop-and-capture coordinator is disabled")
             if not self._occupancy_config.enabled:
                 raise StopScanBlocked("Safety occupancy mapping is disabled")
-            if self._config.maximum_segment_joint_delta_rad is None:
-                raise StopScanBlocked("Short-segment joint bound is not configured")
             if self._robot_config.settle_time_s <= 0.0:
                 raise StopScanBlocked("A positive robot settle_time_s is required")
             if self._config.settle_timeout_s < (
@@ -1674,9 +1672,11 @@ class StopScanCoordinator:
                     raise BladePlanningAssetError("Incomplete selector decision has no target")
                 live_state = self._robot.read_state()
                 self._raise_if_stop_requested()
-                candidate_queue = selection.preflight_candidates[
-                    : self._config.maximum_ranked_preflight_candidates
-                ]
+                # Path safety is a veto, not a reason to fail merely because the
+                # first three high-gain endpoints take blocked straight-line routes.
+                # Candidate generation is already bounded; examine the complete
+                # science-ranked set until one continuous path proves clear.
+                candidate_queue = selection.preflight_candidates
                 rejected: list[tuple[str, tuple[str, ...]]] = []
                 prepared: _PreparedSegmentExecution | None = None
                 selected_for_motion: NextViewSelection | None = None
@@ -1691,7 +1691,7 @@ class StopScanCoordinator:
                     selected_for_motion = selection.choose_ranked_candidate(
                         candidate.target.view_id
                     )
-                    proposal = self._propose_short_segment(
+                    proposal = self._propose_viewpoint_motion(
                         candidate.target,
                         selected_for_motion,
                         live_state,
@@ -1707,7 +1707,8 @@ class StopScanCoordinator:
                             "preflight_attempt_index": rank,
                             "science_rank": science_rank,
                             "ranked_candidate_count": len(selection.preflight_candidates),
-                            "preflight_candidate_limit": (
+                            "preflight_candidate_limit": len(candidate_queue),
+                            "legacy_configured_preflight_limit_ignored": (
                                 self._config.maximum_ranked_preflight_candidates
                             ),
                             "final_target": proposal.final_target,
@@ -2148,6 +2149,7 @@ class StopScanCoordinator:
             maximum_stopped_target_tcp_angular_velocity_rad_s=(
                 envelope.maximum_stopped_target_tcp_angular_velocity_rad_s
             ),
+            require_stop_latch=True,
         )
 
     @staticmethod
@@ -2567,7 +2569,7 @@ class StopScanCoordinator:
         ):
             raise StopScanBlocked("Raw single-view session identity mismatch")
 
-    def _propose_short_segment(
+    def _propose_viewpoint_motion(
         self,
         target: NextViewTarget,
         selection: NextViewSelection,
@@ -2582,34 +2584,24 @@ class StopScanCoordinator:
             )
         start = np.asarray(live_state.joint_positions_rad, dtype=np.float64)
         final = np.asarray(target.joint_positions_rad, dtype=np.float64)
-        delta = final - start
-        maximum_delta = float(np.max(np.abs(delta)))
-        bound = self._config.maximum_segment_joint_delta_rad
-        if bound is None or not math.isfinite(bound) or bound <= 0.0:
-            raise StopScanBlocked("Short-segment joint bound is unavailable")
-        # Split the remaining route into equal bounded legs.  Taking one full-size
-        # leg first can leave an arbitrarily tiny final leg, whose mandatory
-        # capture is not an independent occupancy viewpoint.
-        segment_count = (
-            1
-            if maximum_delta <= 1e-12
-            else max(1, math.ceil(maximum_delta / bound - 1e-12))
-        )
-        scale = 1.0 / segment_count
-        goal = start + scale * delta
-        final_target = bool(scale >= 1.0 - 1e-12)
-        capture_view_id = (
-            target.view_id
-            if final_target
-            else f"transit_{target.view_id}_cycle_{self._cycle_index:04d}"
-        )
+        # One scientific NBV is one approved motion and one stopped capture.  The
+        # historical coordinator confused a 0.02-rad collision sampling interval
+        # with a physical receding-horizon leg and could turn one view into hundreds
+        # of stop/reconstruct/replan cycles.  Trajectory interpolation and continuous
+        # swept-volume proof remain the responsibility of motion preflight.
+        goal = final
+        final_target = True
+        capture_view_id = target.view_id
         payload = {
             "target_view_id": target.view_id,
             "capture_view_id": capture_view_id,
             "start_joint_positions_rad": start.tolist(),
             "goal_joint_positions_rad": goal.tolist(),
             "final_target_joint_positions_rad": final.tolist(),
-            "final_target": final_target,
+            "final_target": True,
+            "legacy_maximum_segment_joint_delta_rad_ignored": (
+                self._config.maximum_segment_joint_delta_rad
+            ),
             "bootstrap_mapping_prefix": bootstrap_mapping_prefix,
             "occupancy_binding": generation.binding.tuple,
             "occupancy_generation_id": generation.generation_id,

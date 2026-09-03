@@ -157,8 +157,8 @@ def test_initial_planning_selects_adaptive_ik_pose_and_records_search_trace() ->
     filtering = ViewFilterConfig(
         workspace=AxisAlignedBoxConfig(
             name="empirical_camera_centres",
-            minimum_m=(-0.05, -0.05, -0.05),
-            maximum_m=(0.05, 0.05, 0.05),
+            minimum_m=(-0.5, -0.5, -0.5),
+            maximum_m=(0.5, 0.5, 0.5),
         ),
         camera_clearance_radius_m=0.01,
     )
@@ -180,7 +180,7 @@ def test_initial_planning_selects_adaptive_ik_pose_and_records_search_trace() ->
         for item in result.filtered_plan.endpoint_feasible
     )
     assert all(
-        "advisory workspace" in " ".join(item.reasons)
+        "advisory workspace" not in " ".join(item.reasons)
         for item in result.filtered_plan.endpoint_feasible
     )
     assert result.motion_authorized is False

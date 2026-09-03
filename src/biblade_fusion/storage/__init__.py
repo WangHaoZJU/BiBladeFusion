@@ -73,6 +73,7 @@ from biblade_fusion.storage.occupancy_mapping import (
     read_legacy_occupancy_mapping_for_replay,
     read_occupancy_mapping,
     read_occupancy_mapping_for_replay,
+    write_live_occupancy_mapping,
     write_occupancy_mapping,
 )
 from biblade_fusion.storage.path_validation import (
@@ -248,6 +249,7 @@ __all__ = [
     "MAXIMUM_COMMISSIONING_CANDIDATE_JOINT_DELTA_RAD",
     "write_native_overlap_report",
     "write_occupancy_mapping",
+    "write_live_occupancy_mapping",
     "write_path_validation",
     "write_coverage_driven_plan",
     "write_depth_comparison",

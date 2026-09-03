@@ -561,7 +561,15 @@ def _fin_discovery_search_config(
         azimuth_samples_deg=(_fin_discovery_azimuth_deg(candidate),),
         roll_samples_deg=adaptive.roll_samples_deg,
         maximum_generated_candidates=adaptive.maximum_generated_candidates,
-        maximum_ik_feasible_candidates=adaptive.maximum_ik_feasible_candidates,
+        # Each nominal discovery family contributes one endpoint to the global
+        # science ranking; collecting eight alternatives for every one of the
+        # eight seed poses only multiplies IK latency.
+        maximum_ik_feasible_candidates=min(
+            2,
+            adaptive.maximum_ik_feasible_candidates,
+        ),
+        maximum_ik_attempts_per_family=adaptive.maximum_ik_attempts_per_family,
+        maximum_search_duration_s=adaptive.maximum_search_duration_s,
         sampling_order="distance_major",
         ranking_mode="fin_discovery",
         require_attempted_per_tilt=True,

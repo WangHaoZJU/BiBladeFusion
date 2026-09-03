@@ -589,13 +589,13 @@ def test_guarded_enable_defers_reverse_session_until_approved_resume() -> None:
     assert arm.stop_snapshot == (generation, False)
 
 
-def test_stop_requests_reverse_idle_and_dashboard_program_stop() -> None:
+def test_normal_segment_stop_keeps_dashboard_program_alive() -> None:
     arm, sdk = enabled_arm()
 
     arm.stop()
 
     assert [name for name, _ in sdk.driver.calls] == ["writeIdle"]
-    assert ("stopProgram", None) in sdk.dashboard.calls
+    assert ("stopProgram", None) not in sdk.dashboard.calls
     assert arm.stop_snapshot[1] is True
 
 

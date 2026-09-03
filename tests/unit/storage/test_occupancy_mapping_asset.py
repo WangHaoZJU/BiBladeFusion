@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import biblade_fusion.storage.occupancy_mapping as occupancy_mapping_module
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import AcquisitionConfig, OccupancyConfig
 from biblade_fusion.devices.depth_camera import CameraIntrinsics
@@ -38,6 +39,7 @@ from biblade_fusion.storage.occupancy_mapping import (
     read_legacy_occupancy_mapping_for_replay,
     read_occupancy_mapping,
     read_occupancy_mapping_for_replay,
+    write_live_occupancy_mapping,
     write_occupancy_mapping,
 )
 from biblade_fusion.workflows.occupancy_mapping import (
@@ -767,6 +769,113 @@ def test_occupancy_mapping_asset_round_trip_verifies_full_chain(tmp_path: Path) 
         stored.frame_evidence[0].predicted_base_t_tcp_matrix,
         stored.frame_evidence[0].observed_base_t_tcp_matrix,
     )
+
+
+def test_live_writer_reuses_fresh_in_process_authority_but_invalidates_on_edit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        updates,
+        config,
+        acquisition,
+        stereo_sources,
+        session_sources,
+        hand_eye_source,
+    ) = _source_inputs(tmp_path)
+    dependencies = _validation_dependencies(updates, stereo_sources, session_sources)
+    monkeypatch.setattr(
+        occupancy_mapping_module,
+        "_production_validation_dependencies",
+        lambda: dependencies,
+    )
+    replay_calls = 0
+    original_replay = occupancy_mapping_module._validate_replayed_mapping
+
+    def count_replay(*args, **kwargs):
+        nonlocal replay_calls
+        replay_calls += 1
+        return original_replay(*args, **kwargs)
+
+    monkeypatch.setattr(
+        occupancy_mapping_module,
+        "_validate_replayed_mapping",
+        count_replay,
+    )
+
+    destination, written = write_live_occupancy_mapping(
+        tmp_path / "live-occupancy",
+        updates,
+        config,
+        acquisition,
+        source_stereo_inferences=stereo_sources,
+        source_sessions=session_sources,
+        source_hand_eye=hand_eye_source,
+    )
+
+    assert replay_calls == 0
+    cached = read_occupancy_mapping(destination)
+    assert cached == written
+    assert cached is not written
+    assert replay_calls == 0
+
+    cached.metadata["motion_authorized"] = True
+    assert read_occupancy_mapping(destination).metadata["motion_authorized"] is False
+
+    metadata_path = destination / "metadata.json"
+    metadata_path.write_bytes(metadata_path.read_bytes() + b"\n")
+    reread = read_occupancy_mapping(destination)
+    assert reread is not written
+    assert replay_calls == len(updates)
+
+
+def test_reader_relocates_synced_data_sources_only_when_hashes_match(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "project" / "data"
+    data_root.mkdir(parents=True)
+    (
+        updates,
+        config,
+        acquisition,
+        stereo_sources,
+        session_sources,
+        hand_eye_source,
+    ) = _source_inputs(data_root)
+    dependencies = _validation_dependencies(updates, stereo_sources, session_sources)
+    destination = _write_occupancy_mapping_with_dependencies(
+        data_root / "occupancy",
+        updates,
+        config,
+        acquisition,
+        source_stereo_inferences=stereo_sources,
+        source_sessions=session_sources,
+        source_hand_eye=hand_eye_source,
+        validation_dependencies=dependencies,
+    )
+    metadata_path = destination / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    records = [metadata["sources"]["hand_eye"]]
+    records.extend(
+        source
+        for frame in metadata["frames"]
+        for source in frame["sources"].values()
+    )
+    local_prefix = str((tmp_path / "project").resolve())
+    for record in records:
+        record["root"] = str(record["root"]).replace(
+            local_prefix,
+            "/retired-host/project",
+            1,
+        )
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    stored = occupancy_mapping_module._read_occupancy_mapping_with_dependencies(
+        destination,
+        validation_dependencies=dependencies,
+    )
+
+    assert stored.motion_eligible is True
 
 
 def test_replay_reader_is_explicitly_unverified_and_never_motion_eligible(

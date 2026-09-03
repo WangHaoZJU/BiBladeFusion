@@ -156,9 +156,9 @@ def test_adaptive_fin_discovery_keeps_opposing_semantics_without_locking_tilt() 
         planning,
         ViewFilterConfig(
             workspace=AxisAlignedBoxConfig(
-                name="advisory_only",
-                minimum_m=(-0.01, -0.01, -0.01),
-                maximum_m=(0.01, 0.01, 0.01),
+                name="required_outer_workspace",
+                minimum_m=(-1.0, -1.0, -1.0),
+                maximum_m=(1.0, 1.0, 1.0),
             ),
             camera_clearance_radius_m=0.01,
             minimum_incidence_cosine=0.4,

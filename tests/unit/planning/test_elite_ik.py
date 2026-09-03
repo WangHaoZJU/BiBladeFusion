@@ -8,6 +8,11 @@ from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import KinematicsConfig
 from biblade_fusion.planning import EliteCs68IkChecker, ReachabilityState
 from biblade_fusion.planning.collision import cs68_mdh_joint_origins
+from biblade_fusion.planning.elite_ik import (
+    _forward_pose_and_jacobian,
+    _HoloRobotMdhIkSolver,
+    _so3_error,
+)
 from biblade_fusion.robotics import load_es68_flange_t_tcp
 
 
@@ -141,3 +146,44 @@ def test_default_elite_ik_uses_holorobot_mdh_solver_without_sdk_plugin() -> None
     assert "HoloRobot MDH" in result.message
     np.testing.assert_allclose(result.joint_positions_rad, joints, atol=1e-12)
     assert ik._loader is None
+
+
+def test_holorobot_analytic_mdh_jacobian_matches_finite_difference() -> None:
+    model = Cs68KinematicsModel(
+        np.array([0.0, np.pi / 2, 0.0, np.pi / 2, -np.pi / 2, np.pi / 2]),
+        np.array([0.0, 0.0, -0.43, -0.37, 0.0, 0.0]),
+        np.array([0.17, 0.0, 0.0, 0.15, 0.12, 0.11]),
+        "analytic-jacobian-test",
+    )
+    joints = np.array([0.2, -1.1, 1.0, -0.8, 0.4, 0.15])
+    pose, analytic = _forward_pose_and_jacobian(model, joints)
+    numeric = np.zeros((6, 6), dtype=np.float64)
+    epsilon = 1e-7
+    for index in range(6):
+        perturbed = joints.copy()
+        perturbed[index] += epsilon
+        shifted, _ = _forward_pose_and_jacobian(model, perturbed)
+        numeric[:3, index] = (shifted.translation_m - pose.translation_m) / epsilon
+        numeric[3:, index] = _so3_error(shifted.rotation, pose.rotation) / epsilon
+
+    np.testing.assert_allclose(analytic, numeric, atol=2e-6, rtol=1e-5)
+
+
+def test_holorobot_mdh_solver_reproduces_a_known_reachable_pose() -> None:
+    model = Cs68KinematicsModel(
+        np.array([0.0, np.pi / 2, 0.0, np.pi / 2, -np.pi / 2, np.pi / 2]),
+        np.array([0.0, 0.0, -0.43, -0.37, 0.0, 0.0]),
+        np.array([0.17, 0.0, 0.0, 0.15, 0.12, 0.11]),
+        "known-pose-test",
+    )
+    expected_joints = np.array([0.2, -1.1, 1.0, -0.8, 0.4, 0.15])
+    target, _ = _forward_pose_and_jacobian(model, expected_joints)
+    solution = _HoloRobotMdhIkSolver(model).solve(
+        target,
+        expected_joints + np.array([0.05, -0.04, 0.03, -0.02, 0.01, -0.05]),
+    )
+
+    assert solution is not None
+    reproduced, _ = _forward_pose_and_jacobian(model, solution)
+    np.testing.assert_allclose(reproduced.translation_m, target.translation_m, atol=1e-4)
+    assert np.linalg.norm(_so3_error(target.rotation, reproduced.rotation)) < 1e-3

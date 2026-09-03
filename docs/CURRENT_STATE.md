@@ -1,6 +1,6 @@
 # BiBladeFusion current state
 
-Checkpoint date: 2026-09-03
+Checkpoint date: 2026-09-04
 
 Authoritative branch for this work: `main`
 
@@ -13,20 +13,10 @@ working. Update it after every material hardware result or fix.
 
 ## 1. Repository checkpoint
 
-At the time of this checkpoint, local `main` and `origin/main` both point to:
-
-```text
-aa279b1 perf: reuse robust proof inside motion envelope
-```
-
-The HoloRobot-aligned control/IK regression described in
-`docs/HOLOROBOT_REGRESSION_2026-09-03.md` is committed as:
-
-```text
-47fc472 fix: align ES68 motion lifecycle with HoloRobot
-```
-
-`aa279b1` is its parent and the deployment's minimum starting checkpoint.
+The commit containing this checkpoint is the deployment's minimum starting point; use
+`git log -1 --oneline` after pulling `origin/main` to record its immutable identifier.
+The preceding HoloRobot-aligned control/IK regression is documented in
+`docs/HOLOROBOT_REGRESSION_2026-09-03.md`.
 
 Relevant preceding fixes are:
 
@@ -114,12 +104,18 @@ The eiai configuration parser confirmed both path and ID. `scan doctor --mode un
 
 ```text
 adaptive IK search: enabled
-maximum ranked preflight candidates: 3
+legacy maximum ranked preflight candidates: parsed but ignored
+legacy maximum segment joint delta: parsed but ignored
 single-view bootstrap motion: enabled
 projected ROI: dilation 12 px, minimum 100 reference points,
                minimum 500 reference pixels, minimum match fraction 0.50
 occupancy ray integration: deterministic CUDA DDA
 ```
+
+The online contract now treats the declared workspace as a hard outer boundary, searches
+at most 32 IK poses / 1.5 s per candidate family, preflights the complete bounded science
+queue, and moves directly to one selected viewpoint. `motion_preflight.maximum_joint_step_rad`
+is only an internal interpolation/collision-proof interval.
 
 Run commands on eiai must use `/usr/bin/env -u PYTHONPATH` because ROS Humble's Python
 3.10 Pinocchio/HPP-FCL packages otherwise shadow the Python 3.12 virtual environment.
@@ -193,111 +189,97 @@ Earlier blockers that have already received code changes include:
 Do not assume they are physically closed merely because a unit test or commit exists;
 regressions must be distinguished from the latest blocker.
 
-## 5. Latest unresolved hardware blocker
+## 5. Historical hardware failures and implemented corrections
 
-### 5.1 Newest run reported at 2026-09-03 22:25–22:27 local time
+The last physical attempt (2026-09-03 22:25–22:27 local time) reached exact approval but
+then showed two reverse-port sessions and ended in a stationarity timeout. Earlier attempts
+expired an already approved permit during guarded enable/recovery and rejected a sampled
+`RUNNING/PLAYING` state despite the motion command having been idled. Those observations
+are historical; none has been re-run on hardware since this wider correction set.
 
-The newest physical run again reached:
+The 2026-09-04 regression corrected the common causes rather than adding more delay:
+
+1. a permit expires only before exact consumption; power/brake recovery cannot invalidate
+   an already consumed permit;
+2. reverse control starts once at guarded resume, and unchanged path evidence is not
+   recomputed a second time after recovery;
+3. final ServoJ feedback converges before stop; normal stop matches HoloRobot's
+   `writeIdle(0)` and does not call Dashboard `stopProgram`;
+4. post-motion stationarity requires an unchanged stop latch plus sampled joint/TCP pose;
+   `runtime_state=PLAYING` and instantaneous velocity noise are not treated as motion by
+   themselves. Bootstrap remains strict Dashboard-STOPPED;
+5. online IK uses a bounded analytic-MDH multi-seed solver instead of the noisy KDL probe;
+6. one NBV is one complete viewpoint path and one capture; the legacy 0.02 rad setting no
+   longer triggers intermediate reconstruction cycles;
+7. all bounded science-ranked endpoints receive path preflight, so an unsafe top result
+   does not hide a safe lower-ranked view;
+8. incremental occupancy reuses an unchanged verified prefix and the live writer does not
+   immediately replay identical rays. Sliding/replacement windows and cross-process reads
+   remain strict full rebuild/replay;
+9. automatic ROI transfer uses the projected proxy's per-pixel depth band plus the blade
+   envelope, and fine NBV receives bounded adaptive distance/incidence fallback;
+10. measurement completion is based on acquired coverage; downstream mesh/watertight QA
+    is nonblocking by default and remains available as a strict opt-in;
+11. synchronized vale/eiai assets with stale absolute roots relocate only after exact
+    content-hash verification.
+
+The previous KDL `-5` flood and the multi-minute source replay are therefore not expected
+on the new normal path. This is an offline conclusion, not a claim that the physical arm
+has already demonstrated it.
+
+## 6. Measured offline performance and remaining boundary
+
+Historical first-cycle evidence showed `220.510 s` of CPU depth-ray integration over
+seven integration calls, versus `3.344 s` for FoundationStereo. The new live initial
+three-view path requires one integration per new source (three total), rather than
+rebuild/write/read replay. eiai's selected CUDA DDA handles those three calls. Exact GPU
+wall time must be read from the next eiai timing asset; it is not inferred here.
+
+The synchronized real placement's coarse view planning completed offline with:
 
 ```text
-coarse_scan/bootstrap_motion_ready
-  -> coarse_scan/waiting_approval
-  -> exact EXECUTE token accepted
+candidates: 2
+geometry feasible: 2
+IK endpoint feasible: 2
+wall time: 0.78 s
 ```
 
-SCHED_FIFO priority 99 succeeded. The Elite driver then opened its three reverse TCP
-ports, closed them after about one second, reopened all three ports, and closed them again
-less than one second later. Approximately 19 seconds later the run terminated with:
+It selected independently feasible front/back adaptive views. That closes the known
+planning-time regression. Current path planning proves straight joint-space motion and
+tries alternative science endpoints; it does not yet synthesize a curved RRT/OMPL route
+around an obstacle to the same endpoint. HoloRobot's optional OMPL implementation was
+inspected, but direct transplantation would not preserve BiBladeFusion's continuous
+uncertainty-bound per-leg evidence and OMPL is absent from the validated dependency set.
 
-```text
-external_execution_failed:
-StationarityTimeoutError: stationarity timed out before the next robot-state sample
-```
+One offline replay of an old occupancy artifact took about 64 s and correctly failed
+because the artifact was rendered with Open3D while the current local environment selected
+the NumPy renderer. This is a cross-process historical replay, not the new live cached
+path. Renderer identity remains a deliberate hard evidence boundary.
 
-The reported total service runtime was `6 min 47.767 s`, with `8 min 35.841 s` CPU time.
-Whether the arm physically moved during this attempt was not reported and must not be
-inferred from the connection log.
-
-The repeated KDL `-5` messages preceded a successfully prepared segment and are therefore
-individual candidate IK failures, not this run's terminal cause. They should eventually
-be summarized rather than flooding the operator log.
-
-### 5.2 Closely related preceding failures
-
-The preceding physical run failed after the exact approval token was entered:
-
-```text
-external_execution_failed:
-RobotCommandError: motion execution permit expired during post-recovery revalidation
-```
-
-The same run's cleanup then failed to obtain a new robot-state sample:
-
-```text
-stop_failed:
-StationarityTimeoutError: stationarity timed out before the next robot-state sample
-```
-
-In the preceding run, the closely related failure was:
-
-```text
-motion execution permit expired during guarded enable
-```
-
-followed by cleanup observing `robot_mode=RUNNING`, `runtime_state=PLAYING` instead of a
-confirmed stopped state.
-
-Taken together, these failures indicated a control-stack lifecycle problem rather than a
-candidate-generation failure. The HoloRobot comparison found that an unused reverse
-session was started during guarded enable while the stop latch remained set and then
-timed out before resume, explaining the double port sequence. It also found that
-BiBladeFusion stopped the controller task before confirming final ServoJ convergence.
-
-Both paths now have offline-tested fixes: reverse control begins once at approved resume,
-and the final approved setpoint is held and checked against persistent RTSI feedback
-before the Dashboard stop. The physical blocker is therefore **code-fixed but not yet
-hardware-verified**.
-
-## 6. Required next action
-
-The required offline work is complete:
-
-1. HoloRobot commit `93216a428cb8004382e9e39e5da7cd7bc6cbfffd` was reviewed for Elite
-   lifecycle, feedback, ServoJ, IK, collision, and occupancy behavior.
-2. The reverse-port double connection was traced and removed from the guarded transition.
-3. HoloRobot endpoint settling was adapted behind the existing guarded capability.
-4. HoloRobot's MDH/DLS multi-seed IK became the default online reachability path.
-5. Stationarity timeout messages now expose last controller/goal/velocity state.
-6. Existing bound robust mesh/occupancy proofs remain reused only under their hashes.
-7. Historical timing artifacts established that manual annotation and CPU DDA—not
-   FoundationStereo or IK—dominated the old first cycle. eiai already selects CUDA DDA.
-8. The focused and full offline regression results passed as recorded below.
+## 7. Required next action and regression result
 
 The next action is exactly one fresh eiai physical validation using the runbook and a new
-`run_id`. Do not change placement, acceptance assets, or safety geometry before this
-test. After the approval token, verify one reverse connection, one segment, endpoint
-settle, controller stop, and transition to the next capture.
+`run_id`. Do not change placement, acceptance assets, or safety geometry before this test.
+After the approval token, verify one reverse connection, one complete viewpoint motion,
+endpoint settle, `writeIdle`, sampled stationary pose, and transition to the next capture.
 
 Current status is:
 
 ```text
 offline/code regression: complete
-full physical single-view-to-motion workflow: not yet re-verified
-latest physical blocker: code-fixed; hardware acceptance pending
+real-data view planning: complete (0.78 s)
+full physical single-view-to-motion workflow: hardware verification pending
 ```
-
-## 7. Offline regression result
 
 Using the main source tree with the available local test environment:
 
 ```text
-full suite: 1209 passed, 3 skipped
+full suite: 1219 passed, 3 skipped in 98.71 s
+ruff: all checks passed
 ```
 
-The skipped tests require optional local PyTorch/Open3D packages absent from this vale
-test environment. CUDA availability and the FoundationStereo stack must still pass
-`scan doctor` on eiai before the physical run. Targeted results and the subsystem audit
-are in `docs/HOLOROBOT_REGRESSION_2026-09-03.md`.
+The skipped tests require optional local PyTorch/Open3D packages absent from the vale test
+environment. CUDA availability and FoundationStereo must still pass `scan doctor` on eiai.
 
 ## 8. Update template
 

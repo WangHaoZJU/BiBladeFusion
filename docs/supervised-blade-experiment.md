@@ -81,15 +81,16 @@ schema-5路径，不迁移prepared segment、permit、审批、旧地图publicat
 - `run_until_attention()`在需要bootstrap视图名、需要批准、阻塞或完成时返回；
 - 缺少显式注入的运动适配器时，批准请求仍然不能执行；
 - `OperatorApproval`必须携带操作员身份和当前预检要求的精确确认字符串；
-- 每次只执行当前一个短段，之后状态必须进入`AWAITING_CAPTURE`；
+- 每次只执行当前一个完整视点运动，之后状态必须进入`AWAITING_CAPTURE`；
 - `--resume`只从命令中明确指定实验根的顶层追加链恢复；旧permit、审批、prepared segment、
   地图新鲜度和控制器权限全部丢弃，恢复后仍须确认物理stop并建立新的安全证据；
 - 操作员stop请求优先锁存并直接到达同一台机械臂的stop边界，不等待感知文件提交。
 
 生产入口建立运动驱动前先通过Dashboard下发控制器stop，并在完整停稳窗口内同时检查运行态、
 机器人模式、安全状态、实际/目标关节速度以及实际/目标TCP线速度和角速度。启动证据必须绑定
-当前stop generation；任一通道缺失、过期、超阈值或stop generation不一致均失败关闭。每段结束
-同样把“stop传输已确认”和“物理停稳已确认”作为两个独立状态，只有二者都成立才可报告STOPPED。
+当前stop generation；任一通道缺失、过期、超阈值或stop generation不一致均失败关闭。正常视点
+运动结束使用`writeIdle`锁存stop generation，并用采样关节/TCP稳定性确认采集边界；此时
+`runtime_state=PLAYING`本身不表示仍在运动。bootstrap仍要求Dashboard任务为STOPPED。
 段执行预算由独立软件看门狗监视；它使用不与ServoJ写入共用命令锁的Dashboard
 `stopProgram`通道。若超时停止调用本身不返回、被SDK拒绝或二次stop失败，运行以
 `single_segment_emergency_stop_unconfirmed`失败关闭并保存证据，不会宣称已停稳。该通道是软件
@@ -97,8 +98,9 @@ schema-5路径，不迁移prepared segment、permit、审批、旧地图publicat
 
 FoundationStereo一次逻辑采集允许在失败后重试，但重试不是覆盖：每次尝试写入新的
 `attempt_<uuid>`目录，失败或取消目录永久保留，只有原子创建的`committed.json`能够选定一个
-成功尝试。提交时重新读取原始session、view metadata、双目推理、停稳、占用和科学资产；占用
-发布与freeze也从磁盘重建，而不是信任可变内存对象。占用schema-7用session manifest SHA、
+成功尝试。提交时验证原始session、view metadata、双目推理、停稳、占用和科学资产；在线占用
+写入可复用同一进程内已完整验证且文件身份未变的对象，跨进程/恢复读取仍从磁盘重建语义和
+射线结果。占用schema-7用session manifest SHA、
 精确view metadata SHA、序号和相机frame number组成物理源身份，因此相同逻辑`view_id`的两次
 真实采集可以分别进入地图，同一个物理帧换名后仍会被拒绝重复计票。schema-6仅允许历史回放。
 
@@ -209,10 +211,11 @@ uv run bbf scan run-unknown \
 追加链绑定每次已接受的粗/精扫代际与对应运行事件边界、schema-5及参考模型、精扫候选与首事件，
 并以最终覆盖代际和严格重放的终态重建共同封存完成态。链的任一写入、来源验证或重读失败
 都不会切换运动权威或报告完成。程序启动后，只有在提示人工初始采集时
-按一次`c`才采一组；它不会自动连续收集初始帧。达到`MAP_READY`后，每个短段都打印当前
-预检的精确确认串，只有原样粘贴才消费一次permit。该permit被消费并完成第一轮现场复核后，
-私有能力边界才允许为本段执行上电/松闸准备；准备动作不清除stop latch、不发送轨迹，随后
-仍须重新核对关节、地图、新鲜度、连续证明及permit期限，才原子恢复ServoJ控制。
+按一次`c`才采一组；启用已验收的单视角bootstrap后，后续独立视角由NBV运动自动补齐，而不是
+要求操作员手动摆出三个视角。每个完整候选路径都打印当前预检的精确确认串，只有原样粘贴才
+消费一次permit。该permit被消费后，私有能力边界才允许上电/松闸准备；准备动作不清除stop
+latch、不发送轨迹，随后仍须重新核对关节、地图、新鲜度及绑定的连续证明，才原子恢复ServoJ
+控制。已经消费的permit不在恢复后按墙钟再次过期。
 
 另一终端只读观察：
 
@@ -431,7 +434,7 @@ publish/commit新地图也不允许运动，因此该挂起不会转化为未受
 
 - 最终ES68、D435i和连接件STL的尺度、原点、轴向、装配姿态和保守余量；
 - 工作空间边界、叶片支架/夹具是否纳入占用或静态障碍物；
-- 关节短段上限、速度缩放、ServoJ周期与跟踪误差；
+- 速度缩放、ServoJ周期、内部轨迹步长与跟踪误差；
 - Dashboard启动stop、段边界stop及六类实际/目标速度通道的停稳阈值与反馈新鲜度；
 - FoundationStereo最坏推理时间、三个启动视角完成时间、schema-5交接时间、地图重放/预检/
   人工响应时间，据此确定全部时序预算；仅在部署明确要求墙钟TTL时另行验收
@@ -441,4 +444,4 @@ publish/commit新地图也不允许运动，因此该挂起不会转化为未受
 - 初始掩模及参考引导掩模对主表面、两只鳍片及全部边界的分区质量；
 - 双面重建厚度、表面RMSE、法向、孔洞和覆盖完成判据。
 
-验收前`configs/default.yaml`保持运动、占用和stop-and-capture关闭，工作空间及短段上限保持未填写。不得为了让doctor变绿而凭经验填写这些物理量。
+验收前`configs/default.yaml`保持运动、占用和stop-and-capture关闭，工作空间保持未填写。不得为了让doctor变绿而凭经验填写这些物理量。

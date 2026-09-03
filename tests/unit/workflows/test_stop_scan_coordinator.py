@@ -766,7 +766,7 @@ def _target() -> NextViewTarget:
     )
 
 
-def test_bootstrap_then_one_short_segment_requires_new_capture(
+def test_bootstrap_then_one_complete_viewpoint_motion_requires_new_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -797,8 +797,8 @@ def test_bootstrap_then_one_short_segment_requires_new_capture(
     assert prepared.preflight is not safety.authoritative_preflight
     prepared.preflight.diagnostics["caller_annotation"] = "detached"
     assert "caller_annotation" not in safety.authoritative_preflight.diagnostics
-    assert prepared.proposal.final_target is False
-    assert prepared.proposal.goal_joint_positions_rad[0] == pytest.approx(0.05)
+    assert prepared.proposal.final_target is True
+    assert prepared.proposal.goal_joint_positions_rad[0] == pytest.approx(0.20)
     assert coordinator.approval_prompt() == "EXECUTE synthetic"
     coordinator.execute_approved(
         operator_id="operator",
@@ -810,32 +810,27 @@ def test_bootstrap_then_one_short_segment_requires_new_capture(
     assert stop.calls == 4
 
     expected_capture = coordinator.checkpoint.expected_capture_view_id
-    assert expected_capture == "transit_fine-front-001_cycle_0003"
-    accepted_coverage = (tmp_path / "accepted-surface-coverage").resolve()
-    accepted_coverage.mkdir()
-    stored_coverage = SimpleNamespace(
-        root=accepted_coverage,
-        ledger=SimpleNamespace(observation_ids=()),
-        current_reconstructed_view_path=None,
-    )
+    assert expected_capture == "fine-front-001"
     monkeypatch.setattr(
-        stop_scan_module,
-        "read_surface_coverage_generation",
-        lambda path, **kwargs: stored_coverage,
+        StopScanCoordinator,
+        "_validate_coarse_science_asset",
+        staticmethod(lambda captured, result: None),
     )
     original_infer = perception.infer_and_update
 
-    def infer_with_carried_coverage(captured):
-        result = replace(original_infer(captured), coverage_path=accepted_coverage)
+    def infer_with_coarse_science(captured):
+        coarse_path = captured.cycle_root / "coarse_scan_view"
+        coarse_path.mkdir()
+        result = replace(original_infer(captured), coarse_scan_view_path=coarse_path)
         perception.pending = (captured, result)
         return result
 
-    perception.infer_and_update = infer_with_carried_coverage  # type: ignore[method-assign]
+    perception.infer_and_update = infer_with_coarse_science  # type: ignore[method-assign]
     coordinator.capture_infer_update()
     assert perception.captures[-1] == expected_capture
     assert perception.capture_requests[-1] == (
         expected_capture,
-        CapturePurpose.TRANSIT,
+        CapturePurpose.CANDIDATE,
     )
     assert coordinator.checkpoint.phase is StopScanPhase.MAP_READY
     assert len(perception.committed) == 4
@@ -925,7 +920,7 @@ def test_single_view_without_static_free_policy_remains_operator_bootstrap(
         coordinator.prepare_next_segment()
 
 
-def test_short_route_is_evenly_split_without_a_tiny_final_capture(
+def test_legacy_segment_bound_does_not_split_one_viewpoint_motion(
     tmp_path: Path,
 ) -> None:
     target = NextViewTarget(
@@ -944,8 +939,8 @@ def test_short_route_is_evenly_split_without_a_tiny_final_capture(
     prepared = coordinator.prepare_next_segment()
 
     assert prepared is not None
-    assert prepared.proposal.final_target is False
-    assert prepared.proposal.goal_joint_positions_rad[0] == pytest.approx(0.0255)
+    assert prepared.proposal.final_target is True
+    assert prepared.proposal.goal_joint_positions_rad[0] == pytest.approx(0.051)
 
 
 def test_exact_approval_is_persisted_once_before_motion(tmp_path: Path) -> None:
