@@ -246,6 +246,38 @@ def test_wait_until_settled_covers_the_full_sampled_window() -> None:
         evidence.sample_count = 0  # type: ignore[misc]
 
 
+def test_wait_until_settled_allows_playing_to_transition_to_stopped() -> None:
+    states = [
+        replace(_state(0.0), robot_mode="RUNNING", runtime_state="PLAYING"),
+        replace(_state(0.25), robot_mode="RUNNING", runtime_state="STOPPED"),
+        replace(_state(0.50), robot_mode="RUNNING", runtime_state="STOPPED"),
+        replace(_state(0.75), robot_mode="RUNNING", runtime_state="STOPPED"),
+    ]
+
+    evidence = _wait(
+        StateSource(states),
+        FakeTime(),
+        settle_time_s=0.5,
+        timeout_s=1.0,
+    )
+
+    assert evidence.final_state is states[-1]
+    assert evidence.sample_count == 3
+    assert evidence.duration_s == pytest.approx(0.5)
+
+
+def test_wait_until_settled_still_rejects_unsafe_transition_state() -> None:
+    state = replace(
+        _state(0.0),
+        robot_mode="RUNNING",
+        runtime_state="PLAYING",
+        safety_status="PROTECTIVE_STOP",
+    )
+
+    with pytest.raises(StationarityError, match="NORMAL or REDUCED"):
+        _wait(StateSource([state]), FakeTime())
+
+
 def test_zero_settle_time_accepts_one_goal_sample_without_sleeping() -> None:
     source = StateSource([_state(0.0, joint=0.0005)])
     fake_time = FakeTime()

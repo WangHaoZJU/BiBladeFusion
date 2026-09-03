@@ -351,6 +351,45 @@ def _read_state(source: RobotStateSource) -> RobotState:
     return state
 
 
+def _read_settling_state(source: RobotStateSource) -> RobotState:
+    """Read a safe state while allowing RUNNING/PLAYING to settle after stop."""
+
+    try:
+        state = source.read_state()
+    except Exception as exc:
+        raise StationarityError(f"robot state read failed: {type(exc).__name__}: {exc}") from exc
+    if not isinstance(state, RobotState):
+        raise StationarityError("robot state source returned a non-RobotState value")
+    timestamp = state.monotonic_time_ns
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, np.integer)) or timestamp < 0:
+        raise StationarityError("robot monotonic timestamp must be a non-negative integer")
+    if not math.isfinite(float(state.controller_time_s)):
+        raise StationarityError("robot controller timestamp must be finite")
+    if (state.base_t_tcp.parent_frame, state.base_t_tcp.child_frame) != ("base", "tcp"):
+        raise StationarityError("stationarity requires robot base_T_tcp state")
+    robot_mode = state.robot_mode.strip().upper()
+    if robot_mode not in {*_STATIONARY_ROBOT_MODES, *_POWERED_STATIONARY_ROBOT_MODES}:
+        raise StationarityError(
+            "stationarity requires controller robot_mode=IDLE or RUNNING while settling; "
+            f"got robot_mode={state.robot_mode!r}"
+        )
+    if robot_mode in _POWERED_STATIONARY_ROBOT_MODES and state.runtime_state is None:
+        raise StationarityError("powered stationarity requires an RTSI runtime_state")
+    if state.safety_status.upper() not in _ACCEPTED_SAFETY_STATUSES:
+        raise StationarityError(
+            f"stationarity requires NORMAL or REDUCED safety status, got {state.safety_status!r}"
+        )
+    return state
+
+
+def _controller_stopped_for_stationarity(state: RobotState) -> bool:
+    robot_mode = state.robot_mode.strip().upper()
+    if robot_mode in _STATIONARY_ROBOT_MODES:
+        return True
+    runtime_state = str(state.runtime_state).strip().upper()
+    return runtime_state in _BOOTSTRAP_STOPPED_RUNTIME_STATES
+
+
 def _validate_state_contract(state: RobotState) -> None:
     timestamp = state.monotonic_time_ns
     if isinstance(timestamp, bool) or not isinstance(timestamp, (int, np.integer)) or timestamp < 0:
@@ -512,7 +551,7 @@ def wait_until_settled(
     if not math.isfinite(deadline):
         raise ValueError("timeout deadline must be finite")
 
-    previous_state = _read_state(state_source)
+    previous_state = _read_settling_state(state_source)
     now = _clock_value(monotonic_clock)
     if now < started_at:
         raise StationarityError("monotonic clock moved backwards during initial read")
@@ -526,7 +565,11 @@ def wait_until_settled(
     maximum_deltas = (0.0, 0.0, 0.0)
     feedback_states = [previous_state]
     feedback_sample_times = [now]
-    if goal_error <= goal_tolerance and velocity_gate(previous_state):
+    if (
+        _controller_stopped_for_stationarity(previous_state)
+        and goal_error <= goal_tolerance
+        and velocity_gate(previous_state)
+    ):
         stable_states.append(previous_state)
         stable_sample_times.append(now)
         stable_started_at = now
@@ -585,7 +628,7 @@ def wait_until_settled(
                 "stationarity timed out before the next robot-state sample"
             )
 
-        current_state = _read_state(state_source)
+        current_state = _read_settling_state(state_source)
         sampled_at = _clock_value(monotonic_clock)
         if sampled_at < wake_time:
             raise StationarityError("monotonic clock moved backwards during state read")
@@ -601,10 +644,11 @@ def wait_until_settled(
         )
 
         goal_error = _goal_error_rad(current_state, goal)
+        controller_stopped = _controller_stopped_for_stationarity(current_state)
         if stable_states and stable_started_at is not None:
             candidate_states = (*stable_states, current_state)
             deltas = _maximum_trace_deltas(candidate_states)
-            velocity_stopped = velocity_gate(current_state)
+            velocity_stopped = controller_stopped and velocity_gate(current_state)
             if (
                 goal_error <= goal_tolerance
                 and velocity_stopped
@@ -623,7 +667,11 @@ def wait_until_settled(
                 stable_sample_times = []
                 stable_started_at = None
                 maximum_deltas = (0.0, 0.0, 0.0)
-        elif goal_error <= goal_tolerance and velocity_gate(current_state):
+        elif (
+            controller_stopped
+            and goal_error <= goal_tolerance
+            and velocity_gate(current_state)
+        ):
             stable_states = [current_state]
             stable_sample_times = [sampled_at]
             stable_started_at = sampled_at

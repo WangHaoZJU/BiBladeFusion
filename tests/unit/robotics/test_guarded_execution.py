@@ -370,6 +370,58 @@ def test_execute_revalidates_and_consumes_one_shot_permit(
     assert arm.events == completed_events
 
 
+def test_execute_revalidation_is_bounded_by_geometric_legs_not_servoj_ticks(
+    checker,
+    occupancy_checker,
+    clear_preflight,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mesh_calls: list[tuple[tuple[float, ...], tuple[float, ...]]] = []
+    occupancy_calls: list[tuple[tuple[float, ...], tuple[float, ...]]] = []
+    original_mesh_check = _SyntheticSweptEs68Checker.check_path
+    occupancy_checker_type = type(occupancy_checker)
+    original_occupancy_check = occupancy_checker_type.check_path
+
+    def counted_mesh_check(self, start, goal, **kwargs):
+        mesh_calls.append((tuple(start), tuple(goal)))
+        return original_mesh_check(self, start, goal, **kwargs)
+
+    def counted_occupancy_check(self, start, goal, **kwargs):
+        occupancy_calls.append((tuple(start), tuple(goal)))
+        return original_occupancy_check(self, start, goal, **kwargs)
+
+    monkeypatch.setattr(_SyntheticSweptEs68Checker, "check_path", counted_mesh_check)
+    monkeypatch.setattr(
+        occupancy_checker_type,
+        "check_path",
+        counted_occupancy_check,
+    )
+    arm = FakeGuardedArm(enabled=False)
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    executor.execute(clear_preflight, permit)
+
+    assert clear_preflight.servoj_stream is not None
+    assert len(clear_preflight.servoj_stream.commands) > 2
+    # Before enable, after enable, and after control recovery: two geometric
+    # legs each, independent of the number of 4 ms ServoJ commands.
+    assert len(mesh_calls) == 6
+    assert len(occupancy_calls) == 6
+    assert all(
+        calls[0][1] == clear_preflight.start_joint_positions_rad
+        for calls in (mesh_calls, occupancy_calls)
+    )
+    assert all(
+        calls[1][1] == clear_preflight.goal_joint_positions_rad
+        for calls in (mesh_calls, occupancy_calls)
+    )
+
+
 def test_execute_stops_arm_when_driver_prepare_raises(
     checker, occupancy_checker, clear_preflight
 ) -> None:
