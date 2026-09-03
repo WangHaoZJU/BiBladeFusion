@@ -77,11 +77,13 @@ from biblade_fusion.workflows.stereo_inference import (
     infer_rectified_stereo,
 )
 from biblade_fusion.workflows.view_planning import (
+    AdaptiveViewPlanTrace,
     OfflineViewPlanningResult,
     plan_initial_observation,
 )
 
 __all__ = [
+    "AdaptiveViewPlanTrace",
     "DepthComparisonError",
     "CoarseModelResult",
     "DepthComparisonMetrics",

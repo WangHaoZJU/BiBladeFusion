@@ -54,6 +54,7 @@ from biblade_fusion.workflows.stop_scan_coordinator import (
     OccupancyGeneration,
     OccupancyGenerationPublisher,
     PerceptionCycleResult,
+    RankedNextViewCandidate,
     StopScanAbortRequested,
     StopScanBlocked,
     StopScanCoordinator,
@@ -667,6 +668,7 @@ class FakeSafetyFactory:
                 "surface_generation_id": proposal.surface_generation_id,
                 "reference_model_sha256": proposal.reference_model_sha256,
                 "selection_policy_sha256": proposal.selection_policy_sha256,
+                "bootstrap_mapping_prefix": proposal.bootstrap_mapping_prefix,
                 "planned_servoj_duration_s": 0.1,
             },
         )
@@ -689,6 +691,7 @@ def _coordinator(
     motion_servoj_dt_s: float = 0.004,
     robot_motion_enabled: bool = True,
     coordinator_updates: dict[str, object] | None = None,
+    occupancy_updates: dict[str, object] | None = None,
     monotonic_clock=None,
 ):
     robot_config = RobotConfig(
@@ -710,12 +713,14 @@ def _coordinator(
     coordinator_values.update(coordinator_updates or {})
     coordinator_config = StopAndCaptureConfig(**coordinator_values)
     acquisition_config = AcquisitionConfig()
-    occupancy_config = OccupancyConfig(
-        enabled=True,
-        workspace_bounds_min_m=(-0.2, -0.2, -0.2),
-        workspace_bounds_max_m=(0.2, 0.2, 0.2),
-        maximum_map_age_s=30.0,
-    )
+    occupancy_values: dict[str, object] = {
+        "enabled": True,
+        "workspace_bounds_min_m": (-0.2, -0.2, -0.2),
+        "workspace_bounds_max_m": (0.2, 0.2, 0.2),
+        "maximum_map_age_s": 30.0,
+    }
+    occupancy_values.update(occupancy_updates or {})
+    occupancy_config = OccupancyConfig(**occupancy_values)
     perception = FakePerception(
         tmp_path,
         source,
@@ -834,6 +839,90 @@ def test_bootstrap_then_one_short_segment_requires_new_capture(
     )
     assert coordinator.checkpoint.phase is StopScanPhase.MAP_READY
     assert len(perception.committed) == 4
+
+
+def test_one_formal_coarse_view_enables_restricted_bootstrap_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accepted_path = tmp_path / "static-free-acceptance"
+    coordinator, _, _, perception, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[1],
+        target=_target(),
+        occupancy_updates={
+            "accepted_static_free_aabbs": (
+                {
+                    "name": "bootstrap_corridor",
+                    "minimum_m": (-0.2, -0.2, -0.2),
+                    "maximum_m": (0.0, 0.2, 0.2),
+                },
+            ),
+            "accepted_static_free_acceptance_id": "a" * 64,
+            "accepted_static_free_acceptance_path": accepted_path,
+        },
+        coordinator_updates={"allow_single_view_bootstrap_motion": True},
+    )
+    original_infer = perception.infer_and_update
+
+    def infer_with_coarse_proxy(captured):
+        result = original_infer(captured)
+        coarse_path = captured.cycle_root / "coarse_scan_view"
+        coarse_path.mkdir()
+        result = replace(result, coarse_scan_view_path=coarse_path)
+        perception.pending = (captured, result)
+        return result
+
+    perception.infer_and_update = infer_with_coarse_proxy  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        StopScanCoordinator,
+        "_validate_coarse_science_asset",
+        staticmethod(lambda captured, result: None),
+    )
+    coordinator.start()
+
+    coordinator.capture_infer_update("single-initial-view")
+
+    assert coordinator.checkpoint.phase is StopScanPhase.BOOTSTRAP_MOTION_READY
+    assert coordinator.checkpoint.occupancy_binding is not None
+    prepared = coordinator.prepare_next_segment()
+    assert prepared is not None and prepared.ready_for_approval
+    assert prepared.proposal.bootstrap_mapping_prefix is True
+    assert prepared.preflight.diagnostics["bootstrap_mapping_prefix"] is True
+
+
+def test_single_view_without_static_free_policy_remains_operator_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _, _, perception, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[1],
+        target=_target(),
+    )
+    original_infer = perception.infer_and_update
+
+    def infer_with_coarse_proxy(captured):
+        result = original_infer(captured)
+        coarse_path = captured.cycle_root / "coarse_scan_view"
+        coarse_path.mkdir()
+        result = replace(result, coarse_scan_view_path=coarse_path)
+        perception.pending = (captured, result)
+        return result
+
+    perception.infer_and_update = infer_with_coarse_proxy  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        StopScanCoordinator,
+        "_validate_coarse_science_asset",
+        staticmethod(lambda captured, result: None),
+    )
+    coordinator.start()
+
+    coordinator.capture_infer_update("single-initial-view")
+
+    assert coordinator.checkpoint.phase is StopScanPhase.BOOTSTRAP_MAP_REQUIRED
+    with pytest.raises(StopScanError, match="Cannot plan"):
+        coordinator.prepare_next_segment()
 
 
 def test_short_route_is_evenly_split_without_a_tiny_final_capture(
@@ -1457,6 +1546,108 @@ def test_missing_continuous_proof_blocks_without_executor(tmp_path: Path) -> Non
     assert "continuous_swept_mesh_unavailable" in coordinator.checkpoint.blocking_reasons
     assert safety.executor is None
     assert stop.calls == 1
+
+
+def test_blocked_highest_gain_candidate_falls_back_to_next_safe_path(
+    tmp_path: Path,
+) -> None:
+    class RankedSelector:
+        def __init__(self) -> None:
+            first = _target()
+            second = NextViewTarget(
+                "fine-back-002",
+                (0.15, 0.0, 0.0, 0.0, 0.0, 0.0),
+                tuple(tuple(float(value) for value in row) for row in np.eye(4)),
+            )
+            self.accepted: list[str] = []
+            self.selection = NextViewSelection(
+                target=first,
+                surface_generation_id="a" * 64,
+                reference_model_sha256="b" * 64,
+                selection_policy_sha256="c" * 64,
+                required_patch_count=4,
+                incomplete_patch_count=2,
+                coverage_complete=False,
+                diagnostics=("science_rank=1", "expected_scientific_gain=0.8"),
+                ranked_candidates=(
+                    RankedNextViewCandidate(
+                        first,
+                        ("science_rank=1", "expected_scientific_gain=0.8"),
+                    ),
+                    RankedNextViewCandidate(
+                        second,
+                        ("science_rank=2", "expected_scientific_gain=0.7"),
+                    ),
+                ),
+            )
+
+        def select_next(self, observation, generation):
+            del observation, generation
+            return self.selection
+
+        def accept_preflight_target(self, view_id: str) -> None:
+            self.accepted.append(view_id)
+            self.selection = self.selection.choose_ranked_candidate(view_id)
+
+    class PathSelectiveSafety(FakeSafetyFactory):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.attempted: list[str] = []
+
+        def prepare(self, proposal, generation):
+            self.attempted.append(proposal.target_view_id)
+            self.clear = proposal.target_view_id == "fine-back-002"
+            return super().prepare(proposal, generation)
+
+    class RecordingSink:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def append_event(self, *, phase, cycle_index, event_type, payload):
+            del phase, cycle_index
+            self.events.append((event_type, dict(payload)))
+
+    sink = RecordingSink()
+    coordinator, source, _, _, original_safety, publisher = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        event_sink=sink,
+    )
+    selector = RankedSelector()
+    safety = PathSelectiveSafety(
+        source,
+        publisher,
+        original_safety.motion_config,
+        original_safety.occupancy_config,
+        original_safety.coordinator_config,
+    )
+    coordinator._selector = selector  # type: ignore[assignment]  # noqa: SLF001
+    coordinator._safety_factory = safety  # type: ignore[assignment]  # noqa: SLF001
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+
+    prepared = coordinator.prepare_next_segment()
+
+    assert prepared is not None and prepared.ready_for_approval
+    assert prepared.proposal.target_view_id == "fine-back-002"
+    assert coordinator.checkpoint.phase is StopScanPhase.WAITING_APPROVAL
+    assert safety.attempted == ["fine-front-001", "fine-back-002"]
+    assert selector.accepted == ["fine-back-002"]
+    rejected = [
+        payload
+        for event_type, payload in sink.events
+        if event_type == "ranked_candidate_preflight_rejected"
+    ]
+    assert rejected == [
+        {
+            "target_view_id": "fine-front-001",
+            "preflight_attempt_index": 1,
+            "science_rank": 1,
+            "blocking_reasons": ["continuous_swept_mesh_unavailable"],
+            "safety_thresholds_unchanged": True,
+        }
+    ]
 
 
 def test_map_change_after_preflight_aborts_before_execute(tmp_path: Path) -> None:

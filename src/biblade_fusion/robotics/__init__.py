@@ -41,7 +41,6 @@ from biblade_fusion.robotics.occupancy_collision import (
     OccupancyQueryState,
     OccupancyRobotCollisionChecker,
     OccupancySemanticAttestation,
-    RobotEnvelopeSphere,
     SweptOccupancyProofEvidence,
     occupancy_evidence_from_snapshot,
 )
@@ -94,7 +93,6 @@ __all__ = [
     "OccupancyQueryState",
     "OccupancyRobotCollisionChecker",
     "OccupancySemanticAttestation",
-    "RobotEnvelopeSphere",
     "SweptMeshProofEvidence",
     "SweptOccupancyProofEvidence",
     "BootstrapSafeStateEvidence",

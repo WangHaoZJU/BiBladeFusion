@@ -13,7 +13,10 @@ a calibrated obstacle-existence probability.
 
 ## Safety invariants
 
-1. Motion uses only a `MAP_READY` occupancy snapshot expressed in `base`.
+1. Ordinary motion uses a `MAP_READY` occupancy snapshot expressed in `base`. The
+   explicitly enabled single-view prefix may use `MAPPING` only while the complete
+   queried robot geometry remains inside immutable accepted-static-free volumes;
+   this never promotes or labels that snapshot as `MAP_READY`.
 2. The snapshot must contain source depth views and valid SHA-256 `content_hash`,
    `mapping_context_hash`, and `quality_evidence_hash` values. All three hashes remain
    bound through preflight, approval, and execution. A missing or changed hash blocks.
@@ -23,9 +26,12 @@ a calibrated obstacle-existence probability.
    ServoJ duration plus the configured execution margin—not merely at motion start. The
    default margin is one second.
 3. Occupied and unknown voxels both block motion. Out-of-grid queries are unknown.
-4. Every robot collision STL is conservatively represented by the bounding sphere of its
-   transformed local AABB. Query radius additionally includes occupancy obstacle
-   inflation and configured collision clearance.
+4. Every moving robot collision STL from the active URDF is measured directly against
+   potentially dangerous occupancy voxel boxes with HPP-FCL. Local AABBs are broad-phase
+   enumeration bounds only and never decide collision. Required separation includes
+   occupancy obstacle inflation, configured collision clearance, and accepted tracking
+   uncertainty. The fixed base support geometry is excluded because its designed table
+   contact cannot change during a motion segment.
 5. A preflight records the exact map `sequence`, content, mapping-context, and quality-
    evidence hashes. Operator approval and the one-shot execution permit bind the same
    values.
@@ -53,11 +59,12 @@ a calibrated obstacle-existence probability.
 12. Mesh swept-volume evidence and occupancy swept-volume evidence are independent
     requirements. A mesh/FCL result cannot substitute for a robot-versus-voxel result.
     The mesh checker proves each joint interval from the exact midpoint FCL separation
-    and a conservative serial-chain displacement bound. The occupancy checker queries
-    robot-envelope spheres enlarged by the same interval displacement bound. Both
-    proofs bisect an inconclusive interval and return `UNKNOWN` if a configured
-    subdivision or numerical limit is reached; clear point samples alone never produce
-    approval-ready evidence.
+    and a conservative serial-chain displacement bound. The occupancy checker separately
+    measures the original midpoint STL against dangerous voxel boxes and certifies an
+    interval only when every separation exceeds clearance plus the same geometry-specific
+    displacement bound. Both proofs bisect an inconclusive interval and return `UNKNOWN`
+    if a configured subdivision or numerical limit is reached; clear point samples alone
+    never produce approval-ready evidence.
 13. A voxel becomes FREE only after the configured number of independent view votes
     (three by default), with at most one vote per frame. Each new supporting camera pose
     must differ from every existing supporting pose by at least 20 mm of camera-centre
@@ -88,10 +95,12 @@ configurations and for every adaptively certified interval it:
    map/evidence hashes, the checker-bound robot-geometry hash, typed semantic attestation,
    and the freshness horizon;
 2. evaluates Pinocchio geometry placements;
-3. transforms each collision mesh's local-AABB sphere into `base`, and for an interval
-   enlarges it by a conservative maximum geometry-displacement bound;
-4. invokes `query_sphere(..., unknown_is_occupied=True)`;
-5. validates state/count/blocking consistency returned by the mapping query;
+3. places each original URDF collision STL in `base` and uses its transformed AABB only
+   to enumerate nearby voxel boxes;
+4. skips known-FREE and whole-voxel accepted-static-free UNKNOWN cells, then computes
+   exact HPP-FCL STL-to-box distance for every remaining OCCUPIED/UNKNOWN candidate;
+5. validates state/count/blocking consistency and requires distance strictly greater
+   than clearance, uncertainty, and (for intervals) the geometry displacement bound;
 6. confirms that the provider still exposes the same sequence, content hash, mapping-
    context hash, and quality-evidence hash.
 
@@ -162,8 +171,9 @@ a separate freshness check against the current clock.
 
 ## Known limitations
 
-- Bounding spheres are conservative and may reject feasible paths. Future mesh-to-voxel
-  collision may reduce false positives, but must not under-approximate the STL geometry.
+- Exact STL-to-voxel checking removes the former long-link circumsphere false positives,
+  but the voxel discretization, clearance, accepted tracking envelope, and interval
+  displacement bound remain deliberately conservative and may still reject a safe path.
 - Robot pixels removed by self masking remain UNKNOWN. Physical motion therefore blocks
   when the swept robot envelope intersects that UNKNOWN volume unless every intersected
   voxel is wholly contained in an immutable, workcell-specific static-free AABB accepted
@@ -173,9 +183,9 @@ a separate freshness check against the current clock.
 - The continuous proofs are conservative software certificates, not a replacement for
   the controller safety system or a physical commissioning test. Mesh certification can
   reject a safe interval when its displacement bound is loose; occupancy certification
-  can reject a safe interval because a complete mesh AABB sphere is deliberately larger
-  than the mesh. Reaching a subdivision, numerical, freshness, or evidence limit is
-  `UNKNOWN` and blocks rather than falling back to point sampling.
+  can reject a safe interval when the displacement bound is loose even though the exact
+  midpoint STL separation is positive. Reaching a subdivision, numerical, freshness, or
+  evidence limit is `UNKNOWN` and blocks rather than falling back to point sampling.
 - This is stop-and-capture static-map avoidance, not certified continuous dynamic obstacle
   avoidance. The mapping provider must be frozen during one motion segment.
 - The occupancy map is safety evidence, not the high-resolution blade reconstruction.

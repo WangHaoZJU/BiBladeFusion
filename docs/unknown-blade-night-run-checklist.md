@@ -389,7 +389,7 @@ uv run bbf initialize stereo-depth \
 - [ ] 初始化`base_points_m.npy`仍有M个原始hard-ROI点，`proxy_support_mask.npy`仅标记其中N个支持点。
 - [ ] `metadata.json.proxy_support`中的输入/保留XYZ边界、点数和比例可由两个数组重算。
 - [ ] 剔除过多、保留点不足、标定/位姿错误或AABB错误时初始化显式失败，不继续生成视点计划。
-- [ ] 每个后续`coarse_scan_view`都是schema 2，均含自己的`proxy_support_mask.npy`、同一包络配置和可重放诊断。
+- [ ] 每个后续`coarse_scan_view`都是schema 3，均含自己的`proxy_support_mask.npy`、同一包络配置和可重放诊断；自动视角还绑定其参考粗扫generation。
 - [ ] coarse generation覆盖率以及最终PCA/ICP、TSDF、曲面/鳍片分区只消费各视角support点；schema-5模型绑定对应coarse-view元数据哈希。
 - [ ] 修改多边形或AABB后使用全新输出目录，不覆盖历史检查资产。
 
@@ -578,6 +578,28 @@ $$
 从单面观测恢复背面，所以代码必须使用配置的`estimated_thickness_m`，再加可见侧、隐藏侧和切向
 margin形成保守双侧OBB。这也是厚度参数不能由单帧“自动准确推断”的原因。
 
+### 8.1.1 第二视角起的自动叶片MASK
+
+第二个及后续自动粗扫视角不再运行“无seed最大深度连通域”。系统严格读取上一已验收粗扫
+generation，把其中所有叶片包络支持点投影到当前整流左图，并以
+`projected_reference_dilation_px`膨胀。膨胀只用于容纳位姿/同步小误差、立体空洞和新暴露鳍片；
+最终当前深度点仍须落入base坐标系叶片专用AABB：
+
+$$
+M_k(u,v)=I_D(u,v)\land I_{\Pi(P_{0:k-1})\oplus B_r}(u,v)
+\land[\boldsymbol\ell\leq T^b_{c_k}\pi^{-1}(u,v,d)\leq\boldsymbol u].
+$$
+
+这里的\(P_{0:k-1}\)只来自已经提交的叶片support点；不会使用未验收帧，也不会把二维首帧
+polygon直接复制到新视角。该交集不做连通域择优，所以彼此断开的鳍片像素可以同时保留；桌面、
+夹具或背景即使形成更大的深度连通块，只要不同时满足投影邻域和叶片AABB就不能进入科学MASK。
+若投影点/像素太少、最终MASK比例异常，或投影区域内当前深度与AABB匹配比例低于门限，则本视角
+fail closed，要求检查位姿、深度、包络或重新采集，而不是静默改选最大物体。
+
+每个schema-3粗扫视角保存参考generation路径、`generation.json`哈希、累计support点内容哈希、
+投影膨胀策略和诊断量，独立读回时重新计算MASK。上述MASK仅用于科学重建；安全占用图仍消费
+机器人自遮罩后的全场景有效深度，包括桌面和夹具，二者不能混用。
+
 ### 8.2 数学原理：普通视点、覆盖网格与斜视发现
 
 针孔相机在距离\(s\)处的可用足迹近似为：
@@ -658,8 +680,9 @@ $$
 \mathbf q(s)=\mathbf q_0+s(\mathbf q_1-\mathbf q_0),\qquad s\in[0,1].
 $$
 
-系统不只抽样若干点后假定中间安全。它对路径区间递归二分，在区间中点计算网格/网格间隙或
-机器人包围球到占用体素的关系，再用该半区间最大关节变化推导几何最大位移\(B\)。只有
+系统不只抽样若干点后假定中间安全。它对路径区间递归二分，在区间中点计算网格/网格间隙，
+并以HPP-FCL直接计算URDF原始碰撞STL到危险占用体素盒的距离，再用该半区间最大关节变化推导
+几何最大位移\(B\)。只有
 
 $$
 d_{mid}-B-\varepsilon>0

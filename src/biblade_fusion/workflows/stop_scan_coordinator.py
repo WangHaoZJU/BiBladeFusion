@@ -130,6 +130,7 @@ class StopScanPhase(StrEnum):
     CAPTURING = "capturing"
     INFERRING = "inferring"
     PUBLISHING_MAP = "publishing_map"
+    BOOTSTRAP_MOTION_READY = "bootstrap_motion_ready"
     MAP_READY = "map_ready"
     PLANNING = "planning"
     PREFLIGHTING = "preflighting"
@@ -586,6 +587,22 @@ class NextViewTarget:
 
 
 @dataclass(frozen=True, slots=True)
+class RankedNextViewCandidate:
+    """One science-ranked endpoint; occupancy has not influenced this order."""
+
+    target: NextViewTarget
+    diagnostics: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.target) is not NextViewTarget:
+            raise ValueError("Ranked next-view candidate requires a typed target")
+        diagnostics = tuple(str(value).strip() for value in self.diagnostics)
+        if not diagnostics or any(not value for value in diagnostics):
+            raise ValueError("Ranked next-view candidate requires non-empty diagnostics")
+        object.__setattr__(self, "diagnostics", diagnostics)
+
+
+@dataclass(frozen=True, slots=True)
 class NextViewSelection:
     """Auditable selector decision bound to one semantic surface generation."""
 
@@ -600,6 +617,7 @@ class NextViewSelection:
     final_reconstruction_path: Path | None = None
     final_reconstruction_id: str | None = None
     final_reconstruction_metadata_sha256: str | None = None
+    ranked_candidates: tuple[RankedNextViewCandidate, ...] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -622,6 +640,20 @@ class NextViewSelection:
         if any(not value for value in diagnostics):
             raise ValueError("Next-view diagnostics must be non-empty strings")
         object.__setattr__(self, "diagnostics", diagnostics)
+        ranked = tuple(self.ranked_candidates)
+        if self.coverage_complete and ranked:
+            raise ValueError("Completed next-view decision cannot contain ranked candidates")
+        if ranked:
+            if any(type(item) is not RankedNextViewCandidate for item in ranked):
+                raise ValueError("Next-view candidate queue must be strongly typed")
+            if ranked[0].target != self.target:
+                raise ValueError("First ranked candidate must equal the selected target")
+            view_ids = tuple(item.target.view_id for item in ranked)
+            if len(set(view_ids)) != len(view_ids):
+                raise ValueError("Ranked next-view candidate IDs must be unique")
+            if ranked[0].diagnostics != diagnostics:
+                raise ValueError("Selected diagnostics must match the first ranked candidate")
+        object.__setattr__(self, "ranked_candidates", ranked)
         terminal_values = (
             self.final_reconstruction_path,
             self.final_reconstruction_id,
@@ -646,6 +678,41 @@ class NextViewSelection:
                 if _SHA256.fullmatch(str(getattr(self, name))) is None:
                     raise ValueError(f"Next-view decision {name} must be a SHA-256 digest")
             object.__setattr__(self, "final_reconstruction_path", path)
+
+    @property
+    def preflight_candidates(self) -> tuple[RankedNextViewCandidate, ...]:
+        """Return the ordered endpoint queue, including legacy singleton decisions."""
+
+        if self.coverage_complete or self.target is None:
+            return ()
+        if self.ranked_candidates:
+            return self.ranked_candidates
+        diagnostics = self.diagnostics or (
+            "science_rank=1",
+            "legacy_singleton_selection",
+        )
+        return (RankedNextViewCandidate(self.target, diagnostics),)
+
+    def choose_ranked_candidate(self, view_id: str) -> NextViewSelection:
+        """Promote one existing ranked endpoint without recomputing its science score."""
+
+        candidates = self.preflight_candidates
+        try:
+            index = next(
+                index
+                for index, candidate in enumerate(candidates)
+                if candidate.target.view_id == view_id
+            )
+        except StopIteration as exc:
+            raise ValueError(f"Unknown ranked next-view candidate: {view_id}") from exc
+        chosen = candidates[index]
+        reordered = (chosen, *candidates[:index], *candidates[index + 1 :])
+        return replace(
+            self,
+            target=chosen.target,
+            diagnostics=chosen.diagnostics,
+            ranked_candidates=reordered,
+        )
 
 
 def next_view_target_from_candidate(
@@ -678,6 +745,8 @@ class NextViewSelector(Protocol):
         generation: OccupancyGeneration,
     ) -> NextViewSelection: ...
 
+    def accept_preflight_target(self, view_id: str) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class SegmentProposal:
@@ -689,6 +758,7 @@ class SegmentProposal:
     final_target_joint_positions_rad: tuple[float, float, float, float, float, float]
     target_base_t_tcp_matrix: tuple[tuple[float, float, float, float], ...]
     final_target: bool
+    bootstrap_mapping_prefix: bool
     occupancy_binding: OccupancyBinding
     occupancy_generation_id: str
     inference_stationarity_sha256: str
@@ -699,6 +769,8 @@ class SegmentProposal:
     def __post_init__(self) -> None:
         if not self.target_view_id.strip() or not self.capture_view_id.strip():
             raise ValueError("Segment proposal view IDs must be non-empty")
+        if type(self.bootstrap_mapping_prefix) is not bool:
+            raise ValueError("Segment bootstrap mapping-prefix flag must be boolean")
         for name in (
             "proposal_id",
             "occupancy_generation_id",
@@ -888,6 +960,13 @@ class GuardedSegmentSafetyFactory:
             )
             for volume in self._occupancy_config.accepted_static_free_aabbs
         )
+        if (
+            self._coordinator_config.allow_single_view_bootstrap_motion
+            and not self._accepted_static_free_aabbs
+        ):
+            raise ValueError(
+                "Single-view bootstrap motion requires accepted static-free AABBs"
+            )
         if self._accepted_static_free_aabbs:
             acceptance_path = self._occupancy_config.accepted_static_free_acceptance_path
             acceptance_id = self._occupancy_config.accepted_static_free_acceptance_id
@@ -1001,6 +1080,17 @@ class GuardedSegmentSafetyFactory:
             or proposal.inference_stationarity_sha256 != generation.inference_stationarity_sha256
         ):
             raise StopScanBlocked("Segment proposal perception evidence changed")
+        if proposal.bootstrap_mapping_prefix:
+            if not self._coordinator_config.allow_single_view_bootstrap_motion:
+                raise StopScanBlocked("Single-view bootstrap motion is not configured")
+            if generation.snapshot.map_state is not OccupancyMapState.MAPPING:
+                raise StopScanBlocked(
+                    "Bootstrap mapping-prefix proposal requires an incomplete MAPPING snapshot"
+                )
+            if not generation.snapshot.source_view_ids:
+                raise StopScanBlocked("Bootstrap mapping prefix has no verified source view")
+        elif generation.snapshot.map_state is not OccupancyMapState.MAP_READY:
+            raise StopScanBlocked("Ordinary segment preflight requires MAP_READY occupancy")
         occupancy_checker = OccupancyRobotCollisionChecker(
             self._collision_checker,
             self._publisher.current_snapshot,
@@ -1018,6 +1108,9 @@ class GuardedSegmentSafetyFactory:
                 generation.snapshot.mapping_context_hash
                 if self._occupancy_config.accepted_static_free_aabbs
                 else None
+            ),
+            allow_mapping_prefix_in_accepted_static_free=(
+                proposal.bootstrap_mapping_prefix
             ),
             semantic_attestation=generation.mapping.semantic_attestation,
             accepted_joint_uncertainty_rad=(
@@ -1054,6 +1147,7 @@ class GuardedSegmentSafetyFactory:
                 "surface_generation_id": proposal.surface_generation_id,
                 "reference_model_sha256": proposal.reference_model_sha256,
                 "selection_policy_sha256": proposal.selection_policy_sha256,
+                "bootstrap_mapping_prefix": proposal.bootstrap_mapping_prefix,
             },
         )
         executor: ApprovedSegmentExecutor | None = None
@@ -1121,6 +1215,13 @@ class StopScanCoordinator:
         self._robot_config = robot_config.model_copy(deep=True)
         self._motion_config = motion_config.model_copy(deep=True)
         self._occupancy_config = occupancy_config.model_copy(deep=True)
+        if (
+            self._config.allow_single_view_bootstrap_motion
+            and not self._occupancy_config.accepted_static_free_aabbs
+        ):
+            raise ValueError(
+                "Single-view bootstrap motion requires accepted static-free AABBs"
+            )
         if self._robot_config.model != "es68":
             raise ValueError("Stop-scan coordination requires robot.model='es68'")
         if not self._robot_config.motion_enabled:
@@ -1185,6 +1286,7 @@ class StopScanCoordinator:
         self._run_selection_policy_sha256: str | None = None
         self._blocking_reasons: tuple[str, ...] = ()
         self._event_store_failure_reason: str | None = None
+        self._bootstrap_motion_active = False
 
     @property
     def checkpoint(self) -> StopScanCheckpoint:
@@ -1373,16 +1475,43 @@ class StopScanCoordinator:
                 self._raise_if_stop_requested()
                 snapshot = generation.snapshot
                 if snapshot.map_state is OccupancyMapState.MAPPING:
-                    next_phase = StopScanPhase.BOOTSTRAP_MAP_REQUIRED
-                    next_event = "bootstrap_map_incomplete"
-                    next_blocking_reasons = (
-                        f"bootstrap_requires_{self._occupancy_config.minimum_source_views}_"
-                        f"independent_views:current={len(snapshot.source_view_ids)}",
+                    bootstrap_motion_ready = bool(
+                        self._config.allow_single_view_bootstrap_motion
+                        and self._occupancy_config.accepted_static_free_aabbs
+                        and snapshot.source_view_ids
+                        and (
+                            self._bootstrap_motion_active
+                            or result.coarse_scan_view_path is not None
+                        )
                     )
-                    next_payload: Mapping[str, Any] = {
-                        "source_view_count": len(snapshot.source_view_ids),
-                        "generation_id": generation.generation_id,
-                    }
+                    if bootstrap_motion_ready:
+                        next_phase = StopScanPhase.BOOTSTRAP_MOTION_READY
+                        next_event = "single_view_bootstrap_motion_ready"
+                        next_blocking_reasons = ()
+                        next_payload = {
+                            "source_view_count": len(snapshot.source_view_ids),
+                            "required_map_ready_source_views": (
+                                self._occupancy_config.minimum_source_views
+                            ),
+                            "generation_id": generation.generation_id,
+                            "binding": list(generation.binding.tuple),
+                            "accepted_static_free_acceptance_id": (
+                                self._occupancy_config.accepted_static_free_acceptance_id
+                            ),
+                            "unknown_outside_accepted_static_free_blocks": True,
+                            "map_ready_claimed": False,
+                        }
+                    else:
+                        next_phase = StopScanPhase.BOOTSTRAP_MAP_REQUIRED
+                        next_event = "bootstrap_map_incomplete"
+                        next_blocking_reasons = (
+                            f"bootstrap_requires_{self._occupancy_config.minimum_source_views}_"
+                            f"independent_views:current={len(snapshot.source_view_ids)}",
+                        )
+                        next_payload = {
+                            "source_view_count": len(snapshot.source_view_ids),
+                            "generation_id": generation.generation_id,
+                        }
                 elif snapshot.map_state is OccupancyMapState.MAP_READY:
                     next_phase = StopScanPhase.MAP_READY
                     next_event = "map_ready"
@@ -1415,6 +1544,9 @@ class StopScanCoordinator:
                 self._expected_capture_purpose = None
                 self._cycle_index += 1
                 self._blocking_reasons = next_blocking_reasons
+                self._bootstrap_motion_active = (
+                    next_phase is StopScanPhase.BOOTSTRAP_MOTION_READY
+                )
                 self._transition(next_phase, next_event, next_payload)
             except StopScanAbortRequested as exc:
                 with suppress(BaseException):
@@ -1493,7 +1625,10 @@ class StopScanCoordinator:
     def prepare_next_segment(self) -> PreparedSegment | None:
         with self._exclusive_operation():
             self._raise_if_stop_requested()
-            if self._phase is not StopScanPhase.MAP_READY:
+            if self._phase not in {
+                StopScanPhase.BOOTSTRAP_MOTION_READY,
+                StopScanPhase.MAP_READY,
+            }:
                 raise StopScanError(f"Cannot plan from phase {self._phase.value}")
             if self._observation is None:
                 raise StopScanError("No current perception observation")
@@ -1502,6 +1637,9 @@ class StopScanCoordinator:
                 raise StopScanBlocked(
                     "Published occupancy no longer matches the current observation"
                 )
+            bootstrap_mapping_prefix = (
+                self._phase is StopScanPhase.BOOTSTRAP_MOTION_READY
+            )
             self._transition(StopScanPhase.PLANNING, "next_view_selection_started", {})
             try:
                 selection = self._select_next_with_timing(self._observation, generation)
@@ -1532,33 +1670,80 @@ class StopScanCoordinator:
                         completion_payload,
                     )
                     return None
-                target = selection.target
-                if target is None:  # guarded again at the trust boundary
+                if selection.target is None:  # guarded again at the trust boundary
                     raise BladePlanningAssetError("Incomplete selector decision has no target")
                 live_state = self._robot.read_state()
                 self._raise_if_stop_requested()
-                proposal = self._propose_short_segment(
-                    target,
-                    selection,
-                    live_state,
-                    generation,
-                )
-                self._transition(
-                    StopScanPhase.PREFLIGHTING,
-                    "single_segment_preflight_started",
-                    {
-                        "proposal_id": proposal.proposal_id,
-                        "target_view_id": proposal.target_view_id,
-                        "final_target": proposal.final_target,
-                        "surface_generation_id": proposal.surface_generation_id,
-                        "reference_model_sha256": proposal.reference_model_sha256,
-                        "selection_policy_sha256": proposal.selection_policy_sha256,
-                    },
-                )
-                prepared = self._safety_factory.prepare(proposal, generation)
-                self._raise_if_stop_requested()
-                self._validate_prepared_segment(prepared, generation)
-                self._validate_planned_segment_duration(prepared)
+                candidate_queue = selection.preflight_candidates[
+                    : self._config.maximum_ranked_preflight_candidates
+                ]
+                rejected: list[tuple[str, tuple[str, ...]]] = []
+                prepared: _PreparedSegmentExecution | None = None
+                selected_for_motion: NextViewSelection | None = None
+                proposal: SegmentProposal | None = None
+                for rank, candidate in enumerate(candidate_queue, start=1):
+                    science_rank = rank
+                    for diagnostic in candidate.diagnostics:
+                        if diagnostic.startswith("science_rank="):
+                            with suppress(ValueError):
+                                science_rank = int(diagnostic.removeprefix("science_rank="))
+                            break
+                    selected_for_motion = selection.choose_ranked_candidate(
+                        candidate.target.view_id
+                    )
+                    proposal = self._propose_short_segment(
+                        candidate.target,
+                        selected_for_motion,
+                        live_state,
+                        generation,
+                        bootstrap_mapping_prefix=bootstrap_mapping_prefix,
+                    )
+                    self._transition(
+                        StopScanPhase.PREFLIGHTING,
+                        "single_segment_preflight_started",
+                        {
+                            "proposal_id": proposal.proposal_id,
+                            "target_view_id": proposal.target_view_id,
+                            "preflight_attempt_index": rank,
+                            "science_rank": science_rank,
+                            "ranked_candidate_count": len(selection.preflight_candidates),
+                            "preflight_candidate_limit": (
+                                self._config.maximum_ranked_preflight_candidates
+                            ),
+                            "final_target": proposal.final_target,
+                            "surface_generation_id": proposal.surface_generation_id,
+                            "reference_model_sha256": proposal.reference_model_sha256,
+                            "selection_policy_sha256": proposal.selection_policy_sha256,
+                            "selection_diagnostics": list(candidate.diagnostics),
+                        },
+                    )
+                    prepared = self._safety_factory.prepare(proposal, generation)
+                    self._raise_if_stop_requested()
+                    self._validate_prepared_segment(prepared, generation)
+                    self._validate_planned_segment_duration(prepared)
+                    if prepared.ready_for_approval:
+                        self._accept_selector_preflight_target(proposal.target_view_id)
+                        break
+                    reasons = tuple(
+                        prepared.preflight.blocking_reasons
+                        or ("preflight_not_ready_for_approval",)
+                    )
+                    rejected.append((proposal.target_view_id, reasons))
+                    self._transition(
+                        StopScanPhase.PREFLIGHTING,
+                        "ranked_candidate_preflight_rejected",
+                        {
+                            "target_view_id": proposal.target_view_id,
+                            "preflight_attempt_index": rank,
+                            "science_rank": science_rank,
+                            "blocking_reasons": list(reasons),
+                            "safety_thresholds_unchanged": True,
+                        },
+                    )
+                if prepared is None or proposal is None or selected_for_motion is None:
+                    raise BladePlanningAssetError(
+                        "Incomplete selection exposed no ranked preflight candidate"
+                    )
             except StopScanAbortRequested as exc:
                 self._prepared = None
                 self._blocking_reasons = (str(exc),)
@@ -1612,14 +1797,30 @@ class StopScanCoordinator:
                 raise
             self._prepared = prepared
             if not prepared.ready_for_approval:
-                reasons = prepared.preflight.blocking_reasons or (
-                    "preflight_not_ready_for_approval",
-                )
-                self._blocking_reasons = tuple(reasons)
+                if len(rejected) == 1:
+                    self._blocking_reasons = rejected[0][1]
+                else:
+                    self._blocking_reasons = tuple(
+                        f"{view_id}: {reason}"
+                        for view_id, reasons in rejected
+                        for reason in reasons
+                    )
                 self._transition(
                     StopScanPhase.MOTION_BLOCKED,
                     "single_segment_blocked",
-                    {"blocking_reasons": list(self._blocking_reasons)},
+                    {
+                        "blocking_reasons": list(self._blocking_reasons),
+                        "rejected_ranked_candidates": [
+                            {
+                                "target_view_id": view_id,
+                                "blocking_reasons": list(reasons),
+                            }
+                            for view_id, reasons in rejected
+                        ],
+                        "attempted_candidate_count": len(rejected),
+                        "available_candidate_count": len(selection.preflight_candidates),
+                        "safety_thresholds_unchanged": True,
+                    },
                 )
                 return prepared.public_summary
             self._transition(
@@ -1627,10 +1828,28 @@ class StopScanCoordinator:
                 "single_segment_waiting_approval",
                 {
                     "proposal_id": proposal.proposal_id,
+                    "target_view_id": proposal.target_view_id,
+                    "rejected_higher_gain_candidates": [
+                        {
+                            "target_view_id": view_id,
+                            "blocking_reasons": list(reasons),
+                        }
+                        for view_id, reasons in rejected
+                    ],
                     "approval_prompt": prepared.executor.approval_prompt(prepared.preflight),
                 },
             )
             return prepared.public_summary
+
+    def _accept_selector_preflight_target(self, view_id: str) -> None:
+        callback = getattr(self._selector, "accept_preflight_target", None)
+        if callback is None:
+            return
+        if not callable(callback):
+            raise BladePlanningAssetError(
+                "Next-view selector exposes an invalid preflight acceptance callback"
+            )
+        callback(view_id)
 
     def approval_prompt(self) -> str:
         if (
@@ -2354,6 +2573,8 @@ class StopScanCoordinator:
         selection: NextViewSelection,
         live_state: RobotState,
         generation: OccupancyGeneration,
+        *,
+        bootstrap_mapping_prefix: bool,
     ) -> SegmentProposal:
         if selection.coverage_complete or selection.target != target:
             raise BladePlanningAssetError(
@@ -2389,6 +2610,7 @@ class StopScanCoordinator:
             "goal_joint_positions_rad": goal.tolist(),
             "final_target_joint_positions_rad": final.tolist(),
             "final_target": final_target,
+            "bootstrap_mapping_prefix": bootstrap_mapping_prefix,
             "occupancy_binding": generation.binding.tuple,
             "occupancy_generation_id": generation.generation_id,
             "inference_stationarity_sha256": (generation.inference_stationarity_sha256),
@@ -2413,6 +2635,7 @@ class StopScanCoordinator:
             target.joint_positions_rad,
             target.base_t_tcp_matrix,
             final_target,
+            bootstrap_mapping_prefix,
             generation.binding,
             generation.generation_id,
             generation.inference_stationarity_sha256,
@@ -2477,6 +2700,8 @@ class StopScanCoordinator:
                 or diagnostics.get("surface_generation_id") != proposal.surface_generation_id
                 or diagnostics.get("reference_model_sha256") != proposal.reference_model_sha256
                 or diagnostics.get("selection_policy_sha256") != proposal.selection_policy_sha256
+                or diagnostics.get("bootstrap_mapping_prefix")
+                is not proposal.bootstrap_mapping_prefix
             ):
                 raise StopScanBlocked(
                     "Approval-eligible preflight lacks perception/selection binding"

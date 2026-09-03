@@ -1,5 +1,17 @@
 """Geometric view planning without robot motion execution."""
 
+from biblade_fusion.planning.adaptive_view_search import (
+    AdaptiveCandidateAttempt,
+    AdaptiveViewSearchConfig,
+    AdaptiveViewSearchError,
+    AdaptiveViewSearchResult,
+    CandidatePoseParameters,
+    MultiSeedIkEvaluation,
+    adaptive_view_search_payload,
+    evaluate_multi_seed_ik,
+    generate_adaptive_candidate_family,
+    search_adaptive_candidate_family,
+)
 from biblade_fusion.planning.coverage import (
     COARSE_COVERAGE_SEQUENCE_POLICY,
     CoverageDrivenViewPlan,
@@ -36,6 +48,10 @@ from biblade_fusion.planning.views import (
 )
 
 __all__ = [
+    "AdaptiveCandidateAttempt",
+    "AdaptiveViewSearchConfig",
+    "AdaptiveViewSearchError",
+    "AdaptiveViewSearchResult",
     "Capsule",
     "CollisionFinding",
     "CollisionValidationError",
@@ -47,6 +63,7 @@ __all__ = [
     "BladeClearanceEnvelope",
     "CandidateView",
     "CandidateMetrics",
+    "CandidatePoseParameters",
     "CandidateStatus",
     "CoverageDrivenViewPlan",
     "CoverageError",
@@ -58,6 +75,7 @@ __all__ = [
     "EliteCs68IkChecker",
     "EliteIkError",
     "FilteredViewPlan",
+    "MultiSeedIkEvaluation",
     "PatchCoverage",
     "coverage_observation_id",
     "ReachabilityChecker",
@@ -65,11 +83,15 @@ __all__ = [
     "ReachabilityState",
     "SurfacePatch",
     "ViewPlanningError",
-    "filter_candidate_views",
+    "adaptive_view_search_payload",
     "create_coverage_ledger",
+    "evaluate_multi_seed_ik",
+    "filter_candidate_views",
+    "generate_adaptive_candidate_family",
     "generate_bilateral_view_plan",
     "generate_oblique_coarse_fallback",
     "select_uncovered_candidates",
+    "search_adaptive_candidate_family",
     "update_coverage",
 ]
 from biblade_fusion.planning.collision import (

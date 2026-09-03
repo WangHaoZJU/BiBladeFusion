@@ -20,6 +20,14 @@ from biblade_fusion.perception.bootstrap_foreground import (
     BootstrapSeed,
     bootstrap_blade_foreground,
 )
+from biblade_fusion.perception.coarse_foreground import (
+    PROJECTED_COARSE_FOREGROUND_ALGORITHM,
+    ProjectedCoarseForegroundDiagnostics,
+    ProjectedCoarseForegroundGuide,
+    ProjectedCoarseForegroundResult,
+    projected_coarse_blade_foreground,
+    projected_coarse_foreground_policy_sha256,
+)
 
 __all__ = [
     "REFERENCE_PROJECTED_ALGORITHM",
@@ -34,4 +42,10 @@ __all__ = [
     "BootstrapForegroundResult",
     "BootstrapSeed",
     "bootstrap_blade_foreground",
+    "PROJECTED_COARSE_FOREGROUND_ALGORITHM",
+    "ProjectedCoarseForegroundDiagnostics",
+    "ProjectedCoarseForegroundGuide",
+    "ProjectedCoarseForegroundResult",
+    "projected_coarse_blade_foreground",
+    "projected_coarse_foreground_policy_sha256",
 ]

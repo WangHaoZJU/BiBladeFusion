@@ -23,10 +23,11 @@ from biblade_fusion.planning import (
     EvaluatedCandidate,
     FilteredViewPlan,
     SurfacePatch,
+    adaptive_view_search_payload,
 )
 from biblade_fusion.workflows import OfflineViewPlanningResult
 
-VIEW_PLAN_SCHEMA_VERSION = 3
+VIEW_PLAN_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +48,7 @@ def _candidate_payload(candidate: CandidateView) -> dict[str, Any]:
     patch = candidate.patch
     return {
         "view_id": candidate.view_id,
+        "patch_id": patch.patch_id,
         "side": patch.side.value,
         "row": patch.row,
         "column": patch.column,
@@ -56,6 +58,9 @@ def _candidate_payload(candidate: CandidateView) -> dict[str, Any]:
         "base_T_left_ir": candidate.base_t_left_ir.matrix.tolist(),
         "standoff_distance_m": candidate.standoff_distance_m,
         "footprint_m": list(candidate.footprint_m),
+        "projection_fraction": candidate.projection_fraction,
+        "visibility_fraction": candidate.visibility_fraction,
+        "distance_policy": candidate.distance_policy,
     }
 
 
@@ -152,6 +157,26 @@ def write_view_plan(
             ),
         },
     }
+    if result.adaptive_trace is not None:
+        payload["adaptive_ik_view_search"] = {
+            "motion_authorized": False,
+            "endpoint_collision_checked": False,
+            "trajectory_checked": False,
+            "targets": [
+                adaptive_view_search_payload(
+                    search,
+                    result.adaptive_trace.config,
+                    result.adaptive_trace.current_joint_positions_rad,
+                    source_initialization=str(Path(source_initialization).resolve()),
+                    source_kinematics=(
+                        str(Path(source_kinematics).resolve())
+                        if source_kinematics is not None
+                        else None
+                    ),
+                )
+                for search in result.adaptive_trace.results
+            ],
+        }
     try:
         path = temporary / "view_plan.json"
         with path.open("w", encoding="utf-8") as stream:
@@ -169,7 +194,7 @@ def write_view_plan(
 def _candidate_from_payload(payload: dict[str, Any]) -> CandidateView:
     view_id = str(payload["view_id"])
     patch = SurfacePatch(
-        patch_id=view_id,
+        patch_id=str(payload.get("patch_id", view_id)),
         side=BladeSide(str(payload["side"])),
         row=int(payload["row"]),
         column=int(payload["column"]),
@@ -183,6 +208,9 @@ def _candidate_from_payload(payload: dict[str, Any]) -> CandidateView:
         PoseSE3("base", f"{view_id}_left_ir", payload["base_T_left_ir"]),
         float(payload["standoff_distance_m"]),
         tuple(float(value) for value in payload["footprint_m"]),
+        float(payload.get("projection_fraction", 1.0)),
+        float(payload.get("visibility_fraction", 1.0)),
+        str(payload.get("distance_policy", "fixed_baseline")),
     )
 
 
@@ -195,7 +223,7 @@ def read_view_plan(path: str | Path) -> StoredViewPlan:
         if not isinstance(payload, dict):
             raise TypeError("view plan root must be an object")
         schema_version = int(payload["schema_version"])
-        if schema_version not in {1, 2, VIEW_PLAN_SCHEMA_VERSION}:
+        if schema_version not in {1, 2, 3, VIEW_PLAN_SCHEMA_VERSION}:
             raise ValueError(f"unsupported schema {payload['schema_version']}")
         if payload.get("motion_authorized") is not False:
             raise ValueError("stored view plan must explicitly forbid motion")
@@ -243,19 +271,25 @@ def read_view_plan(path: str | Path) -> StoredViewPlan:
                 offset_array = np.asarray(offsets, dtype=np.float64)
                 if offset_array.shape != (6,) or not np.isfinite(offset_array).all():
                     raise ValueError("view-plan joint-zero offsets are invalid")
-        if (
-            filtered.endpoint_feasible
-            and kinematics_record is None
-            and schema_version == VIEW_PLAN_SCHEMA_VERSION
-        ):
+        if filtered.endpoint_feasible and kinematics_record is None and schema_version >= 3:
             raise ValueError("endpoint-feasible plan lacks kinematics provenance")
         if (
             filtered.endpoint_feasible
-            and schema_version == VIEW_PLAN_SCHEMA_VERSION
+            and schema_version >= 3
             and kinematics_record is not None
             and kinematics_record.get("joint_zero_offsets_rad") is None
         ):
             raise ValueError("endpoint-feasible plan lacks joint-zero-offset provenance")
+        adaptive_payload = payload.get("adaptive_ik_view_search")
+        if adaptive_payload is not None and any(
+            adaptive_payload.get(name) is not False
+            for name in (
+                "motion_authorized",
+                "endpoint_collision_checked",
+                "trajectory_checked",
+            )
+        ):
+            raise ValueError("adaptive view search must remain explicitly non-authorizing")
         return StoredViewPlan(OfflineViewPlanningResult(geometric, filtered), payload)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid view-plan artifact {root}: {exc}") from exc

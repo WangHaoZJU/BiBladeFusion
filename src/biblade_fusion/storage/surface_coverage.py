@@ -24,6 +24,7 @@ from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     NextViewSelectionConfig,
     ReacquisitionPerturbationConfig,
+    ScientificGainConfig,
     SurfacePartitionConfig,
     SurfaceQualityConfig,
     ViewPlanningConfig,
@@ -673,10 +674,30 @@ def _validated_selection_policy(
     policy_sha256 = str(record["selection_policy_sha256"])
     if _canonical_sha256(payload) != policy_sha256:
         raise ValueError("Fine selection-policy SHA-256 does not match its payload")
-    if payload["algorithm"] != "bilateral_single_fin_coverage_priority_v2":
+    algorithm = payload["algorithm"]
+    if algorithm not in {
+        "bilateral_single_fin_coverage_priority_v2",
+        "bilateral_single_fin_scientific_gain_nbv_v3",
+    }:
         raise ValueError("Fine selection-policy algorithm changed")
-    selection = NextViewSelectionConfig.model_validate(payload["selection"])
-    if selection.model_dump(mode="json") != payload["selection"]:
+    raw_selection = payload["selection"]
+    if algorithm == "bilateral_single_fin_coverage_priority_v2":
+        if not isinstance(raw_selection, dict) or "scientific_gain" in raw_selection:
+            raise ValueError("Legacy fine selection configuration is malformed")
+        selection = NextViewSelectionConfig.model_validate(
+            {
+                **raw_selection,
+                "scientific_gain": ScientificGainConfig(enabled=False).model_dump(
+                    mode="json"
+                ),
+            }
+        )
+        replayed_selection = selection.model_dump(mode="json")
+        replayed_selection.pop("scientific_gain")
+    else:
+        selection = NextViewSelectionConfig.model_validate(raw_selection)
+        replayed_selection = selection.model_dump(mode="json")
+    if replayed_selection != raw_selection:
         raise ValueError("Fine reacquisition configuration is not canonical")
     stored_quality = SurfaceQualityConfig.model_validate(payload["surface_quality"])
     if stored_quality.model_dump(mode="json") != quality_config.model_dump(mode="json"):

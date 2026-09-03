@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from math import acos, degrees
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -241,6 +241,7 @@ def filter_candidate_views(
     *,
     projection_poses: Mapping[str, PoseSE3] | None = None,
     deduplicate: bool = True,
+    workspace_mode: Literal["required", "advisory", "disabled"] = "required",
 ) -> FilteredViewPlan:
     """Apply endpoint-only checks while retaining explicit uncertainty state.
 
@@ -249,6 +250,8 @@ def filter_candidate_views(
     sole pose passed to robot IK and physical workspace/clearance checks.
     """
 
+    if workspace_mode not in {"required", "advisory", "disabled"}:
+        raise ValueError("workspace_mode must be 'required', 'advisory', or 'disabled'")
     candidate_ids = tuple(candidate.view_id for candidate in candidates)
     if projection_poses is not None:
         if set(projection_poses) != set(candidate_ids):
@@ -289,16 +292,23 @@ def filter_candidate_views(
             reasons.append("camera clearance sphere intersects the blade proxy")
 
         position = candidate.base_t_left_ir.translation_m
-        workspace_verified = config.workspace is not None
-        if config.workspace is None:
-            reasons.append("workspace bounds are not configured")
-        elif not _point_inside_workspace(
-            position,
-            config.workspace,
-            config.camera_clearance_radius_m,
-        ):
-            rejected = True
-            reasons.append(f"camera leaves workspace {config.workspace.name}")
+        workspace_verified = workspace_mode != "required" or config.workspace is not None
+        if workspace_mode != "disabled":
+            if config.workspace is None:
+                suffix = " (advisory)" if workspace_mode == "advisory" else ""
+                reasons.append(f"workspace bounds are not configured{suffix}")
+            elif not _point_inside_workspace(
+                position,
+                config.workspace,
+                config.camera_clearance_radius_m,
+            ):
+                if workspace_mode == "required":
+                    rejected = True
+                    reasons.append(f"camera leaves workspace {config.workspace.name}")
+                else:
+                    reasons.append(
+                        f"camera leaves advisory workspace {config.workspace.name}"
+                    )
         for volume in config.forbidden_volumes:
             if _sphere_intersects_box(position, volume, config.camera_clearance_radius_m):
                 rejected = True

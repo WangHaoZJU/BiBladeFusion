@@ -9,8 +9,9 @@ from an Intel RealSense D435i, reproducible session storage, a calibrated
 FoundationStereo inference path, paired native/stereo depth evaluation, a conservative
 single-view blade proxy, paper-derived true curved-surface partitioning, thin-wall-aware
 multi-view TSDF/mesh reconstruction, real-surface quality feedback, and offline Elite KDL
-endpoint IK. A fixed-reference fine-coverage ledger, deterministic bilateral-fin
-next-view selector, and transactional fine-scan foreground/reconstruction/coverage
+endpoint IK. Single-initial-view proxy/fin discovery gain, a fixed-reference fine-coverage
+ledger, online blade-ROI scientific-gain next-view selection, and transactional
+fine-scan foreground/reconstruction/coverage
 branch are implemented. It also contains a fail-closed FoundationStereo-derived
 three-state safety occupancy layer, conservative continuous mesh and occupancy sweep
 certificates, an operator-guided unknown-blade coarse loop, a one-way schema-5 handoff,
@@ -189,6 +190,8 @@ Legacy TCP-primary hand-eye artifacts remain readable for inspection but are rej
 reconstruction, planning, collision, and motion-preflight paths.
 Current implementation status and the prioritized remaining work are tracked in the
 [development log](docs/development-log.md).
+The target-centred, IK-aware pose-family search integrated into coarse proxy planning is
+described in [offline adaptive view search](docs/adaptive-ik-view-search.md).
 The copied/adapted HoloRobot control lifecycle, pose convention, collision preflight,
 and approval boundary are documented in the
 [Elite ES68 control safety contract](docs/elite-cs68-control.md).
@@ -301,7 +304,9 @@ These functions are software-verified on deterministic synthetic data; real D435
 coarse scans and dimensional references are still required for physical validation.
 The [coverage-driven fine selector](docs/coverage-next-view-selector.md) keeps cumulative
 scientific surface evidence separate from the bounded rolling safety-occupancy window and
-never interprets an unreachable incomplete state as completion. The concrete cycle engine
+uses online blade-ROI scientific gain to rank geometry/IK/FK-feasible next views without
+counting background unknown voxels. It never interprets an unreachable incomplete state
+as completion. The concrete cycle engine
 can now stage a reference-projected foreground mask, a FoundationStereo reconstructed view,
 and exactly one fine-coverage successor as one library-level transaction. Its schema-3
 scientific view is replayed from the bound stereo depth, occupancy-derived eligible mask,

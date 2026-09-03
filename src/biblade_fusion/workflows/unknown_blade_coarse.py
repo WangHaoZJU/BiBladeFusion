@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from math import cos, radians, sin, sqrt
+from math import atan2, cos, degrees, radians, sin, sqrt
 from pathlib import Path
 from uuid import uuid4
 
@@ -29,6 +29,7 @@ from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     AppSettings,
     PairedFinDiscoveryFallbackConfig,
+    PointCloudConfig,
     ViewFilterConfig,
     ViewPlanningConfig,
 )
@@ -46,11 +47,18 @@ from biblade_fusion.perception.bootstrap_foreground import (
     bootstrap_blade_foreground,
     bootstrap_seed_payload,
 )
+from biblade_fusion.perception.coarse_foreground import (
+    ProjectedCoarseForegroundGuide,
+    ProjectedCoarseForegroundResult,
+    projected_coarse_blade_foreground,
+)
 from biblade_fusion.perception.proxy import (
     BilateralBladeProxy,
     build_bilateral_proxy,
 )
 from biblade_fusion.planning import (
+    AdaptiveViewSearchConfig,
+    AdaptiveViewSearchResult,
     BladeSide,
     CandidateStatus,
     CandidateView,
@@ -59,17 +67,24 @@ from biblade_fusion.planning import (
     FilteredViewPlan,
     ReachabilityChecker,
     SurfacePatch,
+    adaptive_view_search_payload,
     coverage_observation_id,
     create_coverage_ledger,
     filter_candidate_views,
+    search_adaptive_candidate_family,
     select_uncovered_candidates,
     update_coverage,
+)
+from biblade_fusion.planning.coarse_discovery_gain import (
+    CoarseDiscoveryGain,
+    expected_coarse_discovery_gain,
 )
 from biblade_fusion.storage.coarse_model import (
     read_coarse_model_summary,
     write_coarse_model,
 )
 from biblade_fusion.storage.coarse_scan import (
+    CoarseForegroundResult,
     CoarseTargetKind,
     StoredCoarseScanGeneration,
     StoredCoarseScanView,
@@ -107,6 +122,7 @@ from biblade_fusion.workflows.stop_scan_coordinator import (
     CapturedStopScanView,
     NextViewSelection,
     PerceptionCycleResult,
+    RankedNextViewCandidate,
     next_view_target_from_candidate,
 )
 from biblade_fusion.workflows.view_planning import plan_initial_observation
@@ -131,6 +147,18 @@ class CoarseSciencePolicy:
     """Explicit completion and conservative fin-discovery policy."""
 
     discovery_tilt_deg: float = 15.0
+    discovery_tilt_samples_deg: tuple[float, ...] = (
+        10.0,
+        20.0,
+        30.0,
+        45.0,
+        60.0,
+    )
+    discovery_gain_surface_weight: float = 0.45
+    discovery_gain_side_balance_weight: float = 0.25
+    discovery_gain_fin_pair_weight: float = 0.30
+    discovery_gain_fin_seed_value: float = 0.60
+    discovery_gain_minimum: float = 0.0
     minimum_total_views: int = 6
     minimum_views_per_side: int = 3
     maximum_attempts_per_candidate: int = 2
@@ -139,8 +167,33 @@ class CoarseSciencePolicy:
     maximum_discovery_rotation_error_deg: float = 5.0
 
     def __post_init__(self) -> None:
-        if not 0.0 < self.discovery_tilt_deg < 45.0:
-            raise ValueError("Coarse discovery tilt must lie in (0, 45) degrees")
+        if not 0.0 < self.discovery_tilt_deg < 75.0:
+            raise ValueError("Initial coarse discovery tilt must lie in (0, 75) degrees")
+        samples = tuple(float(value) for value in self.discovery_tilt_samples_deg)
+        if (
+            not samples
+            or not np.isfinite(samples).all()
+            or any(not 0.0 < value < 75.0 for value in samples)
+            or len(set(samples)) != len(samples)
+        ):
+            raise ValueError(
+                "Coarse discovery tilt samples must be unique finite values in (0, 75)"
+            )
+        object.__setattr__(self, "discovery_tilt_samples_deg", samples)
+        gain_weights = (
+            self.discovery_gain_surface_weight,
+            self.discovery_gain_side_balance_weight,
+            self.discovery_gain_fin_pair_weight,
+        )
+        if (
+            not np.isfinite((*gain_weights, self.discovery_gain_fin_seed_value)).all()
+            or any(not 0.0 <= value <= 1.0 for value in gain_weights)
+            or not np.isclose(sum(gain_weights), 1.0, rtol=0.0, atol=1e-9)
+            or not 0.0 <= self.discovery_gain_fin_seed_value <= 1.0
+            or not np.isfinite(self.discovery_gain_minimum)
+            or self.discovery_gain_minimum < 0.0
+        ):
+            raise ValueError("Coarse discovery gain policy is invalid")
         if self.minimum_total_views < 4 or self.minimum_views_per_side < 2:
             raise ValueError("Coarse view gates must include both sides and paired obliques")
         if self.minimum_total_views < 2 * self.minimum_views_per_side:
@@ -154,9 +207,17 @@ class CoarseSciencePolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class AdaptiveFinDiscoverySearch:
+    config: AdaptiveViewSearchConfig
+    result: AdaptiveViewSearchResult
+
+
+@dataclass(frozen=True, slots=True)
 class CoarseDiscoveryPlan:
     filtered: FilteredViewPlan
     policy_sha256: str
+    adaptive_searches: tuple[AdaptiveFinDiscoverySearch, ...] = ()
+    current_joint_positions_rad: tuple[float, float, float, float, float, float] | None = None
 
     @property
     def endpoint_feasible(self) -> tuple[EvaluatedCandidate, ...]:
@@ -290,6 +351,51 @@ def _write_bootstrap_annotation_response(
     )
 
 
+def _projected_foreground_from_generation(
+    generation_path: str | Path,
+    *,
+    stereo: StereoInferenceObservation,
+    integration_valid_mask: np.ndarray,
+    base_t_left_rectified: PoseSE3,
+    foreground_config: BootstrapForegroundConfig,
+    settings: AppSettings,
+) -> ProjectedCoarseForegroundResult:
+    """Use only previously accepted blade support to guide a later coarse mask."""
+
+    generation = read_coarse_scan_generation(generation_path)
+    reference_points = np.vstack(
+        [item.support_cloud.points_m for item in generation.views]
+    )
+    lower = settings.proxy_model.blade_envelope_min_m
+    upper = settings.proxy_model.blade_envelope_max_m
+    if lower is None or upper is None:
+        raise UnknownBladeCoarseError(
+            "Automatic coarse foreground requires a blade-only base-frame envelope"
+        )
+    guide = ProjectedCoarseForegroundGuide(
+        source_generation_path=generation.root,
+        source_generation_metadata_sha256=generation.metadata_sha256,
+        reference_points_content_sha256=array_content_sha256(reference_points),
+        blade_envelope_min_m=lower,
+        blade_envelope_max_m=upper,
+    )
+    try:
+        return projected_coarse_blade_foreground(
+            stereo.rectified.left_ir,
+            stereo.depth_m,
+            integration_valid_mask,
+            foreground_config,
+            intrinsics=stereo.rectified.calibration.left,
+            base_t_left_rectified=base_t_left_rectified,
+            reference_points_base_m=reference_points,
+            guide=guide,
+        )
+    except ValueError as exc:
+        raise UnknownBladeCoarseError(
+            "Projected accumulated-blade foreground could not identify this coarse view"
+        ) from exc
+
+
 def _rotation_error_deg(first: PoseSE3, second: PoseSE3) -> float:
     relative = first.rotation.T @ second.rotation
     cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
@@ -339,6 +445,7 @@ def _look_at_pose(
 
 _DISCOVERY_VIEW_ID = re.compile(
     r"^(front|back)_fin_discovery_(major|minor)_(negative|positive)"
+    r"(?:_adaptive_\d+)?"
     r"(?:_paired_fallback_(\d+))?$"
 )
 
@@ -416,6 +523,51 @@ def _explicit_fin_discovery_pair(
     return candidates[0], candidates[1]
 
 
+def _fin_discovery_azimuth_deg(candidate: CandidateView) -> float:
+    """Recover the signed nominal oblique direction in the candidate tangent frame."""
+
+    normal = candidate.patch.outward_normal
+    direction = candidate.base_t_left_ir.translation_m - candidate.patch.target_m
+    direction /= np.linalg.norm(direction)
+    tangent = direction - normal * float(direction @ normal)
+    tangent /= np.linalg.norm(tangent)
+    tangent_x = candidate.base_t_left_ir.rotation[:, 0].copy()
+    tangent_x -= normal * float(tangent_x @ normal)
+    tangent_x /= np.linalg.norm(tangent_x)
+    tangent_y = np.cross(normal, tangent_x)
+    tangent_y /= np.linalg.norm(tangent_y)
+    return float(degrees(atan2(float(tangent @ tangent_y), float(tangent @ tangent_x))) % 360.0)
+
+
+def _fin_discovery_search_config(
+    candidate: CandidateView,
+    planning_config: ViewPlanningConfig,
+    point_cloud_config: PointCloudConfig,
+    policy: CoarseSciencePolicy,
+) -> AdaptiveViewSearchConfig:
+    adaptive = planning_config.adaptive_ik_view_search
+    tilts = [float(policy.discovery_tilt_deg)]
+    tilts.extend(
+        float(value)
+        for value in policy.discovery_tilt_samples_deg
+        if not np.isclose(value, policy.discovery_tilt_deg, rtol=0.0, atol=1e-12)
+    )
+    return AdaptiveViewSearchConfig(
+        minimum_optical_distance_m=point_cloud_config.minimum_depth_m,
+        maximum_optical_distance_m=point_cloud_config.maximum_depth_m,
+        distance_step_m=adaptive.distance_step_m,
+        maximum_distance_expansions=adaptive.maximum_distance_expansions,
+        tilt_samples_deg=tuple(tilts),
+        azimuth_samples_deg=(_fin_discovery_azimuth_deg(candidate),),
+        roll_samples_deg=adaptive.roll_samples_deg,
+        maximum_generated_candidates=adaptive.maximum_generated_candidates,
+        maximum_ik_feasible_candidates=adaptive.maximum_ik_feasible_candidates,
+        sampling_order="distance_major",
+        ranking_mode="fin_discovery",
+        require_attempted_per_tilt=True,
+    )
+
+
 def generate_fin_discovery_plan(
     proxy: BilateralBladeProxy,
     geometric_footprint_m: tuple[float, float],
@@ -423,6 +575,10 @@ def generate_fin_discovery_plan(
     filter_config: ViewFilterConfig,
     policy: CoarseSciencePolicy,
     reachability_checker: ReachabilityChecker,
+    point_cloud_config: PointCloudConfig | None = None,
+    current_joint_positions_rad: (
+        tuple[float, float, float, float, float, float] | None
+    ) = None,
 ) -> CoarseDiscoveryPlan:
     """Generate paired +/- oblique targets about both unknown fin axes.
 
@@ -466,24 +622,56 @@ def generate_fin_discovery_plan(
                         ),
                         standoff,
                         geometric_footprint_m,
+                        projection_fraction=cos(angle),
+                        visibility_fraction=cos(angle),
                         distance_policy="proxy_fin_discovery_oblique",
                     )
                 )
-    filtered = filter_candidate_views(
-        tuple(candidates),
-        proxy,
-        filter_config,
-        reachability_checker,
-        deduplicate=False,
-    )
-    evaluated = list(filtered.candidates)
+    adaptive_searches: list[AdaptiveFinDiscoverySearch] = []
+    adaptive_enabled = planning_config.adaptive_ik_view_search.enabled
+    if adaptive_enabled:
+        if point_cloud_config is None or current_joint_positions_rad is None:
+            raise UnknownBladeCoarseError(
+                "Adaptive fin discovery requires physical depth limits and current joints"
+            )
+        evaluated = []
+        for candidate in candidates:
+            search_config = _fin_discovery_search_config(
+                candidate,
+                planning_config,
+                point_cloud_config,
+                policy,
+            )
+            search = search_adaptive_candidate_family(
+                candidate,
+                proxy,
+                filter_config,
+                (reachability_checker,),
+                current_joint_positions_rad,
+                search_config,
+            )
+            adaptive_searches.append(AdaptiveFinDiscoverySearch(search_config, search))
+            evaluated.append(
+                search.recommended.evaluated
+                if search.recommended is not None
+                else search.attempts[0].evaluated
+            )
+    else:
+        filtered = filter_candidate_views(
+            tuple(candidates),
+            proxy,
+            filter_config,
+            reachability_checker,
+            deduplicate=False,
+        )
+        evaluated = list(filtered.candidates)
 
     # Generic normal-view fallbacks have different semantics and are intentionally
     # ignored here. Each entry below names one exact side/axis opposing pair.
-    for fallback_index, fallback in enumerate(
-        planning_config.paired_fin_discovery_fallbacks,
-        start=1,
-    ):
+    fallbacks = (
+        () if adaptive_enabled else planning_config.paired_fin_discovery_fallbacks
+    )
+    for fallback_index, fallback in enumerate(fallbacks, start=1):
         side = BladeSide(fallback.side)
         interim = CoarseDiscoveryPlan(FilteredViewPlan(tuple(evaluated), ()), "pending")
         if _paired_discovery_ids(interim, side):
@@ -513,7 +701,11 @@ def generate_fin_discovery_plan(
     filtered = FilteredViewPlan(tuple(evaluated), ())
     canonical = json.dumps(
         {
-            "algorithm": "explicit_bilateral_paired_oblique_fin_discovery_v2",
+            "algorithm": (
+                "adaptive_bilateral_paired_oblique_fin_discovery_v3"
+                if adaptive_enabled
+                else "explicit_bilateral_paired_oblique_fin_discovery_v2"
+            ),
             "policy": asdict(policy),
             "view_planning": planning_config.model_dump(mode="json"),
             "view_filter": filter_config.model_dump(mode="json"),
@@ -540,6 +732,8 @@ def generate_fin_discovery_plan(
     return CoarseDiscoveryPlan(
         filtered,
         hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        tuple(adaptive_searches),
+        current_joint_positions_rad if adaptive_enabled else None,
     )
 
 
@@ -558,7 +752,7 @@ def prepare_unknown_blade_coarse_view(
     target_kind: CoarseTargetKind,
     target_side: BladeSide | None,
     side_proxy: BilateralBladeProxy | None = None,
-    preflight_foreground: BootstrapForegroundResult | None = None,
+    preflight_foreground: CoarseForegroundResult | None = None,
 ) -> PreparedCoarseScienceView:
     """Prepare one stopped coarse view from the occupancy integration-valid depth."""
 
@@ -653,7 +847,7 @@ def _prepare_unknown_blade_coarse_view(
     target_kind: CoarseTargetKind,
     target_side: BladeSide | None,
     side_proxy: BilateralBladeProxy | None,
-    preflight_foreground: BootstrapForegroundResult | None = None,
+    preflight_foreground: CoarseForegroundResult | None = None,
 ) -> PreparedCoarseScienceView:
 
     identity = (
@@ -672,6 +866,15 @@ def _prepare_unknown_blade_coarse_view(
     ):
         raise UnknownBladeCoarseError("Coarse cycle source identities differ")
     if preflight_foreground is None:
+        if target_kind != "operator_seed":
+            raise UnknownBladeCoarseError(
+                "Automatic coarse view requires accepted-generation projected "
+                "foreground preflight"
+            )
+        if seed is None or seed.mode != "hard_roi":
+            raise UnknownBladeCoarseError(
+                "Operator bootstrap requires a hard_roi foreground seed"
+            )
         with performance_span("coarse.foreground"):
             foreground = bootstrap_blade_foreground(
                 stereo.rectified.left_ir,
@@ -977,14 +1180,24 @@ def _missing_discovery_pair_error(
         f"{reason} ({count})"
         for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))
     )
+    adaptive = bool(discovery.adaptive_searches)
     if not reason_summary:
-        reason_summary = "no endpoint supplied both measured-workspace and IK evidence"
+        reason_summary = "no endpoint supplied valid geometry and IK evidence"
+    evaluation = (
+        "adaptive angle/distance/roll evaluation"
+        if adaptive
+        else "explicit paired fallback evaluation"
+    )
+    recovery = (
+        "change blade placement or the bounded adaptive search policy"
+        if adaptive
+        else "change blade placement, or add a measured paired_fin_discovery_fallbacks entry"
+    )
     return UnknownBladeCoarseError(
         f"No endpoint-feasible opposing fin-discovery pair exists on {side.value} "
-        f"after explicit paired fallback evaluation; tested {len(candidates)} endpoints; "
+        f"after {evaluation}; tested {len(candidates)} endpoints; "
         f"rejections: {reason_summary}. Automatic motion remains disabled. Start a new "
-        "attempt after changing blade placement, or add only a measured "
-        "paired_fin_discovery_fallbacks entry; do not widen workspace or bypass IK."
+        f"attempt after you {recovery}; do not bypass IK or collision checks."
     )
 
 
@@ -994,54 +1207,103 @@ def _require_bilateral_discovery_pairs(discovery: CoarseDiscoveryPlan) -> None:
             raise _missing_discovery_pair_error(discovery, side)
 
 
-def _select_candidate(
+def _rank_candidates(
     generation: StoredCoarseScanGeneration,
     discovery: CoarseDiscoveryPlan,
     policy: CoarseSciencePolicy,
     *,
     require_additional_fin_evidence: bool,
-) -> EvaluatedCandidate:
+) -> tuple[tuple[EvaluatedCandidate, CoarseDiscoveryGain], ...]:
     attempts = _candidate_attempts(generation)
     verified = _verified_discovery_ids(generation, discovery, policy)
     discovery_by_id = {item.candidate.view_id: item for item in discovery.endpoint_feasible}
-    # At least one opposing pair on each side is a hard precondition.  An
-    # unreachable member never counts as observed or complete.
+    coverage = read_coverage_ledger(generation.coverage_path).ledger
+    side_view_counts = Counter(item.target_side for item in generation.views)
+    eligible: list[tuple[EvaluatedCandidate, float]] = []
+
+    # Opposing-pair availability remains a hard precondition. Selection within
+    # that feasible set is online gain-driven rather than a fixed front-first list.
     for side in (BladeSide.FRONT, BladeSide.BACK):
         pairs = _paired_discovery_ids(discovery, side)
         if not pairs:
             raise _missing_discovery_pair_error(discovery, side)
-        if not any(set(pair) <= verified for pair in pairs):
-            for pair in pairs:
-                for view_id in pair:
-                    if (
-                        view_id not in verified
-                        and attempts.get(view_id, 0) < policy.maximum_attempts_per_candidate
-                    ):
-                        return discovery_by_id[view_id]
+        complete = any(set(pair) <= verified for pair in pairs)
+        if complete and not require_additional_fin_evidence:
+            continue
+        side_eligible = 0
+        for pair in pairs:
+            for view_id in pair:
+                if (
+                    view_id in verified
+                    or attempts.get(view_id, 0) >= policy.maximum_attempts_per_candidate
+                ):
+                    continue
+                opposite = pair[1] if view_id == pair[0] else pair[0]
+                fin_evidence = (
+                    1.0
+                    if opposite in verified
+                    else policy.discovery_gain_fin_seed_value
+                )
+                eligible.append((discovery_by_id[view_id], fin_evidence))
+                side_eligible += 1
+        if not complete and side_eligible == 0:
             raise UnknownBladeCoarseError(
                 f"Fin-discovery attempts exhausted without an opposing pair on {side.value}"
             )
-    if require_additional_fin_evidence:
-        for side in (BladeSide.FRONT, BladeSide.BACK):
-            for pair in _paired_discovery_ids(discovery, side):
-                for view_id in pair:
-                    if (
-                        view_id not in verified
-                        and attempts.get(view_id, 0) < policy.maximum_attempts_per_candidate
-                    ):
-                        return discovery_by_id[view_id]
 
     plan_root = Path(str(generation.metadata["sources"]["view_plan"]["root"])).resolve()
-    coverage = read_coverage_ledger(generation.coverage_path).ledger
     reduced = select_uncovered_candidates(read_view_plan(plan_root).result.filtered_plan, coverage)
-    endpoint = {
+    proxy_endpoint = {
         item.candidate.view_id: item
         for item in reduced.remaining
         if item.status is CandidateStatus.ENDPOINT_FEASIBLE and item.joint_positions_rad is not None
     }
     for view_id in reduced.sequence.ordered_view_ids:
         if attempts.get(view_id, 0) < policy.maximum_attempts_per_candidate:
-            return endpoint[view_id]
+            eligible.append((proxy_endpoint[view_id], 0.0))
+
+    eligible_by_view_id: dict[str, tuple[EvaluatedCandidate, float]] = {}
+    for candidate, fin_evidence in eligible:
+        view_id = candidate.candidate.view_id
+        previous = eligible_by_view_id.get(view_id)
+        if previous is None or fin_evidence > previous[1]:
+            eligible_by_view_id[view_id] = (candidate, fin_evidence)
+    ranked: list[tuple[EvaluatedCandidate, CoarseDiscoveryGain]] = []
+    for candidate, fin_evidence in eligible_by_view_id.values():
+        gain = expected_coarse_discovery_gain(
+            candidate,
+            coverage,
+            side_observation_count=side_view_counts[candidate.candidate.patch.side],
+            minimum_views_per_side=policy.minimum_views_per_side,
+            fin_pair_evidence=fin_evidence,
+            surface_weight=policy.discovery_gain_surface_weight,
+            side_balance_weight=policy.discovery_gain_side_balance_weight,
+            fin_pair_weight=policy.discovery_gain_fin_pair_weight,
+        )
+        ranked.append((candidate, gain))
+    if ranked:
+        ordered = tuple(sorted(
+            ranked,
+            key=lambda item: (
+                -item[1].expected_gain,
+                -item[1].fin_pair_evidence,
+                -item[1].proxy_coverage_deficit,
+                -item[1].side_observation_deficit,
+                -item[0].metrics.geometric_score,
+                item[0].candidate.view_id,
+            ),
+        ))
+        eligible_ranked = tuple(
+            item
+            for item in ordered
+            if item[1].expected_gain + 1e-12 >= policy.discovery_gain_minimum
+        )
+        if not eligible_ranked:
+            raise UnknownBladeCoarseError(
+                "Coarse evidence is incomplete, but every feasible view has expected "
+                "discovery gain below the configured minimum"
+            )
+        return eligible_ranked
     if reduced.blocked_patch_ids:
         raise UnknownBladeCoarseError(
             "Incomplete proxy patches have no endpoint-feasible target: "
@@ -1050,6 +1312,23 @@ def _select_candidate(
     raise UnknownBladeCoarseError(
         "Coarse evidence is incomplete but all endpoint-feasible attempts are exhausted"
     )
+
+
+def _select_candidate(
+    generation: StoredCoarseScanGeneration,
+    discovery: CoarseDiscoveryPlan,
+    policy: CoarseSciencePolicy,
+    *,
+    require_additional_fin_evidence: bool,
+) -> tuple[EvaluatedCandidate, CoarseDiscoveryGain]:
+    """Compatibility helper returning the highest science-ranked endpoint."""
+
+    return _rank_candidates(
+        generation,
+        discovery,
+        policy,
+        require_additional_fin_evidence=require_additional_fin_evidence,
+    )[0]
 
 
 def select_coarse_next_view(
@@ -1081,7 +1360,7 @@ def select_coarse_next_view(
             True,
             ("schema-5 coarse reference is committed",),
         )
-    candidate = _select_candidate(
+    ranked = _rank_candidates(
         generation,
         discovery,
         policy,
@@ -1093,18 +1372,36 @@ def select_coarse_next_view(
     initialization_root = Path(
         str(generation.metadata["sources"]["initialization"]["root"])
     ).resolve()
+    ranked_candidates: list[RankedNextViewCandidate] = []
+    for rank, (candidate, gain) in enumerate(ranked, start=1):
+        diagnostics = (
+            "algorithm=single_initial_view_proxy_fin_gain_nbv_v1",
+            f"science_rank={rank}",
+            f"coarse target kind={_candidate_kind(candidate.candidate.view_id)}",
+            f"expected_discovery_gain={gain.expected_gain:.6f}",
+            f"gain_proxy_coverage_deficit={gain.proxy_coverage_deficit:.6f}",
+            f"gain_side_observation_deficit={gain.side_observation_deficit:.6f}",
+            f"gain_fin_pair_evidence={gain.fin_pair_evidence:.6f}",
+            f"gain_measurement_quality={gain.measurement_quality:.6f}",
+            "endpoint IK is feasible; trajectory safety remains unproven here",
+        )
+        ranked_candidates.append(
+            RankedNextViewCandidate(
+                next_view_target_from_candidate(candidate, hand_eye),
+                diagnostics,
+            )
+        )
+    selected = ranked_candidates[0]
     return NextViewSelection(
-        next_view_target_from_candidate(candidate, hand_eye),
+        selected.target,
         _sha256(generation.root / "generation.json"),
         _sha256(initialization_root / INITIALIZATION_METADATA_FILENAME),
         discovery.policy_sha256,
         required,
         min(incomplete, required),
         False,
-        (
-            f"coarse target kind={_candidate_kind(candidate.candidate.view_id)}",
-            "endpoint IK is feasible; trajectory safety remains unproven here",
-        ),
+        selected.diagnostics,
+        ranked_candidates=tuple(ranked_candidates),
     )
 
 
@@ -1328,7 +1625,7 @@ def _write_discovery_plan_asset(
     temporary.mkdir()
     try:
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "artifact_kind": "biblade_fusion.coarse_fin_discovery_plan",
             "created_at_utc": datetime.now(UTC).isoformat(),
             "motion_authorized": False,
@@ -1356,6 +1653,23 @@ def _write_discovery_plan_asset(
                 for item in discovery.filtered.candidates
             ],
         }
+        if discovery.adaptive_searches:
+            assert discovery.current_joint_positions_rad is not None
+            payload["adaptive_ik_fin_discovery"] = {
+                "motion_authorized": False,
+                "endpoint_collision_checked": False,
+                "trajectory_checked": False,
+                "targets": [
+                    adaptive_view_search_payload(
+                        trace.result,
+                        trace.config,
+                        discovery.current_joint_positions_rad,
+                        source_initialization=str(source_initialization.resolve()),
+                        source_kinematics=str(source_kinematics.resolve()),
+                    )
+                    for trace in discovery.adaptive_searches
+                ],
+            }
         (temporary / "discovery.json").write_text(
             json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
             encoding="utf-8",
@@ -1377,12 +1691,24 @@ def _verify_discovery_plan_asset(
 ) -> None:
     payload = json.loads((path / "discovery.json").read_text(encoding="utf-8"))
     if (
-        payload.get("schema_version") != 1
+        payload.get("schema_version") not in {1, 2}
         or payload.get("artifact_kind") != "biblade_fusion.coarse_fin_discovery_plan"
         or payload.get("motion_authorized") is not False
         or payload.get("policy_sha256") != discovery.policy_sha256
     ):
         raise UnknownBladeCoarseError("Persisted coarse discovery policy changed")
+    adaptive_payload = payload.get("adaptive_ik_fin_discovery")
+    if adaptive_payload is not None and any(
+        adaptive_payload.get(name) is not False
+        for name in (
+            "motion_authorized",
+            "endpoint_collision_checked",
+            "trajectory_checked",
+        )
+    ):
+        raise UnknownBladeCoarseError(
+            "Adaptive fin discovery must remain explicitly non-authorizing"
+        )
     expected_sources = {
         "initialization": source_initialization / INITIALIZATION_METADATA_FILENAME,
         "view_plan": source_view_plan / "view_plan.json",
@@ -1461,7 +1787,7 @@ class CoarseScienceSession:
         self._pending_operator_side: BladeSide | None = None
         self._pending_seed: BootstrapSeed | None = None
         self._pending_seed_provider: BootstrapSeedProvider | None = None
-        self._pending_foreground: BootstrapForegroundResult | None = None
+        self._pending_foreground: CoarseForegroundResult | None = None
         self._pending_prepared: PreparedCoarseScienceView | None = None
         self._pending_live_readback: _CoarseScanViewReadback | None = None
         self._operator_capture_staged = False
@@ -1505,6 +1831,11 @@ class CoarseScienceSession:
             self._settings.view_filter,
             self._policy,
             self._reachability,
+            self._settings.point_cloud,
+            tuple(
+                float(value)
+                for value in stored_initialization.observation.seed_joint_positions_rad
+            ),
         )
         _verify_discovery_plan_asset(
             discovery_path,
@@ -1659,13 +1990,29 @@ class CoarseScienceSession:
             self._pending_seed = seed
 
         with performance_span("coarse.foreground"):
-            foreground = bootstrap_blade_foreground(
-                stereo.rectified.left_ir,
-                stereo.depth_m,
-                prepared_occupancy.self_mask.integration_valid_mask,
-                self._foreground_config,
-                seed,
-            )
+            if operator_staged or seed is not None:
+                foreground: CoarseForegroundResult = bootstrap_blade_foreground(
+                    stereo.rectified.left_ir,
+                    stereo.depth_m,
+                    prepared_occupancy.self_mask.integration_valid_mask,
+                    self._foreground_config,
+                    seed,
+                )
+            else:
+                if self._generation is None:
+                    raise UnknownBladeCoarseError(
+                        "Automatic coarse foreground has no accepted blade generation"
+                    )
+                foreground = _projected_foreground_from_generation(
+                    self._generation,
+                    stereo=stereo,
+                    integration_valid_mask=(
+                        prepared_occupancy.self_mask.integration_valid_mask
+                    ),
+                    base_t_left_rectified=prepared_occupancy.base_t_camera,
+                    foreground_config=self._foreground_config,
+                    settings=self._settings,
+                )
         if annotation_root is not None:
             _write_bootstrap_annotation_response(annotation_root, foreground)
         self._pending_foreground = foreground
@@ -1916,6 +2263,7 @@ class CoarseScienceSession:
                     self._settings.view_planning,
                     self._settings.view_filter,
                     self._reachability,
+                    self._settings.point_cloud,
                 )
             with performance_span("coarse.view_plan_write"):
                 write_view_plan(
@@ -1936,6 +2284,8 @@ class CoarseScienceSession:
                     self._settings.view_filter,
                     self._policy,
                     self._reachability,
+                    self._settings.point_cloud,
+                    tuple(float(value) for value in observation.seed_joint_positions_rad),
                 )
             # This policy depends only on the first proxy, measured workspace and
             # offline IK. Fail now instead of spending two more long bootstrap

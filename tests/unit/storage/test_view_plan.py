@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -5,13 +6,32 @@ import numpy as np
 import pytest
 
 from biblade_fusion.core.pose import PoseSE3
-from biblade_fusion.core.settings import ViewFilterConfig, ViewPlanningConfig
+from biblade_fusion.core.settings import (
+    AdaptiveIkViewSearchConfig,
+    PointCloudConfig,
+    ViewFilterConfig,
+    ViewPlanningConfig,
+)
 from biblade_fusion.devices.depth_camera.base import CameraIntrinsics
 from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import BilateralBladeProxy
-from biblade_fusion.planning import CandidateStatus, FilteredViewPlan
+from biblade_fusion.planning import (
+    CandidateStatus,
+    FilteredViewPlan,
+    ReachabilityResult,
+    ReachabilityState,
+)
 from biblade_fusion.storage import read_view_plan, write_view_plan
 from biblade_fusion.workflows import InitialObservation, plan_initial_observation
+
+
+class AlwaysReachable:
+    def check(self, _pose: PoseSE3) -> ReachabilityResult:
+        return ReachabilityResult(
+            ReachabilityState.REACHABLE,
+            "offline IK solution",
+            np.zeros(6),
+        )
 
 
 def test_view_plan_round_trip_is_explicitly_non_executable(tmp_path: Path) -> None:
@@ -56,6 +76,82 @@ def test_view_plan_round_trip_is_explicitly_non_executable(tmp_path: Path) -> No
     assert stored.result.motion_authorized is False
     assert len(stored.result.geometric_plan.candidates) == 4
     assert len(stored.result.filtered_plan.accepted) == 4
+
+
+def test_adaptive_search_trace_and_candidate_policy_survive_storage(tmp_path: Path) -> None:
+    proxy = BilateralBladeProxy(
+        PoseSE3.identity("base", "blade_proxy"),
+        np.array([0.1, 0.1, 0.02]),
+        np.zeros(3),
+        np.array([1.0, 0.5, 0.0]),
+        100,
+        100,
+        100,
+        1.0,
+    )
+    observation = InitialObservation(
+        "seed",
+        CameraIntrinsics(101, 101, 50, 50, 50, 50, "none", ()),
+        np.zeros(6),
+        PoseSE3.identity("base", "left_ir"),
+        PoseSE3.identity("base", "depth"),
+        PointCloud(
+            "base",
+            np.zeros((3, 3)),
+            np.array([[0, 0], [1, 0], [2, 0]]),
+            (101, 101),
+        ),
+        proxy,
+    )
+    planning = ViewPlanningConfig(
+        standoff_distance_m=0.1,
+        overlap_fraction=0.0,
+        footprint_utilization=1.0,
+        edge_margin_m=0.0,
+        adaptive_ik_view_search=AdaptiveIkViewSearchConfig(
+            enabled=True,
+            maximum_distance_expansions=0,
+            tilt_samples_deg=(0.0,),
+            azimuth_samples_deg=(0.0,),
+            roll_samples_deg=(0.0,),
+            maximum_ik_feasible_candidates=1,
+        ),
+    )
+    filtering = ViewFilterConfig(camera_clearance_radius_m=0.01)
+    result = plan_initial_observation(
+        observation,
+        planning,
+        filtering,
+        AlwaysReachable(),
+        PointCloudConfig(minimum_depth_m=0.05, maximum_depth_m=0.5),
+    )
+    kinematics = tmp_path / "kinematics.yaml"
+    kinematics.write_text("controller-specific-mdh\n", encoding="utf-8")
+
+    output = write_view_plan(
+        tmp_path / "adaptive-plan",
+        result,
+        planning,
+        filtering,
+        source_initialization=tmp_path / "initialization",
+        source_kinematics=kinematics,
+        joint_zero_offsets_rad=(0.0,) * 6,
+    )
+    payload = json.loads((output / "view_plan.json").read_text(encoding="utf-8"))
+    stored = read_view_plan(output)
+
+    assert payload["adaptive_ik_view_search"]["motion_authorized"] is False
+    assert payload["adaptive_ik_view_search"]["endpoint_collision_checked"] is False
+    assert payload["adaptive_ik_view_search"]["trajectory_checked"] is False
+    assert len(payload["adaptive_ik_view_search"]["targets"]) == 2
+    assert all(
+        candidate.distance_policy == "adaptive_ik_aware_pose_family_v1"
+        for candidate in stored.result.geometric_plan.candidates
+    )
+    assert {candidate.patch.patch_id for candidate in stored.result.geometric_plan.candidates} == {
+        "front_r00_c00",
+        "back_r00_c00",
+    }
 
 
 def test_endpoint_plan_requires_and_verifies_kinematics_provenance(

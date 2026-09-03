@@ -477,7 +477,10 @@ class SupervisedExperimentRunner:
                     else:
                         for callback in self._perception_callbacks:
                             callback(result)
-                elif checkpoint.phase is StopScanPhase.MAP_READY:
+                elif checkpoint.phase in {
+                    StopScanPhase.BOOTSTRAP_MOTION_READY,
+                    StopScanPhase.MAP_READY,
+                }:
                     prepared = self._coordinator.prepare_next_segment()
                     if prepared is not None and type(prepared) is not PreparedSegment:
                         if self._prepared_segment_callbacks:

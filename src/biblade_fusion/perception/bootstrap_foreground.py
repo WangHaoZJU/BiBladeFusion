@@ -45,6 +45,10 @@ class BootstrapForegroundConfig:
     minimum_seed_valid_pixels: int = 25
     minimum_seed_valid_fraction: float = 0.10
     minimum_component_hint_selection_fraction: float = 0.10
+    projected_reference_dilation_px: int = 12
+    minimum_projected_reference_points: int = 100
+    minimum_projected_reference_pixels: int = 500
+    minimum_projected_match_fraction: float = 0.50
 
     def __post_init__(self) -> None:
         finite_nonnegative = (
@@ -66,6 +70,8 @@ class BootstrapForegroundConfig:
             self.minimum_component_pixels,
             self.minimum_mask_pixels,
             self.minimum_seed_valid_pixels,
+            self.minimum_projected_reference_points,
+            self.minimum_projected_reference_pixels,
         )
         if any(value < 1 for value in integer_limits):
             raise ValueError("Bootstrap pixel-count gates must be positive")
@@ -75,11 +81,14 @@ class BootstrapForegroundConfig:
             self.maximum_unseeded_ambiguity_ratio,
             self.minimum_seed_valid_fraction,
             self.minimum_component_hint_selection_fraction,
+            self.minimum_projected_match_fraction,
         )
         if any(not np.isfinite(value) or not 0.0 <= value <= 1.0 for value in fractions):
             raise ValueError("Bootstrap fraction gates must lie in [0, 1]")
         if self.minimum_mask_fraction > self.maximum_mask_fraction:
             raise ValueError("Bootstrap mask-fraction interval is reversed")
+        if self.projected_reference_dilation_px < 1:
+            raise ValueError("Projected-reference dilation must be at least one pixel")
 
 
 @dataclass(frozen=True, slots=True)

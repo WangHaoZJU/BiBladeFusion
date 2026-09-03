@@ -477,7 +477,7 @@ def _selection_policy_payload(
     settings = load_settings("configs/default.yaml")
     metadata_sha256 = hashlib.sha256((coarse / "metadata.json").read_bytes()).hexdigest()
     return {
-        "algorithm": "bilateral_single_fin_coverage_priority_v2",
+        "algorithm": "bilateral_single_fin_scientific_gain_nbv_v3",
         "selection": settings.next_view_selection.model_dump(mode="json"),
         "surface_quality": quality.model_dump(mode="json"),
         "view_filter": settings.view_filter.model_dump(mode="json"),

@@ -19,6 +19,13 @@ from biblade_fusion.perception.bootstrap_foreground import (
     BootstrapSeed,
     bootstrap_blade_foreground,
 )
+from biblade_fusion.perception.coarse_foreground import (
+    PROJECTED_COARSE_FOREGROUND_ALGORITHM,
+    ProjectedCoarseForegroundDiagnostics,
+    ProjectedCoarseForegroundGuide,
+    ProjectedCoarseForegroundResult,
+    projected_coarse_foreground_policy_sha256,
+)
 from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.planning import BladeSide, coverage_observation_id
 from biblade_fusion.storage.coarse_scan import (
@@ -405,6 +412,84 @@ def test_coarse_view_persists_and_replays_per_view_proxy_support(
     assert stored.metadata["proxy_support"]["configuration"] == (
         proxy_config.model_dump(mode="json")
     )
+
+
+def test_projected_coarse_view_binds_exact_predecessor_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _coarse_writer_case(tmp_path, monkeypatch)
+    generation = tmp_path / "accepted-generation"
+    generation.mkdir()
+    generation_metadata = generation / "generation.json"
+    generation_metadata.write_text(
+        '{"artifact_kind":"biblade_fusion.coarse_scan_generation"}\n',
+        encoding="utf-8",
+    )
+    mask = case.foreground.mask
+    projection = case.foreground.seed_mask
+    mask_count = int(np.count_nonzero(mask))
+    projected_count = int(np.count_nonzero(projection))
+    guide = ProjectedCoarseForegroundGuide(
+        source_generation_path=generation,
+        source_generation_metadata_sha256=coarse_scan_module._sha256(
+            generation_metadata
+        ),
+        reference_points_content_sha256="b" * 64,
+        blade_envelope_min_m=(0.0, 0.0, 0.0),
+        blade_envelope_max_m=(1.0, 1.0, 1.0),
+    )
+    projected = ProjectedCoarseForegroundResult(
+        mask=mask,
+        projected_reference_mask=projection,
+        diagnostics=ProjectedCoarseForegroundDiagnostics(
+            image_pixel_count=mask.size,
+            supplied_valid_pixel_count=mask.size,
+            depth_valid_pixel_count=mask.size,
+            reference_point_count=100,
+            projected_reference_pixel_count=projected_count,
+            eligible_projected_pixel_count=projected_count,
+            base_envelope_pixel_count=mask_count,
+            mask_pixel_count=mask_count,
+            mask_fraction=mask_count / mask.size,
+            projected_match_fraction=mask_count / projected_count,
+            minimum_mask_depth_m=0.5,
+            median_mask_depth_m=0.5,
+            maximum_mask_depth_m=0.5,
+        ),
+        config=case.foreground.config,
+        guide=guide,
+        algorithm=PROJECTED_COARSE_FOREGROUND_ALGORITHM,
+        policy_sha256=projected_coarse_foreground_policy_sha256(
+            case.foreground.config
+        ),
+        left_image_content_sha256=case.foreground.left_image_content_sha256,
+        depth_content_sha256=case.foreground.depth_content_sha256,
+        valid_mask_content_sha256=case.foreground.valid_mask_content_sha256,
+    )
+    case.foreground = projected
+    monkeypatch.setattr(
+        coarse_scan_module,
+        "_replay_foreground",
+        lambda **_kwargs: projected,
+    )
+
+    output = _write_coarse_writer_case(case)
+    stored = read_coarse_scan_view(output)
+    metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
+
+    assert stored.foreground.guide == guide
+    assert metadata["foreground"]["algorithm"] == (
+        PROJECTED_COARSE_FOREGROUND_ALGORITHM
+    )
+    assert metadata["foreground"]["guide"] == guide.payload()
+    assert metadata["sources"]["foreground_reference_generation"]["authority"] == (
+        "generation.json"
+    )
+
+    generation_metadata.write_text('{"tampered":true}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="directory source changed"):
+        read_coarse_scan_view(output)
 
 
 @pytest.mark.parametrize(

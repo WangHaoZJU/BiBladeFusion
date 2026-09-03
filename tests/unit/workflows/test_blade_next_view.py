@@ -676,6 +676,66 @@ def test_region_priority_is_deterministic_and_occupancy_independent(
     )
 
 
+def test_online_nbv_prefers_higher_expected_blade_information_gain(
+    tmp_path: Path,
+) -> None:
+    low = _patch(
+        "a_low_visibility",
+        BladeSide.FRONT,
+        SurfaceRegion.SURFACE,
+        center=(-0.1, 0.0, 0.01),
+        normal=(0.0, 0.0, 1.0),
+    )
+    high = _patch(
+        "z_high_visibility",
+        BladeSide.BACK,
+        SurfaceRegion.SURFACE,
+        center=(0.1, 0.0, -0.01),
+        normal=(0.0, 0.0, -1.0),
+    )
+    low_candidate, low_projection = _candidate(low)
+    high_candidate, high_projection = _candidate(high)
+    state = _stored_generation(
+        tmp_path,
+        (low, high),
+        candidate_overrides={
+            low.patch_id: (
+                replace(
+                    low_candidate,
+                    visibility_fraction=0.2,
+                    projection_fraction=0.5,
+                ),
+                low_projection,
+            ),
+            high.patch_id: (high_candidate, high_projection),
+        },
+    )
+    candidates = state.view_plan.candidates
+    factory = _ReachabilityFactory(candidates)
+    selector = _selector(
+        tmp_path,
+        state,
+        _selection_config(SurfaceRegion.SURFACE),
+        factory=factory,
+        fk_model=_MappedFk(candidates, factory),
+    )
+
+    decision = selector.select_next(_observation(state), object())
+
+    assert decision.target is not None
+    assert decision.target.view_id == "z_high_visibility"
+    assert len(decision.ranked_candidates) == 2
+    assert [item.target.view_id for item in decision.ranked_candidates] == [
+        "z_high_visibility",
+        "a_low_visibility",
+    ]
+    assert decision.ranked_candidates[0].diagnostics == decision.diagnostics
+    assert any(
+        item.startswith("expected_scientific_gain=") for item in decision.diagnostics
+    )
+    assert any(item.startswith("gain_coverage_novelty=") for item in decision.diagnostics)
+
+
 def test_only_complete_coverage_returns_a_targetless_decision(tmp_path: Path) -> None:
     patches = (
         _patch(

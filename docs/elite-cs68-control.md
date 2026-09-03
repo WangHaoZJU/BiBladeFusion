@@ -19,7 +19,8 @@ preserve upstream provenance; they must not be interpreted as a CS68 production 
   manifest and fails closed when it is absent or inconsistent.
 - Conservative linear-joint preflight proves the full mesh/workcell interval using FCL
   separation and serial-chain displacement bounds, and independently proves the full
-  robot-versus-voxel interval with displacement-expanded geometry spheres. Both
+  robot-versus-voxel interval using original-STL-to-voxel HPP-FCL distances reduced by
+  the geometry-specific interval displacement bound. Both
   certificates are bound to the exact segment; inconclusive subdivision, numerical,
   evidence or freshness states return `UNKNOWN` and block.
 - Unknown-blade occupancy is built from accepted FoundationStereo observations in
@@ -95,9 +96,10 @@ operator acceptance.
 ## Known limitations
 
 - Both interval proofs are conservative and can reject safe motion. The occupancy proof
-  approximates each collision mesh with a sphere enclosing its transformed local AABB,
-  then further expands it by the interval motion bound. It must not be relaxed to point
-  sampling merely to obtain a feasible route.
+  now measures the original URDF collision STL directly against dangerous voxel boxes;
+  it still requires the exact midpoint distance to exceed clearance, tracking uncertainty,
+  and the interval motion bound. It must not be relaxed to point sampling merely to obtain
+  a feasible route.
 - Because robot pixels are correctly removed without ray-clearing, the robot's own
   volume remains `UNKNOWN`. Only whole UNKNOWN voxels inside an immutable, physically
   accepted static-free AABB may use the narrow external-object-free exception;

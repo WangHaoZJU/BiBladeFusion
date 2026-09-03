@@ -44,10 +44,14 @@ from biblade_fusion.perception.stereo import (
     run_foundation_stereo_doctor,
 )
 from biblade_fusion.planning import (
+    AdaptiveViewSearchConfig,
     BladeSide,
     EliteCs68IkChecker,
+    adaptive_view_search_payload,
     coverage_observation_id,
     create_coverage_ledger,
+    generate_bilateral_view_plan,
+    search_adaptive_candidate_family,
     select_uncovered_candidates,
     update_coverage,
 )
@@ -2291,6 +2295,7 @@ def plan_views(
             settings.view_planning,
             settings.view_filter,
             reachability_checker,
+            settings.point_cloud,
         )
         destination = write_view_plan(
             output,
@@ -2311,6 +2316,133 @@ def plan_views(
         f"endpoint feasible: {len(result.filtered_plan.endpoint_feasible)}"
     )
     typer.echo("Motion authorized: no")
+
+
+def _parse_joint_seed(value: str) -> tuple[float, float, float, float, float, float]:
+    import numpy as np
+
+    parts = tuple(float(item.strip()) for item in value.split(","))
+    if len(parts) != 6:
+        raise ValueError("--ik-seed requires exactly six comma-separated joint values")
+    if not all(np.isfinite(parts)):
+        raise ValueError("--ik-seed values must be finite")
+    return parts  # type: ignore[return-value]
+
+
+@plan_app.command("search-view")
+def plan_search_view(
+    initialization: Annotated[
+        Path,
+        typer.Option("--initialization", exists=True, file_okay=False, readable=True),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="New JSON diagnostic report path."),
+    ],
+    view_id: Annotated[
+        str,
+        typer.Option(
+            "--view-id",
+            help="Ideal bilateral-plan view ID to expand, for example front_r00_c00.",
+        ),
+    ] = "front_r00_c00",
+    ik_seeds: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--ik-seed",
+            help=(
+                "Additional offline KDL seed as six comma-separated radians; repeat to "
+                "search multiple solution branches. The captured seed is always included."
+            ),
+        ),
+    ] = None,
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ] = Path("configs/default.yaml"),
+) -> None:
+    """Search IK-feasible alternatives around one ideal view without commanding motion."""
+
+    import numpy as np
+
+    try:
+        if output.exists():
+            raise FileExistsError(f"Adaptive-view report already exists: {output}")
+        settings = load_settings(config)
+        stored = read_initialization(initialization)
+        geometric = generate_bilateral_view_plan(
+            stored.observation.proxy,
+            stored.observation.planning_intrinsics,
+            settings.view_planning,
+        )
+        nominal = next(
+            (item for item in geometric.candidates if item.view_id == view_id),
+            None,
+        )
+        if nominal is None:
+            available = ", ".join(item.view_id for item in geometric.candidates)
+            raise ValueError(f"Unknown ideal view ID {view_id!r}; available: {available}")
+        if settings.kinematics.model_path is None:
+            raise ValueError("Adaptive view search requires a configured kinematics model")
+        kinematics = load_cs68_kinematics(settings.kinematics.model_path)
+        seed_values = [stored.observation.seed_joint_positions_rad]
+        seed_values.extend(_parse_joint_seed(value) for value in (ik_seeds or []))
+        unique_seeds = []
+        for seed in seed_values:
+            array = np.asarray(seed, dtype=np.float64)
+            if not any(np.array_equal(array, existing) for existing in unique_seeds):
+                unique_seeds.append(array)
+        checkers = tuple(
+            EliteCs68IkChecker(
+                kinematics,
+                stored.hand_eye,
+                seed,
+                settings.kinematics,
+            )
+            for seed in unique_seeds
+        )
+        policy = settings.view_planning.adaptive_ik_view_search
+        search_config = AdaptiveViewSearchConfig(
+            minimum_optical_distance_m=settings.point_cloud.minimum_depth_m,
+            maximum_optical_distance_m=settings.point_cloud.maximum_depth_m,
+            distance_step_m=policy.distance_step_m,
+            maximum_distance_expansions=policy.maximum_distance_expansions,
+            tilt_samples_deg=policy.tilt_samples_deg,
+            azimuth_samples_deg=policy.azimuth_samples_deg,
+            roll_samples_deg=policy.roll_samples_deg,
+            maximum_generated_candidates=policy.maximum_generated_candidates,
+            maximum_ik_feasible_candidates=policy.maximum_ik_feasible_candidates,
+        )
+        result = search_adaptive_candidate_family(
+            nominal,
+            stored.observation.proxy,
+            settings.view_filter,
+            checkers,
+            stored.observation.seed_joint_positions_rad,
+            search_config,
+        )
+        payload = adaptive_view_search_payload(
+            result,
+            search_config,
+            stored.observation.seed_joint_positions_rad,
+            source_initialization=str(initialization.resolve()),
+            source_kinematics=str(settings.kinematics.model_path.resolve()),
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with output.open("x", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+    except Exception as exc:
+        typer.echo(f"Adaptive view search failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Saved offline adaptive-view report: {output}")
+    typer.echo(
+        f"Attempts: {len(result.attempts)}; "
+        f"IK feasible: {len(result.ranked_feasible)}; "
+        f"recommended: "
+        f"{result.recommended.evaluated.candidate.view_id if result.recommended else '-'}"
+    )
+    typer.echo("Motion authorized: no; endpoint collision and trajectory remain unchecked")
 
 
 @coverage_app.command("seed")
@@ -2941,9 +3073,7 @@ def commission_motion_envelope_trial(
         elif normalized_direction != "forward":
             raise ValueError("--direction must be 'forward' or 'reverse'")
         if intentional_tracking_fault:
-            prepared = intentional_tracking_fault_motion_envelope_commissioning_trial(
-                prepared
-            )
+            prepared = intentional_tracking_fault_motion_envelope_commissioning_trial(prepared)
         prepared = bind_motion_envelope_commissioning_output(prepared, output)
         prompt = prepared.approval_prompt
         try:

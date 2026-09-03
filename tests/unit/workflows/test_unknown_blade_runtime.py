@@ -24,6 +24,7 @@ from biblade_fusion.supervision.experiment import (
 from biblade_fusion.workflows.stop_scan_coordinator import (
     NextViewSelection,
     NextViewTarget,
+    RankedNextViewCandidate,
 )
 from biblade_fusion.workflows.unknown_blade_coarse import (
     CoarsePhase,
@@ -152,6 +153,43 @@ def test_coarse_target_is_stable_across_transit_capture(tmp_path: Path) -> None:
     assert session.select_calls == 1
     assert session.stage_selected_calls == 1
     assert session.accept_calls == 0
+
+
+def test_coarse_adapter_restages_the_path_safe_ranked_fallback(tmp_path: Path) -> None:
+    first = _selection("coarse-high-gain")
+    assert first.target is not None
+    second_target = NextViewTarget(
+        "coarse-safe-fallback",
+        (0.1, 0.1, 0.2, 0.3, 0.4, 0.5),
+        tuple(tuple(float(value) for value in row) for row in np.eye(4)),
+    )
+    ranked = replace(
+        first,
+        diagnostics=("science_rank=1", "expected_discovery_gain=0.8"),
+        ranked_candidates=(
+            RankedNextViewCandidate(
+                first.target,
+                ("science_rank=1", "expected_discovery_gain=0.8"),
+            ),
+            RankedNextViewCandidate(
+                second_target,
+                ("science_rank=2", "expected_discovery_gain=0.7"),
+            ),
+        ),
+    )
+    session = _FakeCoarseSession(tmp_path, selections=[ranked])
+    adapter = CoarseSessionNextViewAdapter(session)
+    adapter.bind_checkpoint_sink(lambda _generation: None)
+    adapter.select_next(SimpleNamespace(), SimpleNamespace())
+
+    adapter.accept_preflight_target("coarse-safe-fallback")
+    carried = adapter.select_next(SimpleNamespace(), SimpleNamespace())
+
+    assert carried.target == second_target
+    assert carried.diagnostics[0] == "science_rank=2"
+    assert session.select_calls == 1
+    assert session.reject_calls == 1
+    assert session.stage_selected_calls == 2
 
 
 def test_coarse_live_readback_is_bound_and_transferred_once(tmp_path: Path) -> None:
@@ -286,10 +324,12 @@ class _FakeRunner:
         observer: CoarseSessionNextViewAdapter | None,
         *,
         bootstrap_ready_after: int = 3,
+        bootstrap_motion_ready_after: int | None = None,
     ) -> None:
         self.tmp_path = tmp_path
         self.observer = observer
         self.bootstrap_ready_after = bootstrap_ready_after
+        self.bootstrap_motion_ready_after = bootstrap_motion_ready_after
         self.capture_count = 0
         self.execute_count = 0
         self.plan_count = 0
@@ -330,9 +370,14 @@ class _FakeRunner:
                     )
                 )
             )
+        map_ready = self.capture_count >= self.bootstrap_ready_after
+        bootstrap_motion_ready = bool(
+            self.bootstrap_motion_ready_after is not None
+            and self.capture_count >= self.bootstrap_motion_ready_after
+        )
         disposition = (
             ExperimentDisposition.READY
-            if self.capture_count >= self.bootstrap_ready_after
+            if map_ready or bootstrap_motion_ready
             else ExperimentDisposition.NEEDS_CAPTURE
         )
         self._status = _status(
@@ -340,7 +385,9 @@ class _FakeRunner:
             disposition,
             phase=(
                 "map_ready"
-                if disposition is ExperimentDisposition.READY
+                if map_ready
+                else "bootstrap_motion_ready"
+                if bootstrap_motion_ready
                 else "bootstrap_map_required"
             ),
             cycle=self.capture_count,
@@ -493,10 +540,15 @@ def _runtime(
     maximum_schema5_handoff_duration_s: float | None = None,
     experimental: bool = False,
     monotonic_clock=None,
+    bootstrap_motion_ready_after: int | None = None,
 ) -> tuple[UnknownBladeSupervisedRuntime, _FakeRunner, _FakeCoarseSession]:
     session = _FakeCoarseSession(tmp_path, transitions=transitions)
     adapter = CoarseSessionNextViewAdapter(session)
-    runner = _FakeRunner(tmp_path, adapter)
+    runner = _FakeRunner(
+        tmp_path,
+        adapter,
+        bootstrap_motion_ready_after=bootstrap_motion_ready_after,
+    )
     state = RobotState(
         monotonic_time_ns=1_000_000_000,
         controller_time_s=1.0,
@@ -583,6 +635,32 @@ def test_operator_must_trigger_each_initial_capture(tmp_path: Path) -> None:
     assert diagnostic["status"] == "completed"
     assert diagnostic["spans"]["experiment.checkpoint_append"]["count"] == 1
     assert "experiment.checkpoint_full_verify" not in diagnostic["spans"]
+
+
+def test_one_operator_view_enters_active_coarse_bootstrap_without_claiming_map_ready(
+    tmp_path: Path,
+) -> None:
+    map_ready_checks: list[object] = []
+    runtime, runner, session = _runtime(
+        tmp_path,
+        bootstrap_motion_ready_after=1,
+        map_ready_assertion=lambda result: map_ready_checks.append(result),
+    )
+    runtime.start()
+
+    captured = runtime.capture_operator_view(view_id="single-initial-view")
+
+    assert captured.phase is UnknownBladeRuntimePhase.COARSE_SCAN
+    assert captured.operator_bootstrap_views == 1
+    assert captured.runner_status.phase == "bootstrap_motion_ready"
+    assert map_ready_checks == []
+    assert session.accept_calls == 1
+
+    attention = runtime.advance_to_attention()
+
+    assert attention.runner_status.disposition is ExperimentDisposition.WAITING_APPROVAL
+    assert runner.plan_count == 1
+    assert map_ready_checks == []
 
 
 def test_operator_bootstrap_capture_can_directly_activate_ready_schema5(

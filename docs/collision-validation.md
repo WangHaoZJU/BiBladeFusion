@@ -103,8 +103,9 @@ The mesh checker certifies the complete linear joint interval by combining exact
 midpoint FCL separation with conservative serial-chain displacement bounds for both
 geometries. Inconclusive intervals are bisected; a collision witness returns `BLOCKED`,
 whereas a numerical or subdivision limit returns `UNKNOWN`. The independent occupancy
-checker encloses each robot collision mesh in a midpoint sphere and enlarges it by its
-maximum interval displacement before querying the immutable voxel snapshot. A schema-5
+checker places each original URDF collision STL at the midpoint and measures it directly
+against dangerous voxel boxes. An interval passes only when every exact distance exceeds
+clearance, accepted tracking uncertainty, and maximum interval displacement. A schema-5
 preflight becomes approval-eligible only when both integrity-bound proofs are clear for
 the exact segment and all occupancy semantic/freshness gates pass. Its artifact binds the
 view plan, optional coverage-order proposal, initialization, occupancy, proof evidence,

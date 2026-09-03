@@ -11,9 +11,12 @@ import pytest
 import biblade_fusion.workflows.unknown_blade_coarse as coarse_module
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
+    AdaptiveIkViewSearchConfig,
     AxisAlignedBoxConfig,
     CoarseReachabilityFallbackConfig,
+    CoverageConfig,
     PairedFinDiscoveryFallbackConfig,
+    PointCloudConfig,
     ViewFilterConfig,
     ViewPlanningConfig,
     load_settings,
@@ -23,10 +26,16 @@ from biblade_fusion.perception.bootstrap_foreground import BootstrapSeed
 from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import BilateralBladeProxy, select_proxy_support
 from biblade_fusion.planning import (
+    CandidateMetrics,
+    CandidateStatus,
+    CandidateView,
+    EvaluatedCandidate,
     FilteredViewPlan,
     ReachabilityResult,
     ReachabilityState,
+    SurfacePatch,
 )
+from biblade_fusion.planning.coverage import CoverageLedger, PatchCoverage
 from biblade_fusion.storage.coarse_scan import StoredCoarseScanView
 from biblade_fusion.storage.reconstructed_view import StoredReconstructedBladeView
 from biblade_fusion.workflows.reconstruction import ReconstructedBladeView
@@ -129,6 +138,152 @@ def test_fin_discovery_generates_two_opposing_axes_on_both_sides() -> None:
         assert item.status.value == "endpoint_feasible"
     assert result.motion_authorized is False
     assert len(result.policy_sha256) == 64
+
+
+def test_adaptive_fin_discovery_keeps_opposing_semantics_without_locking_tilt() -> None:
+    planning = ViewPlanningConfig(
+        standoff_distance_m=0.30,
+        adaptive_ik_view_search=AdaptiveIkViewSearchConfig(
+            enabled=True,
+            maximum_distance_expansions=0,
+            roll_samples_deg=(0.0,),
+            maximum_ik_feasible_candidates=1,
+        ),
+    )
+    result = generate_fin_discovery_plan(
+        _proxy(),
+        (0.30, 0.20),
+        planning,
+        ViewFilterConfig(
+            workspace=AxisAlignedBoxConfig(
+                name="advisory_only",
+                minimum_m=(-0.01, -0.01, -0.01),
+                maximum_m=(0.01, 0.01, 0.01),
+            ),
+            camera_clearance_radius_m=0.01,
+            minimum_incidence_cosine=0.4,
+        ),
+        CoarseSciencePolicy(
+            discovery_tilt_deg=15.0,
+            discovery_tilt_samples_deg=(10.0, 30.0, 45.0, 60.0),
+        ),
+        _Reachable(),
+        PointCloudConfig(minimum_depth_m=0.15, maximum_depth_m=1.0),
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+
+    assert len(result.adaptive_searches) == 8
+    assert len(result.endpoint_feasible) == 8
+    assert all(
+        item.candidate.view_id.endswith("_adaptive_0003")
+        for item in result.endpoint_feasible
+    )
+    assert all(
+        trace.result.recommended is not None
+        and trace.result.recommended.parameters.tilt_deg == 45.0
+        for trace in result.adaptive_searches
+    )
+    for side in (coarse_module.BladeSide.FRONT, coarse_module.BladeSide.BACK):
+        assert len(coarse_module._paired_discovery_ids(result, side)) == 2  # noqa: SLF001
+    assert result.motion_authorized is False
+
+
+def test_single_initial_view_gain_selects_the_unseen_back_side(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def evaluated(view_id: str, side: coarse_module.BladeSide) -> EvaluatedCandidate:
+        normal = np.array([0.0, 0.0, 1.0 if side is coarse_module.BladeSide.FRONT else -1.0])
+        patch = SurfacePatch(view_id, side, 0, 0, np.zeros(3), normal, (0.1, 0.1))
+        candidate = CandidateView(
+            view_id,
+            patch,
+            PoseSE3.from_rotation_translation(
+                "base",
+                "left_ir",
+                np.diag([1.0, -1.0, -1.0]),
+                0.3 * normal,
+            ),
+            0.3,
+            (0.1, 0.1),
+            1.0,
+            1.0,
+            "unit_test",
+        )
+        return EvaluatedCandidate(
+            candidate,
+            CandidateStatus.ENDPOINT_FEASIBLE,
+            CandidateMetrics(1.0, 1.0, 1.0, 0.3, 0.0, 0.2, 1.0),
+            (),
+            np.zeros(6),
+        )
+
+    discovery_items = tuple(
+        evaluated(f"{side}_fin_discovery_major_{sign}", coarse_module.BladeSide(side))
+        for side in ("front", "back")
+        for sign in ("negative", "positive")
+    )
+    proxy_items = (
+        evaluated("front_patch", coarse_module.BladeSide.FRONT),
+        evaluated("back_patch", coarse_module.BladeSide.BACK),
+    )
+    coverage_config = CoverageConfig(bins_per_axis=2, minimum_points_per_bin=1)
+    coverage = CoverageLedger(
+        (
+            PatchCoverage(
+                "front_patch",
+                coarse_module.BladeSide.FRONT,
+                0,
+                0,
+                np.ones((2, 2), dtype=np.int64),
+            ),
+            PatchCoverage(
+                "back_patch",
+                coarse_module.BladeSide.BACK,
+                0,
+                0,
+                np.zeros((2, 2), dtype=np.int64),
+            ),
+        ),
+        (),
+        coverage_config,
+        1,
+        1,
+    )
+    generation = SimpleNamespace(
+        views=(
+            SimpleNamespace(
+                target_view_id="operator_initial",
+                target_side=coarse_module.BladeSide.FRONT,
+            ),
+        ),
+        coverage_path=tmp_path / "coverage",
+        metadata={"sources": {"view_plan": {"root": str(tmp_path / "plan")}}},
+    )
+    monkeypatch.setattr(
+        coarse_module,
+        "read_coverage_ledger",
+        lambda _path: SimpleNamespace(ledger=coverage),
+    )
+    monkeypatch.setattr(
+        coarse_module,
+        "read_view_plan",
+        lambda _path: SimpleNamespace(
+            result=SimpleNamespace(filtered_plan=FilteredViewPlan(proxy_items, ()))
+        ),
+    )
+
+    selected, gain = coarse_module._select_candidate(  # noqa: SLF001
+        generation,
+        CoarseDiscoveryPlan(FilteredViewPlan(discovery_items, ()), "a" * 64),
+        CoarseSciencePolicy(),
+        require_additional_fin_evidence=False,
+    )
+
+    assert selected.candidate.patch.side is coarse_module.BladeSide.BACK
+    assert gain.proxy_coverage_deficit == 1.0
+    assert gain.side_observation_deficit == 1.0
+    assert gain.expected_gain > 0.0
 
 
 def _attempt_09_planning(
@@ -311,6 +466,9 @@ def test_fin_discovery_never_promotes_geometry_only_to_endpoint_feasible() -> No
     "kwargs",
     (
         {"discovery_tilt_deg": 0.0},
+        {"discovery_tilt_samples_deg": ()},
+        {"discovery_tilt_samples_deg": (15.0, 15.0)},
+        {"discovery_gain_surface_weight": 0.50},
         {"minimum_total_views": 4, "minimum_views_per_side": 3},
         {"maximum_attempts_per_candidate": 0},
     ),
@@ -742,6 +900,115 @@ def test_every_operator_bootstrap_requires_and_binds_its_own_hard_roi(
         tmp_path / "cycle-1" / "bootstrap_annotation" / "left_rectified.png",
         tmp_path / "cycle-2" / "bootstrap_annotation" / "left_rectified.png",
     ]
+
+
+def test_selected_coarse_view_uses_accepted_generation_projection_not_unseeded_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kinematics = tmp_path / "kinematics.yaml"
+    kinematics.write_text("model: test\n", encoding="utf-8")
+    session = CoarseScienceSession(
+        settings=load_settings("configs/default.yaml"),
+        hand_eye=SimpleNamespace(),  # type: ignore[arg-type]
+        reachability_checker=_Reachable(),
+        source_kinematics=kinematics,
+        output_root=tmp_path / "science",
+    )
+    generation = (tmp_path / "accepted-generation").resolve()
+    session._generation = generation  # noqa: SLF001
+    selection = SimpleNamespace(
+        coverage_complete=False,
+        target=SimpleNamespace(view_id="front:r0:c0"),
+    )
+    session.stage_selected_capture(selection)  # type: ignore[arg-type]
+
+    left = np.zeros((8, 10), dtype=np.uint16)
+    depth = np.full((8, 10), 0.8, dtype=np.float32)
+    integration_valid = np.ones((8, 10), dtype=np.bool_)
+    bundle = SimpleNamespace(
+        view_id="front:r0:c0",
+        sequence_index=4,
+        stereo=SimpleNamespace(frame_number=17),
+    )
+    captured = SimpleNamespace(bundle=bundle, cycle_root=tmp_path / "cycle")
+    stereo = SimpleNamespace(
+        rectified=SimpleNamespace(left_ir=left, source_frame_number=17),
+        depth_m=depth,
+    )
+    base_t_camera = PoseSE3.identity("base", "left_rectified")
+    prepared = SimpleNamespace(
+        bundle=bundle,
+        stereo=stereo,
+        self_mask=SimpleNamespace(integration_valid_mask=integration_valid),
+        base_t_camera=base_t_camera,
+    )
+    projected = SimpleNamespace(algorithm="accepted_projection")
+    calls: list[dict[str, object]] = []
+
+    def project_from_generation(path: Path, **kwargs: object) -> object:
+        calls.append({"path": path, **kwargs})
+        return projected
+
+    monkeypatch.setattr(
+        coarse_module,
+        "_projected_foreground_from_generation",
+        project_from_generation,
+    )
+    monkeypatch.setattr(
+        coarse_module,
+        "bootstrap_blade_foreground",
+        lambda *_args, **_kwargs: pytest.fail(
+            "selected views must not run unseeded largest-component bootstrap"
+        ),
+    )
+
+    session.preflight_engine_cycle(
+        captured,
+        stereo,
+        tmp_path / "stereo",
+        prepared,
+    )
+
+    assert session._pending_foreground is projected  # noqa: SLF001
+    assert calls[0]["path"] == generation
+    assert calls[0]["integration_valid_mask"] is integration_valid
+    assert calls[0]["base_t_left_rectified"] == base_t_camera
+
+
+def test_direct_automatic_coarse_adapter_cannot_fall_back_to_unseeded_component(
+    tmp_path: Path,
+) -> None:
+    bundle = SimpleNamespace(
+        view_id="front:r0:c0",
+        sequence_index=4,
+        stereo=SimpleNamespace(frame_number=17),
+    )
+    captured = SimpleNamespace(bundle=bundle)
+    stereo = SimpleNamespace(
+        source_view_id="front:r0:c0",
+        source_sequence_index=4,
+        rectified=SimpleNamespace(source_frame_number=17),
+    )
+
+    with pytest.raises(UnknownBladeCoarseError, match="projected foreground preflight"):
+        coarse_module._prepare_unknown_blade_coarse_view(  # noqa: SLF001
+            captured=captured,
+            stereo=stereo,
+            stereo_inference_path=tmp_path / "stereo",
+            integration_valid_mask=np.ones((2, 2), dtype=np.bool_),
+            integration_valid_mask_content_hash="a" * 64,
+            integration_identity=("front:r0:c0", 4, 17),
+            occupancy_mapping_path=tmp_path / "occupancy",
+            hand_eye=SimpleNamespace(),
+            settings=load_settings("configs/default.yaml"),
+            foreground_config=coarse_module.BootstrapForegroundConfig(),
+            seed=None,
+            target_view_id="front:r0:c0",
+            target_kind="proxy_normal",
+            target_side=coarse_module.BladeSide.FRONT,
+            side_proxy=None,
+        )
 
 
 def test_generation_append_removes_uncommitted_coverage_before_retry(

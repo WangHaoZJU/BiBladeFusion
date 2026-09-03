@@ -31,6 +31,13 @@ from biblade_fusion.perception.bootstrap_foreground import (
     bootstrap_policy_sha256,
     bootstrap_seed_payload,
 )
+from biblade_fusion.perception.coarse_foreground import (
+    PROJECTED_COARSE_FOREGROUND_ALGORITHM,
+    ProjectedCoarseForegroundGuide,
+    ProjectedCoarseForegroundResult,
+    projected_coarse_blade_foreground,
+    projected_coarse_foreground_policy_sha256,
+)
 from biblade_fusion.perception.pointcloud import PointCloud
 from biblade_fusion.perception.proxy import ProxySupportSelection, select_proxy_support
 from biblade_fusion.planning import BladeSide
@@ -48,7 +55,7 @@ from biblade_fusion.storage.stereo_inference import (
 )
 from biblade_fusion.workflows.occupancy_mapping import occupancy_array_content_hash
 
-COARSE_SCAN_VIEW_SCHEMA_VERSION = 2
+COARSE_SCAN_VIEW_SCHEMA_VERSION = 3
 COARSE_SCAN_GENERATION_SCHEMA_VERSION = 1
 COARSE_SCAN_VIEW_KIND = "biblade_fusion.coarse_scan_view"
 COARSE_SCAN_GENERATION_KIND = "biblade_fusion.coarse_scan_generation"
@@ -61,6 +68,7 @@ CoarseTargetKind = Literal[
     "fin_discovery_minor_negative",
     "fin_discovery_minor_positive",
 ]
+CoarseForegroundResult = BootstrapForegroundResult | ProjectedCoarseForegroundResult
 _COARSE_TARGET_KINDS = frozenset(
     {
         "operator_seed",
@@ -77,7 +85,7 @@ _COARSE_TARGET_KINDS = frozenset(
 class StoredCoarseScanView:
     root: Path
     reconstructed: StoredReconstructedBladeView
-    foreground: BootstrapForegroundResult
+    foreground: CoarseForegroundResult
     target_view_id: str
     target_kind: CoarseTargetKind
     target_side: BladeSide
@@ -305,10 +313,10 @@ def _stored_view_authority_records(
     payload = json.loads((view.root / "metadata.json").read_text(encoding="utf-8"))
     if payload != view.metadata:
         raise ValueError("Coarse view metadata differs from its strict readback")
-    sources = tuple(
-        dict(view.metadata["sources"][name])
-        for name in ("reconstructed_view", "stereo_inference", "occupancy_mapping")
-    )
+    source_names = ["reconstructed_view", "stereo_inference", "occupancy_mapping"]
+    if "foreground_reference_generation" in view.metadata["sources"]:
+        source_names.append("foreground_reference_generation")
+    sources = tuple(dict(view.metadata["sources"][name]) for name in source_names)
     for source in sources:
         _resolve_directory_record(source)
     return record, sources
@@ -342,11 +350,10 @@ def _bind_coarse_scan_view_readback(
     root = view.root.resolve()
     metadata_record, sources = _stored_view_authority_records(view)
     frozen_sources: list[tuple[str, str, str, str, int]] = []
-    for name, source in zip(
-        ("reconstructed_view", "stereo_inference", "occupancy_mapping"),
-        sources,
-        strict=True,
-    ):
+    source_names = ["reconstructed_view", "stereo_inference", "occupancy_mapping"]
+    if "foreground_reference_generation" in view.metadata["sources"]:
+        source_names.append("foreground_reference_generation")
+    for name, source in zip(source_names, sources, strict=True):
         record = dict(source)
         source_root = _resolve_directory_record(record)
         frozen_sources.append(
@@ -493,8 +500,11 @@ def _replay_foreground(
     occupancy_root: Path,
     config: BootstrapForegroundConfig,
     seed: BootstrapSeed | None,
+    algorithm: str = BOOTSTRAP_FOREGROUND_ALGORITHM,
+    guide: ProjectedCoarseForegroundGuide | None = None,
+    reconstructed: StoredReconstructedBladeView | None = None,
     verified_integration: StoredCoarseIntegrationSource | None = None,
-) -> BootstrapForegroundResult:
+) -> CoarseForegroundResult:
     stereo = read_stereo_inference(stereo_root)
     source_session = Path(str(stereo.metadata["source"]["session"])).resolve()
     verify_stereo_inference_source(stereo, expected_session=source_session)
@@ -504,18 +514,43 @@ def _replay_foreground(
         integration_valid = verified_integration.mask
     if integration_valid.shape != stereo.observation.depth_m.shape:
         raise ValueError("Coarse integration-valid mask shape changed")
-    return bootstrap_blade_foreground(
+    if algorithm == BOOTSTRAP_FOREGROUND_ALGORITHM:
+        if guide is not None:
+            raise ValueError("Operator bootstrap foreground cannot carry projected guidance")
+        return bootstrap_blade_foreground(
+            stereo.observation.rectified.left_ir,
+            stereo.observation.depth_m,
+            integration_valid,
+            config,
+            seed,
+        )
+    if algorithm != PROJECTED_COARSE_FOREGROUND_ALGORITHM:
+        raise ValueError("Unsupported coarse foreground algorithm")
+    if seed is not None or guide is None or reconstructed is None:
+        raise ValueError("Projected coarse foreground evidence is incomplete")
+    generation = read_coarse_scan_generation(guide.source_generation_path)
+    if generation.metadata_sha256 != guide.source_generation_metadata_sha256:
+        raise ValueError("Projected coarse source generation changed")
+    reference_points = np.vstack(
+        [item.support_cloud.points_m for item in generation.views]
+    )
+    if array_content_sha256(reference_points) != guide.reference_points_content_sha256:
+        raise ValueError("Projected coarse reference points changed")
+    return projected_coarse_blade_foreground(
         stereo.observation.rectified.left_ir,
         stereo.observation.depth_m,
         integration_valid,
         config,
-        seed,
+        intrinsics=reconstructed.view.planning_intrinsics,
+        base_t_left_rectified=reconstructed.view.base_t_projection_camera,
+        reference_points_base_m=reference_points,
+        guide=guide,
     )
 
 
 def write_coarse_scan_view(
     output_dir: str | Path,
-    foreground: BootstrapForegroundResult,
+    foreground: CoarseForegroundResult,
     *,
     reconstructed_view: str | Path,
     source_stereo_inference: str | Path,
@@ -548,6 +583,13 @@ def write_coarse_scan_view(
         occupancy_root=occupancy_root,
         config=foreground.config,
         seed=foreground.seed,
+        algorithm=foreground.algorithm,
+        guide=(
+            foreground.guide
+            if isinstance(foreground, ProjectedCoarseForegroundResult)
+            else None
+        ),
+        reconstructed=reconstructed,
         verified_integration=integration,
     )
     scalar_fields = (
@@ -562,6 +604,11 @@ def write_coarse_scan_view(
     )
     if any(getattr(foreground, name) != getattr(replayed, name) for name in scalar_fields):
         raise ValueError("Coarse bootstrap foreground does not replay")
+    if isinstance(foreground, ProjectedCoarseForegroundResult) and (
+        not isinstance(replayed, ProjectedCoarseForegroundResult)
+        or foreground.guide != replayed.guide
+    ):
+        raise ValueError("Projected coarse foreground guide does not replay")
     if not np.array_equal(foreground.mask, replayed.mask) or not np.array_equal(
         foreground.seed_mask, replayed.seed_mask
     ):
@@ -599,6 +646,12 @@ def write_coarse_scan_view(
             proxy_support.mask,
             allow_pickle=False,
         )
+        foreground_reference_record = None
+        if isinstance(foreground, ProjectedCoarseForegroundResult):
+            foreground_reference_record = _directory_record(
+                foreground.guide.source_generation_path,
+                "generation.json",
+            )
         payload = {
             "schema_version": COARSE_SCAN_VIEW_SCHEMA_VERSION,
             "artifact_kind": COARSE_SCAN_VIEW_KIND,
@@ -615,9 +668,14 @@ def write_coarse_scan_view(
                 "frame_number": reconstructed.view.source_frame_number,
             },
             "foreground": {
-                "algorithm": BOOTSTRAP_FOREGROUND_ALGORITHM,
+                "algorithm": foreground.algorithm,
                 "config": asdict(foreground.config),
                 "seed": bootstrap_seed_payload(foreground.seed),
+                "guide": (
+                    foreground.guide.payload()
+                    if isinstance(foreground, ProjectedCoarseForegroundResult)
+                    else None
+                ),
                 "policy_sha256": foreground.policy_sha256,
                 "diagnostics": asdict(foreground.diagnostics),
                 "input_content_sha256": {
@@ -641,6 +699,11 @@ def write_coarse_scan_view(
                 "reconstructed_view": _directory_record(reconstructed_root, "metadata.json"),
                 "stereo_inference": _directory_record(stereo_root, "metadata.json"),
                 "occupancy_mapping": occupancy_source_record,
+                **(
+                    {"foreground_reference_generation": foreground_reference_record}
+                    if foreground_reference_record is not None
+                    else {}
+                ),
             },
         }
         (temporary / "metadata.json").write_text(
@@ -659,6 +722,8 @@ def write_coarse_scan_view(
         ):
             raise ValueError("Coarse occupancy integration source changed before publication")
         _resolve_directory_record(occupancy_source_record)
+        if foreground_reference_record is not None:
+            _resolve_directory_record(foreground_reference_record)
         temporary.replace(output)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -674,7 +739,7 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
         metadata_bytes = (root / "metadata.json").read_bytes()
         payload = json.loads(metadata_bytes.decode("utf-8"))
         if (
-            int(payload["schema_version"]) not in {1, COARSE_SCAN_VIEW_SCHEMA_VERSION}
+            int(payload["schema_version"]) not in {1, 2, COARSE_SCAN_VIEW_SCHEMA_VERSION}
             or payload.get("artifact_kind") != COARSE_SCAN_VIEW_KIND
             or payload.get("motion_authorized") is not False
         ):
@@ -683,7 +748,7 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
         schema_version = int(payload["schema_version"])
         expected_files = (
             {"mask", "seed_mask", "proxy_support_mask"}
-            if schema_version == COARSE_SCAN_VIEW_SCHEMA_VERSION
+            if schema_version >= 2
             else {"mask", "seed_mask"}
         )
         if set(files) != expected_files:
@@ -694,16 +759,53 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
         reconstructed_root = _resolve_directory_record(sources["reconstructed_view"])
         stereo_root = _resolve_directory_record(sources["stereo_inference"])
         occupancy_root = _resolve_directory_record(sources["occupancy_mapping"])
+        reconstructed = read_reconstructed_view(reconstructed_root)
         foreground_payload = payload["foreground"]
         config = BootstrapForegroundConfig(**foreground_payload["config"])
         seed = _seed_from_payload(foreground_payload["seed"])
-        if foreground_payload["policy_sha256"] != bootstrap_policy_sha256(config, seed):
-            raise ValueError("coarse bootstrap policy changed")
+        algorithm = str(foreground_payload["algorithm"])
+        guide = None
+        if algorithm == BOOTSTRAP_FOREGROUND_ALGORITHM:
+            expected_policy = bootstrap_policy_sha256(config, seed)
+            if foreground_payload.get("guide") is not None:
+                raise ValueError("Operator bootstrap unexpectedly carries a projected guide")
+            if "foreground_reference_generation" in sources:
+                raise ValueError("Operator bootstrap unexpectedly binds a reference generation")
+        elif algorithm == PROJECTED_COARSE_FOREGROUND_ALGORITHM:
+            if schema_version != COARSE_SCAN_VIEW_SCHEMA_VERSION or seed is not None:
+                raise ValueError("Projected coarse foreground requires schema 3 and no seed")
+            guide_payload = foreground_payload.get("guide")
+            if not isinstance(guide_payload, dict):
+                raise ValueError("Projected coarse foreground guide is missing")
+            reference_root = _resolve_directory_record(
+                sources["foreground_reference_generation"]
+            )
+            guide = ProjectedCoarseForegroundGuide(
+                source_generation_path=reference_root,
+                source_generation_metadata_sha256=str(
+                    guide_payload["source_generation_metadata_sha256"]
+                ),
+                reference_points_content_sha256=str(
+                    guide_payload["reference_points_content_sha256"]
+                ),
+                blade_envelope_min_m=tuple(guide_payload["blade_envelope_min_m"]),
+                blade_envelope_max_m=tuple(guide_payload["blade_envelope_max_m"]),
+            )
+            if str(guide_payload["source_generation_path"]) != str(reference_root):
+                raise ValueError("Projected coarse source path differs from its directory record")
+            expected_policy = projected_coarse_foreground_policy_sha256(config)
+        else:
+            raise ValueError("unsupported coarse foreground algorithm")
+        if foreground_payload["policy_sha256"] != expected_policy:
+            raise ValueError("coarse foreground policy changed")
         replayed = _replay_foreground(
             stereo_root=stereo_root,
             occupancy_root=occupancy_root,
             config=config,
             seed=seed,
+            algorithm=algorithm,
+            guide=guide,
+            reconstructed=reconstructed,
         )
         if (
             foreground_payload["diagnostics"] != asdict(replayed.diagnostics)
@@ -717,7 +819,6 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
             or not np.array_equal(seed_mask, replayed.seed_mask)
         ):
             raise ValueError("coarse bootstrap foreground no longer replays")
-        reconstructed = read_reconstructed_view(reconstructed_root)
         identity = payload["identity"]
         if (
             identity["view_id"] != reconstructed.view.source_view_id
@@ -726,7 +827,7 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
             or not np.array_equal(mask, reconstructed.blade_mask)
         ):
             raise ValueError("coarse reconstructed-view binding changed")
-        if schema_version == COARSE_SCAN_VIEW_SCHEMA_VERSION:
+        if schema_version >= 2:
             proxy_payload = payload["proxy_support"]
             proxy_config = ProxyModelConfig.model_validate(proxy_payload["configuration"])
             proxy_support_mask = np.asarray(

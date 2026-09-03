@@ -88,6 +88,39 @@ def test_workspace_and_reachability_mark_endpoint_feasible() -> None:
     assert result.motion_authorized is False
 
 
+def test_advisory_workspace_reports_but_does_not_reject_ik_feasible_pose() -> None:
+    narrow = AxisAlignedBoxConfig(
+        name="observed_camera_centres",
+        minimum_m=(-0.05, -0.05, -0.05),
+        maximum_m=(0.05, 0.05, 0.05),
+    )
+
+    result = filter_candidate_views(
+        candidates(),
+        make_proxy(),
+        ViewFilterConfig(workspace=narrow, camera_clearance_radius_m=0.01),
+        AlwaysReachable(),
+        workspace_mode="advisory",
+    )
+
+    assert len(result.endpoint_feasible) == len(candidates())
+    assert "advisory workspace" in " ".join(result.endpoint_feasible[0].reasons)
+    assert result.motion_authorized is False
+
+
+def test_disabled_workspace_can_support_offline_ik_search_without_bounds() -> None:
+    result = filter_candidate_views(
+        candidates(),
+        make_proxy(),
+        ViewFilterConfig(camera_clearance_radius_m=0.01),
+        AlwaysReachable(),
+        workspace_mode="disabled",
+    )
+
+    assert len(result.endpoint_feasible) == len(candidates())
+    assert "workspace" not in " ".join(result.endpoint_feasible[0].reasons)
+
+
 def test_forbidden_volume_rejects_front_candidates() -> None:
     forbidden = AxisAlignedBoxConfig(
         name="front_fixture",

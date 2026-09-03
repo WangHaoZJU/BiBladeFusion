@@ -49,6 +49,10 @@ from biblade_fusion.planning import (
     ReachabilityChecker,
     filter_candidate_views,
 )
+from biblade_fusion.planning.scientific_gain import (
+    ExpectedScientificGain,
+    expected_scientific_gain,
+)
 from biblade_fusion.planning.surface_coverage import SurfacePatchQuality
 from biblade_fusion.planning.views import BladeSide, CandidateView
 from biblade_fusion.robotics import Es68KinematicModel, load_es68_flange_t_tcp
@@ -75,10 +79,11 @@ from biblade_fusion.workflows.stop_scan_coordinator import (
     NextViewUnavailable,
     OccupancyGeneration,
     PerceptionCycleResult,
+    RankedNextViewCandidate,
     next_view_target_from_candidate,
 )
 
-_SELECTOR_ALGORITHM = "bilateral_single_fin_coverage_priority_v2"
+_SELECTOR_ALGORITHM = "bilateral_single_fin_scientific_gain_nbv_v3"
 
 
 class FlangeForwardKinematics(Protocol):
@@ -773,19 +778,9 @@ class BladeCoverageNextViewSelector:
         self,
         item: EvaluatedCandidate,
         quality: SurfacePatchQuality,
+        gain: ExpectedScientificGain,
         current_joints: NDArray[np.float64],
     ) -> tuple[object, ...]:
-        priorities = {
-            SurfaceRegion(value): index
-            for index, value in enumerate(self._selection_config.region_priority)
-        }
-        coverage_deficit = 1.0 - quality.coverage_fraction
-        normal_deficit = 1.0 - quality.normal_consistency
-        rmse_ratio = (
-            quality.rmse_m / self._surface_quality_config.maximum_rmse_m
-            if np.isfinite(quality.rmse_m)
-            else float("inf")
-        )
         joints = item.joint_positions_rad
         assert joints is not None
         delta = np.abs(joints - current_joints)
@@ -793,13 +788,33 @@ class BladeCoverageNextViewSelector:
             joint_key = (float(np.max(delta)), float(np.sum(delta)))
         else:
             joint_key = (0.0, 0.0)
+        if self._selection_config.scientific_gain.enabled:
+            science_key: tuple[object, ...] = (
+                -gain.expected_gain,
+                -gain.coverage_novelty,
+                -gain.quality_recovery,
+                -gain.measurement_quality,
+            )
+        else:
+            priorities = {
+                SurfaceRegion(value): index
+                for index, value in enumerate(self._selection_config.region_priority)
+            }
+            rmse_ratio = (
+                quality.rmse_m / self._surface_quality_config.maximum_rmse_m
+                if np.isfinite(quality.rmse_m)
+                else float("inf")
+            )
+            science_key = (
+                priorities[quality.region],
+                -(1.0 - quality.coverage_fraction),
+                -(1.0 - quality.normal_consistency),
+                -rmse_ratio,
+                -item.candidate.visibility_fraction,
+                -item.candidate.projection_fraction,
+            )
         return (
-            priorities[quality.region],
-            -coverage_deficit,
-            -normal_deficit,
-            -rmse_ratio,
-            -item.candidate.visibility_fraction,
-            -item.candidate.projection_fraction,
+            *science_key,
             -item.metrics.geometric_score,
             *joint_key,
             item.metrics.standoff_error_m,
@@ -1011,33 +1026,83 @@ class BladeCoverageNextViewSelector:
                 "Fine coverage is incomplete, but no unused candidate passed "
                 f"geometry, workspace, IK, and FK gates{suffix}"
             )
-        selected = min(
-            feasible,
-            key=lambda item: self._rank_key(
+        gain_by_view_id = {
+            item.candidate.view_id: expected_scientific_gain(
                 item,
                 quality_by_id[item.candidate.patch.patch_id],
-                current_joints,
-            ),
+                self._selection_config,
+                maximum_rmse_m=self._surface_quality_config.maximum_rmse_m,
+            )
+            for item in feasible
+        }
+        ranked = tuple(
+            sorted(
+                feasible,
+                key=lambda item: self._rank_key(
+                    item,
+                    quality_by_id[item.candidate.patch.patch_id],
+                    gain_by_view_id[item.candidate.view_id],
+                    current_joints,
+                ),
+            )
         )
-        selected_quality = quality_by_id[selected.candidate.patch.patch_id]
+        if self._selection_config.scientific_gain.enabled:
+            ranked = tuple(
+                item
+                for item in ranked
+                if gain_by_view_id[item.candidate.view_id].expected_gain
+                >= self._selection_config.scientific_gain.minimum_expected_gain
+            )
+        if not ranked:
+            raise NextViewUnavailable(
+                "Fine coverage remains incomplete, but every feasible view has "
+                "expected scientific gain below the configured minimum"
+            )
+        ranked_candidates: list[RankedNextViewCandidate] = []
+        for rank, item in enumerate(ranked, start=1):
+            quality = quality_by_id[item.candidate.patch.patch_id]
+            gain = gain_by_view_id[item.candidate.view_id]
+            diagnostics = (
+                *base_diagnostics,
+                f"science_rank={rank}",
+                f"selected_patch={quality.patch_id}",
+                f"selected_region={quality.region.value}",
+                f"selected_side={quality.side.value}",
+                f"coverage_fraction={quality.coverage_fraction:.6f}",
+                f"expected_scientific_gain={gain.expected_gain:.6f}",
+                f"gain_coverage_novelty={gain.coverage_novelty:.6f}",
+                f"gain_quality_recovery={gain.quality_recovery:.6f}",
+                f"gain_measurement_quality={gain.measurement_quality:.6f}",
+                f"gain_semantic_priority={gain.semantic_priority:.6f}",
+                f"gain_fin_face_bonus={gain.fin_face_bonus:.6f}",
+                f"reacquisition_attempt={attempt_by_view_id[item.candidate.view_id]}",
+                f"exhausted_patch_count={len(exhausted_patch_ids)}",
+                "occupancy is reserved exclusively for downstream segment safety",
+            )
+            ranked_candidates.append(
+                RankedNextViewCandidate(
+                    next_view_target_from_candidate(item, self._hand_eye),
+                    diagnostics,
+                )
+            )
+        selected = ranked_candidates[0]
         selection = NextViewSelection(
-            next_view_target_from_candidate(selected, self._hand_eye),
+            selected.target,
             state.generation_id,
             reference_sha256,
             self._policy_sha256,
             len(required_patch_ids),
             len(incomplete_patch_ids),
             False,
-            (
-                *base_diagnostics,
-                f"selected_patch={selected_quality.patch_id}",
-                f"selected_region={selected_quality.region.value}",
-                f"selected_side={selected_quality.side.value}",
-                f"coverage_fraction={selected_quality.coverage_fraction:.6f}",
-                f"reacquisition_attempt={attempt_by_view_id[selected.candidate.view_id]}",
-                f"exhausted_patch_count={len(exhausted_patch_ids)}",
-                "occupancy is reserved exclusively for downstream segment safety",
-            ),
+            selected.diagnostics,
+            ranked_candidates=tuple(ranked_candidates),
         )
         self._pending_selection = selection
         return selection
+
+    def accept_preflight_target(self, view_id: str) -> None:
+        """Keep a path-safe fallback endpoint stable across subsequent transit legs."""
+
+        if self._pending_selection is None:
+            raise BladePlanningAssetError("No pending fine selection can be accepted")
+        self._pending_selection = self._pending_selection.choose_ranked_candidate(view_id)

@@ -305,6 +305,10 @@ class BootstrapForegroundSettings(BaseModel):
         ge=0.0,
         le=1.0,
     )
+    projected_reference_dilation_px: int = Field(default=12, ge=1, le=100)
+    minimum_projected_reference_points: int = Field(default=100, ge=1)
+    minimum_projected_reference_pixels: int = Field(default=500, ge=1)
+    minimum_projected_match_fraction: float = Field(default=0.50, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_bootstrap_foreground_policy(self) -> Self:
@@ -409,6 +413,52 @@ class PairedFinDiscoveryFallbackConfig(BaseModel):
         return self
 
 
+class AdaptiveIkViewSearchConfig(BaseModel):
+    """IK-aware coarse-view pose-family policy.
+
+    Optical distance bounds intentionally do not live here. They are supplied by
+    ``PointCloudConfig`` so this policy cannot silently turn an empirical preferred
+    standoff interval into a hard camera-distance gate.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = False
+    distance_step_m: float = Field(default=0.04, gt=0.0, le=0.25)
+    maximum_distance_expansions: int = Field(default=64, ge=0, le=128)
+    tilt_samples_deg: tuple[float, ...] = (0.0, 15.0, 30.0, 45.0, 60.0)
+    azimuth_samples_deg: tuple[float, ...] = (
+        0.0,
+        45.0,
+        90.0,
+        135.0,
+        180.0,
+        225.0,
+        270.0,
+        315.0,
+    )
+    roll_samples_deg: tuple[float, ...] = (0.0, 45.0, -45.0, 90.0)
+    maximum_generated_candidates: int = Field(default=512, ge=1, le=10000)
+    maximum_ik_feasible_candidates: int = Field(default=8, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def validate_pose_samples(self) -> Self:
+        for name, values in (
+            ("tilt_samples_deg", self.tilt_samples_deg),
+            ("azimuth_samples_deg", self.azimuth_samples_deg),
+            ("roll_samples_deg", self.roll_samples_deg),
+        ):
+            if not values or not np.isfinite(values).all():
+                raise ValueError(f"{name} must contain finite values")
+            if len(set(values)) != len(values):
+                raise ValueError(f"{name} must contain unique values")
+        if self.tilt_samples_deg[0] != 0.0 or any(
+            not 0.0 <= value < 90.0 for value in self.tilt_samples_deg
+        ):
+            raise ValueError("Adaptive IK tilt samples must start at zero and lie in [0, 90)")
+        return self
+
+
 class ViewPlanningConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -430,6 +480,9 @@ class ViewPlanningConfig(BaseModel):
     maximum_visibility_split_depth: int = Field(default=2, ge=0, le=5)
     edge_margin_m: float = Field(default=0.005, ge=0.0)
     maximum_candidates: int = Field(default=200, ge=2, le=10000)
+    adaptive_ik_view_search: AdaptiveIkViewSearchConfig = Field(
+        default_factory=AdaptiveIkViewSearchConfig
+    )
     coarse_reachability_fallbacks: tuple[CoarseReachabilityFallbackConfig, ...] = ()
     paired_fin_discovery_fallbacks: tuple[PairedFinDiscoveryFallbackConfig, ...] = ()
 
@@ -452,9 +505,7 @@ class ViewPlanningConfig(BaseModel):
         if bounded_fallbacks and (
             bounds[0] is None or bounds[1] is None or self.standoff_distance_m is None
         ):
-            raise ValueError(
-                "Coarse fallbacks require baseline and bounded standoff distances"
-            )
+            raise ValueError("Coarse fallbacks require baseline and bounded standoff distances")
         if self.standoff_distance_m is not None and bounds[0] is not None and bounds[1] is not None:
             for fallback in bounded_fallbacks:
                 distance = self.standoff_distance_m + fallback.distance_offset_m
@@ -665,9 +716,31 @@ class ReacquisitionPerturbationConfig(BaseModel):
     @model_validator(mode="after")
     def validate_nonzero_perturbation(self) -> Self:
         if self.distance_offset_m == 0.0 and self.tilt_deg == 0.0:
-            raise ValueError(
-                "A reacquisition perturbation must change distance or tilt"
-            )
+            raise ValueError("A reacquisition perturbation must change distance or tilt")
+        return self
+
+
+class ScientificGainConfig(BaseModel):
+    """Auditable expected-gain policy for online blade NBV selection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = True
+    coverage_weight: float = Field(default=0.70, ge=0.0, le=1.0)
+    quality_recovery_weight: float = Field(default=0.30, ge=0.0, le=1.0)
+    region_priority_multiplier: float = Field(default=0.50, ge=0.0, le=2.0)
+    unobserved_fin_face_bonus: float = Field(default=0.15, ge=0.0, le=1.0)
+    minimum_expected_gain: float = Field(default=0.0, ge=0.0, le=10.0)
+
+    @model_validator(mode="after")
+    def validate_gain_weights(self) -> Self:
+        if not np.isclose(
+            self.coverage_weight + self.quality_recovery_weight,
+            1.0,
+            rtol=0.0,
+            atol=1e-9,
+        ):
+            raise ValueError("Scientific gain coverage and quality weights must sum to one")
         return self
 
 
@@ -700,6 +773,7 @@ class NextViewSelectionConfig(BaseModel):
     require_two_observed_fin_faces_per_side: bool = True
     exclude_already_captured_candidate_ids: bool = True
     use_joint_travel_only_as_tiebreak: bool = True
+    scientific_gain: ScientificGainConfig = Field(default_factory=ScientificGainConfig)
     maximum_reacquisition_attempts_per_patch: int = Field(default=3, ge=0, le=8)
     reacquisition_perturbations: tuple[ReacquisitionPerturbationConfig, ...] = (
         ReacquisitionPerturbationConfig(
@@ -733,9 +807,7 @@ class NextViewSelectionConfig(BaseModel):
             raise ValueError(
                 "Captured candidate IDs must remain excluded so every acquisition ID is unique"
             )
-        if len(self.reacquisition_perturbations) != (
-            self.maximum_reacquisition_attempts_per_patch
-        ):
+        if len(self.reacquisition_perturbations) != (self.maximum_reacquisition_attempts_per_patch):
             raise ValueError(
                 "Reacquisition perturbations must exactly match the per-patch attempt budget"
             )
@@ -938,9 +1010,7 @@ class ScienceAcceptanceConfig(BaseModel):
     @model_validator(mode="after")
     def validate_acceptance_binding(self) -> Self:
         if (self.path is None) != (self.acceptance_id is None):
-            raise ValueError(
-                "Science acceptance path and identity must be configured together"
-            )
+            raise ValueError("Science acceptance path and identity must be configured together")
         return self
 
 
@@ -949,7 +1019,21 @@ class CoarseScienceConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    discovery_tilt_deg: float = Field(default=15.0, gt=0.0, lt=45.0)
+    # Retained as the first low-cost probe for artifact compatibility; the
+    # adaptive policy is not restricted to this angle.
+    discovery_tilt_deg: float = Field(default=15.0, gt=0.0, lt=75.0)
+    discovery_tilt_samples_deg: tuple[float, ...] = (
+        10.0,
+        20.0,
+        30.0,
+        45.0,
+        60.0,
+    )
+    discovery_gain_surface_weight: float = Field(default=0.45, ge=0.0, le=1.0)
+    discovery_gain_side_balance_weight: float = Field(default=0.25, ge=0.0, le=1.0)
+    discovery_gain_fin_pair_weight: float = Field(default=0.30, ge=0.0, le=1.0)
+    discovery_gain_fin_seed_value: float = Field(default=0.60, ge=0.0, le=1.0)
+    discovery_gain_minimum: float = Field(default=0.0, ge=0.0, le=10.0)
     minimum_total_views: int = Field(default=6, ge=4)
     minimum_views_per_side: int = Field(default=3, ge=2)
     maximum_attempts_per_candidate: int = Field(default=2, ge=1)
@@ -963,6 +1047,22 @@ class CoarseScienceConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_bilateral_view_gate(self) -> Self:
+        if (
+            not self.discovery_tilt_samples_deg
+            or not np.isfinite(self.discovery_tilt_samples_deg).all()
+            or any(not 0.0 < value < 75.0 for value in self.discovery_tilt_samples_deg)
+            or len(set(self.discovery_tilt_samples_deg)) != len(self.discovery_tilt_samples_deg)
+        ):
+            raise ValueError("Fin-discovery tilt samples must be unique finite values in (0, 75)")
+        if not np.isclose(
+            self.discovery_gain_surface_weight
+            + self.discovery_gain_side_balance_weight
+            + self.discovery_gain_fin_pair_weight,
+            1.0,
+            rtol=0.0,
+            atol=1e-9,
+        ):
+            raise ValueError("Coarse discovery gain weights must sum to one")
         if self.minimum_total_views < 2 * self.minimum_views_per_side:
             raise ValueError("Total coarse-view gate is below the per-side requirement")
         return self
@@ -986,6 +1086,8 @@ class StopAndCaptureConfig(BaseModel):
         gt=0.0,
         le=0.5,
     )
+    maximum_ranked_preflight_candidates: int = Field(default=3, ge=1, le=8)
+    allow_single_view_bootstrap_motion: bool = False
     settle_timeout_s: float = Field(default=15.0, gt=0.0, le=300.0)
     settle_poll_period_s: float = Field(default=0.05, gt=0.0, le=1.0)
     maximum_robot_state_staleness_s: float = Field(
@@ -1189,9 +1291,7 @@ class AppSettings(BaseModel):
     surface_partition: SurfacePartitionConfig = Field(default_factory=SurfacePartitionConfig)
     tsdf: TSDFConfig = Field(default_factory=TSDFConfig)
     surface_quality: SurfaceQualityConfig = Field(default_factory=SurfaceQualityConfig)
-    fine_finalization: FineFinalizationConfig = Field(
-        default_factory=FineFinalizationConfig
-    )
+    fine_finalization: FineFinalizationConfig = Field(default_factory=FineFinalizationConfig)
     next_view_selection: NextViewSelectionConfig = Field(default_factory=NextViewSelectionConfig)
     depth_comparison: DepthComparisonConfig = Field(default_factory=DepthComparisonConfig)
     native_overlap_validation: NativeOverlapValidationConfig = Field(
@@ -1200,9 +1300,7 @@ class AppSettings(BaseModel):
     kinematics: KinematicsConfig = Field(default_factory=KinematicsConfig)
     collision: CollisionConfig = Field(default_factory=CollisionConfig)
     motion_preflight: MotionPreflightConfig = Field(default_factory=MotionPreflightConfig)
-    science_acceptance: ScienceAcceptanceConfig = Field(
-        default_factory=ScienceAcceptanceConfig
-    )
+    science_acceptance: ScienceAcceptanceConfig = Field(default_factory=ScienceAcceptanceConfig)
     coarse_science: CoarseScienceConfig = Field(default_factory=CoarseScienceConfig)
     stop_and_capture: StopAndCaptureConfig = Field(default_factory=StopAndCaptureConfig)
     occupancy: OccupancyConfig = Field(default_factory=OccupancyConfig)

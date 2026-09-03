@@ -15,6 +15,7 @@ from biblade_fusion.core.settings import (
     ReacquisitionPerturbationConfig,
     RobotConfig,
     ScienceAcceptanceConfig,
+    ScientificGainConfig,
     StopAndCaptureConfig,
     SurfacePartitionConfig,
     load_settings,
@@ -223,6 +224,22 @@ def test_reacquisition_attempt_budget_is_strict_and_bounded() -> None:
         )
 
 
+def test_scientific_gain_weights_are_normalized() -> None:
+    with pytest.raises(ValidationError, match="must sum to one"):
+        ScientificGainConfig(coverage_weight=0.8, quality_recovery_weight=0.3)
+
+    config = ScientificGainConfig()
+    assert config.coverage_weight + config.quality_recovery_weight == pytest.approx(1.0)
+
+
+def test_ranked_path_preflight_budget_is_small_and_bounded() -> None:
+    assert StopAndCaptureConfig().maximum_ranked_preflight_candidates == 3
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        StopAndCaptureConfig(maximum_ranked_preflight_candidates=0)
+    with pytest.raises(ValidationError, match="less than or equal to 8"):
+        StopAndCaptureConfig(maximum_ranked_preflight_candidates=9)
+
+
 def test_enabled_occupancy_requires_measured_bounds_and_self_mask() -> None:
     with pytest.raises(ValidationError, match="requires measured workspace bounds"):
         OccupancyConfig(enabled=True)
@@ -244,6 +261,16 @@ def test_occupancy_grid_budget_is_checked() -> None:
             voxel_size_m=0.001,
             maximum_grid_voxels=1_000_000,
         )
+
+
+def test_single_view_bootstrap_motion_is_an_explicit_coordinator_policy() -> None:
+    assert StopAndCaptureConfig().allow_single_view_bootstrap_motion is False
+    assert (
+        StopAndCaptureConfig(
+            allow_single_view_bootstrap_motion=True
+        ).allow_single_view_bootstrap_motion
+        is True
+    )
 
 
 def test_occupancy_requires_at_least_three_source_views() -> None:
@@ -316,9 +343,12 @@ def test_science_acceptance_path_and_identity_are_atomic() -> None:
 
 def test_schema5_handoff_duration_is_optional_but_positive() -> None:
     assert StopAndCaptureConfig().maximum_schema5_handoff_duration_s is None
-    assert StopAndCaptureConfig(
-        maximum_schema5_handoff_duration_s=12.5
-    ).maximum_schema5_handoff_duration_s == 12.5
+    assert (
+        StopAndCaptureConfig(
+            maximum_schema5_handoff_duration_s=12.5
+        ).maximum_schema5_handoff_duration_s
+        == 12.5
+    )
     with pytest.raises(ValidationError, match="maximum_schema5_handoff_duration_s"):
         StopAndCaptureConfig(maximum_schema5_handoff_duration_s=0.0)
 
@@ -348,6 +378,7 @@ def test_coarse_science_config_exactly_constructs_workflow_policy() -> None:
         field.name for field in fields(CoarseSciencePolicy)
     }
     assert policy.discovery_tilt_deg == 15.0
+    assert policy.discovery_tilt_samples_deg == (10.0, 20.0, 30.0, 45.0, 60.0)
     assert policy.minimum_total_views == 6
     assert policy.minimum_views_per_side == 3
     assert policy.maximum_attempts_per_candidate == 2
@@ -361,6 +392,10 @@ def test_coarse_science_config_is_strict_and_bilateral() -> None:
         CoarseScienceConfig(minimum_total_views=5, minimum_views_per_side=3)
     with pytest.raises(ValidationError, match="extra_forbidden"):
         CoarseScienceConfig.model_validate({"unexpected": True})
+    with pytest.raises(ValidationError, match="tilt samples"):
+        CoarseScienceConfig(discovery_tilt_samples_deg=(30.0, 30.0))
+    with pytest.raises(ValidationError, match="gain weights must sum to one"):
+        CoarseScienceConfig(discovery_gain_surface_weight=0.50)
 
 
 def test_enabled_stop_and_capture_requires_enabled_occupancy() -> None:

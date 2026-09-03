@@ -98,10 +98,10 @@ point_cloud:
   pixel_stride: 1
   minimum_valid_points: 100
 
-# Before a schema-5 coarse blade surface exists, select a single interior depth
-# component from the first FoundationStereo observation. Components reaching the
-# valid-depth boundary and ambiguous unseeded scenes fail closed. A persisted
-# rectangle/polygon may be used as a hard ROI or component hint. No erosion is used,
+# Before a schema-5 coarse blade surface exists, the first formal observation uses
+# an operator-authored hard ROI. A standalone diagnostic may still exercise the
+# legacy component selector, but live later coarse views use the accepted 3-D blade
+# projection and the blade-only base-frame envelope below. No erosion is used,
 # because the specimen's thin fin and edge support must survive initialization.
 # These thresholds are software starting values and remain hardware-acceptance items.
 bootstrap_foreground:
@@ -120,6 +120,13 @@ bootstrap_foreground:
   minimum_seed_valid_pixels: 25
   minimum_seed_valid_fraction: 0.10
   minimum_component_hint_selection_fraction: 0.10
+  # Later coarse views never use the unseeded largest component. Accepted blade
+  # support is projected into the new image, dilated to retain newly exposed fins,
+  # and intersected with the blade-only base-frame envelope.
+  projected_reference_dilation_px: 12
+  minimum_projected_reference_points: 100
+  minimum_projected_reference_pixels: 500
+  minimum_projected_match_fraction: 0.50
 
 # Fine-scan science reconstruction projects one explicitly pinned immutable schema-5
 # coarse surface into left_rectified. Enabling this block is insufficient by itself:
@@ -214,6 +221,17 @@ view_planning:
   maximum_visibility_split_depth: 2
   edge_margin_m: 0.005
   maximum_candidates: 200
+  # Disabled in the distributable profile. When enabled, coarse proxy targets
+  # expand over wrist roll, incidence and the physical point-cloud depth range.
+  adaptive_ik_view_search:
+    enabled: false
+    distance_step_m: 0.04
+    maximum_distance_expansions: 64
+    tilt_samples_deg: [0.0, 15.0, 30.0, 45.0, 60.0]
+    azimuth_samples_deg: [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0]
+    roll_samples_deg: [0.0, 45.0, -45.0, 90.0]
+    maximum_generated_candidates: 512
+    maximum_ik_feasible_candidates: 8
 
 view_filter:
   # Endpoint feasibility remains geometry-only until workspace and an IK checker exist.
@@ -330,6 +348,15 @@ next_view_selection:
   require_two_observed_fin_faces_per_side: true
   exclude_already_captured_candidate_ids: true
   use_joint_travel_only_as_tiebreak: true
+  # Online NBV ranks only geometry/IK/FK-feasible blade candidates. Occupancy
+  # remains a downstream hard path-safety gate, never a source of science gain.
+  scientific_gain:
+    enabled: true
+    coverage_weight: 0.70
+    quality_recovery_weight: 0.30
+    region_priority_multiplier: 0.50
+    unobserved_fin_face_bonus: 0.15
+    minimum_expected_gain: 0.0
   # If a nominal patch view is accepted scientifically but still fails the patch
   # quality gates, try only these three deterministic target-centred orbits.  Every
   # retry receives a new immutable view ID and still passes workspace/IK/FK here and
@@ -428,7 +455,17 @@ science_acceptance:
 # defaults exactly mirror CoarseSciencePolicy; production code must consume this
 # configuration rather than instantiate an independent implicit policy.
 coarse_science:
+  # 15 deg is only the first inexpensive probe. Adaptive discovery may select
+  # either a smaller or larger opposing angle for each fin face independently.
   discovery_tilt_deg: 15.0
+  discovery_tilt_samples_deg: [10.0, 20.0, 30.0, 45.0, 60.0]
+  # Single-initial-view coarse NBV: proxy coverage, missing blade side and
+  # opposing fin evidence. Weights are normalized and safety remains downstream.
+  discovery_gain_surface_weight: 0.45
+  discovery_gain_side_balance_weight: 0.25
+  discovery_gain_fin_pair_weight: 0.30
+  discovery_gain_fin_seed_value: 0.60
+  discovery_gain_minimum: 0.0
   minimum_total_views: 6
   minimum_views_per_side: 3
   maximum_attempts_per_candidate: 2
@@ -455,6 +492,11 @@ stop_and_capture:
   depth_backend: foundation_stereo
   bootstrap_mode: operator_guided
   maximum_segment_joint_delta_rad: null
+  # Try this many independently science-ranked endpoints with the unchanged hard
+  # swept-collision preflight before declaring the planning cycle blocked.
+  maximum_ranked_preflight_candidates: 3
+  # May use a verified MAPPING prefix only inside immutable accepted-free regions.
+  allow_single_view_bootstrap_motion: false
   settle_timeout_s: 15.0
   settle_poll_period_s: 0.05
   maximum_robot_state_staleness_s: 0.25

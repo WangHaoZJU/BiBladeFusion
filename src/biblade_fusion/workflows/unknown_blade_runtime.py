@@ -111,6 +111,7 @@ from biblade_fusion.workflows.stop_scan_coordinator import (
     OccupancyGeneration,
     OccupancyGenerationPublisher,
     PerceptionCycleResult,
+    StopScanPhase,
 )
 from biblade_fusion.workflows.supervised_experiment import (
     GuardedCoordinatorMotionExecutor,
@@ -653,6 +654,22 @@ class CoarseSessionNextViewAdapter:
         self._pending_selection = selection
         return selection
 
+    def accept_preflight_target(self, view_id: str) -> None:
+        """Restage a path-safe fallback without recomputing coarse science gain."""
+
+        pending = self._pending_selection
+        if pending is None or pending.target is None:
+            raise UnknownBladeRuntimeError("No pending coarse target can be accepted")
+        chosen = pending.choose_ranked_candidate(view_id)
+        if chosen.target == pending.target:
+            return
+        # No capture has started at this point.  Replace only the in-memory staged
+        # science identity so the eventual CANDIDATE wrapper matches the endpoint
+        # that actually passed the unchanged hard path preflight.
+        self._session.reject_cycle()
+        self._session.stage_selected_capture(chosen)
+        self._pending_selection = chosen
+
 
 class _FineCheckpointRecorder:
     """Persist every advanced fine-run/coverage pair, including run-only advances."""
@@ -990,7 +1007,15 @@ class UnknownBladeSupervisedRuntime:
             self._coarse_adapter.reject_staged_cycle()
             return self._block("operator capture lacked one accepted coarse-science cycle")
         self._bootstrap_count += 1
-        if updated.disposition is ExperimentDisposition.READY:
+        if (
+            updated.disposition is ExperimentDisposition.READY
+            and updated.phase == StopScanPhase.BOOTSTRAP_MOTION_READY.value
+        ):
+            # One formal operator view has produced a coarse proxy and a strong
+            # MAPPING-prefix attestation.  Active coarse motion may now continue,
+            # but schema-5 promotion still waits for an actual MAP_READY result.
+            self._set_phase(UnknownBladeRuntimePhase.COARSE_SCAN)
+        elif updated.disposition is ExperimentDisposition.READY:
             promotion_started_monotonic_s = self._monotonic_now()
             try:
                 transition = self._coarse_adapter.promote_after_exact_map_ready(
@@ -1126,6 +1151,7 @@ class UnknownBladeSupervisedRuntime:
         if (
             self._phase is UnknownBladeRuntimePhase.COARSE_SCAN
             and captured.disposition is ExperimentDisposition.READY
+            and captured.phase == StopScanPhase.MAP_READY.value
         ):
             promotion_started_monotonic_s = self._monotonic_now()
             try:

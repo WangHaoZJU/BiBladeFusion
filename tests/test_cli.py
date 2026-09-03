@@ -9,7 +9,7 @@ import biblade_fusion.cli as cli_module
 import biblade_fusion.storage.runtime_timing_acceptance as timing_acceptance_module
 import biblade_fusion.storage.science_acceptance as science_acceptance_module
 import biblade_fusion.workflows.unknown_blade_runtime as unknown_runtime_module
-from biblade_fusion.cli import _with_emitter_override, app
+from biblade_fusion.cli import _parse_joint_seed, _with_emitter_override, app
 from biblade_fusion.core.settings import load_settings
 from biblade_fusion.robotics import model_gui
 
@@ -43,6 +43,25 @@ def test_stereo_inference_command_is_exposed() -> None:
 
     assert result.exit_code == 0
     assert "infer-session" in result.stdout
+
+
+def test_offline_adaptive_view_search_command_is_exposed() -> None:
+    result = runner.invoke(app, ["plan", "search-view", "--help"])
+    normalized_output = " ".join(result.stdout.split())
+
+    assert result.exit_code == 0
+    assert "--initialization" in result.stdout
+    assert "--view-id" in result.stdout
+    assert "--ik-seed" in result.stdout
+    assert "without commanding motion" in normalized_output
+
+
+def test_adaptive_view_seed_parser_requires_six_finite_joints() -> None:
+    assert _parse_joint_seed("0, 1, 2, 3, 4, 5") == (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+    with pytest.raises(ValueError, match="exactly six"):
+        _parse_joint_seed("0,1")
+    with pytest.raises(ValueError, match="finite"):
+        _parse_joint_seed("0,1,2,3,4,nan")
 
 
 def test_supervised_scan_preparation_commands_are_exposed() -> None:

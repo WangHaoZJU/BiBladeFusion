@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from datetime import UTC, datetime
 
+import hppfcl
+import numpy as np
 import pytest
 
 from biblade_fusion.mapping import OccupancyMapState, OccupancySnapshot
@@ -13,12 +16,12 @@ from biblade_fusion.robotics import (
     OccupancyEvidenceError,
     OccupancyQueryState,
     OccupancyRobotCollisionChecker,
-    RobotEnvelopeSphere,
     occupancy_evidence_from_snapshot,
 )
 from biblade_fusion.robotics.occupancy_collision import (
     OccupancySemanticAttestation,
     _issue_occupancy_semantic_attestation,
+    _PlacedRobotCollisionGeometry,
 )
 
 
@@ -38,7 +41,7 @@ def _checker(checker, snapshot) -> OccupancyRobotCollisionChecker:
     )
 
 
-def test_robot_aabb_spheres_clear_on_known_free_map(
+def test_original_robot_stls_clear_on_known_free_map(
     checker, occupancy_snapshot
 ) -> None:
     result = _checker(checker, occupancy_snapshot).check((0.0,) * 6)
@@ -46,8 +49,141 @@ def test_robot_aabb_spheres_clear_on_known_free_map(
     assert result.status is CollisionCheckStatus.CLEAR
     assert result.evidence is not None
     assert result.evidence.sequence == occupancy_snapshot.sequence
-    assert result.checked_sphere_count == 8
-    assert len(result.diagnostics["queries"]) == 8
+    assert result.checked_geometry_count == 7
+    assert result.checked_sphere_count == 7
+    assert len(result.diagnostics["queries"]) == 7
+    assert result.diagnostics["backend"] == (
+        "hppfcl_original_stl_vs_occupancy_voxel_boxes"
+    )
+    assert all(
+        item["geometry_representation"] == "original_urdf_collision_stl"
+        and "radius_m" not in item
+        for item in result.diagnostics["queries"]
+    )
+
+
+def test_mapping_prefix_and_ready_mode_use_the_same_original_stls(
+    checker, occupancy_snapshot
+) -> None:
+    ordinary = _checker(checker, occupancy_snapshot)
+    bootstrap = OccupancyRobotCollisionChecker(
+        checker,
+        lambda: occupancy_snapshot,
+        verified_robot_geometry_hash="9" * 64,
+        accepted_static_free_aabbs=(
+            AcceptedStaticFreeAabb(
+                name="synthetic_complete_workspace",
+                minimum_m=(-10.0, -10.0, -10.0),
+                maximum_m=(10.0, 10.0, 10.0),
+            ),
+        ),
+        accepted_static_free_acceptance_id="a" * 64,
+        accepted_static_free_mapping_context_hash=(
+            occupancy_snapshot.mapping_context_hash
+        ),
+        allow_mapping_prefix_in_accepted_static_free=True,
+    )
+
+    ordinary_geometries = ordinary._robot_collision_geometries((0.0,) * 6)
+    bootstrap_geometries = bootstrap._robot_collision_geometries((0.0,) * 6)
+
+    assert len(ordinary_geometries) == 7
+    assert len(bootstrap_geometries) == len(ordinary_geometries)
+    assert [item.geometry_name for item in bootstrap_geometries] == [
+        item.geometry_name for item in ordinary_geometries
+    ]
+    assert all(
+        placed.collision_geometry.getNodeType()
+        == checker.geometry_model.geometryObjects[
+            placed.geometry_index
+        ].geometry.getNodeType()
+        and not isinstance(placed.collision_geometry, hppfcl.Sphere)
+        for placed in bootstrap_geometries
+    )
+    assert bootstrap.policy_contract_hash != ordinary.policy_contract_hash
+
+
+def test_long_thin_stl_does_not_inherit_its_circumsphere_false_positive(
+    checker,
+) -> None:
+    class LongThinGeometryChecker(OccupancyRobotCollisionChecker):
+        def _robot_collision_geometries(self, joint_positions_rad):
+            del joint_positions_rad
+            return (
+                _PlacedRobotCollisionGeometry(
+                    geometry_name="synthetic_long_forearm",
+                    geometry_index=2,
+                    collision_geometry=hppfcl.Box(0.50, 0.04, 0.04),
+                    transform_base=hppfcl.Transform3f.Identity(),
+                    world_aabb_minimum_m=(-0.25, -0.02, -0.02),
+                    world_aabb_maximum_m=(0.25, 0.02, 0.02),
+                ),
+            )
+
+    snapshot = OccupancySnapshot(
+        frame_id="base",
+        voxel_size_m=0.01,
+        origin_m=(-0.30, -0.30, -0.10),
+        grid_shape=(60, 60, 20),
+        free_indices=frozenset({(0, 0, 0)}),
+        free_observation_counts=(((0, 0, 0), 3),),
+        minimum_free_observations=3,
+        minimum_free_view_translation_m=0.02,
+        minimum_free_view_direction_deg=5.0,
+        occupied_indices=frozenset(),
+        sequence=3,
+        created_at_utc=datetime(2026, 8, 28, 0, 0, tzinfo=UTC),
+        source_view_ids=("v1", "v2", "v3"),
+        source_camera_centres_base_m=(
+            (0.0, 0.0, 0.0),
+            (0.03, 0.0, 0.0),
+            (0.06, 0.0, 0.0),
+        ),
+        source_camera_axes_base=((0.0, 0.0, 1.0),) * 3,
+        rebuild_started_at_utc=datetime(2026, 8, 28, 0, 0, tzinfo=UTC),
+        map_state=OccupancyMapState.MAP_READY,
+        mapping_context_hash="d" * 64,
+        parent_evidence_hash="b" * 64,
+        quality_evidence_hash="c" * 64,
+        state_reason="synthetic long-link exact-STL regression",
+    )
+    acceptance = AcceptedStaticFreeAabb(
+        name="thin_link_corridor",
+        minimum_m=(-0.30, -0.10, -0.10),
+        maximum_m=(0.30, 0.10, 0.10),
+    )
+
+    def occupancy_for(current_snapshot):
+        return LongThinGeometryChecker(
+            checker,
+            lambda: current_snapshot,
+            verified_robot_geometry_hash="9" * 64,
+            accepted_static_free_aabbs=(acceptance,),
+            accepted_static_free_acceptance_id="a" * 64,
+            accepted_static_free_mapping_context_hash=(
+                current_snapshot.mapping_context_hash
+            ),
+            utc_clock=lambda: datetime(2026, 8, 28, 0, 0, 1, tzinfo=UTC),
+        )
+
+    clear = occupancy_for(snapshot).check((0.0,) * 6)
+    occupied = replace(
+        snapshot,
+        occupied_indices=frozenset({(30, 30, 10)}),
+        sequence=4,
+        content_hash="",
+    )
+    blocked = occupancy_for(occupied).check((0.0,) * 6)
+
+    assert math.sqrt(0.25**2 + 0.02**2 + 0.02**2) > acceptance.maximum_m[1]
+    assert clear.status is CollisionCheckStatus.CLEAR
+    assert clear.diagnostics["queries"][0]["geometry_representation"] == (
+        "original_urdf_collision_stl"
+    )
+    assert blocked.status is CollisionCheckStatus.BLOCKED
+    assert blocked.blocking_reasons == (
+        "environment_occupancy_occupied:synthetic_long_forearm",
+    )
 
 
 @pytest.mark.parametrize(
@@ -185,7 +321,7 @@ def test_path_report_binds_one_exact_snapshot(checker, occupancy_snapshot) -> No
         (0.03, 0.0, 0.0, 0.0, 0.0, 0.0),
     )
     assert result.result.diagnostics["path_semantic"] == (
-        "adaptive_midpoint_expanded_tracking_envelope_sphere_sweep"
+        "adaptive_midpoint_exact_stl_voxel_distance_sweep"
     )
 
 
@@ -234,15 +370,29 @@ def test_swept_occupancy_map_binding_tampering_invalidates_certificate(
 def test_swept_occupancy_limit_returns_unknown_when_expansion_reaches_unknown(
     checker,
 ) -> None:
+    def placed_sphere(
+        *, name: str, center: tuple[float, float, float], radius: float, index: int
+    ) -> _PlacedRobotCollisionGeometry:
+        minimum = tuple(value - radius for value in center)
+        maximum = tuple(value + radius for value in center)
+        return _PlacedRobotCollisionGeometry(
+            geometry_name=name,
+            geometry_index=index,
+            collision_geometry=hppfcl.Sphere(radius),
+            transform_base=hppfcl.Transform3f(np.eye(3), np.asarray(center)),
+            world_aabb_minimum_m=minimum,
+            world_aabb_maximum_m=maximum,
+        )
+
     class SingleEnvelopeChecker(OccupancyRobotCollisionChecker):
-        def _robot_envelope_spheres(self, joint_positions_rad):
+        def _robot_collision_geometries(self, joint_positions_rad):
             del joint_positions_rad
             return (
-                RobotEnvelopeSphere(
-                    geometry_name="upperarm_link_0",
-                    center_base_m=(0.0, 0.0, 0.0),
-                    radius_m=0.04,
-                    geometry_index=2,
+                placed_sphere(
+                    name="upperarm_link_0",
+                    center=(0.0, 0.0, 0.0),
+                    radius=0.04,
+                    index=2,
                 ),
             )
 
@@ -388,19 +538,32 @@ def _single_unknown_voxel_snapshot(occupancy_snapshot, *, occupied: bool = False
 
 
 class _SingleStaticAcceptanceEnvelopeChecker(OccupancyRobotCollisionChecker):
-    def _robot_envelope_spheres(self, joint_positions_rad):
+    def _robot_collision_geometries(self, joint_positions_rad):
         del joint_positions_rad
+        center = (0.25, 0.25, 0.25)
+        radius = 0.01
         return (
-            RobotEnvelopeSphere(
+            _PlacedRobotCollisionGeometry(
                 geometry_name="upperarm_link_0",
-                center_base_m=(0.25, 0.25, 0.25),
-                radius_m=0.01,
                 geometry_index=2,
+                collision_geometry=hppfcl.Sphere(radius),
+                transform_base=hppfcl.Transform3f(
+                    np.eye(3),
+                    np.asarray(center),
+                ),
+                world_aabb_minimum_m=tuple(value - radius for value in center),
+                world_aabb_maximum_m=tuple(value + radius for value in center),
             ),
         )
 
 
-def _static_acceptance_checker(checker, snapshot, *, maximum_m=(0.5, 0.5, 0.5)):
+def _static_acceptance_checker(
+    checker,
+    snapshot,
+    *,
+    maximum_m=(0.5, 0.5, 0.5),
+    allow_mapping_prefix=False,
+):
     return _SingleStaticAcceptanceEnvelopeChecker(
         checker,
         lambda: snapshot,
@@ -414,6 +577,7 @@ def _static_acceptance_checker(checker, snapshot, *, maximum_m=(0.5, 0.5, 0.5)):
         ),
         accepted_static_free_acceptance_id="a" * 64,
         accepted_static_free_mapping_context_hash=snapshot.mapping_context_hash,
+        allow_mapping_prefix_in_accepted_static_free=allow_mapping_prefix,
         utc_clock=lambda: datetime(2026, 8, 28, 0, 0, 1, tzinfo=UTC),
     )
 
@@ -435,6 +599,8 @@ def test_accepted_static_free_requires_whole_unknown_voxel_containment(
     assert accepted.diagnostics["queries"][0]["accepted_unknown_count"] == 1
     assert partial.status is CollisionCheckStatus.BLOCKED
     assert "environment_occupancy_unknown" in partial.blocking_reasons[0]
+    assert partial.diagnostics["queries"][0]["outside_acceptance_unknown_count"] == 1
+    assert partial.diagnostics["queries"][0]["outside_grid_unknown_count"] == 0
 
     swept = accepted_checker.check_path(
         (0.0,) * 6,
@@ -456,6 +622,49 @@ def test_accepted_static_free_never_downgrades_occupied(
 
     assert result.status is CollisionCheckStatus.BLOCKED
     assert "environment_occupancy_occupied" in result.blocking_reasons[0]
+
+
+def test_mapping_prefix_is_usable_only_inside_accepted_static_free(
+    checker, occupancy_snapshot
+) -> None:
+    snapshot = replace(
+        _single_unknown_voxel_snapshot(occupancy_snapshot),
+        map_state=OccupancyMapState.MAPPING,
+        state_reason="single-view mapping prefix",
+        content_hash="",
+    )
+
+    ordinary = _static_acceptance_checker(checker, snapshot).check((0.0,) * 6)
+    bootstrap = _static_acceptance_checker(
+        checker,
+        snapshot,
+        allow_mapping_prefix=True,
+    ).check((0.0,) * 6)
+    outside = _static_acceptance_checker(
+        checker,
+        snapshot,
+        maximum_m=(0.49, 0.5, 0.5),
+        allow_mapping_prefix=True,
+    ).check((0.0,) * 6)
+
+    assert ordinary.status is CollisionCheckStatus.UNKNOWN
+    assert "occupancy_map_not_ready:mapping" in ordinary.blocking_reasons[0]
+    assert bootstrap.status is CollisionCheckStatus.CLEAR
+    assert bootstrap.diagnostics["queries"][0]["accepted_unknown_count"] == 1
+    assert outside.status is CollisionCheckStatus.BLOCKED
+    assert "environment_occupancy_unknown" in outside.blocking_reasons[0]
+
+
+def test_mapping_prefix_mode_requires_static_free_acceptance(
+    checker, occupancy_snapshot
+) -> None:
+    with pytest.raises(ValueError, match="requires accepted static-free AABBs"):
+        OccupancyRobotCollisionChecker(
+            checker,
+            lambda: occupancy_snapshot,
+            verified_robot_geometry_hash="9" * 64,
+            allow_mapping_prefix_in_accepted_static_free=True,
+        )
 
 
 def test_accepted_static_free_is_bound_to_mapping_context_and_acceptance_id(

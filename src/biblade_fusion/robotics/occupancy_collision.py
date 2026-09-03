@@ -22,7 +22,6 @@ import numpy as np
 from biblade_fusion.mapping.occupancy import (
     OccupancySnapshot,
     compute_content_hash,
-    sphere_intersecting_indices,
 )
 from biblade_fusion.robotics.pinocchio_collision import (
     CollisionCheckStatus,
@@ -40,7 +39,7 @@ class OccupancyQueryState(StrEnum):
     UNKNOWN = "unknown"
 
 
-class SphereQueryLike(Protocol):
+class OccupancyGeometryQueryLike(Protocol):
     state: Any
     blocked: bool
     occupied_count: int
@@ -72,7 +71,6 @@ OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH = hashlib.sha256(
         allow_nan=False,
     ).encode("utf-8")
 ).hexdigest()
-
 
 def _semantic_attestation_hash(
     *,
@@ -286,11 +284,13 @@ class OccupancyMapEvidence:
 
 
 @dataclass(frozen=True, slots=True)
-class RobotEnvelopeSphere:
+class _PlacedRobotCollisionGeometry:
     geometry_name: str
-    center_base_m: tuple[float, float, float]
-    radius_m: float
-    geometry_index: int = -1
+    geometry_index: int
+    collision_geometry: Any
+    transform_base: Any
+    world_aabb_minimum_m: tuple[float, float, float]
+    world_aabb_maximum_m: tuple[float, float, float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,12 +326,14 @@ class AcceptedStaticFreeAabb:
         snapshot: OccupancySnapshot,
         index: tuple[int, int, int],
     ) -> bool:
+        tolerance = max(1e-12, snapshot.voxel_size_m * 1e-9)
         lower = tuple(
             snapshot.origin_m[axis] + index[axis] * snapshot.voxel_size_m for axis in range(3)
         )
         upper = tuple(value + snapshot.voxel_size_m for value in lower)
         return all(
-            voxel_low >= accepted_low and voxel_high <= accepted_high
+            voxel_low >= accepted_low - tolerance
+            and voxel_high <= accepted_high + tolerance
             for voxel_low, voxel_high, accepted_low, accepted_high in zip(
                 lower,
                 upper,
@@ -343,13 +345,19 @@ class AcceptedStaticFreeAabb:
 
 
 @dataclass(frozen=True, slots=True)
-class _AcceptedStaticFreeSphereQuery:
+class _RobotGeometryVoxelQuery:
     state: OccupancyQueryState
     blocked: bool
     occupied_count: int
     unknown_count: int
     free_count: int
     accepted_unknown_count: int
+    outside_grid_unknown_count: int
+    outside_acceptance_unknown_count: int
+    separated_dangerous_count: int
+    distance_query_count: int
+    minimum_dangerous_distance_m: float | None
+    blocking_voxel_index: tuple[int, int, int] | None
     queried_count: int
 
 
@@ -358,12 +366,18 @@ class OccupancyCollisionCheckResult:
     status: CollisionCheckStatus
     blocking_reasons: tuple[str, ...]
     evidence: OccupancyMapEvidence | None
-    checked_sphere_count: int
+    checked_geometry_count: int
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def collision_free(self) -> bool:
         return self.status is CollisionCheckStatus.CLEAR
+
+    @property
+    def checked_sphere_count(self) -> int:
+        """Compatibility alias for schema-2 callers; values now count STL geometries."""
+
+        return self.checked_geometry_count
 
     @property
     def motion_authorized(self) -> bool:
@@ -383,7 +397,7 @@ def _occupancy_evidence_binding_sha256(evidence: OccupancyMapEvidence) -> str:
 
 @dataclass(frozen=True, slots=True)
 class SweptOccupancyProofEvidence:
-    """Integrity-bound proof that expanded robot envelopes cover a full path."""
+    """Integrity-bound proof using exact STL-to-voxel distance margins."""
 
     trajectory_sha256: str
     map_binding_sha256: str
@@ -398,13 +412,19 @@ class SweptOccupancyProofEvidence:
     initial_interval_count: int
     certified_interval_count: int
     evaluated_configuration_count: int
-    expanded_sphere_query_count: int
+    geometry_voxel_distance_query_count: int
     accepted_unknown_voxel_query_count: int
     deepest_subdivision: int
     termination_reason: str
     evidence_sha256: str
-    schema: str = "biblade_fusion.swept_occupancy_proof.v2"
-    method: str = "adaptive_midpoint_expanded_tracking_envelope_sphere_sweep"
+    schema: str = "biblade_fusion.swept_occupancy_proof.v3"
+    method: str = "adaptive_midpoint_exact_stl_voxel_distance_sweep"
+
+    @property
+    def expanded_sphere_query_count(self) -> int:
+        """Compatibility alias; no sphere queries are used by schema 3."""
+
+        return self.geometry_voxel_distance_query_count
 
     def _payload(self) -> dict[str, Any]:
         return {
@@ -423,7 +443,9 @@ class SweptOccupancyProofEvidence:
             "initial_interval_count": self.initial_interval_count,
             "certified_interval_count": self.certified_interval_count,
             "evaluated_configuration_count": self.evaluated_configuration_count,
-            "expanded_sphere_query_count": self.expanded_sphere_query_count,
+            "geometry_voxel_distance_query_count": (
+                self.geometry_voxel_distance_query_count
+            ),
             "accepted_unknown_voxel_query_count": (self.accepted_unknown_voxel_query_count),
             "deepest_subdivision": self.deepest_subdivision,
             "termination_reason": self.termination_reason,
@@ -431,8 +453,8 @@ class SweptOccupancyProofEvidence:
 
     @property
     def integrity_valid(self) -> bool:
-        if self.schema != "biblade_fusion.swept_occupancy_proof.v2" or self.method != (
-            "adaptive_midpoint_expanded_tracking_envelope_sphere_sweep"
+        if self.schema != "biblade_fusion.swept_occupancy_proof.v3" or self.method != (
+            "adaptive_midpoint_exact_stl_voxel_distance_sweep"
         ):
             return False
         digests = (
@@ -563,6 +585,7 @@ def occupancy_evidence_from_snapshot(
     required_freshness_horizon_s: float = 0.0,
     verified_robot_geometry_hash: str | None = None,
     semantic_attestation: OccupancySemanticAttestation | None = None,
+    allow_mapping_prefix: bool = False,
 ) -> OccupancyMapEvidence:
     """Validate one snapshot and return the identity bound to motion evidence."""
 
@@ -583,7 +606,10 @@ def occupancy_evidence_from_snapshot(
         raise OccupancyEvidenceError(
             f"occupancy_frame_mismatch:{snapshot.frame_id!s}:expected_base"
         )
-    if _enum_value(snapshot.map_state) != "map_ready":
+    map_state = _enum_value(snapshot.map_state)
+    if map_state != "map_ready" and not (
+        allow_mapping_prefix and map_state == "mapping"
+    ):
         raise OccupancyEvidenceError(f"occupancy_map_not_ready:{_enum_value(snapshot.map_state)}")
     sequence = int(snapshot.sequence)
     if sequence < 0:
@@ -615,11 +641,16 @@ def occupancy_evidence_from_snapshot(
         valid_until = now_utc + timedelta(seconds=horizon)
         if max_age_s is None:
             # Publication replacement, not wall-clock age, owns lifecycle.
-            stale = _enum_value(snapshot.map_state) == "stale"
-            usable = _enum_value(snapshot.map_state) == "map_ready" and not stale
+            stale = map_state == "stale"
+            usable = map_state == "map_ready" or (
+                allow_mapping_prefix and map_state == "mapping"
+            )
         elif authorization_started_at_utc is None:
-            usable = bool(snapshot.is_usable_for_preflight(valid_until, max_age_s))
             stale = bool(snapshot.is_stale(valid_until, max_age_s))
+            usable = not stale and (
+                map_state == "map_ready"
+                or (allow_mapping_prefix and map_state == "mapping")
+            )
         else:
             if authorization_started_at_utc.tzinfo is None:
                 raise ValueError("authorization start must be timezone-aware")
@@ -630,7 +661,10 @@ def occupancy_evidence_from_snapshot(
                 or authorization_age_s < 0.0
                 or authorization_age_s > max_age_s
             )
-            usable = _enum_value(snapshot.map_state) == "map_ready" and not stale
+            usable = not stale and (
+                map_state == "map_ready"
+                or (allow_mapping_prefix and map_state == "mapping")
+            )
     except Exception as exc:  # pragma: no cover - defensive adapter boundary
         raise OccupancyEvidenceError(f"occupancy_lifecycle_query_failed:{exc}") from exc
     if stale or not usable:
@@ -669,11 +703,12 @@ def occupancy_evidence_from_snapshot(
 
 @dataclass(slots=True)
 class OccupancyRobotCollisionChecker:
-    """Query conservative Pinocchio geometry envelopes against a map snapshot.
+    """Query original URDF collision STLs against immutable occupancy voxels.
 
-    Each robot collision STL is represented by its transformed local-AABB bounding
-    sphere.  This intentionally over-approximates the mesh: false positive blocks are
-    acceptable at this safety boundary, while a geometric under-approximation is not.
+    HPP-FCL measures each moving collision geometry directly against dangerous
+    voxel boxes.  Local AABBs are used only as a broad-phase enumeration bound;
+    they never decide collision.  The fixed base geometry is excluded because its
+    designed support contact cannot change during a robot motion segment.
     """
 
     robot_checker: Cs68PinocchioCollisionChecker
@@ -685,6 +720,7 @@ class OccupancyRobotCollisionChecker:
     accepted_static_free_aabbs: tuple[AcceptedStaticFreeAabb, ...] = ()
     accepted_static_free_acceptance_id: str | None = None
     accepted_static_free_mapping_context_hash: str | None = None
+    allow_mapping_prefix_in_accepted_static_free: bool = False
     verified_robot_geometry_hash: str | None = None
     semantic_attestation: OccupancySemanticAttestation | None = None
     accepted_joint_uncertainty_rad: tuple[float, float, float, float, float, float] = (
@@ -734,6 +770,13 @@ class OccupancyRobotCollisionChecker:
             or self.accepted_static_free_mapping_context_hash is not None
         ):
             raise ValueError("static-free acceptance identity/context require at least one AABB")
+        if (
+            self.allow_mapping_prefix_in_accepted_static_free
+            and not self.accepted_static_free_aabbs
+        ):
+            raise ValueError(
+                "mapping-prefix preflight requires accepted static-free AABBs"
+            )
         checker_identity = getattr(self.robot_checker, "robot_geometry_hash", None)
         explicit_identity = self.verified_robot_geometry_hash
         if checker_identity is not None:
@@ -806,7 +849,7 @@ class OccupancyRobotCollisionChecker:
 
     @property
     def continuous_swept_volume_supported(self) -> bool:
-        """Adaptive expanded-sphere intervals conservatively cover full sweeps."""
+        """Exact midpoint distances plus link displacement bounds cover sweeps."""
 
         return True
 
@@ -815,9 +858,9 @@ class OccupancyRobotCollisionChecker:
         """Identity of every occupancy-query rule relevant to motion safety."""
 
         payload = {
-            "schema": "biblade_fusion.occupancy_robot_collision_policy.v5",
-            "backend": "occupancy_snapshot_robot_aabb_spheres",
-            "path_semantic": "adaptive_conservative_expanded_sphere_sweep",
+            "schema": "biblade_fusion.occupancy_robot_collision_policy.v7",
+            "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
+            "path_semantic": "adaptive_exact_stl_voxel_distance_sweep",
             "continuous_swept_volume_supported": (self.continuous_swept_volume_supported),
             "robot_geometry_hash": self.verified_robot_geometry_hash,
             "robot_motion_bound_contract_sha256": (
@@ -848,6 +891,18 @@ class OccupancyRobotCollisionChecker:
                     for item in self.accepted_static_free_aabbs
                 ],
             },
+            "mapping_prefix_policy": {
+                "enabled": self.allow_mapping_prefix_in_accepted_static_free,
+                "accepted_static_free_only": True,
+                "unknown_outside_acceptance_blocks": True,
+                "robot_geometry": "original_urdf_collision_stl",
+            },
+            "voxel_geometry": "hppfcl_axis_aligned_box",
+            "clearance_semantic": "exact_distance_greater_than_required_margin",
+            "fixed_geometry_policy": {
+                "excluded_parent_joint": 0,
+                "reason": "fixed_base_support_contact_does_not_change_during_motion",
+            },
             "unknown_is_occupied": True,
             "semantic_attestation_required_for_motion": True,
             "semantic_verifier_contract_hash": (OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH),
@@ -874,6 +929,9 @@ class OccupancyRobotCollisionChecker:
                 required_freshness_horizon_s=required_freshness_horizon_s,
                 verified_robot_geometry_hash=self.verified_robot_geometry_hash,
                 semantic_attestation=self.semantic_attestation,
+                allow_mapping_prefix=(
+                    self.allow_mapping_prefix_in_accepted_static_free
+                ),
             )
             self._assert_static_free_acceptance_context(evidence)
             return evidence
@@ -915,6 +973,9 @@ class OccupancyRobotCollisionChecker:
                 required_freshness_horizon_s=required_freshness_horizon_s,
                 verified_robot_geometry_hash=self.verified_robot_geometry_hash,
                 semantic_attestation=self.semantic_attestation,
+                allow_mapping_prefix=(
+                    self.allow_mapping_prefix_in_accepted_static_free
+                ),
             )
             self._assert_static_free_acceptance_context(evidence)
             if expected_evidence is not None and evidence.binding != expected_evidence.binding:
@@ -923,33 +984,58 @@ class OccupancyRobotCollisionChecker:
                     f"expected={expected_evidence.sequence}:{expected_evidence.content_hash}:"
                     f"current={evidence.sequence}:{evidence.content_hash}"
                 )
-            spheres = self._robot_envelope_spheres(joint_positions_rad)
+            geometries = self._robot_collision_geometries(joint_positions_rad)
             reasons: list[str] = []
             query_diagnostics: list[dict[str, Any]] = []
-            for sphere in spheres:
-                query = self._query_sphere(snapshot, sphere)
+            for placed in geometries:
+                uncertainty = self.robot_checker.geometry_displacement_bound_m(
+                    placed.geometry_index,
+                    self.accepted_joint_uncertainty_rad,
+                )
+                required_distance = self.additional_clearance_m + uncertainty
+                query = self._query_robot_geometry(
+                    snapshot,
+                    placed,
+                    required_distance_m=required_distance,
+                )
                 state = self._validate_query_result(query)
                 query_diagnostics.append(
                     {
-                        "geometry": sphere.geometry_name,
+                        "geometry": placed.geometry_name,
                         "state": state,
-                        "radius_m": sphere.radius_m,
+                        "geometry_representation": "original_urdf_collision_stl",
+                        "required_distance_m": required_distance,
                         "occupied_count": int(query.occupied_count),
                         "unknown_count": int(query.unknown_count),
                         "free_count": int(query.free_count),
                         "accepted_unknown_count": int(getattr(query, "accepted_unknown_count", 0)),
+                        "outside_grid_unknown_count": int(
+                            getattr(query, "outside_grid_unknown_count", 0)
+                        ),
+                        "outside_acceptance_unknown_count": int(
+                            getattr(query, "outside_acceptance_unknown_count", 0)
+                        ),
+                        "separated_dangerous_count": int(
+                            query.separated_dangerous_count
+                        ),
+                        "distance_query_count": int(query.distance_query_count),
+                        "minimum_dangerous_distance_m": (
+                            query.minimum_dangerous_distance_m
+                        ),
+                        "blocking_voxel_index": query.blocking_voxel_index,
                         "queried_count": int(query.queried_count),
                     }
                 )
                 if state == OccupancyQueryState.FREE.value and not bool(query.blocked):
                     continue
                 if state == OccupancyQueryState.OCCUPIED.value:
-                    reason = f"environment_occupancy_occupied:{sphere.geometry_name}"
+                    reason = f"environment_occupancy_occupied:{placed.geometry_name}"
                 elif state == OccupancyQueryState.UNKNOWN.value:
-                    reason = f"environment_occupancy_unknown:{sphere.geometry_name}"
+                    reason = f"environment_occupancy_unknown:{placed.geometry_name}"
                 else:
                     reason = (
-                        f"environment_occupancy_invalid_query_state:{sphere.geometry_name}:{state}"
+                        "environment_occupancy_invalid_query_state:"
+                        f"{placed.geometry_name}:{state}"
                     )
                 reasons.append(reason)
             self.assert_current_evidence(
@@ -960,14 +1046,15 @@ class OccupancyRobotCollisionChecker:
                 status=(CollisionCheckStatus.BLOCKED if reasons else CollisionCheckStatus.CLEAR),
                 blocking_reasons=tuple(reasons),
                 evidence=evidence,
-                checked_sphere_count=len(spheres),
+                checked_geometry_count=len(geometries),
                 diagnostics={
-                    "backend": "occupancy_snapshot_robot_aabb_spheres",
+                    "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
                     "occupancy_policy_contract_hash": self.policy_contract_hash,
                     "robot_motion_bound_contract_sha256": (
                         self.robot_checker.geometry_motion_bound_contract_sha256
                     ),
                     "unknown_policy": "conservative",
+                    "robot_geometry": "original_urdf_collision_stl",
                     "additional_clearance_m": self.additional_clearance_m,
                     "required_freshness_horizon_s": required_freshness_horizon_s,
                     "continuous_swept_volume_verified": False,
@@ -982,9 +1069,9 @@ class OccupancyRobotCollisionChecker:
                 status=CollisionCheckStatus.UNKNOWN,
                 blocking_reasons=(f"occupancy_checker_error:{exc}",),
                 evidence=None,
-                checked_sphere_count=0,
+                checked_geometry_count=0,
                 diagnostics={
-                    "backend": "occupancy_snapshot_robot_aabb_spheres",
+                    "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
                     "occupancy_policy_contract_hash": self.policy_contract_hash,
                     "unknown_policy": "conservative",
                     "continuous_swept_volume_verified": False,
@@ -996,9 +1083,9 @@ class OccupancyRobotCollisionChecker:
                 status=CollisionCheckStatus.UNKNOWN,
                 blocking_reasons=(f"occupancy_query_failed:{type(exc).__name__}:{exc}",),
                 evidence=None,
-                checked_sphere_count=0,
+                checked_geometry_count=0,
                 diagnostics={
-                    "backend": "occupancy_snapshot_robot_aabb_spheres",
+                    "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
                     "occupancy_policy_contract_hash": self.policy_contract_hash,
                     "unknown_policy": "conservative",
                     "continuous_swept_volume_verified": False,
@@ -1019,12 +1106,11 @@ class OccupancyRobotCollisionChecker:
     ) -> JointPathOccupancyCollisionReport:
         """Prove the robot's complete swept envelope against one immutable map.
 
-        Each STL is already over-approximated by a local-AABB sphere.  For an
-        interval, the sphere at the midpoint is enlarged by a serial-chain motion
-        upper bound, so it contains that geometry for every joint state in the
-        interval.  Known-free queries certify the whole interval.  Blocked expanded
-        queries trigger bisection; a collision is reported only with an actual-pose
-        witness, and a limit without such a witness returns ``UNKNOWN``.
+        At every midpoint the original URDF collision STL is measured directly
+        against dangerous voxel boxes with HPP-FCL.  An interval is certified only
+        when every exact separation exceeds clearance, accepted tracking uncertainty,
+        and the serial-chain displacement bound for that interval.  Otherwise it is
+        bisected; a limit without an actual-pose witness returns ``UNKNOWN``.
         """
 
         start = np.asarray(start_joint_positions_rad, dtype=np.float64)
@@ -1042,8 +1128,8 @@ class OccupancyRobotCollisionChecker:
             raise ValueError("minimum_interval_joint_span_rad must be finite and positive")
         segment_count = max(1, math.ceil(float(np.max(np.abs(end - start))) / step))
         evaluated = 0
-        checked_spheres = 0
-        expanded_queries = 0
+        checked_geometries = 0
+        distance_queries = 0
         accepted_unknown_queries = 0
         certified = 0
         deepest = 0
@@ -1057,6 +1143,9 @@ class OccupancyRobotCollisionChecker:
                 required_freshness_horizon_s=required_freshness_horizon_s,
                 verified_robot_geometry_hash=self.verified_robot_geometry_hash,
                 semantic_attestation=self.semantic_attestation,
+                allow_mapping_prefix=(
+                    self.allow_mapping_prefix_in_accepted_static_free
+                ),
             )
             self._assert_static_free_acceptance_context(bound_evidence)
             if (
@@ -1069,9 +1158,9 @@ class OccupancyRobotCollisionChecker:
                 status=CollisionCheckStatus.UNKNOWN,
                 blocking_reasons=(f"occupancy_checker_error:{exc}",),
                 evidence=None,
-                checked_sphere_count=0,
+                checked_geometry_count=0,
                 diagnostics={
-                    "backend": "occupancy_snapshot_robot_aabb_spheres",
+                    "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
                     "occupancy_policy_contract_hash": self.policy_contract_hash,
                     "continuous_swept_volume_verified": False,
                     "motion_authorized": False,
@@ -1105,7 +1194,7 @@ class OccupancyRobotCollisionChecker:
                 initial_interval_count=segment_count,
                 certified_interval_count=certified,
                 evaluated_configuration_count=evaluated,
-                expanded_sphere_query_count=expanded_queries,
+                geometry_voxel_distance_query_count=distance_queries,
                 accepted_unknown_voxel_query_count=accepted_unknown_queries,
                 deepest_subdivision=deepest,
                 termination_reason=reason,
@@ -1131,7 +1220,7 @@ class OccupancyRobotCollisionChecker:
                 status=result.status,
                 blocking_reasons=result.blocking_reasons,
                 evidence=result.evidence or bound_evidence,
-                checked_sphere_count=checked_spheres,
+                checked_geometry_count=checked_geometries,
                 diagnostics={
                     **result.diagnostics,
                     "occupancy_policy_contract_hash": self.policy_contract_hash,
@@ -1167,7 +1256,7 @@ class OccupancyRobotCollisionChecker:
             return "unknown_or_policy_block_at_pose"
 
         def evaluate_actual(fraction: float) -> OccupancyCollisionCheckResult:
-            nonlocal accepted_unknown_queries, checked_spheres, evaluated
+            nonlocal accepted_unknown_queries, checked_geometries, distance_queries, evaluated
             key = float(fraction)
             cached = checked_fractions.get(key)
             if cached is not None:
@@ -1179,7 +1268,11 @@ class OccupancyRobotCollisionChecker:
             )
             checked_fractions[key] = result
             evaluated += 1
-            checked_spheres += result.checked_sphere_count
+            checked_geometries += result.checked_geometry_count
+            distance_queries += sum(
+                int(item.get("distance_query_count", 0))
+                for item in result.diagnostics.get("queries", ())
+            )
             accepted_unknown_queries += sum(
                 int(item.get("accepted_unknown_count", 0))
                 for item in result.diagnostics.get("queries", ())
@@ -1201,9 +1294,9 @@ class OccupancyRobotCollisionChecker:
                 status=CollisionCheckStatus.CLEAR,
                 blocking_reasons=(),
                 evidence=bound_evidence,
-                checked_sphere_count=checked_spheres,
+                checked_geometry_count=checked_geometries,
                 diagnostics={
-                    "backend": "occupancy_snapshot_robot_aabb_spheres",
+                    "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
                     "occupancy_policy_contract_hash": self.policy_contract_hash,
                     "robot_motion_bound_contract_sha256": motion_bound_hash,
                     "path_semantic": evidence.method,
@@ -1239,25 +1332,27 @@ class OccupancyRobotCollisionChecker:
             upper = start + upper_fraction * (end - start)
             maximum_deviation = np.abs(upper - lower) / 2.0
             try:
-                spheres = self._robot_envelope_spheres(midpoint)
+                geometries = self._robot_collision_geometries(midpoint)
                 evaluated += 1
                 interval_clear = True
-                for sphere in spheres:
+                for placed in geometries:
                     displacement = self.robot_checker.geometry_displacement_bound_m(
-                        sphere.geometry_index,
+                        placed.geometry_index,
                         maximum_deviation,
                     )
-                    query = self._query_sphere(
+                    uncertainty = self.robot_checker.geometry_displacement_bound_m(
+                        placed.geometry_index,
+                        self.accepted_joint_uncertainty_rad,
+                    )
+                    query = self._query_robot_geometry(
                         snapshot,
-                        RobotEnvelopeSphere(
-                            geometry_name=sphere.geometry_name,
-                            center_base_m=sphere.center_base_m,
-                            radius_m=sphere.radius_m + displacement,
-                            geometry_index=sphere.geometry_index,
+                        placed,
+                        required_distance_m=(
+                            self.additional_clearance_m + uncertainty + displacement
                         ),
                     )
-                    expanded_queries += 1
-                    checked_spheres += 1
+                    distance_queries += query.distance_query_count
+                    checked_geometries += 1
                     accepted_unknown_queries += int(getattr(query, "accepted_unknown_count", 0))
                     if self._validate_query_result(query) != OccupancyQueryState.FREE.value:
                         interval_clear = False
@@ -1269,7 +1364,7 @@ class OccupancyRobotCollisionChecker:
                     status=CollisionCheckStatus.UNKNOWN,
                     blocking_reasons=(f"continuous_swept_occupancy_proof_error:{exc}",),
                     evidence=bound_evidence,
-                    checked_sphere_count=checked_spheres,
+                    checked_geometry_count=checked_geometries,
                     diagnostics={},
                 )
                 return finish(
@@ -1291,7 +1386,7 @@ class OccupancyRobotCollisionChecker:
                     status=CollisionCheckStatus.UNKNOWN,
                     blocking_reasons=("continuous_swept_occupancy_unproven:subdivision_limit",),
                     evidence=bound_evidence,
-                    checked_sphere_count=checked_spheres,
+                    checked_geometry_count=checked_geometries,
                     diagnostics={},
                 )
                 return finish(
@@ -1312,7 +1407,7 @@ class OccupancyRobotCollisionChecker:
                 status=CollisionCheckStatus.UNKNOWN,
                 blocking_reasons=(f"occupancy_checker_error:{exc}",),
                 evidence=None,
-                checked_sphere_count=checked_spheres,
+                checked_geometry_count=checked_geometries,
                 diagnostics={},
             )
             return finish(
@@ -1325,9 +1420,9 @@ class OccupancyRobotCollisionChecker:
             status=CollisionCheckStatus.CLEAR,
             blocking_reasons=(),
             evidence=bound_evidence,
-            checked_sphere_count=checked_spheres,
+            checked_geometry_count=checked_geometries,
             diagnostics={
-                "backend": "occupancy_snapshot_robot_aabb_spheres",
+                "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
                 "occupancy_policy_contract_hash": self.policy_contract_hash,
                 "robot_motion_bound_contract_sha256": motion_bound_hash,
                 "unknown_policy": "conservative",
@@ -1356,19 +1451,30 @@ class OccupancyRobotCollisionChecker:
         )
 
     @staticmethod
-    def _validate_query_result(query: SphereQueryLike) -> str:
+    def _validate_query_result(query: OccupancyGeometryQueryLike) -> str:
         accepted_unknown = int(getattr(query, "accepted_unknown_count", 0))
+        separated_dangerous = int(
+            getattr(query, "separated_dangerous_count", 0)
+        )
         counts = (
             int(query.occupied_count),
             int(query.unknown_count),
             int(query.free_count),
             accepted_unknown,
+            separated_dangerous,
             int(query.queried_count),
         )
         if any(value < 0 for value in counts):
             raise OccupancyEvidenceError("occupancy_query_has_negative_count")
-        occupied, unknown, free, accepted_unknown, queried = counts
-        if queried <= 0 or occupied + unknown + free + accepted_unknown != queried:
+        occupied, unknown, free, accepted_unknown, separated_dangerous, queried = counts
+        if queried <= 0 or (
+            occupied
+            + unknown
+            + free
+            + accepted_unknown
+            + separated_dangerous
+            != queried
+        ):
             raise OccupancyEvidenceError("occupancy_query_count_contract_invalid")
         expected_state = (
             OccupancyQueryState.OCCUPIED.value
@@ -1400,39 +1506,107 @@ class OccupancyRobotCollisionChecker:
                 "accepted_static_free_mapping_context_does_not_match_snapshot"
             )
 
-    def _query_sphere(
+    def _query_robot_geometry(
         self,
         snapshot: OccupancySnapshot,
-        sphere: RobotEnvelopeSphere,
-    ) -> SphereQueryLike:
-        if not self.accepted_static_free_aabbs:
-            return snapshot.query_sphere(
-                sphere.center_base_m,
-                sphere.radius_m,
-                unknown_is_occupied=True,
-            )
+        placed: _PlacedRobotCollisionGeometry,
+        *,
+        required_distance_m: float,
+    ) -> _RobotGeometryVoxelQuery:
+        """Measure the original collision STL against every potentially dangerous voxel."""
+
+        try:
+            import hppfcl
+        except ImportError as exc:  # pragma: no cover - Pinocchio already requires it
+            raise ImportError("hpp-fcl is required for exact STL occupancy checking") from exc
+        margin = float(required_distance_m)
+        if not math.isfinite(margin) or margin < 0.0:
+            raise ValueError("required STL-to-voxel distance must be non-negative")
+        voxel_size = float(snapshot.voxel_size_m)
+        origin = np.asarray(snapshot.origin_m, dtype=np.float64)
+        broadphase_minimum = np.asarray(
+            placed.world_aabb_minimum_m,
+            dtype=np.float64,
+        ) - margin
+        broadphase_maximum = np.asarray(
+            placed.world_aabb_maximum_m,
+            dtype=np.float64,
+        ) + margin
+        lower = np.floor((broadphase_minimum - origin) / voxel_size).astype(np.int64) - 1
+        upper = np.floor((broadphase_maximum - origin) / voxel_size).astype(np.int64) + 1
+        voxel_geometry = hppfcl.Box(voxel_size, voxel_size, voxel_size)
+        distance_request = hppfcl.DistanceRequest()
         occupied = 0
         unknown = 0
         free = 0
         accepted_unknown = 0
-        for index in sphere_intersecting_indices(
-            center_m=sphere.center_base_m,
-            radius_m=sphere.radius_m,
-            origin_m=snapshot.origin_m,
-            voxel_size_m=snapshot.voxel_size_m,
+        outside_grid_unknown = 0
+        outside_acceptance_unknown = 0
+        separated_dangerous = 0
+        distance_queries = 0
+        minimum_dangerous_distance = math.inf
+        blocking_voxel: tuple[int, int, int] | None = None
+        tolerance = 1e-9
+        for index_value in np.ndindex(
+            *(int(upper[axis] - lower[axis] + 1) for axis in range(3))
         ):
+            index = tuple(
+                int(lower[axis] + index_value[axis]) for axis in range(3)
+            )
             state = _enum_value(snapshot.state_at_index(index))
+            if state == OccupancyQueryState.FREE.value:
+                free += 1
+                continue
+            accepted = state == OccupancyQueryState.UNKNOWN.value and any(
+                region.contains_voxel(snapshot, index)
+                for region in self.accepted_static_free_aabbs
+            )
+            if accepted:
+                accepted_unknown += 1
+                continue
+            center = origin + (np.asarray(index, dtype=np.float64) + 0.5) * voxel_size
+            voxel_transform = hppfcl.Transform3f(np.eye(3), center)
+            distance_result = hppfcl.DistanceResult()
+            distance = float(
+                hppfcl.distance(
+                    placed.collision_geometry,
+                    placed.transform_base,
+                    voxel_geometry,
+                    voxel_transform,
+                    distance_request,
+                    distance_result,
+                )
+            )
+            distance_queries += 1
+            if not math.isfinite(distance):
+                raise ValueError(
+                    f"non-finite STL-to-voxel distance for {placed.geometry_name}"
+                )
+            if distance < -1e100:
+                # BVH/primitive penetration may use the lowest representable
+                # double as a collision sentinel rather than a signed depth.
+                distance = 0.0
+            minimum_dangerous_distance = min(minimum_dangerous_distance, distance)
+            if distance > margin + tolerance:
+                separated_dangerous += 1
+                continue
             if state == OccupancyQueryState.OCCUPIED.value:
                 occupied += 1
-            elif state == OccupancyQueryState.FREE.value:
-                free += 1
-            elif any(
-                region.contains_voxel(snapshot, index) for region in self.accepted_static_free_aabbs
-            ):
-                accepted_unknown += 1
             else:
                 unknown += 1
-        queried = occupied + unknown + free + accepted_unknown
+                if snapshot.index_in_bounds(index):
+                    outside_acceptance_unknown += 1
+                else:
+                    outside_grid_unknown += 1
+            if blocking_voxel is None:
+                blocking_voxel = index
+        queried = (
+            occupied
+            + unknown
+            + free
+            + accepted_unknown
+            + separated_dangerous
+        )
         state = (
             OccupancyQueryState.OCCUPIED
             if occupied
@@ -1440,21 +1614,35 @@ class OccupancyRobotCollisionChecker:
             if unknown
             else OccupancyQueryState.FREE
         )
-        return _AcceptedStaticFreeSphereQuery(
+        return _RobotGeometryVoxelQuery(
             state=state,
             blocked=bool(occupied or unknown),
             occupied_count=occupied,
             unknown_count=unknown,
             free_count=free,
             accepted_unknown_count=accepted_unknown,
+            outside_grid_unknown_count=outside_grid_unknown,
+            outside_acceptance_unknown_count=outside_acceptance_unknown,
+            separated_dangerous_count=separated_dangerous,
+            distance_query_count=distance_queries,
+            minimum_dangerous_distance_m=(
+                minimum_dangerous_distance
+                if math.isfinite(minimum_dangerous_distance)
+                else None
+            ),
+            blocking_voxel_index=blocking_voxel,
             queried_count=queried,
         )
 
-    def _robot_envelope_spheres(
+    def _robot_collision_geometries(
         self, joint_positions_rad: Sequence[float]
-    ) -> tuple[RobotEnvelopeSphere, ...]:
-        """Transform each robot STL's local-AABB sphere into ``base``."""
+    ) -> tuple[_PlacedRobotCollisionGeometry, ...]:
+        """Place the original URDF collision geometries without envelope substitution."""
 
+        try:
+            import hppfcl
+        except ImportError as exc:  # pragma: no cover - Pinocchio already requires it
+            raise ImportError("hpp-fcl is required for exact STL occupancy checking") from exc
         from biblade_fusion.robotics.pinocchio_collision import _require_pinocchio
 
         joints = self.robot_checker.pinocchio_model._to_configuration(joint_positions_rad)
@@ -1468,38 +1656,44 @@ class OccupancyRobotCollisionChecker:
             self.robot_checker.geometry_data,
         )
         ignored = set(self.ignored_geometry_names)
-        spheres: list[RobotEnvelopeSphere] = []
-        for index, geometry_object in enumerate(self.robot_checker.geometry_model.geometryObjects):
+        placed_geometries: list[_PlacedRobotCollisionGeometry] = []
+        for index, geometry_object in enumerate(
+            self.robot_checker.geometry_model.geometryObjects
+        ):
             name = str(geometry_object.name)
-            if name.startswith("environment::") or name in ignored:
+            if (
+                name.startswith("environment::")
+                or name in ignored
+                or int(geometry_object.parentJoint) == 0
+            ):
                 continue
             geometry = geometry_object.geometry
             geometry.computeLocalAABB()
-            local_center = np.asarray(geometry.aabb_center, dtype=np.float64)
-            radius = (
-                float(geometry.aabb_radius)
-                + self.additional_clearance_m
-                + self.robot_checker.geometry_displacement_bound_m(
-                    index,
-                    self.accepted_joint_uncertainty_rad,
-                )
-            )
+            local_minimum = np.asarray(geometry.aabb_local.min_, dtype=np.float64)
+            local_maximum = np.asarray(geometry.aabb_local.max_, dtype=np.float64)
+            local_center = (local_minimum + local_maximum) / 2.0
+            local_half_extents = (local_maximum - local_minimum) / 2.0
             placement = self.robot_checker.geometry_data.oMg[index]
-            center = np.asarray(placement.rotation, dtype=np.float64) @ local_center + np.asarray(
-                placement.translation, dtype=np.float64
-            )
-            if center.shape != (3,) or not np.isfinite(center).all():
-                raise ValueError(f"non-finite occupancy envelope center for {name}")
-            if not math.isfinite(radius) or radius <= 0.0:
-                raise ValueError(f"invalid occupancy envelope radius for {name}")
-            spheres.append(
-                RobotEnvelopeSphere(
+            rotation = np.asarray(placement.rotation, dtype=np.float64)
+            translation = np.asarray(placement.translation, dtype=np.float64)
+            world_center = rotation @ local_center + translation
+            world_half_extents = np.abs(rotation) @ local_half_extents
+            if not np.isfinite((world_center, world_half_extents)).all():
+                raise ValueError(f"non-finite STL placement for {name}")
+            placed_geometries.append(
+                _PlacedRobotCollisionGeometry(
                     geometry_name=name,
-                    center_base_m=tuple(float(value) for value in center),
-                    radius_m=radius,
                     geometry_index=index,
+                    collision_geometry=geometry,
+                    transform_base=hppfcl.Transform3f(rotation, translation),
+                    world_aabb_minimum_m=tuple(
+                        float(value) for value in world_center - world_half_extents
+                    ),
+                    world_aabb_maximum_m=tuple(
+                        float(value) for value in world_center + world_half_extents
+                    ),
                 )
             )
-        if not spheres:
-            raise ValueError("robot occupancy envelope contains no geometry")
-        return tuple(spheres)
+        if not placed_geometries:
+            raise ValueError("robot occupancy checker contains no collision STL geometry")
+        return tuple(placed_geometries)
