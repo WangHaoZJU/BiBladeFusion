@@ -900,15 +900,16 @@ class GuardedEliteExecutor:
         preflight: JointMotionPreflight,
         expected_occupancy: OccupancyMapEvidence,
     ) -> None:
-        """Recheck the live-start bridge and the bound linear ServoJ path.
+        """Recheck the live-start bridge into the bound linear ServoJ path.
 
         ``validate_preflight_servoj_contract`` has already reproduced the stream
         and proved that every command lies on the conservative linear path from
         the preflight start to goal.  Re-running continuous collision proofs for
-        every 4 ms command adds no geometric coverage and can consume the entire
-        one-shot permit before controller enable.  The two segments below cover
-        the only paths that can actually be executed: the live-state correction
-        to the reproduced first command, and that command to the reproduced goal.
+        every 4 ms command or the already-proved full path adds no geometric
+        coverage and can consume the entire one-shot permit before controller
+        enable.  Only the live-state correction into the reproduced first command
+        is new geometry; the immutable preflight proof covers that command through
+        the reproduced goal.
         """
 
         try:
@@ -935,7 +936,6 @@ class GuardedEliteExecutor:
         chain = (
             tuple(float(value) for value in np.asarray(live_start, dtype=np.float64)),
             stream.commands[0],
-            stream.commands[-1],
         )
         freshness_horizon = self._required_freshness_horizon_s(preflight)
         for segment_index, (start, goal) in enumerate(zip(chain[:-1], chain[1:], strict=True)):

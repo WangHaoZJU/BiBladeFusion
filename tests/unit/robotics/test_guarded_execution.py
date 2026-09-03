@@ -408,16 +408,12 @@ def test_execute_revalidation_is_bounded_by_geometric_legs_not_servoj_ticks(
 
     assert clear_preflight.servoj_stream is not None
     assert len(clear_preflight.servoj_stream.commands) > 2
-    # Before enable, after enable, and after control recovery: two geometric
-    # legs each, independent of the number of 4 ms ServoJ commands.
-    assert len(mesh_calls) == 6
-    assert len(occupancy_calls) == 6
+    # Before enable, after enable, and after control recovery: only the live-start
+    # bridge is new geometry, independent of the number of 4 ms ServoJ commands.
+    assert len(mesh_calls) == 3
+    assert len(occupancy_calls) == 3
     assert all(
         calls[0][1] == clear_preflight.start_joint_positions_rad
-        for calls in (mesh_calls, occupancy_calls)
-    )
-    assert all(
-        calls[1][1] == clear_preflight.goal_joint_positions_rad
         for calls in (mesh_calls, occupancy_calls)
     )
 

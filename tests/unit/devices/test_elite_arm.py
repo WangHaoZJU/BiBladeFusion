@@ -564,6 +564,16 @@ def test_guarded_enable_requires_capability_and_preserves_stop_latch() -> None:
     assert [name for name, _ in sdk.driver.calls] == ["writeIdle"]
 
 
+def test_stop_requests_reverse_idle_and_dashboard_program_stop() -> None:
+    arm, sdk = enabled_arm()
+
+    arm.stop()
+
+    assert [name for name, _ in sdk.driver.calls] == ["writeIdle"]
+    assert ("stopProgram", None) in sdk.dashboard.calls
+    assert arm.stop_snapshot[1] is True
+
+
 def test_stop_between_power_on_and_brake_release_forces_power_off() -> None:
     arm, sdk = connected_arm()
     arm.stop()
