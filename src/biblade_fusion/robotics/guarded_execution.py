@@ -933,10 +933,17 @@ class GuardedEliteExecutor:
             or metadata_sha256 != self._occupancy_checker.motion_envelope_metadata_sha256
         ):
             raise RobotCommandError("motion preflight envelope differs from executor")
-        chain = (
-            tuple(float(value) for value in np.asarray(live_start, dtype=np.float64)),
-            stream.commands[0],
+        live_start_tuple = tuple(
+            float(value) for value in np.asarray(live_start, dtype=np.float64)
         )
+        if np.all(
+            np.abs(np.asarray(live_start_tuple) - np.asarray(stream.commands[0]))
+            <= np.asarray(uncertainty)
+        ):
+            # The accepted robust swept-volume proof already covers this exact
+            # live start; recomputing even a zero-length bridge is redundant.
+            return
+        chain = (live_start_tuple, stream.commands[0])
         freshness_horizon = self._required_freshness_horizon_s(preflight)
         for segment_index, (start, goal) in enumerate(zip(chain[:-1], chain[1:], strict=True)):
             live_collision = self._collision_checker.check_path(

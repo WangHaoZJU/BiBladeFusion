@@ -396,7 +396,10 @@ def test_execute_revalidation_is_bounded_by_geometric_legs_not_servoj_ticks(
         "check_path",
         counted_occupancy_check,
     )
-    arm = FakeGuardedArm(enabled=False)
+    arm = FakeGuardedArm(
+        joint_positions_rad=np.full(6, 0.002),
+        enabled=False,
+    )
     executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
     permit = executor.authorize(
         clear_preflight,
@@ -416,6 +419,31 @@ def test_execute_revalidation_is_bounded_by_geometric_legs_not_servoj_ticks(
         calls[0][1] == clear_preflight.start_joint_positions_rad
         for calls in (mesh_calls, occupancy_calls)
     )
+
+
+def test_execute_reuses_robust_proof_when_live_start_is_inside_envelope(
+    checker,
+    occupancy_checker,
+    clear_preflight,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_recomputation(*_args, **_kwargs):
+        pytest.fail("in-envelope live start must reuse the bound robust path proof")
+
+    monkeypatch.setattr(_SyntheticSweptEs68Checker, "check_path", unexpected_recomputation)
+    monkeypatch.setattr(type(occupancy_checker), "check_path", unexpected_recomputation)
+    arm = FakeGuardedArm(enabled=False)
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    result = executor.execute(clear_preflight, permit)
+
+    assert result.ok is True
+    assert arm.guarded_enable_calls == 1
 
 
 def test_execute_stops_arm_when_driver_prepare_raises(
