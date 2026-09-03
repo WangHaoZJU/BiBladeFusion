@@ -3138,8 +3138,8 @@ def safety_record_static_free_acceptance(
     try:
         from biblade_fusion.robotics import (
             AcceptedStaticFreeAabb,
-            Cs68PinocchioCollisionChecker,
             Es68D435iCollisionResources,
+            Es68PinocchioCollisionChecker,
         )
         from biblade_fusion.storage import write_static_free_acceptance
 
@@ -3176,7 +3176,7 @@ def safety_record_static_free_acceptance(
         )
         if len(regions) != len(raw_regions):
             raise ValueError("Every accepted static-free region must be an object")
-        checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+        checker = Es68PinocchioCollisionChecker.from_es68_resources(
             Es68D435iCollisionResources.packaged_template(),
             joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
             environment_obstacles=settings.collision.obstacles,
@@ -3223,8 +3223,8 @@ def safety_record_motion_envelope_acceptance(
 
     try:
         from biblade_fusion.robotics import (
-            Cs68PinocchioCollisionChecker,
             Es68D435iCollisionResources,
+            Es68PinocchioCollisionChecker,
         )
         from biblade_fusion.storage import (
             motion_control_contract_for_settings,
@@ -3257,7 +3257,7 @@ def safety_record_motion_envelope_acceptance(
             raise ValueError(
                 "Motion-envelope declaration fields must be exactly: " + ", ".join(sorted(expected))
             )
-        checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+        checker = Es68PinocchioCollisionChecker.from_es68_resources(
             Es68D435iCollisionResources.packaged_template(),
             joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
             environment_obstacles=settings.collision.obstacles,

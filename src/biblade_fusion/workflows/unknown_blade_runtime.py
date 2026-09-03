@@ -52,6 +52,7 @@ from biblade_fusion.robotics import (
     Cs68PinocchioCollisionChecker,
     Es68D435iCollisionResources,
     Es68KinematicModel,
+    Es68PinocchioCollisionChecker,
     wait_until_bootstrap_safe_state,
     wait_until_settled,
 )
@@ -1607,7 +1608,7 @@ def unknown_blade_runtime_readiness(
         missing.append("motion_preflight.motion_envelope_acceptance")
     else:
         try:
-            checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+            checker = Es68PinocchioCollisionChecker.from_es68_resources(
                 Es68D435iCollisionResources.packaged_template(),
                 joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
                 environment_obstacles=settings.collision.obstacles,
@@ -1960,7 +1961,7 @@ def open_production_unknown_blade_runtime(
     hand_eye = load_hand_eye_calibration(settings.hand_eye)
     hand_eye.require_flange_primary()
     resources = Es68D435iCollisionResources.packaged_template()
-    collision_checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+    collision_checker = Es68PinocchioCollisionChecker.from_es68_resources(
         resources,
         joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
         environment_obstacles=settings.collision.obstacles,

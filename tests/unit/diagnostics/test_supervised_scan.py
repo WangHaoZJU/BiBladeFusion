@@ -100,7 +100,7 @@ def test_collision_backend_audit_checks_both_real_backend_contracts(monkeypatch)
     )
     monkeypatch.setattr(
         supervised_scan,
-        "Cs68PinocchioCollisionChecker",
+        "Es68PinocchioCollisionChecker",
         FakeMeshChecker,
     )
     monkeypatch.setattr(

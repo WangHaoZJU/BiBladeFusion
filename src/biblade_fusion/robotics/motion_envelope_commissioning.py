@@ -35,7 +35,10 @@ from biblade_fusion.robotics.motion_preflight import (
     MotionPreflightStatus,
     preflight_linear_joint_motion,
 )
-from biblade_fusion.robotics.pinocchio_collision import Cs68PinocchioCollisionChecker
+from biblade_fusion.robotics.pinocchio_collision import (
+    Cs68PinocchioCollisionChecker,
+    Es68PinocchioCollisionChecker,
+)
 from biblade_fusion.storage.motion_envelope_commissioning import (
     MAXIMUM_COMMISSIONING_CANDIDATE_JOINT_DELTA_RAD,
     StoredCommissioningTrialCandidate,
@@ -282,7 +285,7 @@ def prepare_motion_envelope_commissioning_trial(
         or candidate.blocking_reasons
     ):
         raise ValueError("commissioning candidate is not bounded and continuously mesh-clear")
-    checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+    checker = Es68PinocchioCollisionChecker.from_es68_resources(
         Es68D435iCollisionResources.packaged_template(),
         joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
         environment_obstacles=settings.collision.obstacles,

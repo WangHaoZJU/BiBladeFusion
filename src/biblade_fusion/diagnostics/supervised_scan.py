@@ -18,8 +18,8 @@ from biblade_fusion.diagnostics.types import CheckLevel, CheckResult
 from biblade_fusion.perception.stereo import run_foundation_stereo_doctor
 from biblade_fusion.robotics import (
     AcceptedStaticFreeAabb,
-    Cs68PinocchioCollisionChecker,
     Es68D435iCollisionResources,
+    Es68PinocchioCollisionChecker,
     OccupancyRobotCollisionChecker,
 )
 from biblade_fusion.storage import (
@@ -189,7 +189,7 @@ def _static_free_acceptance_check(settings: AppSettings) -> CheckResult:
         )
     try:
         resources = Es68D435iCollisionResources.packaged_template()
-        checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+        checker = Es68PinocchioCollisionChecker.from_es68_resources(
             resources,
             joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
             environment_obstacles=settings.collision.obstacles,
@@ -282,7 +282,7 @@ def _collision_backend_check(settings: AppSettings) -> CheckResult:
     try:
         resources = Es68D435iCollisionResources.packaged_template()
         template = resources.load_active()
-        checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+        checker = Es68PinocchioCollisionChecker.from_es68_resources(
             resources,
             joint_zero_offsets_rad=settings.kinematics.joint_zero_offsets_rad,
             environment_obstacles=settings.collision.obstacles,

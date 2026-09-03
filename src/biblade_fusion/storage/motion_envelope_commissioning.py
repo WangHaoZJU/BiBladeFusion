@@ -17,8 +17,8 @@ import numpy as np
 from biblade_fusion.core.settings import CollisionConfig, MotionPreflightConfig
 from biblade_fusion.planning import CandidateStatus
 from biblade_fusion.robotics import (
-    Cs68PinocchioCollisionChecker,
     Es68D435iCollisionResources,
+    Es68PinocchioCollisionChecker,
     preflight_linear_joint_motion,
 )
 from biblade_fusion.storage.initialization import read_initialization
@@ -214,7 +214,7 @@ def _derive_candidate(
     ):
         raise ValueError("Commissioning start session differs from occupancy provenance")
 
-    checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+    checker = Es68PinocchioCollisionChecker.from_es68_resources(
         Es68D435iCollisionResources.packaged_template(),
         joint_zero_offsets_rad=joint_zero_offsets_rad,
         environment_obstacles=collision_config.obstacles,

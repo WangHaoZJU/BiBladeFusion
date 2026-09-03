@@ -1880,7 +1880,7 @@ def test_experimental_open_keeps_science_authority_and_settings_unbound(
         lambda: object(),
     )
     monkeypatch.setattr(
-        runtime_module.Cs68PinocchioCollisionChecker,
+        runtime_module.Es68PinocchioCollisionChecker,
         "from_es68_resources",
         lambda *_args, **_kwargs: checker,
     )
@@ -2316,7 +2316,7 @@ def test_unknown_runtime_experimental_scope_skips_only_release_acceptance(
         lambda _settings, _checker: (object(), "control-hash"),
     )
     monkeypatch.setattr(
-        runtime_module.Cs68PinocchioCollisionChecker,
+        runtime_module.Es68PinocchioCollisionChecker,
         "from_es68_resources",
         lambda *_args, **_kwargs: object(),
     )

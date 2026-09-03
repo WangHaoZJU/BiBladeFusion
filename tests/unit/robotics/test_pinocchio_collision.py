@@ -228,7 +228,7 @@ def test_environment_pair_bound_retains_absolute_robot_motion() -> None:
 
 
 def test_tracking_error_box_is_subdivided_instead_of_becoming_a_fixed_floor() -> None:
-    checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+    checker = Es68PinocchioCollisionChecker.from_es68_resources(
         Es68D435iCollisionResources.packaged_template(),
         minimum_clearance_m=0.01,
     )
@@ -266,7 +266,7 @@ def test_tracking_error_box_is_subdivided_instead_of_becoming_a_fixed_floor() ->
 
 
 def test_pinocchio_swept_proof_limit_returns_unknown_not_sampled_clear() -> None:
-    checker = Cs68PinocchioCollisionChecker.from_es68_resources(
+    checker = Es68PinocchioCollisionChecker.from_es68_resources(
         Es68D435iCollisionResources.packaged_template(),
         minimum_clearance_m=0.01,
     )
