@@ -62,6 +62,12 @@ fin-side tilt are search variables. The original `+-15 degree` fin probes are us
 directions, not hard requirements. A candidate can move farther, nearer, or to another
 incidence angle when that improves reachability or measurement value.
 
+Opposing fin evidence constrains the sign of the view component across a fin; it does not
+require a geometrically symmetric camera pair. The candidate family may add a shared
+tangential bias so the arm can observe both fin faces from asymmetric but informative
+poses. Runtime IK reuses the same Pinocchio/URDF kinematic model already loaded for the
+ES68 collision assembly and the bounded neighboring-seed pattern proven in HoloRobot.
+
 There is no scientific reason to prescribe one narrow standoff interval when the actual
 requirements are stereo depth validity, sufficient projected support, collision-free
 geometry, and a solvable robot posture.

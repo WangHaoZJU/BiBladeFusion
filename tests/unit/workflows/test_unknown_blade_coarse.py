@@ -175,7 +175,7 @@ def test_adaptive_fin_discovery_keeps_opposing_semantics_without_locking_tilt() 
     assert len(result.adaptive_searches) == 8
     assert len(result.endpoint_feasible) == 8
     assert all(
-        item.candidate.view_id.endswith("_adaptive_0003")
+        item.candidate.view_id.endswith("_adaptive_0000")
         for item in result.endpoint_feasible
     )
     assert all(
@@ -186,6 +186,37 @@ def test_adaptive_fin_discovery_keeps_opposing_semantics_without_locking_tilt() 
     for side in (coarse_module.BladeSide.FRONT, coarse_module.BladeSide.BACK):
         assert len(coarse_module._paired_discovery_ids(result, side)) == 2  # noqa: SLF001
     assert result.motion_authorized is False
+
+
+def test_fin_discovery_azimuth_search_adds_asymmetric_common_bias() -> None:
+    baseline = generate_fin_discovery_plan(
+        _proxy(),
+        (0.30, 0.20),
+        ViewPlanningConfig(standoff_distance_m=0.30),
+        ViewFilterConfig(
+            workspace=AxisAlignedBoxConfig(
+                name="cell",
+                minimum_m=(-1.0, -1.0, -1.0),
+                maximum_m=(1.0, 1.0, 1.0),
+            ),
+            camera_clearance_radius_m=0.01,
+            minimum_incidence_cosine=0.4,
+        ),
+        CoarseSciencePolicy(),
+        _Reachable(),
+    ).filtered.candidates[0].candidate
+
+    nominal = coarse_module._fin_discovery_azimuth_deg(baseline)  # noqa: SLF001
+    samples = coarse_module._fin_discovery_azimuth_samples_deg(  # noqa: SLF001
+        baseline,
+        (0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0),
+    )
+    offsets = tuple(
+        round((value - nominal + 180.0) % 360.0 - 180.0, 1)
+        for value in samples
+    )
+
+    assert offsets == (0.0, -67.5, 67.5, -45.0, 45.0, -22.5, 22.5)
 
 
 def test_single_initial_view_gain_selects_the_unseen_back_side(

@@ -2017,6 +2017,7 @@ def open_production_unknown_blade_runtime(
             hand_eye,
             state.joint_positions_rad,
             settings.kinematics,
+            pinocchio_model=collision_checker.pinocchio_model,
         )
         coarse_session = CoarseScienceSession(
             settings=coarse_settings,

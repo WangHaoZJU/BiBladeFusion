@@ -207,7 +207,7 @@ def evaluate_multi_seed_ik(
         )
         result = ReachabilityResult(
             ReachabilityState.REACHABLE,
-            f"{len(solutions)} IK solution(s) found across {len(checkers)} seed(s); "
+            f"{len(solutions)} IK solution(s) found from {len(checkers)} checker(s); "
             "collision and trajectory remain unchecked",
             solutions[chosen],
         )
@@ -220,7 +220,7 @@ def evaluate_multi_seed_ik(
     )
     result = ReachabilityResult(
         state,
-        f"no IK solution found across {len(checkers)} seed(s): " + " | ".join(messages),
+        f"no IK solution found from {len(checkers)} checker(s): " + " | ".join(messages),
     )
     return MultiSeedIkEvaluation(result, (), None, messages)
 
@@ -319,7 +319,6 @@ def generate_adaptive_candidate_family(
     tangent_x, tangent_y = _tangent_basis(nominal)
     distances = _distance_samples(nominal.standoff_distance_m, config)
     family = []
-    sequence_index = 0
     if config.sampling_order == "tilt_major":
         parameter_order = (
             (tilt, distance_index, distance)
@@ -341,30 +340,53 @@ def generate_adaptive_candidate_family(
         azimuths = (0.0,) if tilt == 0.0 else config.azimuth_samples_deg
         for azimuth in azimuths:
             directional_parameters.append((tilt, distance_index, distance, azimuth))
-    for roll in config.roll_samples_deg:
-        for tilt, distance_index, distance, azimuth in directional_parameters:
-            parameters = CandidatePoseParameters(
-                distance,
-                tilt,
-                azimuth,
-                roll,
-                distance_index,
-            )
-            family.append(
-                (
+    # Fin discovery is wrist-orientation sensitive: at the nominal distance its
+    # bounded first pass must cover every requested tilt *and* roll before it
+    # spends the remaining budget on distance expansion.  The former global
+    # roll-major order could consume all 32 IK attempts at roll=0 and then claim
+    # that an "angle/distance/roll" family was unreachable without trying a
+    # single alternate wrist roll.  Ordinary surface families retain their
+    # direction-first breadth because they also carry many azimuth samples.
+    if config.ranking_mode == "fin_discovery":
+        ordered_parameters = (
+            (tilt, distance_index, distance, azimuth, roll)
+            for tilt, distance_index, distance, azimuth in directional_parameters
+            for roll in config.roll_samples_deg
+        )
+    else:
+        ordered_parameters = (
+            (tilt, distance_index, distance, azimuth, roll)
+            for roll in config.roll_samples_deg
+            for tilt, distance_index, distance, azimuth in directional_parameters
+        )
+    for sequence_index, (
+        tilt,
+        distance_index,
+        distance,
+        azimuth,
+        roll,
+    ) in enumerate(ordered_parameters):
+        parameters = CandidatePoseParameters(
+            distance,
+            tilt,
+            azimuth,
+            roll,
+            distance_index,
+        )
+        family.append(
+            (
+                parameters,
+                _candidate_from_parameters(
+                    nominal,
                     parameters,
-                    _candidate_from_parameters(
-                        nominal,
-                        parameters,
-                        tangent_x,
-                        tangent_y,
-                        sequence_index,
-                    ),
-                )
+                    tangent_x,
+                    tangent_y,
+                    sequence_index,
+                ),
             )
-            sequence_index += 1
-            if len(family) >= config.maximum_generated_candidates:
-                return tuple(family)
+        )
+        if len(family) >= config.maximum_generated_candidates:
+            return tuple(family)
     return tuple(family)
 
 

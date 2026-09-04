@@ -191,6 +191,41 @@ def test_fin_search_samples_every_tilt_at_nominal_distance_and_prefers_45_deg() 
     assert result.recommended.parameters.tilt_deg == 45.0
 
 
+def test_fin_search_covers_wrist_rolls_before_distance_expansion() -> None:
+    config = AdaptiveViewSearchConfig(
+        maximum_distance_expansions=1,
+        tilt_samples_deg=(15.0, 45.0),
+        azimuth_samples_deg=(90.0,),
+        roll_samples_deg=(0.0, 45.0, -45.0, 90.0),
+        maximum_ik_feasible_candidates=8,
+        maximum_ik_attempts_per_family=8,
+        sampling_order="distance_major",
+        ranking_mode="fin_discovery",
+        require_attempted_per_tilt=True,
+    )
+
+    result = search_adaptive_candidate_family(
+        make_nominal(),
+        make_proxy(),
+        wide_workspace_filter(minimum_incidence_cosine=0.4),
+        (FixedChecker(np.zeros(6)),),
+        np.zeros(6),
+        config,
+    )
+
+    assert [item.parameters.distance_m for item in result.attempts] == [0.30] * 8
+    assert [item.parameters.roll_deg for item in result.attempts] == [
+        0.0,
+        45.0,
+        -45.0,
+        90.0,
+        0.0,
+        45.0,
+        -45.0,
+        90.0,
+    ]
+
+
 def test_report_is_json_serializable_and_explicitly_non_executable() -> None:
     config = AdaptiveViewSearchConfig(
         maximum_distance_expansions=0,

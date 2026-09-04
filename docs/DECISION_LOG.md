@@ -244,3 +244,28 @@ The D013 solver contract remains, but its finite-difference Jacobian is replaced
 analytic world geometric Jacobian derived from the calibrated fixed-MDH chain. This removes
 six FK perturbations per iteration while retaining DLS, joint limits, multiple seeds,
 nearest equivalent joint wrapping, FK replay, and bounded search time.
+
+## D020 — Runtime candidate IK and fin discovery use the shared Pinocchio model
+
+Date: 2026-09-04
+
+Status: accepted; offline real-data replay verified, physical verification pending
+
+The 2026-09-04 09:56 physical attempt completed the first capture and FoundationStereo
+stage but rejected every symmetric back-side fin pair before motion. Its diagnostic also
+mislabelled one composite IK checker as one seed. The runtime now reuses the already loaded
+collision URDF's Pinocchio kinematic model, following HoloRobot's current preferred
+URDF/Pinocchio IK backend and its bounded near-pose seed perturbations. The analytic MDH
+solver remains an offline fallback when a shared Pinocchio model is unavailable.
+
+An opposing fin pair constrains the sign of the fin-axis component; it does not require
+two camera positions symmetric about that axis. Candidate azimuth now searches the signed
+open half-plane, including common tangential bias, while distance, incidence and wrist
+roll remain variables. The first bounded pass ranks the 45-degree information optimum
+before lower-value tilts and interleaves wrist rolls. No IK, workspace, collision, or
+continuous-path gate is relaxed.
+
+Replay of the synchronized attempt-09 proxy changed back-side pair availability from zero
+to one complete pair. With the production Pinocchio checker, fin-discovery planning took
+about 1.17 seconds, excluding the Pinocchio model load already paid by runtime collision
+construction.

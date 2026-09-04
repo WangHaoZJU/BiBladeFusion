@@ -539,6 +539,45 @@ def _fin_discovery_azimuth_deg(candidate: CandidateView) -> float:
     return float(degrees(atan2(float(tangent @ tangent_y), float(tangent @ tangent_x))) % 360.0)
 
 
+def _fin_discovery_azimuth_samples_deg(
+    candidate: CandidateView,
+    configured_samples_deg: tuple[float, ...],
+) -> tuple[float, ...]:
+    """Search the signed fin half-plane, including HoloRobot-style common bias."""
+
+    nominal = _fin_discovery_azimuth_deg(candidate)
+    configured = tuple(float(value) % 360.0 for value in configured_samples_deg)
+    ordered = tuple(sorted(set(configured)))
+    midpoints = tuple(
+        (first + ((second - first) % 360.0) / 2.0) % 360.0
+        for first, second in zip(ordered, (*ordered[1:], ordered[0]), strict=True)
+    )
+    available = {nominal, *configured, *midpoints}
+
+    def signed_offset(value: float) -> float:
+        return (value - nominal + 180.0) % 360.0 - 180.0
+
+    # A strict open half-plane retains the requested negative/positive fin-face
+    # identity.  Within it, try the nominal direction first and then the largest
+    # common tangential biases: those asymmetric look-at poses are what lets a
+    # wrist-limited arm observe opposing fin faces without demanding a symmetric
+    # pair of camera positions.
+    valid = tuple(
+        value for value in available if abs(signed_offset(value)) < 90.0 - 1e-9
+    )
+    return tuple(
+        sorted(
+            valid,
+            key=lambda value: (
+                0 if abs(signed_offset(value)) <= 1e-9 else 1,
+                -abs(signed_offset(value)),
+                signed_offset(value) > 0.0,
+                value,
+            ),
+        )
+    )
+
+
 def _fin_discovery_search_config(
     candidate: CandidateView,
     planning_config: ViewPlanningConfig,
@@ -552,13 +591,24 @@ def _fin_discovery_search_config(
         for value in policy.discovery_tilt_samples_deg
         if not np.isclose(value, policy.discovery_tilt_deg, rtol=0.0, atol=1e-12)
     )
+    # Rank useful incidence first.  sin(t)*cos(t), also used by the science
+    # ranking, peaks at 45 degrees; +/-15 degrees remains a seed, not a gate.
+    tilts.sort(
+        key=lambda value: (
+            -(sin(radians(value)) * cos(radians(value))),
+            value,
+        )
+    )
     return AdaptiveViewSearchConfig(
         minimum_optical_distance_m=point_cloud_config.minimum_depth_m,
         maximum_optical_distance_m=point_cloud_config.maximum_depth_m,
         distance_step_m=adaptive.distance_step_m,
         maximum_distance_expansions=adaptive.maximum_distance_expansions,
         tilt_samples_deg=tuple(tilts),
-        azimuth_samples_deg=(_fin_discovery_azimuth_deg(candidate),),
+        azimuth_samples_deg=_fin_discovery_azimuth_samples_deg(
+            candidate,
+            adaptive.azimuth_samples_deg,
+        ),
         roll_samples_deg=adaptive.roll_samples_deg,
         maximum_generated_candidates=adaptive.maximum_generated_candidates,
         # Each nominal discovery family contributes one endpoint to the global
@@ -572,7 +622,7 @@ def _fin_discovery_search_config(
         maximum_search_duration_s=adaptive.maximum_search_duration_s,
         sampling_order="distance_major",
         ranking_mode="fin_discovery",
-        require_attempted_per_tilt=True,
+        require_attempted_per_tilt=False,
     )
 
 
@@ -1201,9 +1251,23 @@ def _missing_discovery_pair_error(
         if adaptive
         else "change blade placement, or add a measured paired_fin_discovery_fallbacks entry"
     )
+    attempt_summary = f"tested {len(candidates)} semantic endpoints"
+    if adaptive:
+        traces = tuple(
+            trace.result
+            for trace in discovery.adaptive_searches
+            if trace.result.nominal_view_id.startswith(f"{side.value}_fin_discovery_")
+        )
+        attempts = tuple(attempt for trace in traces for attempt in trace.attempts)
+        rolls = sorted({attempt.parameters.roll_deg for attempt in attempts})
+        azimuths = sorted({round(attempt.parameters.azimuth_deg, 6) for attempt in attempts})
+        attempt_summary += (
+            f" backed by {len(attempts)} pose samples across {len(traces)} families; "
+            f"rolls={rolls}, azimuth_count={len(azimuths)}"
+        )
     return UnknownBladeCoarseError(
         f"No endpoint-feasible opposing fin-discovery pair exists on {side.value} "
-        f"after {evaluation}; tested {len(candidates)} endpoints; "
+        f"after {evaluation}; {attempt_summary}; "
         f"rejections: {reason_summary}. Automatic motion remains disabled. Start a new "
         f"attempt after you {recovery}; do not bypass IK or collision checks."
     )

@@ -163,8 +163,10 @@ to the blade measurement objective:
   0.02 rad segment setting no longer creates repeated inference/map cycles;
 - every bounded science-ranked endpoint receives the same hard swept-path veto instead
   of stopping after a configured top three;
-- IK searches distance and incidence before roll, uses an analytic MDH Jacobian, and is
-  bounded to 32 attempts / 1.5 s per family by default;
+- runtime IK reuses the collision URDF's HoloRobot Pinocchio model and bounded neighboring
+  seeds; analytic MDH remains the offline fallback;
+- fin discovery searches signed asymmetric common-bias azimuths and interleaved wrist
+  rolls, and remains bounded to 32 attempts / 1.5 s per family by default;
 - appended occupancy sources reuse their already verified update prefix, and live
   persistence avoids immediate same-process ray replay while retaining strict disk replay;
 - projected blade foreground uses a per-pixel reference depth band and the accepted blade

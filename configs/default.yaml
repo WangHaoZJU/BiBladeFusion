@@ -460,8 +460,8 @@ science_acceptance:
 # defaults exactly mirror CoarseSciencePolicy; production code must consume this
 # configuration rather than instantiate an independent implicit policy.
 coarse_science:
-  # 15 deg is only the first inexpensive probe. Adaptive discovery may select
-  # either a smaller or larger opposing angle for each fin face independently.
+  # 15 deg is a seed, not a hard or first probe. Adaptive discovery information-ranks
+  # incidence and may select a smaller or larger angle for each fin face independently.
   discovery_tilt_deg: 15.0
   discovery_tilt_samples_deg: [10.0, 20.0, 30.0, 45.0, 60.0]
   # Single-initial-view coarse NBV: proxy coverage, missing blade side and

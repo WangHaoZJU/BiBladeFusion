@@ -201,9 +201,10 @@ Keep a hand on the physical emergency stop. Abort on unexpected physical motion,
 pull, loss of visibility, or approach to the blade/fixture that disagrees with the
 displayed plan.
 
-The normal online path now uses HoloRobot MDH/DLS IK and should not emit repeated vendor
-KDL warnings. KDL output is expected only from an explicitly requested historical
-reproduction path.
+The normal online path now reuses the already loaded HoloRobot Pinocchio/URDF model for
+IK and should not emit repeated vendor KDL warnings. It searches bounded neighboring
+joint seeds and asymmetric signed-half-plane fin poses; KDL output is expected only from
+an explicitly requested historical reproduction path.
 
 For the first post-fix run, observe the reverse-port lines after approval. There should
 be one group of ports 50002/50003/50004 connecting before the stream. Normal segment

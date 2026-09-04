@@ -10,10 +10,13 @@ from biblade_fusion.planning import EliteCs68IkChecker, ReachabilityState
 from biblade_fusion.planning.collision import cs68_mdh_joint_origins
 from biblade_fusion.planning.elite_ik import (
     _forward_pose_and_jacobian,
+    _holorobot_near_seed_perturbations,
     _HoloRobotMdhIkSolver,
+    _HoloRobotPinocchioIkSolver,
     _so3_error,
 )
-from biblade_fusion.robotics import load_es68_flange_t_tcp
+from biblade_fusion.robotics import Cs68ModelResources, load_es68_flange_t_tcp
+from biblade_fusion.robotics.pinocchio_collision import PinocchioCs68Model
 
 
 class FakeSolver:
@@ -143,7 +146,7 @@ def test_default_elite_ik_uses_holorobot_mdh_solver_without_sdk_plugin() -> None
     result = ik.check(camera_pose)
 
     assert result.state is ReachabilityState.REACHABLE
-    assert "HoloRobot MDH" in result.message
+    assert "HoloRobot analytic MDH" in result.message
     np.testing.assert_allclose(result.joint_positions_rad, joints, atol=1e-12)
     assert ik._loader is None
 
@@ -187,3 +190,34 @@ def test_holorobot_mdh_solver_reproduces_a_known_reachable_pose() -> None:
     reproduced, _ = _forward_pose_and_jacobian(model, solution)
     np.testing.assert_allclose(reproduced.translation_m, target.translation_m, atol=1e-4)
     assert np.linalg.norm(_so3_error(target.rotation, reproduced.rotation)) < 1e-3
+
+
+def test_holorobot_near_seed_sweep_matches_active_mapping_pattern() -> None:
+    seed = np.arange(6, dtype=np.float64)
+
+    candidates = _holorobot_near_seed_perturbations(seed)
+
+    assert len(candidates) == 12
+    np.testing.assert_allclose(candidates[0] - seed, [0.12, 0, 0, 0, 0, 0])
+    np.testing.assert_allclose(candidates[1] - seed, [-0.12, 0, 0, 0, 0, 0])
+    np.testing.assert_allclose(candidates[-1] - seed, [-0.06, 0, 0, -0.12, 0, 0])
+
+
+def test_holorobot_pinocchio_solver_reproduces_reachable_urdf_pose() -> None:
+    pinocchio_model = PinocchioCs68Model.from_urdf(
+        Cs68ModelResources.packaged().urdf_path
+    )
+    expected = np.array([0.2, -1.1, 1.0, -0.8, 0.4, 0.15])
+    target = PoseSE3("base", "flange", pinocchio_model.forward_kinematics(expected))
+
+    solution = _HoloRobotPinocchioIkSolver(pinocchio_model).solve(
+        target,
+        expected + np.array([0.05, -0.04, 0.03, -0.02, 0.01, -0.05]),
+    )
+
+    assert solution is not None
+    np.testing.assert_allclose(
+        pinocchio_model.forward_kinematics(solution),
+        target.matrix,
+        atol=1e-3,
+    )

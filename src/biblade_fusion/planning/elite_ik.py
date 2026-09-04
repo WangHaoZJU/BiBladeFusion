@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,31 @@ _HOLOROBOT_IK_PRESET_SEEDS: tuple[tuple[float, ...], ...] = (
     (0.1, -0.2, 0.3, -0.4, 0.5, -0.6),
     (0.0, -1.0, 1.0, -1.0, 0.0, 0.0),
 )
+
+
+def _holorobot_near_seed_perturbations(
+    seed: NDArray[np.float64],
+    magnitude_rad: float = 0.12,
+) -> tuple[NDArray[np.float64], ...]:
+    """Copy HoloRobot active-mapping's bounded nearby-seed sweep."""
+
+    magnitude = abs(float(magnitude_rad))
+    half = magnitude * 0.5
+    deltas = (
+        (magnitude, 0.0, 0.0, 0.0, 0.0, 0.0),
+        (-magnitude, 0.0, 0.0, 0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, magnitude, 0.0, 0.0),
+        (0.0, 0.0, 0.0, -magnitude, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 0.0, magnitude, 0.0),
+        (0.0, 0.0, 0.0, 0.0, -magnitude, 0.0),
+        (half, 0.0, 0.0, 0.0, magnitude, 0.0),
+        (-half, 0.0, 0.0, 0.0, magnitude, 0.0),
+        (half, 0.0, 0.0, 0.0, -magnitude, 0.0),
+        (-half, 0.0, 0.0, 0.0, -magnitude, 0.0),
+        (half, 0.0, 0.0, magnitude, 0.0, 0.0),
+        (-half, 0.0, 0.0, -magnitude, 0.0, 0.0),
+    )
+    return tuple(seed + np.asarray(delta, dtype=np.float64) for delta in deltas)
 
 _JOINT_AXIS_Z = np.array((0.0, 0.0, 1.0), dtype=np.float64)
 
@@ -176,7 +202,11 @@ class _HoloRobotMdhIkSolver:
         if cached is not None:
             self._cache.move_to_end(key)
             return cached
-        candidates = (seed, *(_joint_seed(value) for value in _HOLOROBOT_IK_PRESET_SEEDS))
+        candidates = (
+            seed,
+            *_holorobot_near_seed_perturbations(seed),
+            *(_joint_seed(value) for value in _HOLOROBOT_IK_PRESET_SEEDS),
+        )
         seen: set[tuple[float, ...]] = set()
         solutions: list[NDArray[np.float64]] = []
         for candidate in candidates:
@@ -250,6 +280,130 @@ class _HoloRobotMdhIkSolver:
         return result
 
 
+class _HoloRobotPinocchioIkSolver:
+    """HoloRobot's preferred URDF/Pinocchio IK with its active-mapping seed sweep."""
+
+    def __init__(self, pinocchio_model: Any) -> None:
+        self._model = pinocchio_model
+        self._data = pinocchio_model.model.createData()
+        self._pin = import_module("pinocchio")
+        self._joint_limits = Es68KinematicModel.from_resources().joint_limit_pairs()
+        self._cache: OrderedDict[
+            tuple[float, ...], tuple[NDArray[np.float64], ...]
+        ] = OrderedDict()
+
+    def solve(
+        self,
+        target_base_t_flange: PoseSE3,
+        seed: NDArray[np.float64],
+    ) -> NDArray[np.float64] | None:
+        solutions = self.solve_all(target_base_t_flange, seed)
+        return solutions[0] if solutions else None
+
+    def solve_all(
+        self,
+        target_base_t_flange: PoseSE3,
+        seed: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], ...]:
+        key = tuple(round(float(value), 9) for value in target_base_t_flange.matrix.ravel())
+        key += tuple(round(float(value), 6) for value in seed)
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            return cached
+
+        candidates = (
+            seed,
+            *_holorobot_near_seed_perturbations(seed),
+            *(_joint_seed(value) for value in _HOLOROBOT_IK_PRESET_SEEDS),
+        )
+        target = self._pin.SE3(
+            target_base_t_flange.rotation,
+            target_base_t_flange.translation_m,
+        )
+        seen: set[tuple[float, ...]] = set()
+        result: tuple[NDArray[np.float64], ...] = ()
+        for candidate in candidates:
+            controller_seed = self._clamp(candidate)
+            seed_key = tuple(round(float(value), 6) for value in controller_seed)
+            if seed_key in seen:
+                continue
+            seen.add(seed_key)
+            solution = self._solve_single(target, controller_seed)
+            if solution is not None:
+                result = (solution,)
+                break
+
+        self._cache[key] = result
+        self._cache.move_to_end(key)
+        while len(self._cache) > 1024:
+            self._cache.popitem(last=False)
+        return result
+
+    def _solve_single(
+        self,
+        target: Any,
+        controller_seed: NDArray[np.float64],
+        *,
+        maximum_iterations: int = 120,
+        position_tolerance_m: float = 1e-4,
+        rotation_tolerance_rad: float = 1e-3,
+    ) -> NDArray[np.float64] | None:
+        configuration = self._model._to_configuration(controller_seed)
+        for _ in range(maximum_iterations):
+            self._pin.forwardKinematics(self._model.model, self._data, configuration)
+            self._pin.updateFramePlacements(self._model.model, self._data)
+            current = self._data.oMf[self._model.tool_frame_id]
+            error = self._pin.log6(current.inverse() * target).vector
+            if (
+                np.linalg.norm(error[:3]) <= position_tolerance_m
+                and np.linalg.norm(error[3:]) <= rotation_tolerance_rad
+            ):
+                joints = self._model.controller_joints_from_configuration(configuration)
+                normalized = _nearest_equivalent_joints(
+                    joints,
+                    controller_seed,
+                    self._joint_limits,
+                )
+                if all(
+                    minimum - 1e-9 <= value <= maximum + 1e-9
+                    for value, (minimum, maximum) in zip(
+                        normalized,
+                        self._joint_limits,
+                        strict=True,
+                    )
+                ):
+                    return normalized
+                return None
+            jacobian = self._pin.computeFrameJacobian(
+                self._model.model,
+                self._data,
+                configuration,
+                self._model.tool_frame_id,
+                self._pin.ReferenceFrame.LOCAL,
+            )
+            try:
+                step = _damped_least_squares_step(
+                    np.asarray(jacobian, dtype=np.float64),
+                    np.asarray(error, dtype=np.float64),
+                    damping=1e-4,
+                )
+            except np.linalg.LinAlgError:
+                return None
+            configuration = self._pin.integrate(
+                self._model.model,
+                configuration,
+                step * 0.25,
+            )
+        return None
+
+    def _clamp(self, joints: ArrayLike) -> NDArray[np.float64]:
+        result = _joint_seed(joints).copy()
+        for index, (minimum, maximum) in enumerate(self._joint_limits):
+            result[index] = float(np.clip(result[index], minimum, maximum))
+        return result
+
+
 def _resolve_plugin(native_module: Any, configured_path: Path | None) -> Path:
     if configured_path is not None:
         path = configured_path.resolve()
@@ -272,6 +426,7 @@ class EliteCs68IkChecker:
         *,
         native_module: Any | None = None,
         solver: Any | None = None,
+        pinocchio_model: Any | None = None,
     ) -> None:
         try:
             self._flange_t_left_ir = hand_eye.require_flange_primary()
@@ -282,8 +437,14 @@ class EliteCs68IkChecker:
             ) from exc
         self._near = _joint_seed(near_joint_positions_rad)
         self._loader: Any | None = None
+        self._solver_label = "Elite KDL"
         if solver is None and native_module is None:
-            self._solver = _HoloRobotMdhIkSolver(model)
+            if pinocchio_model is not None:
+                self._solver = _HoloRobotPinocchioIkSolver(pinocchio_model)
+                self._solver_label = "HoloRobot Pinocchio/URDF"
+            else:
+                self._solver = _HoloRobotMdhIkSolver(model)
+                self._solver_label = "HoloRobot analytic MDH"
             self._uses_vendor_solver = False
             return
         if solver is None:
@@ -325,16 +486,17 @@ class EliteCs68IkChecker:
             except Exception as exc:
                 return ReachabilityResult(
                     ReachabilityState.UNKNOWN,
-                    f"HoloRobot MDH IK call failed: {exc}",
+                    f"{self._solver_label} IK call failed: {exc}",
                 )
             if solution is None:
                 return ReachabilityResult(
                     ReachabilityState.UNREACHABLE,
-                    "HoloRobot MDH IK found no endpoint solution",
+                    f"{self._solver_label} IK found no endpoint solution across "
+                    "the bounded seed sweep",
                 )
             return ReachabilityResult(
                 ReachabilityState.REACHABLE,
-                "HoloRobot MDH endpoint IK solution found; collision and trajectory "
+                f"{self._solver_label} endpoint IK solution found; collision and trajectory "
                 "remain unchecked",
                 _joint_seed(solution),
             )
@@ -384,20 +546,21 @@ class EliteCs68IkChecker:
             return (
                 ReachabilityResult(
                     ReachabilityState.UNKNOWN,
-                    f"HoloRobot analytic MDH IK call failed: {exc}",
+                    f"{self._solver_label} IK call failed: {exc}",
                 ),
             )
         if not solutions:
             return (
                 ReachabilityResult(
                     ReachabilityState.UNREACHABLE,
-                    "HoloRobot analytic MDH IK found no endpoint solution",
+                    f"{self._solver_label} IK found no endpoint solution across "
+                    "the bounded seed sweep",
                 ),
             )
         return tuple(
             ReachabilityResult(
                 ReachabilityState.REACHABLE,
-                "HoloRobot analytic MDH endpoint IK solution found; collision and "
+                f"{self._solver_label} endpoint IK solution found; collision and "
                 "trajectory remain unchecked",
                 solution,
             )

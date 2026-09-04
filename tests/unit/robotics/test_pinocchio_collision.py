@@ -67,6 +67,22 @@ def test_pinocchio_fk_matches_holorobot_yaml_model(
     )
 
 
+def test_pinocchio_configuration_controller_joint_round_trip(tmp_path: Path) -> None:
+    offsets = (0.01, -0.02, 0.03, -0.04, 0.05, -0.06)
+    urdf_path = write_cs68_urdf(tmp_path / "cs68.urdf", include_d435i_mount=False)
+    pin_model = PinocchioCs68Model.from_urdf(
+        urdf_path,
+        joint_zero_offsets_rad=offsets,
+    )
+    joints = np.array([0.2, -1.1, 1.0, -0.8, 0.4, 0.15])
+
+    restored = pin_model.controller_joints_from_configuration(
+        pin_model._to_configuration(joints)
+    )
+
+    np.testing.assert_allclose(restored, joints, atol=1e-12)
+
+
 def test_pinocchio_collision_includes_d435i_and_holorobot_pairs() -> None:
     checker = Cs68PinocchioCollisionChecker.from_resources()
 
@@ -263,6 +279,27 @@ def test_tracking_error_box_is_subdivided_instead_of_becoming_a_fixed_floor() ->
     assert report.proof_evidence is not None
     assert report.proof_evidence.deepest_subdivision > 0
     assert report.proof_evidence.evaluated_configuration_count > 3
+
+
+def test_es68_pinocchio_tool_frame_matches_runtime_calibrated_fk() -> None:
+    checker = Es68PinocchioCollisionChecker.from_es68_resources(
+        Es68D435iCollisionResources.packaged_template()
+    )
+    joints = (
+        3.7294016957032246,
+        -1.982535364175026,
+        2.0464796841372563,
+        -2.189910131300226,
+        -2.3942590974776885,
+        0.04317535171214368,
+    )
+
+    np.testing.assert_allclose(
+        checker.pinocchio_model.forward_kinematics(joints),
+        checker.kinematic_model.forward_kinematics(joints),
+        atol=1e-9,
+        rtol=0.0,
+    )
 
 
 def test_pinocchio_swept_proof_limit_returns_unknown_not_sampled_clear() -> None:

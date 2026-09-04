@@ -191,7 +191,14 @@ regressions must be distinguished from the latest blocker.
 
 ## 5. Historical hardware failures and implemented corrections
 
-The last physical attempt (2026-09-03 22:25–22:27 local time) reached exact approval but
+The 2026-09-04 09:56–09:59 physical attempt
+`planning-test-20260904-095629` captured and reconstructed a new first view, then stopped
+before motion because the planner required a back-side opposing fin pair but had searched
+only symmetric fin-axis azimuths. The message's `tested 4 endpoints` counted four semantic
+families rather than their internal attempts, and `1 seed` meant one composite checker;
+both descriptions hid the actual search trace.
+
+The preceding physical attempt (2026-09-03 22:25–22:27 local time) reached exact approval but
 then showed two reverse-port sessions and ended in a stationarity timeout. Earlier attempts
 expired an already approved permit during guarded enable/recovery and rejected a sampled
 `RUNNING/PLAYING` state despite the motion command having been idled. Those observations
@@ -208,7 +215,9 @@ The 2026-09-04 regression corrected the common causes rather than adding more de
 4. post-motion stationarity requires an unchanged stop latch plus sampled joint/TCP pose;
    `runtime_state=PLAYING` and instantaneous velocity noise are not treated as motion by
    themselves. Bootstrap remains strict Dashboard-STOPPED;
-5. online IK uses a bounded analytic-MDH multi-seed solver instead of the noisy KDL probe;
+5. online IK reuses the already loaded Pinocchio/URDF collision model and HoloRobot's
+   neighboring-seed sweep; analytic MDH remains the offline fallback and KDL is not the
+   normal path;
 6. one NBV is one complete viewpoint path and one capture; the legacy 0.02 rad setting no
    longer triggers intermediate reconstruction cycles;
 7. all bounded science-ranked endpoints receive path preflight, so an unsafe top result
@@ -222,6 +231,9 @@ The 2026-09-04 regression corrected the common causes rather than adding more de
     is nonblocking by default and remains available as a strict opt-in;
 11. synchronized vale/eiai assets with stale absolute roots relocate only after exact
     content-hash verification.
+12. opposing fin candidates retain the required sign but may share a tangential bias;
+    incidence is information-ranked, wrist rolls are interleaved, and a symmetric camera
+    pair is no longer required.
 
 The previous KDL `-5` flood and the multi-minute source replay are therefore not expected
 on the new normal path. This is an offline conclusion, not a claim that the physical arm
@@ -256,9 +268,15 @@ because the artifact was rendered with Open3D while the current local environmen
 the NumPy renderer. This is a cross-process historical replay, not the new live cached
 path. Renderer identity remains a deliberate hard evidence boundary.
 
+The 2026-09-04 fin-discovery regression was separately reproduced with the synchronized
+attempt-09 real proxy. The previous symmetric policy produced zero complete back pairs.
+The signed common-bias policy plus production Pinocchio checker produced one complete back
+pair in about 1.17 s; all IK, workspace and later motion gates remain unchanged.
+
 ## 7. Required next action and regression result
 
-The next action is exactly one fresh eiai physical validation using the runbook and a new
+The next action is exactly one fresh eiai physical validation after pulling the
+post-`5fd885e` fin-discovery correction, using the runbook and a new
 `run_id`. Do not change placement, acceptance assets, or safety geometry before this test.
 After the approval token, verify one reverse connection, one complete viewpoint motion,
 endpoint settle, `writeIdle`, sampled stationary pose, and transition to the next capture.
@@ -274,7 +292,7 @@ full physical single-view-to-motion workflow: hardware verification pending
 Using the main source tree with the available local test environment:
 
 ```text
-full suite: 1219 passed, 3 skipped in 98.71 s
+full suite: 1225 passed, 3 skipped in 103.80 s
 ruff: all checks passed
 ```
 

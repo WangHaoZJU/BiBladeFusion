@@ -351,6 +351,26 @@ class PinocchioCs68Model:
         pin.updateFramePlacements(self.model, self.data)
         return np.asarray(self.data.oMf[self.tool_frame_id].homogeneous, dtype=np.float64).copy()
 
+    def controller_joints_from_configuration(
+        self,
+        configuration: Sequence[float],
+    ) -> NDArray[np.float64]:
+        """Convert a Pinocchio configuration back to controller joint readings."""
+
+        values = np.asarray(configuration, dtype=np.float64)
+        if values.shape != (int(self.model.nq),) or not np.isfinite(values).all():
+            raise ValueError("Pinocchio configuration must be a finite nq-vector")
+        joints = np.empty(6, dtype=np.float64)
+        offsets = (
+            np.asarray(self.joint_zero_offsets_rad, dtype=np.float64)
+            if self.joint_zero_offsets_rad
+            else np.zeros(6, dtype=np.float64)
+        )
+        for index, name in enumerate(CS68_JOINT_NAMES):
+            joint_id = self.joint_name_to_id[name]
+            joints[index] = values[int(self.model.joints[joint_id].idx_q)] - offsets[index]
+        return joints
+
 
 def _add_holorobot_collision_pairs(
     geometry_model: Any,

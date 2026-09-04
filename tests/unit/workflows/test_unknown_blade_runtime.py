@@ -1862,6 +1862,7 @@ def test_experimental_open_keeps_science_authority_and_settings_unbound(
         collision_model_id="collision-model",
         collision_model_hash="collision-hash",
         robot_geometry_hash="geometry-hash",
+        pinocchio_model=object(),
     )
     coarse_session = SimpleNamespace(
         prepare_engine_cycle=lambda *_args, **_kwargs: None,
@@ -1903,7 +1904,11 @@ def test_experimental_open_keeps_science_authority_and_settings_unbound(
     monkeypatch.setattr(runtime_module, "EliteArm", FakeArm)
     monkeypatch.setattr(runtime_module, "RealSenseD435i", FakeCamera)
     monkeypatch.setattr(runtime_module, "load_cs68_kinematics", lambda _path: object())
-    monkeypatch.setattr(runtime_module, "EliteCs68IkChecker", lambda *_args: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "EliteCs68IkChecker",
+        lambda *_args, **_kwargs: object(),
+    )
     monkeypatch.setattr(runtime_module, "_bootstrap_foreground_config", lambda _settings: object())
     monkeypatch.setattr(runtime_module, "CoarseSciencePolicy", lambda **_kwargs: object())
     monkeypatch.setattr(runtime_module, "CoarseScienceSession", lambda **_kwargs: coarse_session)

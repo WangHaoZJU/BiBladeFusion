@@ -7,13 +7,15 @@ roll, incidence tilt and azimuth, and camera distance. Distance is bounded only 
 configured stereo-depth limits; the ideal standoff is evaluated first and deviations are
 penalized during ranking.
 
-The search order is deliberately measurement-first: ideal pose, normal-incidence distance
-expansion, then increasing incidence tilt and azimuth; wrist-roll alternatives are tried
-only after those distance/direction samples. Every candidate continues to look at the
-same surface target. A family is bounded by both 32 IK attempts and 1.5 seconds by default.
-Each configured IK seed is evaluated, all successful solutions are retained, and the
-solution with the smallest maximum and total joint change from the current posture is
-preferred among candidates with the same geometric score.
+The search order is deliberately measurement-first. Ordinary surface families retain an
+ideal/direction/distance breadth pass. Fin families first test the incidence with highest
+`sin(tilt)*cos(tilt)` information, interleave wrist rolls, and only then spend their
+remaining budget on lower-value tilts and distance expansion. Every candidate continues
+to look at the same surface target. A family is bounded by both 32 IK attempts and 1.5
+seconds by default. Runtime IK reuses the collision URDF's Pinocchio model plus
+HoloRobot's bounded neighboring-seed sweep; the analytic calibrated-MDH solver remains
+the no-shared-model fallback. A successful endpoint is still replayed through the
+authoritative ES68 FK and all later collision/path gates.
 
 The configured camera workspace is the declared physical outer boundary and is a hard
 candidate rejection. Blade/camera clearance and configured forbidden volumes are also
@@ -44,11 +46,12 @@ being endpoint-IK feasible still does not authorize motion.
 
 Fin discovery uses the same bounded pose-family mechanism without treating `15 deg` as a
 hard constraint. The positive and negative members remain separate semantic targets on
-each proxy axis, because they are intended to reveal opposing fin faces. For each member,
-the planner evaluates the initial 15-degree probe plus the configured
-`coarse_science.discovery_tilt_samples_deg`, physical stereo-depth distances and wrist
-rolls. It samples every tilt at the nominal distance before distance expansion, so an
-early IK solution cannot silently prevent larger angles from being considered.
+each proxy axis, because they are intended to reveal opposing fin faces. Their fin-axis
+component must keep the requested sign, but their camera positions need not be symmetric:
+configured azimuth samples and their midpoints provide a common tangential bias inside
+that signed open half-plane. For each member, the planner evaluates configured incidence,
+physical stereo-depth distance and wrist roll. The 45-degree information optimum is tried
+first; `15 deg` remains one bounded seed rather than a prerequisite.
 
 The fin-specific geometry score uses `sin(tilt) * cos(tilt)` as a conservative proxy for
 new fin information: the first factor represents side-face exposure and the second the
