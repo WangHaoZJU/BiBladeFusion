@@ -10,6 +10,7 @@ from biblade_fusion.planning import (
     AdaptiveViewSearchConfig,
     BladeSide,
     CandidateView,
+    EndpointConfigurationCheck,
     ReachabilityResult,
     ReachabilityState,
     SurfacePatch,
@@ -124,6 +125,47 @@ def test_multi_seed_ik_keeps_all_solutions_and_selects_nearest_current() -> None
     assert len(evaluation.solutions_rad) == 2
     assert evaluation.chosen_solution_index == 1
     np.testing.assert_allclose(evaluation.result.joint_positions_rad, near)
+
+
+def test_multi_seed_ik_selects_nearest_collision_clear_branch() -> None:
+    colliding_near = np.full(6, 0.1)
+    clear_far = np.full(6, 0.4)
+
+    def endpoint_validator(joints: np.ndarray) -> EndpointConfigurationCheck:
+        if np.allclose(joints, colliding_near):
+            return EndpointConfigurationCheck(False, ("self_collision:wrist:camera",))
+        return EndpointConfigurationCheck(True)
+
+    evaluation = evaluate_multi_seed_ik(
+        make_nominal().base_t_left_ir,
+        (FixedChecker(colliding_near), FixedChecker(clear_far)),
+        np.zeros(6),
+        endpoint_validator,
+    )
+
+    assert evaluation.endpoint_collision_checked is True
+    assert evaluation.chosen_solution_index == 1
+    assert evaluation.solution_blocking_reasons == (
+        ("self_collision:wrist:camera",),
+        (),
+    )
+    np.testing.assert_allclose(evaluation.result.joint_positions_rad, clear_far)
+
+
+def test_multi_seed_ik_rejects_pose_when_every_branch_collides() -> None:
+    evaluation = evaluate_multi_seed_ik(
+        make_nominal().base_t_left_ir,
+        (FixedChecker(np.full(6, 0.1)), FixedChecker(np.full(6, 0.4))),
+        np.zeros(6),
+        lambda _joints: EndpointConfigurationCheck(
+            False,
+            ("self_collision:forearm:camera",),
+        ),
+    )
+
+    assert evaluation.result.state is ReachabilityState.UNREACHABLE
+    assert evaluation.chosen_solution_index is None
+    assert "every endpoint is collision blocked" in evaluation.result.message
 
 
 def test_search_never_escapes_configured_outer_workspace() -> None:
@@ -250,3 +292,28 @@ def test_report_is_json_serializable_and_explicitly_non_executable() -> None:
     assert payload["endpoint_collision_checked"] is False
     assert payload["trajectory_checked"] is False
     assert payload["summary"]["ik_feasible_count"] == 1
+
+
+def test_report_records_endpoint_collision_filtering() -> None:
+    config = AdaptiveViewSearchConfig(
+        maximum_distance_expansions=0,
+        tilt_samples_deg=(0.0,),
+        azimuth_samples_deg=(0.0,),
+        roll_samples_deg=(0.0,),
+        maximum_ik_feasible_candidates=1,
+    )
+    result = search_adaptive_candidate_family(
+        make_nominal(),
+        make_proxy(),
+        wide_workspace_filter(),
+        (FixedChecker(np.zeros(6)),),
+        np.zeros(6),
+        config,
+        endpoint_validator=lambda _joints: EndpointConfigurationCheck(True),
+    )
+
+    payload = adaptive_view_search_payload(result, config, np.zeros(6))
+
+    assert payload["schema_version"] == 2
+    assert payload["endpoint_collision_checked"] is True
+    assert payload["attempts"][0]["endpoint_collision_checked"] is True

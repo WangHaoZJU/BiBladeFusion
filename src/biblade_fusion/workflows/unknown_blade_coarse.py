@@ -63,6 +63,8 @@ from biblade_fusion.planning import (
     CandidateStatus,
     CandidateView,
     CoverageLedger,
+    EndpointCollisionAwareReachabilityChecker,
+    EndpointConfigurationValidator,
     EvaluatedCandidate,
     FilteredViewPlan,
     ReachabilityChecker,
@@ -637,6 +639,7 @@ def generate_fin_discovery_plan(
     current_joint_positions_rad: (
         tuple[float, float, float, float, float, float] | None
     ) = None,
+    endpoint_validator: EndpointConfigurationValidator | None = None,
 ) -> CoarseDiscoveryPlan:
     """Generate paired +/- oblique targets about both unknown fin axes.
 
@@ -687,6 +690,17 @@ def generate_fin_discovery_plan(
                 )
     adaptive_searches: list[AdaptiveFinDiscoverySearch] = []
     adaptive_enabled = planning_config.adaptive_ik_view_search.enabled
+    endpoint_checker = reachability_checker
+    if not adaptive_enabled and endpoint_validator is not None:
+        if current_joint_positions_rad is None:
+            raise UnknownBladeCoarseError(
+                "Endpoint collision-aware fin discovery requires current joints"
+            )
+        endpoint_checker = EndpointCollisionAwareReachabilityChecker(
+            reachability_checker,
+            current_joint_positions_rad,
+            endpoint_validator,
+        )
     if adaptive_enabled:
         if point_cloud_config is None or current_joint_positions_rad is None:
             raise UnknownBladeCoarseError(
@@ -707,6 +721,7 @@ def generate_fin_discovery_plan(
                 (reachability_checker,),
                 current_joint_positions_rad,
                 search_config,
+                endpoint_validator=endpoint_validator,
             )
             adaptive_searches.append(AdaptiveFinDiscoverySearch(search_config, search))
             evaluated.append(
@@ -719,7 +734,7 @@ def generate_fin_discovery_plan(
             tuple(candidates),
             proxy,
             filter_config,
-            reachability_checker,
+            endpoint_checker,
             deduplicate=False,
         )
         evaluated = list(filtered.candidates)
@@ -752,7 +767,7 @@ def generate_fin_discovery_plan(
             pair,
             proxy,
             filter_config,
-            reachability_checker,
+            endpoint_checker,
             deduplicate=False,
         )
         evaluated.extend(checked.candidates)
@@ -760,10 +775,11 @@ def generate_fin_discovery_plan(
     canonical = json.dumps(
         {
             "algorithm": (
-                "adaptive_bilateral_paired_oblique_fin_discovery_v3"
+                "adaptive_bilateral_paired_oblique_fin_discovery_v4"
                 if adaptive_enabled
-                else "explicit_bilateral_paired_oblique_fin_discovery_v2"
+                else "explicit_bilateral_paired_oblique_fin_discovery_v3"
             ),
+            "ik_branch_collision_filter_enabled": endpoint_validator is not None,
             "policy": asdict(policy),
             "view_planning": planning_config.model_dump(mode="json"),
             "view_filter": filter_config.model_dump(mode="json"),
@@ -1697,7 +1713,7 @@ def _write_discovery_plan_asset(
     temporary.mkdir()
     try:
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "artifact_kind": "biblade_fusion.coarse_fin_discovery_plan",
             "created_at_utc": datetime.now(UTC).isoformat(),
             "motion_authorized": False,
@@ -1727,20 +1743,23 @@ def _write_discovery_plan_asset(
         }
         if discovery.adaptive_searches:
             assert discovery.current_joint_positions_rad is not None
+            targets = [
+                adaptive_view_search_payload(
+                    trace.result,
+                    trace.config,
+                    discovery.current_joint_positions_rad,
+                    source_initialization=str(source_initialization.resolve()),
+                    source_kinematics=str(source_kinematics.resolve()),
+                )
+                for trace in discovery.adaptive_searches
+            ]
             payload["adaptive_ik_fin_discovery"] = {
                 "motion_authorized": False,
-                "endpoint_collision_checked": False,
+                "endpoint_collision_checked": bool(targets) and all(
+                    target["endpoint_collision_checked"] is True for target in targets
+                ),
                 "trajectory_checked": False,
-                "targets": [
-                    adaptive_view_search_payload(
-                        trace.result,
-                        trace.config,
-                        discovery.current_joint_positions_rad,
-                        source_initialization=str(source_initialization.resolve()),
-                        source_kinematics=str(source_kinematics.resolve()),
-                    )
-                    for trace in discovery.adaptive_searches
-                ],
+                "targets": targets,
             }
         (temporary / "discovery.json").write_text(
             json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
@@ -1763,24 +1782,26 @@ def _verify_discovery_plan_asset(
 ) -> None:
     payload = json.loads((path / "discovery.json").read_text(encoding="utf-8"))
     if (
-        payload.get("schema_version") not in {1, 2}
+        payload.get("schema_version") not in {1, 2, 3}
         or payload.get("artifact_kind") != "biblade_fusion.coarse_fin_discovery_plan"
         or payload.get("motion_authorized") is not False
         or payload.get("policy_sha256") != discovery.policy_sha256
     ):
         raise UnknownBladeCoarseError("Persisted coarse discovery policy changed")
     adaptive_payload = payload.get("adaptive_ik_fin_discovery")
-    if adaptive_payload is not None and any(
-        adaptive_payload.get(name) is not False
-        for name in (
-            "motion_authorized",
-            "endpoint_collision_checked",
-            "trajectory_checked",
-        )
-    ):
-        raise UnknownBladeCoarseError(
-            "Adaptive fin discovery must remain explicitly non-authorizing"
-        )
+    if adaptive_payload is not None:
+        if any(
+            adaptive_payload.get(name) is not False
+            for name in ("motion_authorized", "trajectory_checked")
+        ):
+            raise UnknownBladeCoarseError(
+                "Adaptive fin discovery must remain explicitly non-authorizing"
+            )
+        endpoint_checked = adaptive_payload.get("endpoint_collision_checked")
+        if type(endpoint_checked) is not bool:
+            raise UnknownBladeCoarseError(
+                "Adaptive fin discovery endpoint-collision status is invalid"
+            )
     expected_sources = {
         "initialization": source_initialization / INITIALIZATION_METADATA_FILENAME,
         "view_plan": source_view_plan / "view_plan.json",
@@ -1836,6 +1857,7 @@ class CoarseScienceSession:
         output_root: str | Path,
         foreground_config: BootstrapForegroundConfig | None = None,
         policy: CoarseSciencePolicy | None = None,
+        endpoint_validator: EndpointConfigurationValidator | None = None,
         recovered_generation: str | Path | None = None,
     ) -> None:
         source_kinematics_path = Path(source_kinematics).resolve()
@@ -1844,6 +1866,7 @@ class CoarseScienceSession:
         self._settings = settings.model_copy(deep=True)
         self._hand_eye = hand_eye
         self._reachability = reachability_checker
+        self._endpoint_validator = endpoint_validator
         self._source_kinematics = source_kinematics_path
         self._output_root = Path(output_root).resolve()
         self._foreground_config = foreground_config or BootstrapForegroundConfig()
@@ -1908,6 +1931,7 @@ class CoarseScienceSession:
                 float(value)
                 for value in stored_initialization.observation.seed_joint_positions_rad
             ),
+            self._endpoint_validator,
         )
         _verify_discovery_plan_asset(
             discovery_path,
@@ -2336,6 +2360,7 @@ class CoarseScienceSession:
                     self._settings.view_filter,
                     self._reachability,
                     self._settings.point_cloud,
+                    self._endpoint_validator,
                 )
             with performance_span("coarse.view_plan_write"):
                 write_view_plan(
@@ -2358,6 +2383,7 @@ class CoarseScienceSession:
                     self._reachability,
                     self._settings.point_cloud,
                     tuple(float(value) for value in observation.seed_joint_positions_rad),
+                    self._endpoint_validator,
                 )
             # This policy depends only on the first proxy, measured workspace and
             # offline IK. Fail now instead of spending two more long bootstrap

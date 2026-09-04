@@ -129,6 +129,13 @@ def motion_control_contract_for_settings(settings: Any) -> str:
     motion_preflight = motion.model_dump(mode="json", exclude={
         "motion_envelope_acceptance_path",
         "motion_envelope_acceptance_id",
+        # Planner search policy changes path shape, not the accepted ServoJ
+        # tracking/stop envelope. Every returned route still uses the same
+        # velocity-limited stream and exact collision preflight below.
+        "enable_ompl_fallback",
+        "ompl_plan_timeout_s",
+        "ompl_rrt_range_rad",
+        "ompl_simplify_path",
     })
     runtime = ServoJStreamConfig(
         dt_s=motion.servoj_dt_s,

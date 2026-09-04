@@ -187,6 +187,10 @@ def preflight_view_sequence_motion(
             accepted_joint_uncertainty_rad=accepted_joint_uncertainty_rad,
             motion_envelope_acceptance_id=motion_envelope_acceptance_id,
             motion_envelope_metadata_sha256=motion_envelope_metadata_sha256,
+            enable_ompl_fallback=config.enable_ompl_fallback,
+            ompl_plan_timeout_s=config.ompl_plan_timeout_s,
+            ompl_rrt_range_rad=config.ompl_rrt_range_rad,
+            ompl_simplify_path=config.ompl_simplify_path,
         )
         preflight = _apply_endpoint_gate(preflight, endpoint_consistency)
         if evaluation_time is not None:
@@ -377,6 +381,10 @@ def preflight_live_joint_segment(
         motion_envelope_acceptance_id=motion_envelope_acceptance_id,
         motion_envelope_metadata_sha256=motion_envelope_metadata_sha256,
         path_validation_mode=path_validation_mode,
+        enable_ompl_fallback=config.enable_ompl_fallback,
+        ompl_plan_timeout_s=config.ompl_plan_timeout_s,
+        ompl_rrt_range_rad=config.ompl_rrt_range_rad,
+        ompl_simplify_path=config.ompl_simplify_path,
     )
     endpoint = None
     if final_target:

@@ -29,6 +29,7 @@ from biblade_fusion.planning import (
     CandidateMetrics,
     CandidateStatus,
     CandidateView,
+    EndpointConfigurationCheck,
     EvaluatedCandidate,
     FilteredViewPlan,
     ReachabilityResult,
@@ -138,6 +139,36 @@ def test_fin_discovery_generates_two_opposing_axes_on_both_sides() -> None:
         assert item.status.value == "endpoint_feasible"
     assert result.motion_authorized is False
     assert len(result.policy_sha256) == 64
+
+
+def test_nonadaptive_fin_discovery_rejects_colliding_ik_endpoint() -> None:
+    result = generate_fin_discovery_plan(
+        _proxy(),
+        (0.30, 0.20),
+        ViewPlanningConfig(standoff_distance_m=0.30),
+        ViewFilterConfig(
+            workspace=AxisAlignedBoxConfig(
+                name="cell",
+                minimum_m=(-1.0, -1.0, -0.5),
+                maximum_m=(1.0, 1.0, 1.5),
+            ),
+            minimum_incidence_cosine=0.95,
+        ),
+        CoarseSciencePolicy(),
+        _Reachable(),
+        current_joint_positions_rad=(0.0,) * 6,
+        endpoint_validator=lambda _joints: EndpointConfigurationCheck(
+            False,
+            ("self_collision:forearm:camera",),
+        ),
+    )
+
+    assert not result.endpoint_feasible
+    assert all(item.status is CandidateStatus.REJECTED for item in result.filtered.candidates)
+    assert all(
+        any("self_collision:forearm:camera" in reason for reason in item.reasons)
+        for item in result.filtered.candidates
+    )
 
 
 def test_adaptive_fin_discovery_keeps_opposing_semantics_without_locking_tilt() -> None:

@@ -27,7 +27,7 @@ from biblade_fusion.planning import (
 )
 from biblade_fusion.workflows import OfflineViewPlanningResult
 
-VIEW_PLAN_SCHEMA_VERSION = 4
+VIEW_PLAN_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,24 +158,27 @@ def write_view_plan(
         },
     }
     if result.adaptive_trace is not None:
+        targets = [
+            adaptive_view_search_payload(
+                search,
+                result.adaptive_trace.config,
+                result.adaptive_trace.current_joint_positions_rad,
+                source_initialization=str(Path(source_initialization).resolve()),
+                source_kinematics=(
+                    str(Path(source_kinematics).resolve())
+                    if source_kinematics is not None
+                    else None
+                ),
+            )
+            for search in result.adaptive_trace.results
+        ]
         payload["adaptive_ik_view_search"] = {
             "motion_authorized": False,
-            "endpoint_collision_checked": False,
+            "endpoint_collision_checked": bool(targets) and all(
+                target["endpoint_collision_checked"] is True for target in targets
+            ),
             "trajectory_checked": False,
-            "targets": [
-                adaptive_view_search_payload(
-                    search,
-                    result.adaptive_trace.config,
-                    result.adaptive_trace.current_joint_positions_rad,
-                    source_initialization=str(Path(source_initialization).resolve()),
-                    source_kinematics=(
-                        str(Path(source_kinematics).resolve())
-                        if source_kinematics is not None
-                        else None
-                    ),
-                )
-                for search in result.adaptive_trace.results
-            ],
+            "targets": targets,
         }
     try:
         path = temporary / "view_plan.json"
@@ -223,7 +226,7 @@ def read_view_plan(path: str | Path) -> StoredViewPlan:
         if not isinstance(payload, dict):
             raise TypeError("view plan root must be an object")
         schema_version = int(payload["schema_version"])
-        if schema_version not in {1, 2, 3, VIEW_PLAN_SCHEMA_VERSION}:
+        if schema_version not in {1, 2, 3, 4, VIEW_PLAN_SCHEMA_VERSION}:
             raise ValueError(f"unsupported schema {payload['schema_version']}")
         if payload.get("motion_authorized") is not False:
             raise ValueError("stored view plan must explicitly forbid motion")
@@ -281,15 +284,22 @@ def read_view_plan(path: str | Path) -> StoredViewPlan:
         ):
             raise ValueError("endpoint-feasible plan lacks joint-zero-offset provenance")
         adaptive_payload = payload.get("adaptive_ik_view_search")
-        if adaptive_payload is not None and any(
-            adaptive_payload.get(name) is not False
-            for name in (
-                "motion_authorized",
-                "endpoint_collision_checked",
-                "trajectory_checked",
-            )
-        ):
-            raise ValueError("adaptive view search must remain explicitly non-authorizing")
+        if adaptive_payload is not None:
+            if any(
+                adaptive_payload.get(name) is not False
+                for name in ("motion_authorized", "trajectory_checked")
+            ):
+                raise ValueError("adaptive view search must remain explicitly non-authorizing")
+            endpoint_checked = adaptive_payload.get("endpoint_collision_checked")
+            if type(endpoint_checked) is not bool:
+                raise ValueError("adaptive endpoint-collision status must be boolean")
+            targets = adaptive_payload.get("targets")
+            if endpoint_checked and (
+                not isinstance(targets, list)
+                or not targets
+                or any(target.get("endpoint_collision_checked") is not True for target in targets)
+            ):
+                raise ValueError("adaptive endpoint-collision evidence is inconsistent")
         return StoredViewPlan(OfflineViewPlanningResult(geometric, filtered), payload)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid view-plan artifact {root}: {exc}") from exc

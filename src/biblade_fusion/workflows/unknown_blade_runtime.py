@@ -26,6 +26,8 @@ from threading import Event, Thread
 from typing import Literal, Protocol
 from uuid import uuid4
 
+import numpy as np
+
 from biblade_fusion.acquisition import SynchronizedAcquirer
 from biblade_fusion.calibration import load_cs68_kinematics, load_hand_eye_calibration
 from biblade_fusion.core.settings import AppSettings
@@ -46,9 +48,14 @@ from biblade_fusion.perception.bootstrap_foreground import (
     BootstrapSeed,
 )
 from biblade_fusion.perception.stereo import FoundationStereoBackend
-from biblade_fusion.planning import BladeSide, EliteCs68IkChecker
+from biblade_fusion.planning import (
+    BladeSide,
+    EliteCs68IkChecker,
+    EndpointConfigurationCheck,
+)
 from biblade_fusion.robotics import (
     BootstrapSafeStateEvidence,
+    CollisionCheckStatus,
     Cs68PinocchioCollisionChecker,
     Es68D435iCollisionResources,
     Es68KinematicModel,
@@ -2022,6 +2029,19 @@ def open_production_unknown_blade_runtime(
             settings.kinematics,
             pinocchio_model=collision_checker.pinocchio_model,
         )
+
+        def endpoint_collision_check(
+            joints: np.ndarray,
+        ) -> EndpointConfigurationCheck:
+            result = collision_checker.check(joints)
+            if result.status is CollisionCheckStatus.CLEAR:
+                return EndpointConfigurationCheck(True)
+            return EndpointConfigurationCheck(
+                False,
+                result.blocking_reasons
+                or (f"endpoint_collision_status:{result.status.value}",),
+            )
+
         coarse_session = CoarseScienceSession(
             settings=coarse_settings,
             hand_eye=hand_eye,
@@ -2032,6 +2052,7 @@ def open_production_unknown_blade_runtime(
             policy=CoarseSciencePolicy(
                 **settings.coarse_science.model_dump(mode="python")
             ),
+            endpoint_validator=endpoint_collision_check,
             recovered_generation=(
                 resume_plan.coarse_generation_path
                 if resume_plan is not None
@@ -2233,6 +2254,7 @@ def open_production_unknown_blade_runtime(
                 reference_coarse_model=reference,
                 science_authority=science_authority,
                 experimental=experimental,
+                endpoint_validator=endpoint_collision_check,
             )
             # Coarse and fine coordinators are distinct motion authorities.  Fine
             # may reuse verified perception sources, but it must publish its own
@@ -2541,8 +2563,9 @@ def run_unknown_blade_operator_console(
         if status.disposition is ExperimentDisposition.READY:
             if status.phase in {"bootstrap_motion_ready", "map_ready"}:
                 output_fn(
-                    "Planning next view with HoloRobot single-arm sampling "
-                    "(complete selector-bounded queue; collision checks fail fast)..."
+                    "Planning next view with HoloRobot single-arm composite planning "
+                    "(straight first; bounded RRTConnect only for an interior path "
+                    "block; complete selector-bounded queue)..."
                 )
             planning_started = time.monotonic()
             planning_finished = Event()

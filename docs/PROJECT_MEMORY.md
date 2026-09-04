@@ -67,6 +67,14 @@ require a geometrically symmetric camera pair. The candidate family may add a sh
 tangential bias so the arm can observe both fin faces from asymmetric but informative
 poses. Runtime IK reuses the same Pinocchio/URDF kinematic model already loaded for the
 ES68 collision assembly and the bounded neighboring-seed pattern proven in HoloRobot.
+Every distinct IK branch is endpoint-collision checked before choosing the nearest clear
+solution; the nearest mathematical solution is not privileged when it collides.
+
+After endpoint filtering, motion follows HoloRobot's single-arm composite order: try the
+conservative straight joint route first, then invoke one tightly bounded RRTConnect search
+only for a true interior path obstruction. UNKNOWN evidence and invalid endpoints are not
+planning problems and must fail fast. Every detour is resampled and fully rechecked before
+operator approval.
 
 There is no scientific reason to prescribe one narrow standoff interval when the actual
 requirements are stereo depth validity, sufficient projected support, collision-free
@@ -160,8 +168,8 @@ largest-component selection.
 
 This is a supervised research experiment, not an initial production release. Essential
 physical protections remain mandatory: exact robot geometry, collision checking,
-continuous path validation, controller state, stop behavior, immutable map identity,
-and operator access to the physical emergency stop.
+complete route validation under the reviewed online contract, controller state, stop
+behavior, immutable map identity, and operator access to the physical emergency stop.
 
 At the same time, a safety gate must correspond to a concrete physical or evidence
 invariant. Camera/robot timestamp jitter, small stopped-pose variation, computation time,

@@ -981,6 +981,10 @@ class MotionPreflightConfig(BaseModel):
     servoj_dt_s: float = Field(default=0.004, gt=0.0, le=0.1)
     speed_scaling: float = Field(default=0.08, gt=0.0, le=1.0)
     velocity_margin: float = Field(default=0.8, gt=0.0, le=1.0)
+    enable_ompl_fallback: bool = True
+    ompl_plan_timeout_s: float = Field(default=1.0, gt=0.0, le=5.0)
+    ompl_rrt_range_rad: float = Field(default=0.25, gt=0.0, le=1.0)
+    ompl_simplify_path: bool = True
     maximum_endpoint_translation_error_m: float = Field(default=0.002, gt=0.0)
     maximum_endpoint_rotation_error_deg: float = Field(default=0.3, gt=0.0, le=180.0)
     motion_envelope_acceptance_path: Path | None = None

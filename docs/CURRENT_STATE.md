@@ -113,8 +113,9 @@ occupancy ray integration: deterministic CUDA DDA
 ```
 
 The online contract now treats the declared workspace as a hard outer boundary, searches
-at most 32 IK poses / 1.5 s per candidate family, preflights at most the configured top
-three science candidates, and moves directly to one selected viewpoint.
+at most 32 IK poses / 1.5 s per candidate family, collision-checks every distinct IK
+branch before choosing an endpoint, and preflights the selector's complete bounded
+science-ranked queue before moving to one selected viewpoint.
 `motion_preflight.maximum_joint_step_rad` is only an internal HoloRobot interpolation and
 sampled-collision interval.
 
@@ -221,8 +222,9 @@ The 2026-09-04 regression corrected the common causes rather than adding more de
    normal path;
 6. one NBV is one complete viewpoint path and one capture; the legacy 0.02 rad setting is
    HoloRobot-style joint interpolation, not an intermediate reconstruction trigger;
-7. each online cycle checks at most `maximum_ranked_preflight_candidates` science-ranked
-   endpoints (currently 3 on eiai), so a large NBV set cannot create an unbounded pause;
+7. each online cycle checks the selector's complete already-bounded science-ranked queue;
+   the legacy `maximum_ranked_preflight_candidates` value is parse-only and cannot discard
+   a safe fourth or later candidate;
 8. incremental occupancy reuses an unchanged verified prefix and the live writer does not
    immediately replay identical rays. Sliding/replacement windows and cross-process reads
    remain strict full rebuild/replay;
@@ -243,6 +245,14 @@ The 2026-09-04 regression corrected the common causes rather than adding more de
     UNKNOWN-as-blocked occupancy, map/hash binding, approval, ServoJ tracking stop, and
     endpoint settling remain active. Adjacent same-state occupancy voxels are represented
     as exact X-axis run boxes to remove per-voxel FCL calls without using link spheres.
+14. every distinct solution returned by HoloRobot's bounded Pinocchio seed sweep is now
+    checked at the endpoint with the same hash-bound URDF/STL model. The nearest clear
+    branch is retained; a nearer colliding branch cannot hide a farther clear branch.
+15. motion planning now follows HoloRobot's composite order: validate endpoints, try the
+    straight conservative route, and invoke one bounded RRTConnect search only for a true
+    interior `PATH_BLOCKED` result. UNKNOWN evidence and endpoint collisions fail fast and
+    never consume an OMPL timeout. Any detour is resampled and completely rechecked before
+    a permit can be prepared.
 
 The previous KDL `-5` flood and the multi-minute source replay are therefore not expected
 on the new normal path. This is an offline conclusion, not a claim that the physical arm
@@ -265,12 +275,14 @@ IK endpoint feasible: 2
 wall time: 0.78 s
 ```
 
-It selected independently feasible front/back adaptive views. Online path preflight now
-checks the same straight joint-space route with HoloRobot's bounded sampled-segment
-contract and walks the selector's complete bounded science-ranked queue until the first
-safe path. It does not yet synthesize a curved RRT/OMPL route around an obstacle to the same endpoint. The former
-recursive interval proof remains available for offline acceptance/diagnostics but is no
-longer called by the active NBV loop.
+It selected independently feasible front/back adaptive views. Online preflight walks the
+selector's complete bounded science-ranked queue. For each endpoint it first checks the
+straight joint-space route with HoloRobot's sampled-segment contract. When—and only
+when—both endpoints are clear and the route is blocked in its interior, one RRTConnect
+solve receives a 1.0 s default budget. A returned detour is resampled at no more than
+0.02 rad and rechecked in full against exact robot geometry and one bound occupancy map.
+The former recursive interval proof remains available for offline acceptance/diagnostics
+but is no longer called by the active NBV loop.
 
 One offline replay of an old occupancy artifact took about 64 s and correctly failed
 because the artifact was rendered with Open3D while the current local environment selected
@@ -312,16 +324,17 @@ physically verified.
 
 ## 7. Required next action and regression result
 
-The next action is exactly one fresh eiai physical validation after pulling the
-bound-snapshot/effective-resolution correction that follows `701eb09`, using the runbook and a new
-`run_id`. Do not change placement, acceptance assets, or safety geometry before this test.
+The next action is exactly one fresh eiai physical validation after pulling the composite
+planning/IK-branch correction recorded in D024, installing the optional pinned OMPL wheel,
+and passing `scan doctor`, using the runbook and a new `run_id`. Do not change placement,
+acceptance assets, or safety geometry before this test.
 After the approval token, verify one reverse connection, one complete viewpoint motion,
 endpoint settle, `writeIdle`, sampled stationary pose, and transition to the next capture.
 
 Current status is:
 
 ```text
-offline/code regression: complete
+offline/code regression: complete for D024
 real-data view planning: complete (0.78 s)
 full physical single-view-to-motion workflow: hardware verification pending
 ```
@@ -329,7 +342,9 @@ full physical single-view-to-motion workflow: hardware verification pending
 Using the main source tree with the available local test environment:
 
 ```text
-full suite: 1229 passed, 3 skipped in 97.27 s
+full suite: 1238 passed, 3 skipped in 100.68 s
+planning/runtime/storage/diagnostic focus: 255 passed in 10.38 s
+real OMPL binding probe: clear detour, maximum resampled step below 0.02 rad
 ruff: all checks passed
 ```
 

@@ -23,6 +23,7 @@ from biblade_fusion.robotics import (
     Es68PinocchioCollisionChecker,
     OccupancyRobotCollisionChecker,
 )
+from biblade_fusion.robotics.holorobot_joint_planner import ompl_available
 from biblade_fusion.robotics.motion_preflight import (
     HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD,
     HOLOROBOT_NATIVE_SEGMENT_SAMPLES,
@@ -306,6 +307,13 @@ def _collision_backend_check(settings: AppSettings) -> CheckResult:
                 ),
                 "offline_continuous_swept_mesh_supported": mesh_supported,
                 "offline_continuous_swept_occupancy_supported": occupancy_supported,
+                "online_composite_planner_enabled": (
+                    settings.motion_preflight.enable_ompl_fallback
+                ),
+                "ompl_fallback_available": ompl_available(),
+                "ompl_fallback_timeout_s": (
+                    settings.motion_preflight.ompl_plan_timeout_s
+                ),
             }
         )
     except Exception as exc:
@@ -323,11 +331,22 @@ def _collision_backend_check(settings: AppSettings) -> CheckResult:
             "one or both conservative continuous sweep proofs are unavailable",
             details,
         )
+    if (
+        settings.motion_preflight.enable_ompl_fallback
+        and not details["ompl_fallback_available"]
+    ):
+        return CheckResult(
+            "supervised_scan_holorobot_single_arm",
+            CheckLevel.WARN,
+            "straight HoloRobot preflight is available, but the configured bounded "
+            "RRTConnect fallback is not installed",
+            details,
+        )
     return CheckResult(
         "supervised_scan_holorobot_single_arm",
         CheckLevel.PASS,
-        "HoloRobot fixed-step sampled single-arm preflight is configured; exact "
-        "URDF/STL backends are available",
+        "HoloRobot straight-primary/bounded-RRTConnect single-arm preflight is "
+        "configured; exact URDF/STL backends are available",
         details,
     )
 

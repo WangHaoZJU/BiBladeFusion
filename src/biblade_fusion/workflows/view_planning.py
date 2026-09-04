@@ -14,6 +14,8 @@ from biblade_fusion.planning import (
     AdaptiveViewSearchResult,
     BilateralViewPlan,
     CandidateStatus,
+    EndpointCollisionAwareReachabilityChecker,
+    EndpointConfigurationValidator,
     FilteredViewPlan,
     ReachabilityChecker,
     filter_candidate_views,
@@ -50,6 +52,7 @@ def plan_initial_observation(
     filter_config: ViewFilterConfig,
     reachability_checker: ReachabilityChecker | None = None,
     point_cloud_config: PointCloudConfig | None = None,
+    endpoint_validator: EndpointConfigurationValidator | None = None,
 ) -> OfflineViewPlanningResult:
     """Partition both proxy faces and endpoint-filter candidates without moving hardware."""
 
@@ -61,11 +64,22 @@ def plan_initial_observation(
     adaptive_policy = planning_config.adaptive_ik_view_search
     # Adaptive search already begins at the nominal pose.  Geometry-only filtering
     # here avoids solving that same IK once before, then again inside its family.
+    initial_checker = reachability_checker
+    if (
+        not adaptive_policy.enabled
+        and reachability_checker is not None
+        and endpoint_validator is not None
+    ):
+        initial_checker = EndpointCollisionAwareReachabilityChecker(
+            reachability_checker,
+            observation.seed_joint_positions_rad,
+            endpoint_validator,
+        )
     filtered = filter_candidate_views(
         geometric.candidates,
         observation.proxy,
         filter_config,
-        None if adaptive_policy.enabled else reachability_checker,
+        None if adaptive_policy.enabled else initial_checker,
     )
     adaptive_trace = None
     if adaptive_policy.enabled:
@@ -101,6 +115,7 @@ def plan_initial_observation(
                 (reachability_checker,),
                 observation.seed_joint_positions_rad,
                 search_config,
+                endpoint_validator=endpoint_validator,
             )
             searches.append(search)
             if search.recommended is not None:
@@ -138,7 +153,7 @@ def plan_initial_observation(
                     (candidate,),
                     observation.proxy,
                     filter_config,
-                    reachability_checker,
+                    initial_checker,
                     deduplicate=False,
                 ).candidates[0]
                 if checked.status is CandidateStatus.ENDPOINT_FEASIBLE:

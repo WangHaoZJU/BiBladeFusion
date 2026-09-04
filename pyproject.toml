@@ -43,6 +43,9 @@ foundation-stereo = [
   "torch==2.4.1",
   "torchvision==0.19.1",
 ]
+motion-ompl = [
+  "ompl>=2.0,<3; platform_system != 'Windows'",
+]
 
 [project.scripts]
 bbf = "biblade_fusion.cli:app"

@@ -346,3 +346,32 @@ unchanged science-gain order and accepts the first safe route. It remains fail-f
 each route, never relaxes a collision threshold, and never generates new unbounded
 candidates. The legacy configuration key stays parseable so reviewed deployment files do
 not break, but it no longer discards valid fallback paths.
+
+## D024 — Filter every IK branch, then use HoloRobot composite path planning
+
+Date: 2026-09-04
+
+Status: accepted; offline verified, physical verification pending
+
+HoloRobot's Pinocchio solver already explores a bounded neighboring/preset seed set, but
+the old candidate interface selected the nearest IK solution before collision checking.
+Consequently a self-colliding wrist branch could reject a camera pose even when another
+solution for the same pose was clear. Adaptive coarse and fine planning now expose every
+distinct solution, check each endpoint with the already loaded hash-bound ES68+D435i
+URDF/STL backend, and select the nearest collision-clear branch. The artifact records each
+branch verdict; endpoint feasibility remains a hard gate and contributes no science gain.
+
+After endpoints are valid, online route planning now follows HoloRobot's
+`CompositeMotionPlanner` order: conservative straight joint path first, RRTConnect only
+for an interior `PATH_BLOCKED` result. UNKNOWN collision state, stale or mismatched map
+evidence, and collisions at start or goal fail fast and never enter OMPL. The blade
+experiment uses one 1.0 s solve by default instead of HoloRobot's general five attempts of
+five seconds. This is a deliberate bounded-latency specialization, not a new planner.
+
+OMPL is optional and pinned as the `motion-ompl` extra. If it is absent, the straight
+planner and complete bounded NBV candidate queue remain functional and `scan doctor`
+reports the missing fallback as a warning. A successful detour is resampled to the same
+joint-step contract, checked again in full against exact robot geometry and one immutable
+occupancy transaction, converted into the existing velocity-limited ServoJ stream, and
+bound into path evidence by a waypoint SHA-256. No collision threshold, UNKNOWN policy,
+operator approval, tracking stop, or stationarity gate is relaxed.

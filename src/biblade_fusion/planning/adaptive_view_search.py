@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from math import cos, radians, sin
 from time import monotonic
@@ -107,11 +107,39 @@ class CandidatePoseParameters:
 
 
 @dataclass(frozen=True, slots=True)
+class EndpointConfigurationCheck:
+    """One exact IK branch's endpoint collision verdict.
+
+    The validator is deliberately independent of the camera-pose IK interface so
+    planning code can reuse the already loaded URDF/STL collision backend without
+    importing a robotics implementation into this geometry module.
+    """
+
+    clear: bool
+    blocking_reasons: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        reasons = tuple(str(value).strip() for value in self.blocking_reasons)
+        if any(not value for value in reasons):
+            raise ValueError("endpoint blocking reasons must be non-empty strings")
+        if self.clear and reasons:
+            raise ValueError("a clear endpoint cannot carry blocking reasons")
+        if not self.clear and not reasons:
+            raise ValueError("a blocked endpoint requires a blocking reason")
+        object.__setattr__(self, "blocking_reasons", reasons)
+
+
+EndpointConfigurationValidator = Callable[[NDArray[np.float64]], EndpointConfigurationCheck]
+
+
+@dataclass(frozen=True, slots=True)
 class MultiSeedIkEvaluation:
     result: ReachabilityResult
     solutions_rad: tuple[NDArray[np.float64], ...]
     chosen_solution_index: int | None
     messages: tuple[str, ...]
+    endpoint_collision_checked: bool = False
+    solution_blocking_reasons: tuple[tuple[str, ...], ...] = ()
 
     def __post_init__(self) -> None:
         solutions = []
@@ -125,7 +153,22 @@ class MultiSeedIkEvaluation:
             0 <= self.chosen_solution_index < len(solutions)
         ):
             raise ValueError("chosen IK solution index is out of range")
+        reasons = tuple(
+            tuple(str(item) for item in values)
+            for values in self.solution_blocking_reasons
+        )
+        if self.endpoint_collision_checked and len(reasons) != len(solutions):
+            raise ValueError("endpoint collision results must match all IK solutions")
+        if not self.endpoint_collision_checked and reasons:
+            raise ValueError("unchecked IK solutions cannot carry collision results")
+        if (
+            self.endpoint_collision_checked
+            and self.chosen_solution_index is not None
+            and reasons[self.chosen_solution_index]
+        ):
+            raise ValueError("chosen IK solution cannot be endpoint-collision blocked")
         object.__setattr__(self, "solutions_rad", tuple(solutions))
+        object.__setattr__(self, "solution_blocking_reasons", reasons)
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +177,8 @@ class AdaptiveCandidateAttempt:
     evaluated: EvaluatedCandidate
     ik_solutions_rad: tuple[NDArray[np.float64], ...] = ()
     chosen_solution_index: int | None = None
+    endpoint_collision_checked: bool = False
+    solution_blocking_reasons: tuple[tuple[str, ...], ...] = ()
 
     @property
     def ik_feasible(self) -> bool:
@@ -164,12 +209,37 @@ class _PrecomputedReachabilityChecker:
         return self._result
 
 
+class EndpointCollisionAwareReachabilityChecker:
+    """Expose IK reachability only after all returned branches are endpoint-clear."""
+
+    def __init__(
+        self,
+        checker: ReachabilityChecker,
+        current_joint_positions_rad: ArrayLike,
+        endpoint_validator: EndpointConfigurationValidator,
+    ) -> None:
+        self._checker = checker
+        self._current = np.asarray(current_joint_positions_rad, dtype=np.float64)
+        if self._current.shape != (6,) or not np.isfinite(self._current).all():
+            raise ValueError("current joints must be a finite six-vector")
+        self._endpoint_validator = endpoint_validator
+
+    def check(self, base_t_left_ir: PoseSE3) -> ReachabilityResult:
+        return evaluate_multi_seed_ik(
+            base_t_left_ir,
+            (self._checker,),
+            self._current,
+            self._endpoint_validator,
+        ).result
+
+
 def evaluate_multi_seed_ik(
     pose: PoseSE3,
     checkers: Sequence[ReachabilityChecker],
     current_joint_positions_rad: ArrayLike,
+    endpoint_validator: EndpointConfigurationValidator | None = None,
 ) -> MultiSeedIkEvaluation:
-    """Keep all seed solutions and select the one closest to current joints."""
+    """Keep all IK branches and select the nearest collision-clear endpoint."""
 
     current = np.asarray(current_joint_positions_rad, dtype=np.float64)
     if current.shape != (6,) or not np.isfinite(current).all():
@@ -196,9 +266,17 @@ def evaluate_multi_seed_ik(
         if outcome.state is ReachabilityState.REACHABLE
         and outcome.joint_positions_rad is not None
     )
-    if solutions:
+    solution_blocking_reasons: tuple[tuple[str, ...], ...] = ()
+    eligible = tuple(range(len(solutions)))
+    if solutions and endpoint_validator is not None:
+        checks = tuple(endpoint_validator(solution) for solution in solutions)
+        if any(type(check) is not EndpointConfigurationCheck for check in checks):
+            raise TypeError("endpoint validator must return EndpointConfigurationCheck")
+        solution_blocking_reasons = tuple(check.blocking_reasons for check in checks)
+        eligible = tuple(index for index, check in enumerate(checks) if check.clear)
+    if eligible:
         chosen = min(
-            range(len(solutions)),
+            eligible,
             key=lambda index: (
                 float(np.max(np.abs(solutions[index] - current))),
                 float(np.sum(np.abs(solutions[index] - current))),
@@ -208,10 +286,43 @@ def evaluate_multi_seed_ik(
         result = ReachabilityResult(
             ReachabilityState.REACHABLE,
             f"{len(solutions)} IK solution(s) found from {len(checkers)} checker(s); "
-            "collision and trajectory remain unchecked",
+            + (
+                f"{len(eligible)} endpoint-collision clear; trajectory remains unchecked"
+                if endpoint_validator is not None
+                else "endpoint collision and trajectory remain unchecked"
+            ),
             solutions[chosen],
         )
-        return MultiSeedIkEvaluation(result, solutions, chosen, messages)
+        return MultiSeedIkEvaluation(
+            result,
+            solutions,
+            chosen,
+            messages,
+            endpoint_validator is not None,
+            solution_blocking_reasons,
+        )
+
+    if solutions and endpoint_validator is not None:
+        unique_reasons = tuple(
+            dict.fromkeys(
+                reason
+                for branch_reasons in solution_blocking_reasons
+                for reason in branch_reasons
+            )
+        )
+        result = ReachabilityResult(
+            ReachabilityState.UNREACHABLE,
+            f"{len(solutions)} IK solution(s) found, but every endpoint is collision "
+            f"blocked: {' | '.join(unique_reasons)}",
+        )
+        return MultiSeedIkEvaluation(
+            result,
+            solutions,
+            None,
+            messages,
+            True,
+            solution_blocking_reasons,
+        )
 
     state = (
         ReachabilityState.UNKNOWN
@@ -428,9 +539,10 @@ def search_adaptive_candidate_family(
     current_joint_positions_rad: ArrayLike,
     config: AdaptiveViewSearchConfig | None = None,
     *,
+    endpoint_validator: EndpointConfigurationValidator | None = None,
     monotonic_clock=monotonic,
 ) -> AdaptiveViewSearchResult:
-    """Find endpoint-IK alternatives; no collision, path, or motion is authorized."""
+    """Find endpoint IK alternatives, optionally rejecting colliding IK branches."""
 
     policy = config or AdaptiveViewSearchConfig()
     current = np.asarray(current_joint_positions_rad, dtype=np.float64)
@@ -464,6 +576,7 @@ def search_adaptive_candidate_family(
                 candidate.base_t_left_ir,
                 ik_checkers,
                 current,
+                endpoint_validator,
             )
             evaluated = filter_candidate_views(
                 (candidate,),
@@ -477,6 +590,8 @@ def search_adaptive_candidate_family(
                 evaluated,
                 ik.solutions_rad,
                 ik.chosen_solution_index,
+                ik.endpoint_collision_checked,
+                ik.solution_blocking_reasons,
             )
         attempts.append(attempt)
         if attempt.ik_feasible:
@@ -544,6 +659,10 @@ def adaptive_view_search_payload(
                 "metrics": asdict(attempt.evaluated.metrics),
                 "ik_solutions_rad": [item.tolist() for item in attempt.ik_solutions_rad],
                 "chosen_solution_index": attempt.chosen_solution_index,
+                "endpoint_collision_checked": attempt.endpoint_collision_checked,
+                "ik_solution_blocking_reasons": [
+                    list(reasons) for reasons in attempt.solution_blocking_reasons
+                ],
                 "chosen_joint_positions_rad": (
                     attempt.evaluated.joint_positions_rad.tolist()
                     if attempt.evaluated.joint_positions_rad is not None
@@ -554,10 +673,16 @@ def adaptive_view_search_payload(
         )
     recommended = result.recommended
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_kind": "biblade_fusion.offline_adaptive_view_search",
         "motion_authorized": False,
-        "endpoint_collision_checked": False,
+        "endpoint_collision_checked": any(
+            attempt.ik_solutions_rad for attempt in result.attempts
+        ) and all(
+            attempt.endpoint_collision_checked
+            for attempt in result.attempts
+            if attempt.ik_solutions_rad
+        ),
         "trajectory_checked": False,
         "nominal_view_id": result.nominal_view_id,
         "current_joint_positions_rad": current.tolist(),

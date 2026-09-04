@@ -14,6 +14,12 @@ from numpy.typing import ArrayLike
 
 from biblade_fusion.devices.robot.streaming import ServoJStream, ServoJStreamConfig
 from biblade_fusion.diagnostics.performance_timing import performance_span, performance_timed
+from biblade_fusion.robotics.holorobot_joint_planner import (
+    HoloRobotJointPlanStatus,
+    HoloRobotOmplConfig,
+    ompl_available,
+    plan_holorobot_rrtconnect,
+)
 from biblade_fusion.robotics.occupancy_collision import (
     JointPathOccupancyCollisionReport,
     OccupancyRobotCollisionChecker,
@@ -133,6 +139,15 @@ def _canonical_sha256(payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _waypoints_sha256(waypoints: tuple[tuple[float, ...], ...]) -> str:
+    return _canonical_sha256(
+        {
+            "schema": "biblade_fusion.joint_waypoints.v1",
+            "waypoints": [list(item) for item in waypoints],
+        }
+    )
+
+
 def _holorobot_sampled_configurations(
     waypoints: tuple[tuple[float, ...], ...],
     *,
@@ -182,11 +197,14 @@ def _holorobot_sampled_evidence_payload(
     collision_diagnostics = collision.result.diagnostics
     occupancy_diagnostics = occupancy.result.diagnostics
     return {
-        "schema": "biblade_fusion.holorobot_sampled_path_evidence.v2",
+        "schema": "biblade_fusion.holorobot_sampled_path_evidence.v3",
         "method": HOLOROBOT_SAMPLED_VALIDATION,
         "trajectory_sha256": _joint_path_sha256(
             preflight.start_joint_positions_rad,
             preflight.goal_joint_positions_rad,
+        ),
+        "planning_waypoints_sha256": _waypoints_sha256(
+            preflight.planning_waypoints
         ),
         "maximum_joint_step_rad": collision.maximum_joint_step_rad,
         "occupancy_maximum_joint_step_rad": occupancy.maximum_joint_step_rad,
@@ -331,7 +349,11 @@ def validate_preflight_servoj_contract(
     fails closed before an execution permit can be issued.
     """
 
-    if preflight.diagnostics.get("planner") != "holorobot_conservative_linear_joint":
+    planner = preflight.diagnostics.get("planner")
+    if planner not in {
+        "holorobot_conservative_linear_joint",
+        "holorobot_composite_ompl_rrtconnect",
+    }:
         raise ValueError("Unsupported motion preflight planner contract")
     if preflight.diagnostics.get("trajectory_generator") != "holorobot_velocity_limited_servoj":
         raise ValueError("Unsupported motion trajectory-generator contract")
@@ -394,11 +416,35 @@ def validate_preflight_servoj_contract(
         preflight.goal_joint_positions_rad,
         label="motion preflight goal",
     )
-    expected_waypoints = _linear_waypoints(
-        start,
-        goal,
-        maximum_joint_step_rad=maximum_step,
-    )
+    if planner == "holorobot_conservative_linear_joint":
+        expected_waypoints = _linear_waypoints(
+            start,
+            goal,
+            maximum_joint_step_rad=maximum_step,
+        )
+    else:
+        expected_waypoints = tuple(
+            _joint_vector(item, label="motion preflight waypoint")
+            for item in preflight.planning_waypoints
+        )
+        if len(expected_waypoints) < 2:
+            raise ValueError("OMPL motion preflight requires at least two waypoints")
+        if expected_waypoints[0] != start or expected_waypoints[-1] != goal:
+            raise ValueError("OMPL motion preflight endpoints do not reproduce")
+        if any(
+            max(abs(end - begin) for begin, end in zip(first, second, strict=True))
+            > maximum_step + 1e-12
+            for first, second in zip(
+                expected_waypoints[:-1],
+                expected_waypoints[1:],
+                strict=True,
+            )
+        ):
+            raise ValueError("OMPL motion preflight exceeds its resampling step")
+        if preflight.diagnostics.get("planning_waypoints_sha256") != _waypoints_sha256(
+            expected_waypoints
+        ):
+            raise ValueError("OMPL motion preflight waypoint identity changed")
     if preflight.planning_waypoints != expected_waypoints:
         raise ValueError("Motion preflight waypoints do not reproduce")
     expected_stream = _velocity_limited_stream(
@@ -499,6 +545,7 @@ def _sample_occupancy_path_holorobot_style(
         tuple(fraction for _configuration, fraction in sampled),
         maximum_joint_step_rad=maximum_joint_step_rad,
         required_freshness_horizon_s=required_freshness_horizon_s,
+        precheck_last_configuration=True,
     )
     return replace(
         report,
@@ -514,8 +561,7 @@ def _sample_occupancy_path_holorobot_style(
     )
 
 
-@performance_timed("planning.preflight_linear_joint_motion")
-def preflight_linear_joint_motion(
+def _preflight_joint_waypoints(
     start_joint_positions_rad: ArrayLike,
     goal_joint_positions_rad: ArrayLike,
     *,
@@ -542,16 +588,20 @@ def preflight_linear_joint_motion(
     motion_envelope_acceptance_id: str | None = None,
     motion_envelope_metadata_sha256: str | None = None,
     path_validation_mode: str = CONTINUOUS_INTERVAL_VALIDATION,
+    planning_waypoints: tuple[tuple[float, ...], ...],
+    planner: str = "holorobot_conservative_linear_joint",
+    planner_diagnostics: dict[str, object] | None = None,
 ) -> JointMotionPreflight:
-    """Plan, collision-check, and time-parameterize one conservative linear joint leg."""
+    """Collision-check and time-parameterize one already generated joint path."""
 
     start = _joint_vector(start_joint_positions_rad, label="motion start")
     goal = _joint_vector(goal_joint_positions_rad, label="motion goal")
-    waypoints = _linear_waypoints(
-        start,
-        goal,
-        maximum_joint_step_rad=maximum_joint_step_rad,
+    waypoints = tuple(
+        _joint_vector(item, label="motion planning waypoint")
+        for item in planning_waypoints
     )
+    if len(waypoints) < 2 or waypoints[0] != start or waypoints[-1] != goal:
+        raise ValueError("motion planning waypoints must preserve exact start and goal")
     freshness_margin_s = float(execution_freshness_margin_s)
     if not math.isfinite(freshness_margin_s) or freshness_margin_s < 0.0:
         raise ValueError("execution_freshness_margin_s must be finite and non-negative")
@@ -602,7 +652,7 @@ def preflight_linear_joint_motion(
         require_swept_mesh = False
         require_continuous_occupancy_sweep = False
     diagnostics = {
-        "planner": "holorobot_conservative_linear_joint",
+        "planner": planner,
         "trajectory_generator": "holorobot_velocity_limited_servoj",
         "maximum_joint_step_rad": maximum_joint_step_rad,
         "servoj_dt_s": servoj_dt_s,
@@ -618,6 +668,8 @@ def preflight_linear_joint_motion(
         "path_validation_mode": validation_mode,
         "provenance": robot_stack_provenance(),
         "motion_authorized": False,
+        "planning_waypoints_sha256": _waypoints_sha256(waypoints),
+        **(planner_diagnostics or {}),
     }
     unavailable_reason = str(checker_unavailable_reason).strip()
     if not unavailable_reason:
@@ -853,3 +905,331 @@ def preflight_linear_joint_motion(
             path_validation_evidence_sha256=_canonical_sha256(payload),
         )
     return preflight
+
+
+def _endpoint_blocked_preflight(
+    *,
+    start: tuple[float, ...],
+    goal: tuple[float, ...],
+    waypoints: tuple[tuple[float, ...], ...],
+    collision: JointPathMeshCollisionReport,
+    occupancy: JointPathOccupancyCollisionReport | None,
+    blocking_reasons: tuple[str, ...],
+    maximum_joint_step_rad: float,
+    path_validation_mode: str,
+    require_occupancy: bool,
+    accepted_joint_uncertainty_rad: tuple[float, ...],
+    motion_envelope_acceptance_id: str | None,
+    motion_envelope_metadata_sha256: str | None,
+) -> JointMotionPreflight:
+    return JointMotionPreflight(
+        status=MotionPreflightStatus.BLOCKED,
+        start_joint_positions_rad=start,
+        goal_joint_positions_rad=goal,
+        planning_waypoints=waypoints,
+        servoj_stream=None,
+        collision=collision,
+        occupancy=occupancy,
+        blocking_reasons=blocking_reasons,
+        warnings=(),
+        diagnostics={
+            "planner": "holorobot_composite_joint",
+            "primary_planner": "holorobot_conservative_linear_joint",
+            "fallback_planner": "holorobot_ompl_rrtconnect",
+            "fallback_used": False,
+            "failure_stage": "goal_endpoint",
+            "maximum_joint_step_rad": maximum_joint_step_rad,
+            "path_validation_mode": path_validation_mode,
+            "require_occupancy": require_occupancy,
+            "accepted_joint_uncertainty_rad": list(
+                accepted_joint_uncertainty_rad
+            ),
+            "motion_envelope_acceptance_id": motion_envelope_acceptance_id,
+            "motion_envelope_metadata_sha256": motion_envelope_metadata_sha256,
+            "planning_waypoints_sha256": _waypoints_sha256(waypoints),
+            "motion_authorized": False,
+        },
+        occupancy_required=require_occupancy,
+        swept_mesh_required=False,
+        continuous_occupancy_sweep_required=False,
+        path_validation_mode=path_validation_mode,
+    )
+
+
+def _with_failed_fallback(
+    primary: JointMotionPreflight,
+    *,
+    status: HoloRobotJointPlanStatus,
+    reasons: tuple[str, ...],
+    diagnostics: dict[str, object] | None,
+) -> JointMotionPreflight:
+    return replace(
+        primary,
+        blocking_reasons=tuple(
+            dict.fromkeys(
+                (
+                    *primary.blocking_reasons,
+                    *(f"ompl_fallback:{reason}" for reason in reasons),
+                )
+            )
+        ),
+        diagnostics={
+            **primary.diagnostics,
+            "planner": "holorobot_composite_joint",
+            "primary_planner": "holorobot_conservative_linear_joint",
+            "primary_status": primary.status.value,
+            "fallback_planner": "holorobot_ompl_rrtconnect",
+            "fallback_status": status.value,
+            "fallback_used": False,
+            "fallback_diagnostics": diagnostics or {},
+        },
+    )
+
+
+def _primary_failed_on_interior_path(
+    primary: JointMotionPreflight,
+) -> bool:
+    """Match HoloRobot's PATH_BLOCKED-only fallback transition.
+
+    UNKNOWN checker/evidence states and collisions at either endpoint are not
+    search problems.  Sending those states to OMPL used to hide the real cause
+    behind a planning timeout and added avoidable latency.
+    """
+
+    if primary.status is not MotionPreflightStatus.BLOCKED:
+        return False
+    report: JointPathMeshCollisionReport | JointPathOccupancyCollisionReport | None
+    if primary.collision is not None and (
+        primary.collision.status is not CollisionCheckStatus.CLEAR
+    ):
+        report = primary.collision
+    elif primary.occupancy is not None and (
+        primary.occupancy.status is not CollisionCheckStatus.CLEAR
+    ):
+        report = primary.occupancy
+    else:
+        return False
+    fraction = report.blocked_path_fraction
+    return bool(
+        report.status is CollisionCheckStatus.BLOCKED
+        and fraction is not None
+        and 0.0 < float(fraction) < 1.0
+    )
+
+
+@performance_timed("planning.preflight_linear_joint_motion")
+def preflight_linear_joint_motion(
+    start_joint_positions_rad: ArrayLike,
+    goal_joint_positions_rad: ArrayLike,
+    *,
+    collision_checker: Cs68PinocchioCollisionChecker | None,
+    checker_unavailable_reason: str = "checker_unavailable",
+    occupancy_checker: OccupancyRobotCollisionChecker | None = None,
+    require_occupancy: bool = True,
+    require_swept_mesh: bool = True,
+    require_continuous_occupancy_sweep: bool = True,
+    maximum_joint_step_rad: float = 0.02,
+    servoj_dt_s: float = 0.004,
+    speed_scaling: float = 0.08,
+    velocity_margin: float = 0.8,
+    execution_freshness_margin_s: float = 1.0,
+    servoj_runtime_config: ServoJStreamConfig | None = None,
+    accepted_joint_uncertainty_rad: tuple[float, float, float, float, float, float] = (
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ),
+    motion_envelope_acceptance_id: str | None = None,
+    motion_envelope_metadata_sha256: str | None = None,
+    path_validation_mode: str = CONTINUOUS_INTERVAL_VALIDATION,
+    enable_ompl_fallback: bool = False,
+    ompl_plan_timeout_s: float = 1.0,
+    ompl_rrt_range_rad: float = 0.25,
+    ompl_simplify_path: bool = True,
+) -> JointMotionPreflight:
+    """Use HoloRobot's straight-primary, RRTConnect-fallback planning order."""
+
+    start = _joint_vector(start_joint_positions_rad, label="motion start")
+    goal = _joint_vector(goal_joint_positions_rad, label="motion goal")
+    waypoints = _linear_waypoints(
+        start,
+        goal,
+        maximum_joint_step_rad=maximum_joint_step_rad,
+    )
+    common: dict[str, Any] = {
+        "collision_checker": collision_checker,
+        "checker_unavailable_reason": checker_unavailable_reason,
+        "occupancy_checker": occupancy_checker,
+        "require_occupancy": require_occupancy,
+        "require_swept_mesh": require_swept_mesh,
+        "require_continuous_occupancy_sweep": require_continuous_occupancy_sweep,
+        "maximum_joint_step_rad": maximum_joint_step_rad,
+        "servoj_dt_s": servoj_dt_s,
+        "speed_scaling": speed_scaling,
+        "velocity_margin": velocity_margin,
+        "execution_freshness_margin_s": execution_freshness_margin_s,
+        "servoj_runtime_config": servoj_runtime_config,
+        "accepted_joint_uncertainty_rad": accepted_joint_uncertainty_rad,
+        "motion_envelope_acceptance_id": motion_envelope_acceptance_id,
+        "motion_envelope_metadata_sha256": motion_envelope_metadata_sha256,
+        "path_validation_mode": path_validation_mode,
+    }
+
+    # HoloRobot rejects an invalid goal before spending time on either a direct
+    # path or RRTConnect.  Preserve that ordering for the online sampled mode.
+    if (
+        path_validation_mode == HOLOROBOT_SAMPLED_VALIDATION
+        and collision_checker is not None
+    ):
+        goal_mesh = collision_checker.check(goal)
+        goal_mesh_report = JointPathMeshCollisionReport(
+            status=goal_mesh.status,
+            sample_count=1,
+            blocked_sample_index=(
+                None if goal_mesh.status is CollisionCheckStatus.CLEAR else 0
+            ),
+            blocked_path_fraction=(
+                None if goal_mesh.status is CollisionCheckStatus.CLEAR else 1.0
+            ),
+            result=replace(
+                goal_mesh,
+                diagnostics={
+                    **goal_mesh.diagnostics,
+                    "path_validation_mode": HOLOROBOT_SAMPLED_VALIDATION,
+                    "sampled_path_verified": (
+                        goal_mesh.status is CollisionCheckStatus.CLEAR
+                    ),
+                    "effective_maximum_sample_step_rad": (
+                        HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD
+                    ),
+                },
+            ),
+            maximum_joint_step_rad=maximum_joint_step_rad,
+        )
+        if goal_mesh.status is not CollisionCheckStatus.CLEAR:
+            return _endpoint_blocked_preflight(
+                start=start,
+                goal=goal,
+                waypoints=waypoints,
+                collision=goal_mesh_report,
+                occupancy=None,
+                blocking_reasons=goal_mesh.blocking_reasons
+                or (f"goal_collision_status:{goal_mesh.status.value}",),
+                maximum_joint_step_rad=maximum_joint_step_rad,
+                path_validation_mode=path_validation_mode,
+                require_occupancy=require_occupancy,
+                accepted_joint_uncertainty_rad=accepted_joint_uncertainty_rad,
+                motion_envelope_acceptance_id=motion_envelope_acceptance_id,
+                motion_envelope_metadata_sha256=motion_envelope_metadata_sha256,
+            )
+    primary = _preflight_joint_waypoints(
+        start,
+        goal,
+        planning_waypoints=waypoints,
+        **common,
+    )
+    if (
+        primary.status is MotionPreflightStatus.CLEAR
+        or not enable_ompl_fallback
+        or path_validation_mode != HOLOROBOT_SAMPLED_VALIDATION
+        or collision_checker is None
+        or occupancy_checker is None
+    ):
+        return primary
+    if not _primary_failed_on_interior_path(primary):
+        return replace(
+            primary,
+            diagnostics={
+                **primary.diagnostics,
+                "planner": "holorobot_composite_joint",
+                "primary_planner": "holorobot_conservative_linear_joint",
+                "fallback_planner": "holorobot_ompl_rrtconnect",
+                "fallback_used": False,
+                "fallback_reason": "not_an_interior_path_block",
+                "failure_stage": (
+                    "goal_endpoint"
+                    if any(
+                        report is not None
+                        and report.blocked_path_fraction == 1.0
+                        for report in (primary.collision, primary.occupancy)
+                    )
+                    else "start_endpoint_or_checker_evidence"
+                ),
+            },
+        )
+    if not ompl_available():
+        return _with_failed_fallback(
+            primary,
+            status=HoloRobotJointPlanStatus.PLANNER_UNAVAILABLE,
+            reasons=("ompl_python_bindings_unavailable",),
+            diagnostics=None,
+        )
+
+    try:
+        with (
+            performance_span("planning.holorobot_ompl_fallback"),
+            occupancy_checker.bind_configuration_queries() as bound_occupancy,
+        ):
+
+            def state_validity(
+                configuration: tuple[float, ...],
+            ) -> tuple[bool, tuple[str, ...]]:
+                mesh = collision_checker.check(configuration)
+                if mesh.status is not CollisionCheckStatus.CLEAR:
+                    return False, mesh.blocking_reasons or (
+                        f"mesh_collision_status:{mesh.status.value}",
+                    )
+                occupancy = bound_occupancy.check(configuration)
+                if occupancy.status is not CollisionCheckStatus.CLEAR:
+                    return False, occupancy.blocking_reasons or (
+                        f"occupancy_status:{occupancy.status.value}",
+                    )
+                return True, ()
+
+            fallback = plan_holorobot_rrtconnect(
+                start,
+                goal,
+                joint_limits_rad=collision_checker.kinematic_model.joint_limit_pairs(),
+                state_validity=state_validity,
+                config=HoloRobotOmplConfig(
+                    maximum_joint_step_rad=maximum_joint_step_rad,
+                    plan_timeout_s=ompl_plan_timeout_s,
+                    rrt_range_rad=ompl_rrt_range_rad,
+                    simplify_path=ompl_simplify_path,
+                ),
+            )
+    except Exception as exc:
+        return _with_failed_fallback(
+            primary,
+            status=HoloRobotJointPlanStatus.PATH_BLOCKED,
+            reasons=(f"planner_error:{type(exc).__name__}:{exc}",),
+            diagnostics=None,
+        )
+    if not fallback.clear:
+        return _with_failed_fallback(
+            primary,
+            status=fallback.status,
+            reasons=fallback.blocking_reasons,
+            diagnostics=fallback.diagnostics,
+        )
+
+    verified = _preflight_joint_waypoints(
+        start,
+        goal,
+        planning_waypoints=fallback.waypoints,
+        planner="holorobot_composite_ompl_rrtconnect",
+        planner_diagnostics={
+            "primary_planner": "holorobot_conservative_linear_joint",
+            "primary_status": primary.status.value,
+            "primary_blocking_reasons": list(primary.blocking_reasons),
+            "fallback_planner": "holorobot_ompl_rrtconnect",
+            "fallback_status": fallback.status.value,
+            "fallback_used": True,
+            "fallback_diagnostics": fallback.diagnostics or {},
+        },
+        **common,
+    )
+    return verified

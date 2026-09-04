@@ -180,13 +180,10 @@ to the blade measurement objective:
 These changes are covered by the repository full suite and supersede the narrower test
 counts above. The physical acceptance criterion remains unchanged.
 
-HoloRobot also contains an optional `OmplJointPlanner`/`CompositeMotionPlanner`. It is
-not copied into this release: that adapter validates a generic sampled waypoint path,
-whereas BiBladeFusion's motion permit currently binds two continuous uncertainty-aware
-proofs to each straight segment; the validated eiai dependency set also does not include
-OMPL. Copying the class alone would either be unavailable at runtime or silently weaken
-the proof contract, and HoloRobot's configured five 5-second attempts would reintroduce
-the latency this regression removes. The current bounded fallback is therefore multiple
-science endpoints and IK branches, each with a complete straight-path proof. A future
-OMPL integration must emit a permit-bound sequence of per-leg continuous proofs before
-it can replace that explicit limitation.
+HoloRobot also contains an optional `OmplJointPlanner`/`CompositeMotionPlanner`. It was
+not copied into this historical release. D021 later replaced recursive online interval
+proofs with a distinct permit-bound sampled contract, and D024 consequently supersedes
+this limitation: BiBladeFusion now ports the same straight-primary/RRTConnect-fallback
+order, but uses one 1.0 s solve rather than HoloRobot's generic five 5-second attempts.
+Every returned detour is resampled, rechecked against exact URDF/STL and bound occupancy,
+and hashed into the sampled-path permit evidence.

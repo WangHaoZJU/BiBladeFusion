@@ -26,6 +26,12 @@ from biblade_fusion.robotics.guarded_execution import (
     GuardedEliteExecutor,
     MotionExecutionPermit,
 )
+from biblade_fusion.robotics.holorobot_joint_planner import (
+    HoloRobotJointPlan,
+    HoloRobotJointPlanStatus,
+    HoloRobotOmplConfig,
+    ompl_available,
+)
 from biblade_fusion.robotics.motion_preflight import (
     CONTINUOUS_INTERVAL_VALIDATION,
     HOLOROBOT_SAMPLED_VALIDATION,
@@ -82,6 +88,9 @@ __all__ = [
     "Es68D435iCollisionTemplate",
     "Es68ModelResources",
     "GuardedEliteExecutor",
+    "HoloRobotJointPlan",
+    "HoloRobotJointPlanStatus",
+    "HoloRobotOmplConfig",
     "CONTINUOUS_INTERVAL_VALIDATION",
     "HOLOROBOT_SAMPLED_VALIDATION",
     "JointPathMeshCollisionReport",
@@ -104,6 +113,7 @@ __all__ = [
     "StationarityEvidence",
     "StationarityTimeoutError",
     "occupancy_evidence_from_snapshot",
+    "ompl_available",
     "preflight_linear_joint_motion",
     "build_es68_d435i_collision_urdf",
     "es68_d435i_collision_content_hash",

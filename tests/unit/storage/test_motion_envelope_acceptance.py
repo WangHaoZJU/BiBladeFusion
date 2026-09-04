@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from biblade_fusion.core.settings import load_settings
 from biblade_fusion.storage.motion_envelope_acceptance import (
+    motion_control_contract_for_settings,
     motion_control_contract_sha256,
     read_motion_envelope_acceptance,
     write_motion_envelope_acceptance,
@@ -103,6 +105,29 @@ def test_motion_control_contract_is_canonical_and_sensitive() -> None:
 
     assert first == reordered
     assert first != changed
+
+
+def test_motion_control_contract_excludes_path_search_policy() -> None:
+    settings = load_settings("configs/default.yaml")
+    baseline = motion_control_contract_for_settings(settings)
+    changed = settings.model_copy(
+        update={
+            "motion_preflight": settings.motion_preflight.model_copy(
+                update={
+                    "enable_ompl_fallback": not (
+                        settings.motion_preflight.enable_ompl_fallback
+                    ),
+                    "ompl_plan_timeout_s": 0.5,
+                    "ompl_rrt_range_rad": 0.1,
+                    "ompl_simplify_path": not (
+                        settings.motion_preflight.ompl_simplify_path
+                    ),
+                }
+            )
+        }
+    )
+
+    assert motion_control_contract_for_settings(changed) == baseline
 
 
 def test_motion_envelope_acceptance_rejects_unmeasured_or_unchecked_values(

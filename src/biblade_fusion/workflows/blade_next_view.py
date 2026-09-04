@@ -47,6 +47,8 @@ from biblade_fusion.planning import (
     BladeClearanceEnvelope,
     CandidateStatus,
     EliteCs68IkChecker,
+    EndpointCollisionAwareReachabilityChecker,
+    EndpointConfigurationValidator,
     EvaluatedCandidate,
     ReachabilityChecker,
     filter_candidate_views,
@@ -86,7 +88,7 @@ from biblade_fusion.workflows.stop_scan_coordinator import (
     next_view_target_from_candidate,
 )
 
-_SELECTOR_ALGORITHM = "bilateral_single_fin_scientific_gain_nbv_v3"
+_SELECTOR_ALGORITHM = "bilateral_single_fin_scientific_gain_nbv_v4"
 
 
 class FlangeForwardKinematics(Protocol):
@@ -152,6 +154,7 @@ def _selection_policy_payload(
     finalization_config: FineFinalizationConfig | None,
     view_planning_config: ViewPlanningConfig | None = None,
     point_cloud_config: PointCloudConfig | None = None,
+    endpoint_collision_filter_enabled: bool,
 ) -> dict[str, object]:
     return {
         "algorithm": _SELECTOR_ALGORITHM,
@@ -168,6 +171,7 @@ def _selection_policy_payload(
             else {"enabled": False}
         ),
         "motion_endpoint_gate": {
+            "ik_branch_collision_filter_enabled": endpoint_collision_filter_enabled,
             "maximum_translation_error_m": motion_config.maximum_endpoint_translation_error_m,
             "maximum_rotation_error_deg": motion_config.maximum_endpoint_rotation_error_deg,
         },
@@ -220,6 +224,7 @@ def production_selection_policy_payload(
         finalization_config=settings.fine_finalization,
         view_planning_config=settings.view_planning,
         point_cloud_config=settings.point_cloud,
+        endpoint_collision_filter_enabled=True,
     )
 
 
@@ -291,6 +296,7 @@ class BladeCoverageNextViewSelector:
         finalization_config: FineFinalizationConfig | None = None,
         view_planning_config: ViewPlanningConfig | None = None,
         point_cloud_config: PointCloudConfig | None = None,
+        endpoint_validator: EndpointConfigurationValidator | None = None,
     ) -> None:
         self._hand_eye = hand_eye
         self._flange_t_left_ir = hand_eye.require_flange_primary()
@@ -339,6 +345,7 @@ class BladeCoverageNextViewSelector:
         self._last_surface_root: Path | None = None
         self._last_surface_generation_id: str | None = None
         self._pending_selection: NextViewSelection | None = None
+        self._endpoint_validator = endpoint_validator
 
         if reachability_factory is None:
             model_path = self._kinematics_config.model_path
@@ -391,6 +398,7 @@ class BladeCoverageNextViewSelector:
             finalization_config=finalization_config,
             view_planning_config=self._view_planning_config,
             point_cloud_config=self._point_cloud_config,
+            endpoint_collision_filter_enabled=self._endpoint_validator is not None,
         )
         self._policy_sha256 = _canonical_sha256(self._policy_payload)
 
@@ -403,6 +411,7 @@ class BladeCoverageNextViewSelector:
         reference_coarse_model: str | Path,
         science_authority: ScienceAcceptanceAuthority | None,
         experimental: bool = False,
+        endpoint_validator: EndpointConfigurationValidator | None = None,
     ) -> BladeCoverageNextViewSelector:
         """Build the production selector without connecting to the robot."""
 
@@ -461,6 +470,7 @@ class BladeCoverageNextViewSelector:
             finalization_config=settings.fine_finalization,
             view_planning_config=settings.view_planning,
             point_cloud_config=settings.point_cloud,
+            endpoint_validator=endpoint_validator,
         )
 
     @property
@@ -928,6 +938,7 @@ class BladeCoverageNextViewSelector:
                 (checker,),
                 current_joints,
                 search_config,
+                endpoint_validator=self._endpoint_validator,
             )
             for attempt in search.ranked_feasible:
                 item = attempt.evaluated
@@ -1142,6 +1153,13 @@ class BladeCoverageNextViewSelector:
             raise NextViewUnavailable(
                 f"Cannot initialize endpoint IK from the current stopped joints: {exc}"
             ) from exc
+        endpoint_checker: ReachabilityChecker = checker
+        if self._endpoint_validator is not None:
+            endpoint_checker = EndpointCollisionAwareReachabilityChecker(
+                checker,
+                current_joints,
+                self._endpoint_validator,
+            )
         candidates = tuple(item[1] for item in selectable)
         projection_poses = {
             item[1].view_id: item[2]
@@ -1153,7 +1171,7 @@ class BladeCoverageNextViewSelector:
                 candidates,
                 _surface_envelope(state.surface),
                 self._view_filter_config,
-                checker,
+                endpoint_checker,
                 projection_poses=projection_poses,
                 deduplicate=False,
             )

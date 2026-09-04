@@ -42,6 +42,18 @@ the private Elite SDK wheel and GPU/FoundationStereo dependencies because those 
 are deployment additions. Rebuild only when dependencies actually changed, using the
 project GPU bootstrap procedure and the real Elite SDK wheel.
 
+The composite HoloRobot planner adds one optional pinned runtime wheel. Install only that
+wheel without reconciling or removing the rest of the deployment environment:
+
+```bash
+/usr/bin/env -u PYTHONPATH uv pip install \
+  --python .venv/bin/python \
+  'ompl==2.0.1'
+
+/usr/bin/env -u PYTHONPATH .venv/bin/python -c \
+  "import ompl; print('OMPL: OK')"
+```
+
 Always keep ROS Python 3.10 packages out of this Python 3.12 environment:
 
 ```bash
@@ -72,11 +84,23 @@ Required before proceeding:
 - Elite SDK, FoundationStereo dependencies, CUDA, CUDA DDA, collision backends,
   calibration, static-free acceptance, and coarse-to-fine policy pass.
 - `supervised_scan_holorobot_single_arm` must report the fixed-step sampled online
-  contract. Offline continuous-proof capability may still appear in JSON details, but it
-  is not executed by the online NBV loop.
+  contract and `ompl_fallback_available: true`. Offline continuous-proof capability may
+  still appear in JSON details, but it is not executed by the online NBV loop.
 - xFormers and FlashAttention warnings are optional acceleration warnings.
 - `Motion authorized: no; hardware acceptance is a separate gate` is an informational
   release statement in experimental mode; it is not itself the runtime failure.
+
+Confirm the active single-arm planner details explicitly:
+
+```bash
+/usr/bin/env -u PYTHONPATH .venv/bin/bbf \
+  scan doctor \
+  --mode unknown \
+  --experimental \
+  --ray-integration-backend cuda \
+  --config configs/local.yaml \
+  --json | jq '.[] | select(.name == "supervised_scan_holorobot_single_arm")'
+```
 
 If `unknown_blade_coarse_to_fine` fails, get the exact details instead of guessing:
 
@@ -184,10 +208,12 @@ The normal transition is:
 
 ```text
 bootstrap_motion_ready/map_ready
-  -> "Planning next view with HoloRobot single-arm sampling ..."
+  -> "Planning next view with HoloRobot single-arm composite planning ..."
   -> complete NBV-selector-bounded queue in unchanged science-rank order
-  -> 0.02-rad pre-interpolated waypoints (finer than HoloRobot's effective 0.025 rad),
-     first collision exits
+  -> every IK branch receives a fail-fast exact URDF/STL endpoint check
+  -> straight 0.02-rad route first (finer than HoloRobot's effective 0.025 rad)
+  -> if endpoints are clear and only the route interior is blocked, one bounded
+     RRTConnect attempt, then full resampling/recheck
   -> waiting_approval
   -> exact EXECUTE token entered
   -> permit consumed, then permit-bound power/brake preparation
@@ -204,7 +230,11 @@ still use original URDF/STL robot geometry and conservative occupancy. `sampled`
 mean collision checking is disabled. One path hashes/binds its immutable occupancy at the
 two transaction boundaries; it does not re-hash the whole map for every robot pose. The
 legacy `maximum_ranked_preflight_candidates` value is ignored: the selector has already
-bounded the queue, and stopping after three can discard a safe fourth or fifth path.
+bounded the queue, and stopping after three can discard a safe fourth or fifth path. The
+default OMPL budget is one 1.0 s solve, not HoloRobot's generic five-by-five-second
+application budget. UNKNOWN, stale/mismatched map evidence, and start/goal collision fail
+immediately; they are never sent to OMPL. If OMPL cannot find a detour within its budget,
+the coordinator records that candidate and continues to the next ranked endpoint.
 
 Paste the entire exact token, including `EXECUTE`, once. After Enter, a short preparation
 interval is expected while the driver connects and controller state is established. The

@@ -433,14 +433,22 @@ collision:
   minimum_clearance_m: 0.01
   maximum_joint_step_rad: 0.02
 
-# HoloRobot-derived motion-preflight contract. Production eligibility requires independent
-# conservative continuous mesh/FCL and robot-versus-voxel interval certificates. Failure to
-# prove a complete interval is UNKNOWN and blocks; discrete samples are diagnostic only.
+# HoloRobot-derived online motion contract. The active NBV path uses bounded sampled
+# URDF/STL and occupancy checks; the recursive interval certificate remains available
+# only for offline acceptance/diagnostics. UNKNOWN still blocks and cannot invoke OMPL.
 motion_preflight:
   maximum_joint_step_rad: 0.02
   servoj_dt_s: 0.004
   speed_scaling: 0.08
   velocity_margin: 0.8
+  # HoloRobot composite planner: a straight path remains primary. RRTConnect is
+  # attempted once, with this strict budget, only when both endpoints are clear
+  # but the direct route is blocked. Missing optional OMPL bindings do not weaken
+  # collision checks; the runtime proceeds to the next bounded NBV candidate.
+  enable_ompl_fallback: true
+  ompl_plan_timeout_s: 1.0
+  ompl_rrt_range_rad: 0.25
+  ompl_simplify_path: true
   # Every stored IK endpoint must reproduce its requested base_T_tcp under the calibrated
   # ES68 FK and packaged flange_T_tcp before any future approval-eligible stream exists.
   maximum_endpoint_translation_error_m: 0.002

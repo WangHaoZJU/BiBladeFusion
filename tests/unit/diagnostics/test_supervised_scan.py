@@ -108,6 +108,7 @@ def test_collision_backend_audit_checks_both_real_backend_contracts(monkeypatch)
         "OccupancyRobotCollisionChecker",
         FakeOccupancyChecker,
     )
+    monkeypatch.setattr(supervised_scan, "ompl_available", lambda: True)
 
     result = supervised_scan._collision_backend_check(
         load_settings("configs/default.yaml")
@@ -122,6 +123,9 @@ def test_collision_backend_audit_checks_both_real_backend_contracts(monkeypatch)
     assert result.details["online_effective_maximum_sample_step_rad"] == 0.025
     assert result.details["offline_continuous_swept_mesh_supported"] is True
     assert result.details["offline_continuous_swept_occupancy_supported"] is True
+    assert result.details["online_composite_planner_enabled"] is True
+    assert result.details["ompl_fallback_available"] is True
+    assert result.details["ompl_fallback_timeout_s"] == 1.0
     assert result.details["motion_authorized"] is False
 
 

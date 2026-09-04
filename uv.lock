@@ -85,12 +85,6 @@ dependencies = [
 calibration-gui = [
     { name = "pyside6" },
 ]
-supervision-gui = [
-    { name = "pyside6" },
-]
-robot-model-gui = [
-    { name = "pyside6" },
-]
 foundation-stereo = [
     { name = "einops" },
     { name = "huggingface-hub" },
@@ -99,6 +93,15 @@ foundation-stereo = [
     { name = "timm" },
     { name = "torch" },
     { name = "torchvision" },
+]
+motion-ompl = [
+    { name = "ompl", marker = "sys_platform != 'win32'" },
+]
+robot-model-gui = [
+    { name = "pyside6" },
+]
+supervision-gui = [
+    { name = "pyside6" },
 ]
 tsdf-open3d = [
     { name = "open3d" },
@@ -117,6 +120,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'foundation-stereo'", specifier = ">=0.24,<2" },
     { name = "numpy", specifier = ">=1.26,<2" },
     { name = "omegaconf", marker = "extra == 'foundation-stereo'", specifier = ">=2.3,<3" },
+    { name = "ompl", marker = "sys_platform != 'win32' and extra == 'motion-ompl'", specifier = ">=2.0,<3" },
     { name = "open3d", marker = "extra == 'tsdf-open3d'", specifier = ">=0.18,<1" },
     { name = "opencv-python-headless", specifier = ">=4.10,<5" },
     { name = "pin", specifier = ">=2.7,<3" },
@@ -135,7 +139,7 @@ requires-dist = [
     { name = "trimesh", specifier = ">=4,<5" },
     { name = "typer", specifier = ">=0.12,<1" },
 ]
-provides-extras = ["calibration-gui", "supervision-gui", "robot-model-gui", "tsdf-open3d", "foundation-stereo"]
+provides-extras = ["calibration-gui", "supervision-gui", "robot-model-gui", "tsdf-open3d", "foundation-stereo", "motion-ompl"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1060,6 +1064,17 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ce/3d/e4b57b8d9008c6ebe0d5eff901f91d5700cf7bdb8c8863df817463a7fd5e/omegaconf-2.3.1.tar.gz", hash = "sha256:e5e7de64aeebeddaf8e6d3f7a783b32ac2a01c0fbd9c878012caecb891a1f42a", size = 3298472, upload-time = "2026-06-11T05:05:12.885Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a4/0e/152509871bf30df6fc38569f52a2db9b55dd41aae957adae50a053ac7778/omegaconf-2.3.1-py3-none-any.whl", hash = "sha256:3d701d14e9a8828f1edd28bb70b725908b34277cdd72cf7d6a83f94dadc6b6a0", size = 79502, upload-time = "2026-06-11T05:05:09.954Z" },
+]
+
+[[package]]
+name = "ompl"
+version = "2.0.1"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/18/31/3a26c1371b5de82778914ca05ff1dbd24e5b38cbd110decb9c7dbb4d0958/ompl-2.0.1-cp312-cp312-macosx_15_0_arm64.whl", hash = "sha256:ccfc22cb870986b4720c9f722dadc03c9532ed40655662e8ca02fb6afc1991cb", size = 2304323, upload-time = "2026-06-23T05:46:16.11Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/16/4d9449532f03532b1b0b12756ff690518e3171ae6a8cbc36c26e46e59e5c/ompl-2.0.1-cp312-cp312-macosx_15_0_x86_64.whl", hash = "sha256:f0a885358e37f3e34b06584ea9e83cdb000cbf3de889a0c456ad234e5e70c0c4", size = 3055309, upload-time = "2026-06-23T05:46:22.833Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/c0/8115e7c09adfed6fac18f05746c603b38a76a69fee7421b70c9a568b37d8/ompl-2.0.1-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:23a0df9b698cfc310b99e06a37fca42e28d9ffb4be0a99acde5dc2968f0235d0", size = 4389643, upload-time = "2026-06-23T05:46:29.681Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/6e/cfbe93750730a2e3268bfec9214cf7b6ce4488c306c6591fd6afecf0c027/ompl-2.0.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:3792acfda54e2c5a9462d92272863823c1ef6e781258341a470a198a186e5d47", size = 4566067, upload-time = "2026-06-23T05:46:36.049Z" },
 ]
 
 [[package]]

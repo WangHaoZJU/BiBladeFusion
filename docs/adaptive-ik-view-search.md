@@ -14,14 +14,17 @@ remaining budget on lower-value tilts and distance expansion. Every candidate co
 to look at the same surface target. A family is bounded by both 32 IK attempts and 1.5
 seconds by default. Runtime IK reuses the collision URDF's Pinocchio model plus
 HoloRobot's bounded neighboring-seed sweep; the analytic calibrated-MDH solver remains
-the no-shared-model fallback. A successful endpoint is still replayed through the
-authoritative ES68 FK and all later collision/path gates.
+the no-shared-model fallback. Every distinct solution from that sweep is checked
+immediately against the hash-bound ES68+D435i URDF/STL model. The nearest
+collision-clear branch is selected, so a nearer self-colliding wrist posture cannot hide
+a farther valid branch. A successful endpoint is still replayed through the authoritative
+ES68 FK and all later path gates.
 
 The configured camera workspace is the declared physical outer boundary and is a hard
 candidate rejection. Blade/camera clearance and configured forbidden volumes are also
 hard geometric rejections. This does not replace the production motion
-boundary: endpoint collision, swept-path collision, trajectory feasibility, and operator
-authorization are not performed, and every report explicitly stores
+boundary: endpoint collision is now performed, while swept-path collision, trajectory
+feasibility, and operator authorization remain downstream. Every report explicitly stores
 `motion_authorized: false`.
 
 Run the search on an immutable initialization artifact without connecting to hardware:
@@ -40,7 +43,7 @@ radians. The captured initialization posture is always included.
 When `view_planning.adaptive_ik_view_search.enabled` is true, the ordinary `plan views`
 workflow and the unknown-blade coarse session now run this search for each front/back
 proxy patch. The selected candidate replaces the old one-shot normal/fixed-fallback pose,
-while the complete search trace is embedded in view-plan schema 4. The runtime then uses
+while the complete search trace is embedded in view-plan schema 5. The runtime then uses
 the unchanged FK-consistency, collision, occupancy and motion-preflight chain. A candidate
 being endpoint-IK feasible still does not authorize motion.
 
@@ -58,8 +61,9 @@ new fin information: the first factor represents side-face exposure and the seco
 remaining support on the blade surface. Thus 45 degrees is preferred when equally safe
 and reachable, but it is not mandatory; IK feasibility, forbidden-volume/clearance
 rejections, joint travel and distance deviation can select a different angle independently
-for every positive or negative target. The complete per-target trace is stored in coarse
-fin-discovery schema 2. Collision and trajectory checks remain downstream and unchanged.
+for every positive or negative target. The complete per-target trace, including
+per-IK-branch endpoint collision reasons, is stored in coarse fin-discovery schema 3.
+Path collision and trajectory checks remain downstream.
 
 ## Single-initial-view coarse NBV
 
@@ -87,10 +91,13 @@ remain downstream vetoes and contribute no positive science gain.
 
 Both coarse discovery and fine NBV retain their deterministic science-ranked endpoint
 queues. The stop-scan coordinator hard-preflights the complete bounded queue in that
-unchanged order and accepts the first collision-free straight joint-space path. A blocked endpoint is
-audited and skipped; no occupancy value is fed back into discovery gain, and no
-collision threshold is relaxed. Asset, map-binding, or timing failures remain terminal
-for the cycle rather than being misclassified as candidate-specific path vetoes.
+unchanged order. For each endpoint, HoloRobot's conservative straight route is primary.
+Only a true interior path collision can invoke one bounded RRTConnect fallback; endpoint
+collision, UNKNOWN state, or map/evidence failure cannot. A returned detour is resampled
+and checked again in full before it can be approved. A blocked candidate is audited and
+skipped; no occupancy value is fed back into discovery gain, and no collision threshold
+is relaxed. Asset, map-binding, or timing failures remain terminal for the cycle rather
+than being misclassified as candidate-specific path vetoes.
 
 Fine NBV uses the same bounded pose-family fallback. A nominal curved-surface candidate
 is tried first; if workspace/geometry/IK rejects it, up to four highest-priority incomplete
@@ -102,7 +109,7 @@ One NBV endpoint is now one operator-approved motion and one stopped capture. Th
 `stop_and_capture.maximum_segment_joint_delta_rad` and
 `maximum_ranked_preflight_candidates` keys remain parseable only for old reviewed config
 files and are ignored. `motion_preflight.maximum_joint_step_rad` still controls internal
-ServoJ interpolation and continuous collision proof; it never creates an intermediate
+ServoJ interpolation and sampled route verification; it never creates an intermediate
 view, FoundationStereo inference, or occupancy rebuild.
 
 ## Evidence-gated motion after one initial view

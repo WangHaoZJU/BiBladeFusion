@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from biblade_fusion.robotics import (
+    CollisionCheckStatus,
     Cs68KinematicModel,
     Cs68PinocchioCollisionChecker,
     Es68PinocchioCollisionChecker,
@@ -14,8 +15,17 @@ from biblade_fusion.robotics import (
     OccupancyRobotCollisionChecker,
     preflight_linear_joint_motion,
 )
+from biblade_fusion.robotics import motion_preflight as motion_preflight_module
 from biblade_fusion.robotics import occupancy_collision as occupancy_collision_module
-from biblade_fusion.robotics.motion_preflight import HOLOROBOT_SAMPLED_VALIDATION
+from biblade_fusion.robotics.holorobot_joint_planner import (
+    HoloRobotJointPlan,
+    HoloRobotJointPlanStatus,
+    resample_joint_path,
+)
+from biblade_fusion.robotics.motion_preflight import (
+    HOLOROBOT_SAMPLED_VALIDATION,
+    validate_preflight_servoj_contract,
+)
 
 
 class _SyntheticSweptEs68Checker(Es68PinocchioCollisionChecker):
@@ -191,6 +201,116 @@ def test_online_holorobot_preflight_hashes_occupancy_once_at_each_boundary(
     assert report.occupancy is not None
     assert report.occupancy.sample_count == 4
     assert calls == 2
+
+
+def test_online_holorobot_preflight_uses_bounded_ompl_detour(
+    checker,
+    occupancy_checker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_check = checker.check
+
+    def corridor_check(configuration):
+        result = original_check(configuration)
+        joints = np.asarray(configuration, dtype=np.float64)
+        if 0.035 <= joints[0] <= 0.075 and joints[2] < 0.025:
+            return replace(
+                result,
+                status=CollisionCheckStatus.BLOCKED,
+                blocking_reasons=("synthetic_joint_corridor",),
+            )
+        return result
+
+    def fake_rrtconnect(start, goal, **_kwargs):
+        waypoints = resample_joint_path(
+            (
+                start,
+                (0.0, 0.0, 0.05, 0.0, 0.0, 0.0),
+                (0.1, 0.0, 0.05, 0.0, 0.0, 0.0),
+                goal,
+            ),
+            maximum_joint_step_rad=0.02,
+        )
+        return HoloRobotJointPlan(
+            HoloRobotJointPlanStatus.CLEAR,
+            waypoints=waypoints,
+            diagnostics={"planner": "synthetic_rrtconnect"},
+        )
+
+    monkeypatch.setattr(checker, "check", corridor_check)
+    monkeypatch.setattr(motion_preflight_module, "ompl_available", lambda: True)
+    monkeypatch.setattr(
+        motion_preflight_module,
+        "plan_holorobot_rrtconnect",
+        fake_rrtconnect,
+    )
+
+    report = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        (0.1, 0.0, 0.0, 0.0, 0.0, 0.0),
+        collision_checker=checker,
+        occupancy_checker=occupancy_checker,
+        maximum_joint_step_rad=0.02,
+        path_validation_mode=HOLOROBOT_SAMPLED_VALIDATION,
+        enable_ompl_fallback=True,
+    )
+
+    assert report.ready_for_approval is True
+    assert report.diagnostics["planner"] == "holorobot_composite_ompl_rrtconnect"
+    assert report.diagnostics["fallback_used"] is True
+    assert max(item[2] for item in report.planning_waypoints) == pytest.approx(0.05)
+    assert validate_preflight_servoj_contract(report, checker) == report.servoj_stream
+    tampered = replace(
+        report,
+        planning_waypoints=report.planning_waypoints[:-1],
+    )
+    assert tampered.ready_for_approval is False
+
+
+def test_online_holorobot_preflight_does_not_send_unknown_state_to_ompl(
+    checker,
+    occupancy_checker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_check = checker.check
+
+    def unknown_mid_path(configuration):
+        result = original_check(configuration)
+        joint_0 = float(configuration[0])
+        if 0.035 <= joint_0 <= 0.075:
+            return replace(
+                result,
+                status=CollisionCheckStatus.UNKNOWN,
+                blocking_reasons=("synthetic_checker_evidence_unknown",),
+            )
+        return result
+
+    def ompl_must_not_run(*_args, **_kwargs):
+        pytest.fail("UNKNOWN evidence is not a HoloRobot PATH_BLOCKED result")
+
+    monkeypatch.setattr(checker, "check", unknown_mid_path)
+    monkeypatch.setattr(motion_preflight_module, "ompl_available", lambda: True)
+    monkeypatch.setattr(
+        motion_preflight_module,
+        "plan_holorobot_rrtconnect",
+        ompl_must_not_run,
+    )
+
+    report = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        (0.1, 0.0, 0.0, 0.0, 0.0, 0.0),
+        collision_checker=checker,
+        occupancy_checker=occupancy_checker,
+        maximum_joint_step_rad=0.02,
+        path_validation_mode=HOLOROBOT_SAMPLED_VALIDATION,
+        enable_ompl_fallback=True,
+    )
+
+    assert report.status is MotionPreflightStatus.BLOCKED
+    assert report.collision is not None
+    assert report.collision.status is CollisionCheckStatus.UNKNOWN
+    assert report.diagnostics["fallback_used"] is False
+    assert report.diagnostics["fallback_reason"] == "not_an_interior_path_block"
 
 
 def test_folded_goal_is_blocked_before_trajectory_generation(checker) -> None:

@@ -11,7 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -382,6 +383,50 @@ class OccupancyCollisionCheckResult:
     @property
     def motion_authorized(self) -> bool:
         return False
+
+
+@dataclass(slots=True)
+class BoundOccupancyConfigurationQuery:
+    """Many state-validity queries against one integrity-checked map snapshot."""
+
+    checker: OccupancyRobotCollisionChecker
+    snapshot: OccupancySnapshot
+    evidence: OccupancyMapEvidence
+    required_freshness_horizon_s: float
+    _closed: bool = False
+
+    def check(
+        self,
+        joint_positions_rad: Sequence[float],
+    ) -> OccupancyCollisionCheckResult:
+        if self._closed:
+            raise OccupancyEvidenceError("bound_occupancy_query_is_closed")
+        try:
+            return self.checker._check_bound_configuration(
+                self.snapshot,
+                self.evidence,
+                joint_positions_rad,
+                required_freshness_horizon_s=self.required_freshness_horizon_s,
+            )
+        except (OccupancyEvidenceError, TypeError, ValueError, RuntimeError) as exc:
+            return self.checker._unknown_result(
+                f"occupancy_checker_error:{exc}",
+                evidence=self.evidence,
+            )
+        except Exception as exc:  # pragma: no cover - fail closed across FCL
+            return self.checker._unknown_result(
+                f"occupancy_query_failed:{type(exc).__name__}:{exc}",
+                evidence=self.evidence,
+            )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.checker.assert_current_evidence(
+            self.evidence,
+            required_freshness_horizon_s=self.required_freshness_horizon_s,
+        )
+        self._closed = True
 
 
 def _occupancy_evidence_binding_sha256(evidence: OccupancyMapEvidence) -> str:
@@ -997,6 +1042,29 @@ class OccupancyRobotCollisionChecker:
                 f"occupancy_query_failed:{type(exc).__name__}:{exc}"
             )
 
+    @contextmanager
+    def bind_configuration_queries(
+        self,
+        *,
+        required_freshness_horizon_s: float = 0.0,
+    ) -> Iterator[BoundOccupancyConfigurationQuery]:
+        """Bind one immutable map for an OMPL/state-search transaction."""
+
+        snapshot, evidence = self._bind_snapshot(
+            expected_evidence=None,
+            required_freshness_horizon_s=required_freshness_horizon_s,
+        )
+        query = BoundOccupancyConfigurationQuery(
+            self,
+            snapshot,
+            evidence,
+            float(required_freshness_horizon_s),
+        )
+        try:
+            yield query
+        finally:
+            query.close()
+
     def check_sampled_configurations(
         self,
         configurations: Sequence[Sequence[float]],
@@ -1004,6 +1072,7 @@ class OccupancyRobotCollisionChecker:
         *,
         maximum_joint_step_rad: float,
         required_freshness_horizon_s: float = 0.0,
+        precheck_last_configuration: bool = False,
     ) -> JointPathOccupancyCollisionReport:
         """Check a sampled path while hashing and binding its immutable map once.
 
@@ -1049,9 +1118,14 @@ class OccupancyRobotCollisionChecker:
             )
 
         last_result: OccupancyCollisionCheckResult | None = None
-        for sample_index, (configuration, fraction) in enumerate(
-            zip(samples, fractions, strict=True)
-        ):
+        ordered_indices = (
+            (len(samples) - 1, *range(len(samples) - 1))
+            if precheck_last_configuration
+            else tuple(range(len(samples)))
+        )
+        for checked_count, sample_index in enumerate(ordered_indices, start=1):
+            configuration = samples[sample_index]
+            fraction = fractions[sample_index]
             try:
                 result = self._check_bound_configuration(
                     snapshot,
@@ -1083,7 +1157,7 @@ class OccupancyRobotCollisionChecker:
                     )
                 return self._finish_sampled_path(
                     result,
-                    sample_count=sample_index + 1,
+                    sample_count=checked_count,
                     blocked_sample_index=sample_index,
                     blocked_path_fraction=fraction,
                     maximum_joint_step_rad=step,
