@@ -293,12 +293,14 @@ def test_operator_rejection_is_durable_and_cannot_later_execute(tmp_path: Path) 
     assert executor.calls == 0
 
 
-def test_stale_occupancy_stops_before_selection_or_preflight(tmp_path: Path) -> None:
+def test_stale_occupancy_requests_safety_refresh_before_selection_or_preflight(
+    tmp_path: Path,
+) -> None:
     runner, coordinator = _runner(tmp_path, stale=True)
 
     status = runner.run_until_attention(bootstrap_view_provider=lambda _: "bootstrap_00")
 
-    assert status.disposition is ExperimentDisposition.BLOCKED
+    assert status.disposition is ExperimentDisposition.NEEDS_CAPTURE
     assert status.blocking_reasons == ("occupancy_not_fresh_map_ready:stale",)
     assert coordinator.prepare_count == 0
     assert coordinator.execute_count == 0

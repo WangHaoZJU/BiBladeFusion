@@ -105,6 +105,9 @@ Required before proceeding:
   contract and `ompl_fallback_available: true`. Offline continuous-proof capability may
   still appear in JSON details, but it is not executed by the online NBV loop.
 - xFormers and FlashAttention warnings are optional acceleration warnings.
+- `supervised_scan_realsense_sdk` must pass. Kinematics and stereo calibration checks now
+  parse their contents and verify the configured image size; a readable malformed file is
+  no longer sufficient.
 - `Motion authorized: no; hardware acceptance is a separate gate` is an informational
   release statement in experimental mode; it is not itself the runtime failure.
 
@@ -265,10 +268,24 @@ application budget. UNKNOWN, stale/mismatched map evidence, and start/goal colli
 immediately; they are never sent to OMPL. If OMPL cannot find a detour within its budget,
 the coordinator records that candidate and continues to the next ranked endpoint.
 
+The complete NBV selection and ranked path queue has a 30-second responsiveness limit. If
+no safe automatic route exists from the current state, the console remains in the coarse
+scan and prompts for an operator-positioned safety refresh instead of terminating the
+experiment. Manually place the stopped arm at a clearly safe posture, enter exactly `c`,
+and do not provide a side label. That frame updates occupancy only; it does not count as a
+blade science view. The prior proposal is discarded and the next plan regenerates fin IK
+from the new stopped joints.
+
+After any successful automatic capture, fin discovery is re-evaluated from that exact
+stopped posture and written under `coarse_science/fin_discovery_revisions/`. A candidate
+that was unreachable at the initial view may therefore become usable later; the runtime
+does not reuse its first-view joint solution.
+
 Paste the entire exact token, including `EXECUTE`, once. After Enter, a short preparation
 interval is expected while the driver connects and controller state is established. The
-full already-bound path is not proved again; only a changed live-start bridge is checked in
-the same HoloRobot sampled mode. Permit lifetime is checked when the token is consumed;
+full already-bound path is not proved again. A live start outside HoloRobot's 0.001 rad
+tolerance is rejected rather than bridged by an unplanned command. Permit lifetime is
+checked when the token is consumed;
 elapsed enable/recovery time cannot retroactively expire an already consumed permit. A
 separately configured measured segment-duration watchdog may still stop a genuinely
 overlong move.

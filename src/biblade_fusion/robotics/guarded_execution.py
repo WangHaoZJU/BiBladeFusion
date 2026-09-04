@@ -28,7 +28,6 @@ from biblade_fusion.robotics.motion_preflight import (
     CONTINUOUS_INTERVAL_VALIDATION,
     HOLOROBOT_SAMPLED_VALIDATION,
     JointMotionPreflight,
-    preflight_linear_joint_motion,
     validate_preflight_servoj_contract,
 )
 from biblade_fusion.robotics.occupancy_collision import (
@@ -301,6 +300,15 @@ class GuardedEliteExecutor:
             raise ValueError(
                 "Guarded execution requires a measured, hash-bound motion envelope"
             )
+        maximum_live_start_tolerance = min(
+            _HOLOROBOT_PLAN_START_TOLERANCE_RAD,
+            float(np.min(uncertainty)),
+        )
+        if live_start_tolerance_rad > maximum_live_start_tolerance:
+            raise ValueError(
+                "live_start_tolerance_rad exceeds the HoloRobot/accepted-envelope "
+                f"limit {maximum_live_start_tolerance:.9g} rad"
+            )
         freshness_margin = float(execution_freshness_margin_s)
         if not math.isfinite(freshness_margin) or freshness_margin < 0.0:
             raise ValueError("execution_freshness_margin_s must be finite and non-negative")
@@ -504,12 +512,6 @@ class GuardedEliteExecutor:
                 "live robot state no longer matches preflight start "
                 f"({maximum_start_error:.6f} rad)"
             )
-        self._revalidate_exact_stream_path(
-            state.joint_positions_rad,
-            stream,
-            preflight,
-            expected_occupancy,
-        )
         try:
             self._occupancy_checker.assert_current_evidence(
                 expected_occupancy,
@@ -575,12 +577,6 @@ class GuardedEliteExecutor:
                         "live robot state changed during guarded enable "
                         f"({enabled_start_error:.6f} rad)"
                     )
-                self._revalidate_exact_stream_path(
-                    enabled_state.joint_positions_rad,
-                    stream,
-                    preflight,
-                    expected_occupancy,
-                )
                 try:
                     self._occupancy_checker.assert_current_evidence(
                         expected_occupancy,
@@ -942,135 +938,6 @@ class GuardedEliteExecutor:
             raise RobotCommandError(
                 f"motion preflight ServoJ contract is not reproducible: {exc}"
             ) from exc
-
-    def _revalidate_exact_stream_path(
-        self,
-        live_start: np.ndarray,
-        stream: ServoJStream,
-        preflight: JointMotionPreflight,
-        expected_occupancy: OccupancyMapEvidence,
-    ) -> None:
-        """Recheck the live-start bridge with the preflight's bound path mode.
-
-        ``validate_preflight_servoj_contract`` has already reproduced the stream
-        and proved that every command lies on the linear path from preflight start
-        to goal.  The full path is not checked again.  Only a new live-state bridge
-        is validated, using either archived continuous proof semantics or the
-        online HoloRobot sampled-segment semantics recorded in the permit.
-        """
-
-        try:
-            maximum_step = float(preflight.diagnostics["maximum_joint_step_rad"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RobotCommandError("motion preflight maximum joint step is invalid") from exc
-        if not math.isfinite(maximum_step) or maximum_step <= 0.0:
-            raise RobotCommandError("motion preflight maximum joint step is invalid")
-        try:
-            uncertainty = tuple(
-                float(value)
-                for value in preflight.diagnostics["accepted_joint_uncertainty_rad"]
-            )
-            acceptance_id = str(preflight.diagnostics["motion_envelope_acceptance_id"])
-            metadata_sha256 = str(preflight.diagnostics["motion_envelope_metadata_sha256"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RobotCommandError("motion preflight envelope binding is invalid") from exc
-        if (
-            uncertainty != self._occupancy_checker.accepted_joint_uncertainty_rad
-            or acceptance_id != self._occupancy_checker.motion_envelope_acceptance_id
-            or metadata_sha256 != self._occupancy_checker.motion_envelope_metadata_sha256
-        ):
-            raise RobotCommandError("motion preflight envelope differs from executor")
-        live_start_tuple = tuple(
-            float(value) for value in np.asarray(live_start, dtype=np.float64)
-        )
-        if np.all(
-            np.abs(np.asarray(live_start_tuple) - np.asarray(stream.commands[0]))
-            <= np.asarray(uncertainty)
-        ):
-            # The accepted tracking envelope already covers this live start for
-            # either the archived continuous proof or the online sampled path.
-            return
-        chain = (live_start_tuple, stream.commands[0])
-        freshness_horizon = self._required_freshness_horizon_s(preflight)
-        for segment_index, (start, goal) in enumerate(zip(chain[:-1], chain[1:], strict=True)):
-            if preflight.path_validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
-                bridge = preflight_linear_joint_motion(
-                    start,
-                    goal,
-                    collision_checker=self._collision_checker,
-                    occupancy_checker=self._occupancy_checker,
-                    maximum_joint_step_rad=maximum_step,
-                    servoj_dt_s=stream.dt_s,
-                    speed_scaling=float(preflight.diagnostics["speed_scaling"]),
-                    velocity_margin=float(preflight.diagnostics["velocity_margin"]),
-                    maximum_joint_acceleration_rad_s2=tuple(
-                        float(value)
-                        for value in preflight.diagnostics[
-                            "maximum_joint_acceleration_rad_s2"
-                        ]
-                    ),
-                    execution_freshness_margin_s=self._execution_freshness_margin_s,
-                    servoj_runtime_config=preflight.servoj_runtime_config,
-                    accepted_joint_uncertainty_rad=uncertainty,
-                    motion_envelope_acceptance_id=acceptance_id,
-                    motion_envelope_metadata_sha256=metadata_sha256,
-                    path_validation_mode=HOLOROBOT_SAMPLED_VALIDATION,
-                )
-                if not bridge.ready_for_approval or bridge.occupancy is None:
-                    reasons = ", ".join(bridge.blocking_reasons) or (
-                        "holorobot_sampled_bridge_not_clear"
-                    )
-                    raise RobotCommandError(
-                        "live collision revalidation blocked HoloRobot sampled bridge "
-                        f"{segment_index}: {reasons}"
-                    )
-                if (
-                    bridge.occupancy.evidence is None
-                    or bridge.occupancy.evidence.binding != expected_occupancy.binding
-                ):
-                    raise RobotCommandError(
-                        "live HoloRobot sampled bridge used a different occupancy snapshot"
-                    )
-                continue
-            live_collision = self._collision_checker.check_path(
-                start,
-                goal,
-                maximum_joint_step_rad=maximum_step,
-                maximum_joint_path_deviation_rad=uncertainty,
-                motion_envelope_acceptance_id=acceptance_id,
-                motion_envelope_metadata_sha256=metadata_sha256,
-            )
-            if (
-                live_collision.status is not CollisionCheckStatus.CLEAR
-                or not live_collision.continuous_swept_volume_evidence_valid
-                or live_collision.proof_evidence is None
-                or not live_collision.proof_evidence.matches_path(start, goal)
-            ):
-                reasons = ", ".join(live_collision.result.blocking_reasons)
-                if not reasons:
-                    reasons = "continuous_swept_mesh_unavailable"
-                raise RobotCommandError(
-                    "live collision revalidation blocked exact ServoJ segment "
-                    f"{segment_index}: {reasons}"
-                )
-            live_occupancy = self._occupancy_checker.check_path(
-                start,
-                goal,
-                maximum_joint_step_rad=maximum_step,
-                expected_evidence=expected_occupancy,
-                required_freshness_horizon_s=freshness_horizon,
-            )
-            if (
-                live_occupancy.status is not CollisionCheckStatus.CLEAR
-                or not live_occupancy.continuous_swept_volume_evidence_valid
-            ):
-                reasons = ", ".join(live_occupancy.result.blocking_reasons) or (
-                    "continuous_swept_occupancy_unavailable"
-                )
-                raise RobotCommandError(
-                    "live occupancy revalidation blocked exact ServoJ segment "
-                    f"{segment_index}: {reasons}"
-                )
 
     @staticmethod
     def _stream_duration_s(preflight: JointMotionPreflight) -> float:

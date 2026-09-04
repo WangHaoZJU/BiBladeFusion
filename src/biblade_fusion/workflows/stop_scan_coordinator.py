@@ -1676,6 +1676,20 @@ class StopScanCoordinator:
 
     def prepare_next_segment(self) -> PreparedSegment | None:
         with self._exclusive_operation():
+            planning_started_monotonic_s = self._monotonic_now()
+
+            def require_planning_budget(stage: str) -> None:
+                elapsed = self._elapsed_monotonic(
+                    planning_started_monotonic_s,
+                    label="planning/preflight",
+                )
+                limit = self._config.maximum_planning_preflight_duration_s
+                if elapsed > limit:
+                    raise StopScanBlocked(
+                        "planning/preflight exceeded its responsiveness budget "
+                        f"({stage}): actual={elapsed:.9g}s, limit={limit:.9g}s"
+                    )
+
             self._raise_if_stop_requested()
             if self._phase not in {
                 StopScanPhase.BOOTSTRAP_MOTION_READY,
@@ -1695,6 +1709,7 @@ class StopScanCoordinator:
             self._transition(StopScanPhase.PLANNING, "next_view_selection_started", {})
             try:
                 selection = self._select_next_with_timing(self._observation, generation)
+                require_planning_budget("after next-view selection")
                 if type(selection) is not NextViewSelection:
                     raise BladePlanningAssetError("Next-view selector returned an untyped decision")
                 self._validate_selection_run_binding(selection)
@@ -1738,6 +1753,7 @@ class StopScanCoordinator:
                 selected_for_motion: NextViewSelection | None = None
                 proposal: SegmentProposal | None = None
                 for rank, candidate in enumerate(candidate_queue, start=1):
+                    require_planning_budget(f"before ranked candidate {rank}")
                     science_rank = rank
                     for diagnostic in candidate.diagnostics:
                         if diagnostic.startswith("science_rank="):
@@ -1776,6 +1792,7 @@ class StopScanCoordinator:
                         },
                     )
                     prepared = self._safety_factory.prepare(proposal, generation)
+                    require_planning_budget(f"after ranked candidate {rank}")
                     self._raise_if_stop_requested()
                     self._validate_prepared_segment(prepared, generation)
                     self._validate_planned_segment_duration(prepared)
@@ -2010,9 +2027,7 @@ class StopScanCoordinator:
                         "single_segment_executing",
                         {"proposal_id": prepared.proposal.proposal_id},
                     )
-                    execution_limit_s = (
-                        self._config.maximum_segment_execution_duration_s
-                    )
+                    execution_limit_s = self._segment_execution_limit_s(prepared)
                     execution_started_monotonic_s = self._monotonic_now()
                     result = prepared.executor.execute(
                         prepared.preflight,
@@ -2828,6 +2843,41 @@ class StopScanCoordinator:
                 "planned segment exceeds accepted timing budget: "
                 f"planned={duration:.9g}s, limit={limit:.9g}s"
             )
+
+    def _segment_execution_limit_s(
+        self,
+        prepared: _PreparedSegmentExecution,
+    ) -> float:
+        """Return a finite watchdog even when release timing is bypassed.
+
+        Production uses the measured immutable limit.  Experimental runs may omit
+        that release asset, but physical motion must still have a deadline.  The
+        fallback is derived from the approved ServoJ duration and existing bounded
+        controller/settling policies instead of inventing a second empirical gate.
+        """
+
+        configured = self._config.maximum_segment_execution_duration_s
+        if configured is not None:
+            return float(configured)
+        raw = prepared.preflight.diagnostics.get("planned_servoj_duration_s")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, np.number)):
+            raise StopScanBlocked(
+                "Experimental motion watchdog requires planned_servoj_duration_s evidence"
+            )
+        planned = float(raw)
+        if not math.isfinite(planned) or planned < 0.0:
+            raise StopScanBlocked(
+                "Experimental motion watchdog received invalid planned duration"
+            )
+        limit = (
+            planned
+            + float(self._robot_config.maximum_motion_timeout_s)
+            + float(self._config.settle_timeout_s)
+            + float(self._config.execution_freshness_margin_s)
+        )
+        if not math.isfinite(limit) or limit <= 0.0:
+            raise StopScanBlocked("Derived experimental motion watchdog is invalid")
+        return limit
 
     def _monotonic_now(self) -> float:
         value = float(self._monotonic_clock())

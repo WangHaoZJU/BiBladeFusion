@@ -1007,15 +1007,25 @@ def _write_coarse_scan_generation_from_verified(
                 "A view-preserving coarse generation must be the one-way schema-5 transition"
             )
         previous_sources = previous.metadata["sources"]
-        if (
+        initialization_changed = (
             Path(str(previous_sources["initialization"]["root"])).resolve()
             != initialization_root
-            or Path(str(previous_sources["view_plan"]["root"])).resolve()
+        )
+        view_plan_changed = (
+            Path(str(previous_sources["view_plan"]["root"])).resolve()
             != view_plan_root
-            or Path(str(previous_sources["discovery_plan"]["root"])).resolve()
+        )
+        discovery_changed = (
+            Path(str(previous_sources["discovery_plan"]["root"])).resolve()
             != discovery_plan_root
-        ):
+        )
+        if initialization_changed or view_plan_changed:
             raise ValueError("Coarse-scan generation changed a bound planning source")
+        # A newly appended physical view may bind a new immutable IK evaluation
+        # from its latest stopped posture.  A view-preserving schema-5 transition,
+        # however, must retain the exact discovery revision of its predecessor.
+        if phase_transition and discovery_changed:
+            raise ValueError("Schema-5 transition changed its discovery revision")
         previous_coverage = previous.coverage_path
         coverage_predecessor = coverage_asset.metadata["previous_ledger"]
         if phase_transition:

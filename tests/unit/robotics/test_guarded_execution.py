@@ -421,64 +421,17 @@ def test_execute_revalidates_and_consumes_one_shot_permit(
     assert arm.events == completed_events
 
 
-def test_execute_revalidation_is_bounded_by_geometric_legs_not_servoj_ticks(
+def test_executor_rejects_live_start_tolerance_wider_than_holorobot(
     checker,
     occupancy_checker,
-    clear_preflight,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    mesh_calls: list[tuple[tuple[float, ...], tuple[float, ...]]] = []
-    occupancy_calls: list[tuple[tuple[float, ...], tuple[float, ...]]] = []
-    original_mesh_check = _SyntheticSweptEs68Checker.check_path
-    occupancy_checker_type = type(occupancy_checker)
-    original_occupancy_check = occupancy_checker_type.check_path
-
-    def counted_mesh_check(self, start, goal, **kwargs):
-        mesh_calls.append((tuple(start), tuple(goal)))
-        return original_mesh_check(self, start, goal, **kwargs)
-
-    def counted_occupancy_check(self, start, goal, **kwargs):
-        occupancy_calls.append((tuple(start), tuple(goal)))
-        return original_occupancy_check(self, start, goal, **kwargs)
-
-    monkeypatch.setattr(_SyntheticSweptEs68Checker, "check_path", counted_mesh_check)
-    monkeypatch.setattr(
-        occupancy_checker_type,
-        "check_path",
-        counted_occupancy_check,
-    )
-    arm = FakeGuardedArm(
-        joint_positions_rad=np.full(6, 0.002),
-        enabled=False,
-    )
-    # Exercise the optional bridge path explicitly.  Production uses HoloRobot's
-    # stricter 1e-3 rad plan-start tolerance and therefore never reaches this
-    # compatibility branch for a 0.002 rad drift.
-    executor = GuardedEliteExecutor(
-        arm,
-        checker,
-        occupancy_checker,
-        live_start_tolerance_rad=0.01,
-    )
-    permit = executor.authorize(
-        clear_preflight,
-        operator_id="operator-a",
-        confirmation=executor.approval_prompt(clear_preflight),
-    )
-
-    executor.execute(clear_preflight, permit)
-
-    assert clear_preflight.servoj_stream is not None
-    assert len(clear_preflight.servoj_stream.commands) > 2
-    # Before and after enable: control recovery sends no joint command, so its
-    # unchanged start state reuses the second exact robust path proof instead of
-    # leaving the reverse socket idle for a third identical sweep.
-    assert len(mesh_calls) == 2
-    assert len(occupancy_calls) == 2
-    assert all(
-        calls[0][1] == clear_preflight.start_joint_positions_rad
-        for calls in (mesh_calls, occupancy_calls)
-    )
+    with pytest.raises(ValueError, match="HoloRobot/accepted-envelope"):
+        GuardedEliteExecutor(
+            FakeGuardedArm(),
+            checker,
+            occupancy_checker,
+            live_start_tolerance_rad=0.01,
+        )
 
 
 def test_execute_reuses_robust_proof_when_live_start_is_inside_envelope(
@@ -643,7 +596,6 @@ def test_execute_revalidates_live_start_after_control_recovery(
         arm,
         checker,
         occupancy_checker,
-        live_start_tolerance_rad=0.01,
     )
     permit = executor.authorize(
         clear_preflight,
@@ -1027,7 +979,6 @@ def test_live_start_mismatch_blocks_before_driver_prepare(
         arm,
         checker,
         occupancy_checker,
-        live_start_tolerance_rad=0.01,
     )
     permit = executor.authorize(
         clear_preflight,

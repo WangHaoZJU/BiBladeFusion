@@ -1127,6 +1127,15 @@ class StopAndCaptureConfig(BaseModel):
             "bounded by the active NBV selector is checked in science-rank order."
         ),
     )
+    maximum_planning_preflight_duration_s: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=300.0,
+        description=(
+            "Wall-clock watchdog for one NBV selection plus its bounded ranked-path "
+            "preflight queue. This is a responsiveness limit, not a collision waiver."
+        ),
+    )
     allow_single_view_bootstrap_motion: bool = False
     settle_timeout_s: float = Field(default=15.0, gt=0.0, le=300.0)
     settle_poll_period_s: float = Field(default=0.05, gt=0.0, le=1.0)

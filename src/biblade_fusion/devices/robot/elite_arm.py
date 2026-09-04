@@ -823,10 +823,11 @@ class EliteArm:
                     deadline_exceeded,
                     stage="before ServoJ preparation write",
                 )
-                self._write_servoj_joint(
+                self._write_servoj_startup_with_recovery_locked(
                     positions,
                     timeout_ms=_SERVOJ_HOLD_TIMEOUT_MS,
                     expected_stop_generation=expected_stop_generation,
+                    deadline_exceeded=deadline_exceeded,
                 )
                 self._raise_if_execution_deadline(
                     deadline_exceeded,
@@ -840,10 +841,11 @@ class EliteArm:
                     stage="during ServoJ warmup",
                 )
                 tick = self._stream_time()
-                self._write_servoj_joint(
+                self._write_servoj_startup_with_recovery_locked(
                     positions,
                     timeout_ms=_SERVOJ_HOLD_TIMEOUT_MS,
                     expected_stop_generation=expected_stop_generation,
+                    deadline_exceeded=deadline_exceeded,
                 )
                 remaining = min(
                     max(0.0, dt_s - (self._stream_time() - tick)),
@@ -1047,11 +1049,19 @@ class EliteArm:
                 return result(False, "execution_deadline_exceeded")
             write_start = now()
             try:
-                self._write_servoj_joint(
-                    list(command),
-                    timeout_ms=_SERVOJ_STREAM_TIMEOUT_MS,
-                    expected_stop_generation=expected_stop_generation,
-                )
+                if index == 0:
+                    self._write_servoj_startup_with_recovery_locked(
+                        list(command),
+                        timeout_ms=_SERVOJ_STREAM_TIMEOUT_MS,
+                        expected_stop_generation=expected_stop_generation,
+                        deadline_exceeded=deadline_exceeded,
+                    )
+                else:
+                    self._write_servoj_joint(
+                        list(command),
+                        timeout_ms=_SERVOJ_STREAM_TIMEOUT_MS,
+                        expected_stop_generation=expected_stop_generation,
+                    )
             except RobotMotionInterruptedError:
                 return result(False, "operator_stop")
             except RobotCommandError:
@@ -1149,29 +1159,81 @@ class EliteArm:
             self._require_active_stop_generation(expected_stop_generation)
             writer = getattr(self._driver, "writeServoj", None)
             timeout = max(1, int(timeout_ms))
-            if writer is not None:
-                try:
-                    accepted = writer(command, timeout, False, False)
-                except TypeError:
+            try:
+                if writer is not None:
                     try:
-                        accepted = writer(command, timeout, False)
+                        accepted = writer(command, timeout, False, False)
                     except TypeError:
-                        accepted = writer(command, timeout)
-            else:
-                writer = getattr(self._driver, "writeServoJ", None)
-                if writer is None:
-                    raise RobotCommandError("EliteDriver does not expose writeServoj")
-                try:
-                    accepted = writer(
-                        command,
-                        self._config.servoj_time_s,
-                        self._config.servoj_lookahead_time_s,
-                        self._config.servoj_gain,
-                    )
-                except TypeError:
-                    accepted = writer(command, self._config.servoj_time_s)
+                        try:
+                            accepted = writer(command, timeout, False)
+                        except TypeError:
+                            accepted = writer(command, timeout)
+                else:
+                    writer = getattr(self._driver, "writeServoJ", None)
+                    if writer is None:
+                        raise RobotCommandError(
+                            "EliteDriver does not expose writeServoj"
+                        )
+                    try:
+                        accepted = writer(
+                            command,
+                            self._config.servoj_time_s,
+                            self._config.servoj_lookahead_time_s,
+                            self._config.servoj_gain,
+                        )
+                    except TypeError:
+                        accepted = writer(command, self._config.servoj_time_s)
+            except RobotCommandError:
+                raise
+            except Exception as exc:
+                raise RobotCommandError("writeServoj transport failed") from exc
         if accepted is False:
             raise RobotCommandError("writeServoj rejected command")
+
+    def _write_servoj_startup_with_recovery_locked(
+        self,
+        positions: list[float],
+        *,
+        timeout_ms: int,
+        expected_stop_generation: int,
+        deadline_exceeded: Callable[[], bool] | None,
+    ) -> None:
+        """Retry one unchanged startup hold after HoloRobot-style reconnection."""
+
+        try:
+            self._write_servoj_joint(
+                positions,
+                timeout_ms=timeout_ms,
+                expected_stop_generation=expected_stop_generation,
+            )
+            return
+        except RobotMotionInterruptedError:
+            raise
+        except RobotCommandError as first_error:
+            self._raise_if_execution_deadline(
+                deadline_exceeded,
+                stage="before ServoJ session recovery",
+            )
+            try:
+                self._ensure_driver_reverse_connected()
+                self._raise_if_execution_deadline(
+                    deadline_exceeded,
+                    stage="during ServoJ session recovery",
+                )
+                self._write_servoj_joint(
+                    positions,
+                    timeout_ms=timeout_ms,
+                    expected_stop_generation=expected_stop_generation,
+                )
+            except RobotMotionInterruptedError:
+                raise
+            except Exception as recovery_error:
+                raise RobotCommandError(
+                    "ServoJ startup recovery failed after the initial write"
+                ) from ExceptionGroup(
+                    "ServoJ startup write and recovery both failed",
+                    [first_error, recovery_error],
+                )
 
     def _execute_trajectory_point(
         self,

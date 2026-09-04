@@ -541,6 +541,10 @@ class SupervisedExperimentRunner:
                 current.disposition is ExperimentDisposition.NEEDS_CAPTURE
                 and current.expected_capture_view_id is None
             ):
+                if current.phase == StopScanPhase.MOTION_BLOCKED.value:
+                    # A safety refresh requires an actual operator repositioning;
+                    # never feed it through the bootstrap provider automatically.
+                    return current
                 if bootstrap_view_provider is None:
                     return current
                 try:
@@ -760,10 +764,10 @@ def _disposition(
     if checkpoint.phase in {
         StopScanPhase.BOOTSTRAP_MAP_REQUIRED,
         StopScanPhase.AWAITING_CAPTURE,
+        StopScanPhase.MOTION_BLOCKED,
     }:
         return ExperimentDisposition.NEEDS_CAPTURE
     if checkpoint.phase in {
-        StopScanPhase.MOTION_BLOCKED,
         StopScanPhase.ABORTED,
         StopScanPhase.FAILED,
     }:

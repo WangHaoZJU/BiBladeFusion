@@ -42,6 +42,7 @@ from biblade_fusion.workflows.unknown_blade_runtime import (
     UnknownBladeRuntimeError,
     UnknownBladeRuntimePhase,
     UnknownBladeSupervisedRuntime,
+    _BestEffortLiveSupervision,
     _rebind_coarse_selection_to_current_stop,
     load_unknown_blade_resume_plan,
     open_production_unknown_blade_runtime,
@@ -62,6 +63,25 @@ class _SingleBranchChecker:
                 self.joints,
             ),
         )
+
+
+def test_read_only_live_supervision_failure_never_blocks_runtime() -> None:
+    class BrokenBridge:
+        def observe_event(self, _event) -> None:
+            raise RuntimeError("timeline disk unavailable")
+
+        def __call__(self, _status) -> None:
+            raise AssertionError("disabled observer must not be called again")
+
+    observer = _BestEffortLiveSupervision(BrokenBridge())  # type: ignore[arg-type]
+
+    with pytest.warns(RuntimeWarning, match="without interrupting"):
+        observer.observe_event(object())
+    observer(SimpleNamespace())  # type: ignore[arg-type]
+
+    assert observer.disabled_reason == (
+        "observe_event:RuntimeError:timeline disk unavailable"
+    )
 
 
 def _selection(
@@ -269,10 +289,41 @@ def test_coarse_run_rejects_reference_hash_change(tmp_path: Path) -> None:
     adapter.select_next(SimpleNamespace(), SimpleNamespace())
     adapter.observe_perception(SimpleNamespace(coarse_scan_view_path=tmp_path / "coarse-view-000"))
 
-    with pytest.raises(UnknownBladeRuntimeError, match="changed within one run"):
+    with pytest.raises(UnknownBladeRuntimeError, match="reference model changed"):
         adapter.select_next(SimpleNamespace(), SimpleNamespace())
 
     assert session.stage_selected_calls == 1
+
+
+def test_coarse_run_allows_state_dependent_selection_policy_revision(
+    tmp_path: Path,
+) -> None:
+    session = _FakeCoarseSession(
+        tmp_path,
+        selections=[
+            _selection("coarse-000", policy="c" * 64),
+            _selection("coarse-001", policy="d" * 64),
+        ],
+        transitions=[_transition(tmp_path), _transition(tmp_path)],
+    )
+    refreshes: list[object] = []
+    adapter = CoarseSessionNextViewAdapter(
+        session,
+        discovery_refresher=refreshes.append,
+    )
+    adapter.bind_checkpoint_sink(lambda _generation: None)
+    first_observation = SimpleNamespace(name="first")
+    second_observation = SimpleNamespace(name="second")
+
+    adapter.select_next(first_observation, SimpleNamespace())
+    adapter.observe_perception(
+        SimpleNamespace(coarse_scan_view_path=tmp_path / "coarse-view-000")
+    )
+    selected = adapter.select_next(second_observation, SimpleNamespace())
+
+    assert selected.selection_policy_sha256 == "d" * 64
+    assert refreshes == [first_observation, second_observation]
+    assert session.stage_selected_calls == 2
 
 
 def test_schema5_handoff_never_emits_changed_coarse_completion_binding(
@@ -1082,6 +1133,52 @@ def test_cleanup_attempts_physical_stop_when_runtime_stop_raises(
     assert calls == ["runtime_stop", "arm_stop", "stationarity"]
 
 
+def test_cleanup_reuses_confirmed_runtime_stop_without_second_driver_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    stopped_status = SimpleNamespace(
+        phase="aborted",
+        disposition=ExperimentDisposition.BLOCKED,
+        stop_requested=True,
+        stop_transport_acknowledged=True,
+        stop_stationarity_verified=True,
+    )
+
+    class Runtime:
+        snapshot = SimpleNamespace(
+            phase=UnknownBladeRuntimePhase.BLOCKED,
+            runner_status=SimpleNamespace(phase="aborted"),
+        )
+
+        def request_stop(self, reason: str):
+            assert reason
+            calls.append("runtime_stop")
+            return SimpleNamespace(
+                phase=UnknownBladeRuntimePhase.STOPPED,
+                runner_status=stopped_status,
+            )
+
+    class Arm:
+        def stop(self) -> None:
+            calls.append("arm_stop")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "wait_until_settled",
+        lambda *_args, **_kwargs: calls.append("stationarity"),
+    )
+
+    runtime_module._finalize_production_runtime(
+        Runtime(),
+        Arm(),
+        load_settings("configs/default.yaml"),
+        SimpleNamespace(),
+    )
+
+    assert calls == ["runtime_stop"]
+
+
 def test_cleanup_skips_invalid_runner_transition_after_terminal_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1500,6 +1597,34 @@ def test_expired_coarse_window_enters_fine_replenishment_instead_of_blocking(
     snapshot = runtime.capture_fine_source_replenishment(view_id="fine-refresh-002")
     assert snapshot.runner_status.disposition is ExperimentDisposition.READY
     assert snapshot.fine_source_replenishment_views == 2
+
+
+def test_path_blocked_coarse_run_accepts_operator_safety_refresh(
+    tmp_path: Path,
+) -> None:
+    runtime, runner, session = _runtime(tmp_path)
+    runtime.start()
+    for _ in range(3):
+        runtime.capture_operator_view()
+    assert runtime.snapshot.phase is UnknownBladeRuntimePhase.COARSE_SCAN
+    runner._status = _status(  # noqa: SLF001
+        tmp_path,
+        ExperimentDisposition.NEEDS_CAPTURE,
+        phase="motion_blocked",
+        cycle=runner.capture_count,
+        blocking=("all ranked paths blocked by current occupancy",),
+    )
+    # Safety-refresh frames update occupancy only; this test fake otherwise treats
+    # every capture as a coarse-science candidate.
+    runner.observer = None
+    rejected_before = session.reject_calls
+
+    snapshot = runtime.capture_coarse_safety_refresh(view_id="operator-refresh-000")
+
+    assert snapshot.phase is UnknownBladeRuntimePhase.COARSE_SCAN
+    assert runner.last_step_view_id == "operator-refresh-000"
+    assert session.reject_calls == rejected_before + 1
+    assert snapshot.runner_status.disposition is ExperimentDisposition.READY
 
 
 @pytest.mark.parametrize(

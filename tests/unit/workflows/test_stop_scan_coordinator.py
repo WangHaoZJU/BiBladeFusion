@@ -554,6 +554,7 @@ class FakeExecutor:
         self.source = source
         self.goal = np.asarray(goal)
         self.execute_calls = 0
+        self.last_maximum_duration_s: float | None = None
 
     def approval_prompt(self, preflight) -> str:
         del preflight
@@ -600,6 +601,7 @@ class FakeExecutor:
     ) -> StreamServoJResult:
         del preflight, permit
         assert maximum_duration_s is None or maximum_duration_s > 0.0
+        self.last_maximum_duration_s = maximum_duration_s
         if cancellation_requested():
             raise StopScanAbortRequested("cancelled before fake execution")
         self.execute_calls += 1
@@ -807,6 +809,7 @@ def test_bootstrap_then_one_complete_viewpoint_motion_requires_new_capture(
 
     assert coordinator.checkpoint.phase is StopScanPhase.AWAITING_CAPTURE
     assert safety.executor is not None and safety.executor.execute_calls == 1
+    assert safety.executor.last_maximum_duration_s is not None
     assert stop.calls == 4
 
     expected_capture = coordinator.checkpoint.expected_capture_view_id
@@ -1109,7 +1112,7 @@ def test_planned_segment_timing_budget_blocks_before_approval(tmp_path: Path) ->
 
 def test_actual_segment_timing_overrun_stops_and_aborts(tmp_path: Path) -> None:
     # The perception transaction now rechecks its deadline at every commit gate.
-    clock = iter((0.0, *([0.1] * 8), 10.0, 11.000001))
+    clock = iter((0.0, *([0.1] * 12), 10.0, 11.000001))
     coordinator, source, _, _, _, _ = _coordinator(
         tmp_path,
         mapping_counts=[3],
@@ -1133,6 +1136,26 @@ def test_actual_segment_timing_overrun_stops_and_aborts(tmp_path: Path) -> None:
 
     assert coordinator.checkpoint.phase is StopScanPhase.ABORTED
     assert source.calls > stops_before
+
+
+def test_planning_preflight_has_a_finite_responsiveness_budget(
+    tmp_path: Path,
+) -> None:
+    coordinator, _, _, _, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        coordinator_updates={"maximum_planning_preflight_duration_s": 1.0},
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    clock = iter((0.0, 1.000001))
+    coordinator._monotonic_clock = lambda: next(clock)  # noqa: SLF001
+
+    with pytest.raises(StopScanBlocked, match="responsiveness budget"):
+        coordinator.prepare_next_segment()
+
+    assert coordinator.checkpoint.phase is StopScanPhase.MOTION_BLOCKED
 
 
 def test_unconfirmed_emergency_stop_is_persisted_as_terminal_failed(
@@ -2064,7 +2087,8 @@ def test_request_stop_interrupts_execution_without_transaction_lock(
         maximum_duration_s,
     ):
         del preflight, permit
-        assert maximum_duration_s is None
+        assert maximum_duration_s is not None
+        assert maximum_duration_s > 0.0
         entered.set()
         assert release.wait(timeout=2.0)
         if cancellation_requested():

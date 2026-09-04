@@ -517,6 +517,9 @@ stop_and_capture:
   # science-ranked queue until one continuously safe endpoint is found.
   # Deprecated compatibility key. The selector's complete bounded queue is checked.
   maximum_ranked_preflight_candidates: 3
+  # One NBV selection plus the complete selector-bounded path queue must return
+  # attention instead of leaving a physical experiment apparently hung.
+  maximum_planning_preflight_duration_s: 30.0
   # May use a verified MAPPING prefix only inside immutable accepted-free regions.
   allow_single_view_bootstrap_motion: false
   settle_timeout_s: 15.0

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import warnings
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
@@ -52,6 +53,7 @@ from biblade_fusion.planning import (
     BladeSide,
     EliteCs68IkChecker,
     EndpointConfigurationCheck,
+    ReachabilityChecker,
     evaluate_multi_seed_ik,
 )
 from biblade_fusion.robotics import (
@@ -219,6 +221,13 @@ class _CoarseSession(Protocol):
     ) -> _CoarseScanViewReadback: ...
 
     def select_next(self) -> NextViewSelection: ...
+
+    def refresh_discovery(
+        self,
+        *,
+        current_joint_positions_rad: tuple[float, float, float, float, float, float],
+        reachability_checker: ReachabilityChecker,
+    ) -> None: ...
 
     def evaluate_transition(self) -> CoarsePhaseTransition: ...
 
@@ -499,6 +508,47 @@ class CompletedUnknownBladeRuntime:
         return self._snapshot
 
 
+class _BestEffortLiveSupervision:
+    """Keep the read-only timeline outside every science and motion authority."""
+
+    def __init__(self, bridge: LiveSupervisionBridge) -> None:
+        self._bridge = bridge
+        self._disabled_reason: str | None = None
+
+    @property
+    def disabled_reason(self) -> str | None:
+        return self._disabled_reason
+
+    def _observe(self, method: str, *args: object, **kwargs: object) -> None:
+        if self._disabled_reason is not None:
+            return
+        try:
+            getattr(self._bridge, method)(*args, **kwargs)
+        except Exception as exc:
+            self._disabled_reason = f"{method}:{type(exc).__name__}:{exc}"
+            warnings.warn(
+                "Read-only live supervision was disabled without interrupting the "
+                f"experiment: {self._disabled_reason}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    def __call__(self, status: ExperimentStatusSnapshot) -> None:
+        self._observe("__call__", status)
+
+    def observe_event(self, event: object) -> None:
+        self._observe("observe_event", event)
+
+    def observe_perception(self, result: object, **kwargs: object) -> None:
+        self._observe("observe_perception", result, **kwargs)
+
+    def observe_prepared_segment(self, prepared: object) -> None:
+        self._observe("observe_prepared_segment", prepared)
+
+    def begin_new_event_stream(self, *, run_id: str) -> None:
+        self._observe("begin_new_event_stream", run_id=run_id)
+
+
 def _rebind_coarse_selection_to_current_stop(
     selection: NextViewSelection,
     *,
@@ -582,9 +632,11 @@ class CoarseSessionNextViewAdapter:
             [NextViewSelection, PerceptionCycleResult], NextViewSelection
         ]
         | None = None,
+        discovery_refresher: Callable[[PerceptionCycleResult], None] | None = None,
     ) -> None:
         self._session = session
         self._selection_rebinder = selection_rebinder
+        self._discovery_refresher = discovery_refresher
         self._pending_selection: NextViewSelection | None = None
         self._last_transition: CoarsePhaseTransition | None = None
         self._accepted_cycle_count = 0
@@ -717,6 +769,8 @@ class CoarseSessionNextViewAdapter:
                 "Schema-5 is ready for the outer fine handoff; the coarse run must "
                 "not emit a completion decision with a different reference hash"
             )
+        if self._discovery_refresher is not None:
+            self._discovery_refresher(observation)
         selection = self._session.select_next()
         if selection.coverage_complete or selection.target is None:
             raise UnknownBladeRuntimeError(
@@ -724,22 +778,17 @@ class CoarseSessionNextViewAdapter:
             )
         if self._selection_rebinder is not None:
             selection = self._selection_rebinder(selection, observation)
-        binding = (
-            selection.reference_model_sha256,
-            selection.selection_policy_sha256,
-        )
+        binding = selection.reference_model_sha256
         if self._run_reference_model_sha256 is None:
-            (
-                self._run_reference_model_sha256,
-                self._run_selection_policy_sha256,
-            ) = binding
-        elif binding != (
-            self._run_reference_model_sha256,
-            self._run_selection_policy_sha256,
-        ):
+            self._run_reference_model_sha256 = binding
+        elif binding != self._run_reference_model_sha256:
             raise UnknownBladeRuntimeError(
-                "Coarse reference or selection policy changed within one run"
+                "Coarse reference model changed within one run"
             )
+        # The policy digest includes the state-dependent evaluated candidate set.
+        # It is intentionally rebound on every stopped-posture revision and is
+        # still frozen into the one proposal/approval transaction that consumes it.
+        self._run_selection_policy_sha256 = selection.selection_policy_sha256
         self._session.stage_selected_capture(selection)
         self._pending_selection = selection
         return selection
@@ -891,6 +940,7 @@ class UnknownBladeSupervisedRuntime:
         self._experimental = experimental
         self._monotonic_clock = monotonic_clock
         self._bootstrap_count = 0
+        self._coarse_safety_refresh_count = 0
         self._fine_replenishment_count = 0
         self._phase = (
             UnknownBladeRuntimePhase.FINE_SCAN
@@ -1196,6 +1246,51 @@ class UnknownBladeSupervisedRuntime:
                 "fine source replenishment reached an invalid coordinator disposition"
             )
         self._fine_replenishment_count += 1
+        return self.snapshot
+
+    def capture_coarse_safety_refresh(
+        self,
+        *,
+        view_id: str | None = None,
+    ) -> UnknownBladeRuntimeSnapshot:
+        """Accept one operator-repositioned safety-map view after path blockage."""
+
+        self._require_started()
+        if self._phase is not UnknownBladeRuntimePhase.COARSE_SCAN:
+            raise UnknownBladeRuntimeError(
+                "Coarse safety refresh is available only during active coarse scan"
+            )
+        status = self._active_runner.status
+        if (
+            status.phase != StopScanPhase.MOTION_BLOCKED.value
+            or status.disposition is not ExperimentDisposition.NEEDS_CAPTURE
+            or status.expected_capture_view_id is not None
+        ):
+            raise UnknownBladeRuntimeError(
+                "The coarse runner is not awaiting an operator-positioned safety refresh"
+            )
+        selected = (
+            view_id or f"coarse_safety_refresh_{self._coarse_safety_refresh_count:03d}"
+        ).strip()
+        if not selected:
+            raise ValueError("Coarse safety-refresh view ID must be non-empty")
+        # A path-blocked proposal is not reusable after the operator changes the
+        # current posture/map.  Clear it before the SAFETY_REFRESH cycle so the
+        # next selection re-evaluates IK and paths from the new stopped state.
+        self._coarse_adapter.reject_staged_cycle()
+        updated = self._active_runner.step(view_id=selected)
+        if updated.disposition is ExperimentDisposition.BLOCKED:
+            return self._block("coarse safety refresh was blocked")
+        if updated.disposition is ExperimentDisposition.COMPLETE:
+            return self._block("coarse runner completed while refreshing its safety map")
+        if updated.disposition not in {
+            ExperimentDisposition.NEEDS_CAPTURE,
+            ExperimentDisposition.READY,
+        }:
+            return self._block(
+                "coarse safety refresh reached an invalid coordinator disposition"
+            )
+        self._coarse_safety_refresh_count += 1
         return self.snapshot
 
     def execute_exact_approval(self, confirmation: str) -> UnknownBladeRuntimeSnapshot:
@@ -1855,19 +1950,35 @@ def _finalize_production_runtime(
     settings: AppSettings,
     motion_envelope: StoredMotionEnvelopeAcceptance,
 ) -> None:
-    """Always attempt the physical stop even if outer supervision stop fails."""
+    """Confirm one stop boundary, falling back to the driver only when needed."""
 
     stop_errors: list[BaseException] = []
+    stop_confirmed = False
     try:
         snapshot = runtime.snapshot
         runner_status = getattr(snapshot, "runner_status", None)
-        if (
+        stop_confirmed = (
+            snapshot.phase is UnknownBladeRuntimePhase.STOPPED
+            and runner_status is not None
+            and UnknownBladeSupervisedRuntime._stop_status_confirmed(runner_status)
+        )
+        if not stop_confirmed and (
             snapshot.phase is not UnknownBladeRuntimePhase.COMPLETE
             and getattr(runner_status, "phase", None) != "failed"
         ):
-            runtime.request_stop("production runtime context closed")
+            stopped = runtime.request_stop("production runtime context closed")
+            stopped_status = getattr(stopped, "runner_status", None)
+            stop_confirmed = (
+                stopped.phase is UnknownBladeRuntimePhase.STOPPED
+                and stopped_status is not None
+                and UnknownBladeSupervisedRuntime._stop_status_confirmed(
+                    stopped_status
+                )
+            )
     except BaseException as exc:
         stop_errors.append(exc)
+    if stop_confirmed:
+        return
     try:
         arm.stop()
     except BaseException as exc:
@@ -2086,6 +2197,10 @@ def open_production_unknown_blade_runtime(
     model_path = settings.kinematics.model_path
     if bounds_min is None or bounds_max is None or model_path is None:
         raise UnknownBladeRuntimeError("Readiness accepted incomplete runtime geometry")
+    # Parse and validate the controller-specific ES68 model while the runtime is
+    # still entirely offline.  A readable-but-malformed YAML must never reserve an
+    # experiment root or open the robot/camera before it fails.
+    kinematic_model = load_cs68_kinematics(model_path)
     # Model construction can dominate the first inference and can expose checkpoint
     # incompatibilities that a path/dependency doctor cannot.  Complete it before
     # reserving the run root or opening either hardware endpoint.
@@ -2107,7 +2222,6 @@ def open_production_unknown_blade_runtime(
         stack.callback(camera.close)
         thermal = NullThermalCamera()
         state = arm.read_state()
-        kinematic_model = load_cs68_kinematics(model_path)
 
         def runtime_reachability_checker(
             seed: np.ndarray,
@@ -2176,9 +2290,24 @@ def open_production_unknown_blade_runtime(
                 endpoint_validator=endpoint_collision_check,
             )
 
+        def refresh_coarse_discovery(observation: PerceptionCycleResult) -> None:
+            trace = observation.inference_robot_state_trace
+            current_array = (
+                trace[-1].joint_positions_rad
+                if trace
+                else observation.stationarity_reference.joint_positions_rad
+            )
+            current = tuple(float(value) for value in current_array)
+            checker = runtime_reachability_checker(np.asarray(current, dtype=np.float64))
+            coarse_session.refresh_discovery(
+                current_joint_positions_rad=current,
+                reachability_checker=checker,
+            )
+
         coarse_adapter = CoarseSessionNextViewAdapter(
             coarse_session,
             selection_rebinder=rebind_coarse_selection,
+            discovery_refresher=refresh_coarse_discovery,
         )
         acquirer = SynchronizedAcquirer(
             arm,
@@ -2244,15 +2373,16 @@ def open_production_unknown_blade_runtime(
             kinematics=display_kinematics,
             collision_geometry=live_collision_geometry,
         )
+        live_supervision = _BestEffortLiveSupervision(coarse_bridge)
 
         def observe_coarse_perception(result: PerceptionCycleResult) -> None:
             """Keep coarse acceptance/checkpoint/live reuse in one ordered transaction."""
 
             coarse_adapter.observe_perception(result)
             if result.coarse_scan_view_path is None:
-                coarse_bridge.observe_perception(result)
+                live_supervision.observe_perception(result)
                 return
-            coarse_bridge.observe_perception(
+            live_supervision.observe_perception(
                 result,
                 coarse_readback=coarse_adapter.take_live_readback(result),
             )
@@ -2271,11 +2401,11 @@ def open_production_unknown_blade_runtime(
                 "safety_factory": safety_factory,
                 "publisher": publisher,
                 "motion_executor": GuardedCoordinatorMotionExecutor(),
-                "status_callbacks": (coarse_bridge,),
-                "event_callbacks": (coarse_bridge.observe_event,),
+                "status_callbacks": (live_supervision,),
+                "event_callbacks": (live_supervision.observe_event,),
                 "perception_callbacks": (observe_coarse_perception,),
                 "prepared_segment_callbacks": (
-                    coarse_bridge.observe_prepared_segment,
+                    live_supervision.observe_prepared_segment,
                 ),
             }
             if resume_plan is None:
@@ -2383,7 +2513,7 @@ def open_production_unknown_blade_runtime(
                 motion_envelope,
                 motion_control_hash,
             )
-            coarse_bridge.begin_new_event_stream(run_id=identity)
+            live_supervision.begin_new_event_stream(run_id=identity)
             runner_kwargs = {
                 "config": settings.stop_and_capture,
                 "acquisition_config": settings.acquisition,
@@ -2396,17 +2526,17 @@ def open_production_unknown_blade_runtime(
                 "safety_factory": fine_safety_factory,
                 "publisher": fine_publisher,
                 "motion_executor": GuardedCoordinatorMotionExecutor(),
-                "status_callbacks": (coarse_bridge,),
-                "event_callbacks": (coarse_bridge.observe_event,),
+                "status_callbacks": (live_supervision,),
+                "event_callbacks": (live_supervision.observe_event,),
                 "perception_callbacks": (
                     lambda result: fine_checkpoint_recorder.record(
                         result,
                         fine_run_root=effective_run_root,
                     ),
-                    coarse_bridge.observe_perception,
+                    live_supervision.observe_perception,
                 ),
                 "prepared_segment_callbacks": (
-                    coarse_bridge.observe_prepared_segment,
+                    live_supervision.observe_prepared_segment,
                 ),
             }
             if resume_run_root is not None:
@@ -2648,6 +2778,11 @@ def run_unknown_blade_operator_console(
                         output_fn("Fine safety replenishment does not accept a side label.")
                         continue
                     runtime.capture_fine_source_replenishment()
+                elif snapshot.phase is UnknownBladeRuntimePhase.COARSE_SCAN:
+                    if explicit_side is not None:
+                        output_fn("Coarse safety refresh does not accept a side label.")
+                        continue
+                    runtime.capture_coarse_safety_refresh()
                 else:
                     first_capture = snapshot.operator_bootstrap_views == 0
                     runtime.capture_operator_view(

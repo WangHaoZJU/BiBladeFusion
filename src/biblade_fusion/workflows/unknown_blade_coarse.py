@@ -724,11 +724,18 @@ def generate_fin_discovery_plan(
                 endpoint_validator=endpoint_validator,
             )
             adaptive_searches.append(AdaptiveFinDiscoverySearch(search_config, search))
-            evaluated.append(
-                search.recommended.evaluated
-                if search.recommended is not None
-                else search.attempts[0].evaluated
-            )
+            if search.ranked_feasible:
+                # Preserve bounded same-semantics pose alternatives.  A high-gain
+                # endpoint whose path is blocked must not hide a lower-ranked
+                # angle/distance/roll pose for the same fin face.
+                evaluated.extend(
+                    attempt.evaluated
+                    for attempt in search.ranked_feasible[
+                        : search_config.maximum_ik_feasible_candidates
+                    ]
+                )
+            elif search.attempts:
+                evaluated.append(search.attempts[0].evaluated)
     else:
         filtered = filter_candidate_views(
             tuple(candidates),
@@ -1112,14 +1119,7 @@ def _append_coarse_scan_generation_from_verified(
             str(previous.metadata["sources"]["initialization"]["root"])
         ).resolve()
         expected_plan = Path(str(previous.metadata["sources"]["view_plan"]["root"])).resolve()
-        expected_discovery = Path(
-            str(previous.metadata["sources"]["discovery_plan"]["root"])
-        ).resolve()
-        if (
-            expected_initialization != initialization_root
-            or expected_plan != plan_root
-            or expected_discovery != discovery_root
-        ):
+        if expected_initialization != initialization_root or expected_plan != plan_root:
             raise UnknownBladeCoarseError("Coarse generation changed proxy or view plan")
         if any(item.root == current.root for item in previous.views):
             raise UnknownBladeCoarseError("Coarse view was already accepted")
@@ -1225,18 +1225,21 @@ def _paired_discovery_ids(
     discovery: CoarseDiscoveryPlan,
     side: BladeSide,
 ) -> tuple[tuple[str, str], ...]:
-    families: dict[tuple[str, str], dict[str, str]] = {}
+    families: dict[tuple[str, str], dict[str, list[str]]] = {}
     for item in discovery.endpoint_feasible:
         identity = _discovery_view_identity(item.candidate.view_id)
         if identity is None or identity[0] is not side:
             continue
         _, axis, sign_name, family = identity
-        families.setdefault((axis, family), {})[sign_name] = item.candidate.view_id
-    return tuple(
-        (members["negative"], members["positive"])
-        for members in families.values()
-        if set(members) == {"negative", "positive"}
-    )
+        families.setdefault((axis, family), {}).setdefault(sign_name, []).append(
+            item.candidate.view_id
+        )
+    pairs: list[tuple[str, str]] = []
+    for members in families.values():
+        for negative in members.get("negative", ()):
+            for positive in members.get("positive", ()):
+                pairs.append((negative, positive))
+    return tuple(pairs)
 
 
 def _missing_discovery_pair_error(
@@ -1281,6 +1284,8 @@ def _missing_discovery_pair_error(
             f" backed by {len(attempts)} pose samples across {len(traces)} families; "
             f"rolls={rolls}, azimuth_count={len(azimuths)}"
         )
+        if any(trace.truncated for trace in traces):
+            attempt_summary += "; bounded search prefix was truncated"
     return UnknownBladeCoarseError(
         f"No endpoint-feasible opposing fin-discovery pair exists on {side.value} "
         f"after {evaluation}; {attempt_summary}; "
@@ -1309,12 +1314,16 @@ def _rank_candidates(
     side_view_counts = Counter(item.target_side for item in generation.views)
     eligible: list[tuple[EvaluatedCandidate, float]] = []
 
-    # Opposing-pair availability remains a hard precondition. Selection within
-    # that feasible set is online gain-driven rather than a fixed front-first list.
+    missing_pair_sides: list[BladeSide] = []
+    exhausted_pair_sides: list[BladeSide] = []
+    # Fin pairs are high-value candidates, not a requirement that must be proved
+    # from the initial stopped posture.  Final schema-5 promotion still requires
+    # measured bilateral opposing evidence.
     for side in (BladeSide.FRONT, BladeSide.BACK):
         pairs = _paired_discovery_ids(discovery, side)
         if not pairs:
-            raise _missing_discovery_pair_error(discovery, side)
+            missing_pair_sides.append(side)
+            continue
         complete = any(set(pair) <= verified for pair in pairs)
         if complete and not require_additional_fin_evidence:
             continue
@@ -1335,9 +1344,7 @@ def _rank_candidates(
                 eligible.append((discovery_by_id[view_id], fin_evidence))
                 side_eligible += 1
         if not complete and side_eligible == 0:
-            raise UnknownBladeCoarseError(
-                f"Fin-discovery attempts exhausted without an opposing pair on {side.value}"
-            )
+            exhausted_pair_sides.append(side)
 
     plan_root = Path(str(generation.metadata["sources"]["view_plan"]["root"])).resolve()
     reduced = select_uncovered_candidates(read_view_plan(plan_root).result.filtered_plan, coverage)
@@ -1392,6 +1399,13 @@ def _rank_candidates(
                 "discovery gain below the configured minimum"
             )
         return eligible_ranked
+    if missing_pair_sides:
+        raise _missing_discovery_pair_error(discovery, missing_pair_sides[0])
+    if exhausted_pair_sides:
+        raise UnknownBladeCoarseError(
+            "Fin-discovery attempts exhausted without an opposing pair on "
+            + ", ".join(side.value for side in exhausted_pair_sides)
+        )
     if reduced.blocked_patch_ids:
         raise UnknownBladeCoarseError(
             "Incomplete proxy patches have no endpoint-feasible target: "
@@ -1713,11 +1727,16 @@ def _write_discovery_plan_asset(
     temporary.mkdir()
     try:
         payload = {
-            "schema_version": 3,
+            "schema_version": 4,
             "artifact_kind": "biblade_fusion.coarse_fin_discovery_plan",
             "created_at_utc": datetime.now(UTC).isoformat(),
             "motion_authorized": False,
             "policy_sha256": discovery.policy_sha256,
+            "current_joint_positions_rad": (
+                list(discovery.current_joint_positions_rad)
+                if discovery.current_joint_positions_rad is not None
+                else None
+            ),
             "sources": {
                 "initialization": _file_source_record(
                     source_initialization / INITIALIZATION_METADATA_FILENAME
@@ -1782,12 +1801,22 @@ def _verify_discovery_plan_asset(
 ) -> None:
     payload = json.loads((path / "discovery.json").read_text(encoding="utf-8"))
     if (
-        payload.get("schema_version") not in {1, 2, 3}
+        payload.get("schema_version") not in {1, 2, 3, 4}
         or payload.get("artifact_kind") != "biblade_fusion.coarse_fin_discovery_plan"
         or payload.get("motion_authorized") is not False
         or payload.get("policy_sha256") != discovery.policy_sha256
     ):
         raise UnknownBladeCoarseError("Persisted coarse discovery policy changed")
+    if payload.get("schema_version") == 4:
+        expected_current = (
+            list(discovery.current_joint_positions_rad)
+            if discovery.current_joint_positions_rad is not None
+            else None
+        )
+        if payload.get("current_joint_positions_rad") != expected_current:
+            raise UnknownBladeCoarseError(
+                "Persisted coarse discovery current posture changed"
+            )
     adaptive_payload = payload.get("adaptive_ik_fin_discovery")
     if adaptive_payload is not None:
         if any(
@@ -1919,6 +1948,21 @@ class CoarseScienceSession:
         discovery_path = Path(str(sources["discovery_plan"]["root"])).resolve()
         stored_initialization = read_initialization(initialization)
         stored_plan = read_view_plan(view_plan)
+        discovery_payload = json.loads(
+            (discovery_path / "discovery.json").read_text(encoding="utf-8")
+        )
+        current_joint_positions = discovery_payload.get("current_joint_positions_rad")
+        if current_joint_positions is None:
+            # Schema <= 3 discovery assets were evaluated only at the operator
+            # bootstrap posture.  Preserve their deterministic recovery contract.
+            current_joint_positions = (
+                stored_initialization.observation.seed_joint_positions_rad
+            )
+        current = tuple(float(value) for value in current_joint_positions)
+        if len(current) != 6 or not np.isfinite(current).all():
+            raise UnknownBladeCoarseError(
+                "Persisted coarse discovery current posture is invalid"
+            )
         discovery = generate_fin_discovery_plan(
             stored_initialization.observation.proxy,
             stored_plan.result.geometric_plan.footprint_m,
@@ -1927,10 +1971,7 @@ class CoarseScienceSession:
             self._policy,
             self._reachability,
             self._settings.point_cloud,
-            tuple(
-                float(value)
-                for value in stored_initialization.observation.seed_joint_positions_rad
-            ),
+            current,
             self._endpoint_validator,
         )
         _verify_discovery_plan_asset(
@@ -1945,6 +1986,84 @@ class CoarseScienceSession:
         self._view_plan = view_plan
         self._discovery_path = discovery_path
         self._discovery = discovery
+
+    def refresh_discovery(
+        self,
+        *,
+        current_joint_positions_rad: tuple[float, float, float, float, float, float],
+        reachability_checker: ReachabilityChecker,
+    ) -> None:
+        """Re-evaluate fin endpoints from the latest stopped robot posture.
+
+        IK feasibility is state dependent.  Keeping the bootstrap posture's
+        evaluated candidate set for the whole experiment could permanently label
+        a view unreachable even after an earlier safe move made it reachable.
+        Each revision is immutable and the accepting generation records the exact
+        revision used for its selection.
+        """
+
+        if self._pending_selection is not None or self._pending_prepared is not None:
+            raise UnknownBladeCoarseError(
+                "Cannot refresh fin discovery while a coarse transaction is pending"
+            )
+        if (
+            self._generation is None
+            or self._initialization is None
+            or self._view_plan is None
+            or self._discovery is None
+        ):
+            raise UnknownBladeCoarseError(
+                "Cannot refresh fin discovery before bootstrap initialization"
+            )
+        current = tuple(float(value) for value in current_joint_positions_rad)
+        if len(current) != 6 or not np.isfinite(current).all():
+            raise UnknownBladeCoarseError("Current discovery posture is invalid")
+        prior = self._discovery.current_joint_positions_rad
+        if prior is not None and np.max(np.abs(np.asarray(current) - np.asarray(prior))) <= 1e-3:
+            return
+        initialization = read_initialization(self._initialization)
+        view_plan = read_view_plan(self._view_plan)
+        with performance_span("coarse.fin_discovery_refresh"):
+            discovery = generate_fin_discovery_plan(
+                initialization.observation.proxy,
+                view_plan.result.geometric_plan.footprint_m,
+                self._settings.view_planning,
+                self._settings.view_filter,
+                self._policy,
+                reachability_checker,
+                self._settings.point_cloud,
+                current,
+                self._endpoint_validator,
+            )
+        posture_sha256 = hashlib.sha256(
+            json.dumps(current, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        ).hexdigest()
+        generation_index = read_coarse_scan_generation(self._generation).generation_index
+        output = (
+            self._output_root
+            / "fin_discovery_revisions"
+            / f"{generation_index:06d}_{posture_sha256[:16]}"
+        )
+        if output.exists():
+            _verify_discovery_plan_asset(
+                output,
+                discovery,
+                source_initialization=self._initialization,
+                source_view_plan=self._view_plan,
+                source_kinematics=self._source_kinematics,
+            )
+            discovery_path = output.resolve()
+        else:
+            discovery_path = _write_discovery_plan_asset(
+                output,
+                discovery,
+                source_initialization=self._initialization,
+                source_view_plan=self._view_plan,
+                source_kinematics=self._source_kinematics,
+            )
+        self._reachability = reachability_checker
+        self._discovery = discovery
+        self._discovery_path = discovery_path
 
     def prepare_cycle(
         self,
@@ -2385,10 +2504,6 @@ class CoarseScienceSession:
                     tuple(float(value) for value in observation.seed_joint_positions_rad),
                     self._endpoint_validator,
                 )
-            # This policy depends only on the first proxy, measured workspace and
-            # offline IK. Fail now instead of spending two more long bootstrap
-            # cycles before discovering that automatic coarse motion cannot start.
-            _require_bilateral_discovery_pairs(discovery)
             with performance_span("coarse.discovery_plan_write"):
                 discovery_path = _write_discovery_plan_asset(
                     discovery_output,

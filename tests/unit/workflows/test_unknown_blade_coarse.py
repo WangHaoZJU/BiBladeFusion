@@ -219,6 +219,88 @@ def test_adaptive_fin_discovery_keeps_opposing_semantics_without_locking_tilt() 
     assert result.motion_authorized is False
 
 
+def test_adaptive_fin_discovery_preserves_bounded_same_semantics_fallbacks() -> None:
+    planning = ViewPlanningConfig(
+        standoff_distance_m=0.30,
+        adaptive_ik_view_search=AdaptiveIkViewSearchConfig(
+            enabled=True,
+            maximum_distance_expansions=1,
+            roll_samples_deg=(0.0, 45.0),
+            maximum_ik_feasible_candidates=2,
+        ),
+    )
+
+    result = generate_fin_discovery_plan(
+        _proxy(),
+        (0.30, 0.20),
+        planning,
+        ViewFilterConfig(
+            workspace=AxisAlignedBoxConfig(
+                name="cell",
+                minimum_m=(-1.0, -1.0, -1.0),
+                maximum_m=(1.0, 1.0, 1.0),
+            ),
+            camera_clearance_radius_m=0.01,
+            minimum_incidence_cosine=0.4,
+        ),
+        CoarseSciencePolicy(),
+        _Reachable(),
+        PointCloudConfig(minimum_depth_m=0.15, maximum_depth_m=1.0),
+        (0.0,) * 6,
+    )
+
+    assert len(result.endpoint_feasible) == 16
+    assert all(
+        len(
+            [
+                item
+                for item in result.endpoint_feasible
+                if item.candidate.view_id.startswith(trace.result.nominal_view_id)
+            ]
+        )
+        == 2
+        for trace in result.adaptive_searches
+    )
+
+
+def test_adaptive_fin_discovery_handles_a_budget_exhausted_empty_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        coarse_module,
+        "search_adaptive_candidate_family",
+        lambda candidate, *_args, **_kwargs: coarse_module.AdaptiveViewSearchResult(
+            candidate.view_id,
+            (),
+            (),
+            True,
+        ),
+    )
+
+    result = generate_fin_discovery_plan(
+        _proxy(),
+        (0.30, 0.20),
+        ViewPlanningConfig(
+            standoff_distance_m=0.30,
+            adaptive_ik_view_search=AdaptiveIkViewSearchConfig(enabled=True),
+        ),
+        ViewFilterConfig(
+            workspace=AxisAlignedBoxConfig(
+                name="cell",
+                minimum_m=(-1.0, -1.0, -1.0),
+                maximum_m=(1.0, 1.0, 1.0),
+            )
+        ),
+        CoarseSciencePolicy(),
+        _Reachable(),
+        PointCloudConfig(minimum_depth_m=0.15, maximum_depth_m=1.0),
+        (0.0,) * 6,
+    )
+
+    assert len(result.adaptive_searches) == 8
+    assert result.filtered.candidates == ()
+
+
 def test_fin_discovery_azimuth_search_adds_asymmetric_common_bias() -> None:
     baseline = generate_fin_discovery_plan(
         _proxy(),
@@ -334,6 +416,17 @@ def test_single_initial_view_gain_selects_the_unseen_back_side(
             result=SimpleNamespace(filtered_plan=FilteredViewPlan(proxy_items, ()))
         ),
     )
+
+    # A first stopped posture need not already solve opposing fin pairs on both
+    # sides.  A useful uncovered normal view is enough to start online motion.
+    provisional, provisional_gain = coarse_module._select_candidate(  # noqa: SLF001
+        generation,
+        CoarseDiscoveryPlan(FilteredViewPlan((), ()), "a" * 64),
+        CoarseSciencePolicy(),
+        require_additional_fin_evidence=False,
+    )
+    assert provisional.candidate.view_id == "back_patch"
+    assert provisional_gain.expected_gain > 0.0
 
     selected, gain = coarse_module._select_candidate(  # noqa: SLF001
         generation,
@@ -785,6 +878,82 @@ def test_generation_accept_reuses_one_current_and_one_predecessor_read(
     assert captured["verified_previous_generation"] is previous
     assert session.take_live_readback(expected_coarse_view=current_root) is readback
     assert output.name == f"{view_number - 1:06d}"
+
+
+def test_discovery_is_re_evaluated_from_latest_stopped_posture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kinematics = tmp_path / "kinematics.yaml"
+    kinematics.write_text("model: test\n", encoding="utf-8")
+    session = CoarseScienceSession(
+        settings=load_settings("configs/default.yaml"),
+        hand_eye=SimpleNamespace(),  # type: ignore[arg-type]
+        reachability_checker=_Reachable(),
+        source_kinematics=kinematics,
+        output_root=tmp_path / "science",
+    )
+    initialization = (tmp_path / "initialization").resolve()
+    view_plan = (tmp_path / "view-plan").resolve()
+    generation = (tmp_path / "generation").resolve()
+    prior = CoarseDiscoveryPlan(
+        FilteredViewPlan((), ()),
+        "a" * 64,
+        current_joint_positions_rad=(0.0,) * 6,
+    )
+    refreshed = CoarseDiscoveryPlan(
+        FilteredViewPlan((), ()),
+        "b" * 64,
+        current_joint_positions_rad=(0.2,) * 6,
+    )
+    session._generation = generation  # noqa: SLF001
+    session._initialization = initialization  # noqa: SLF001
+    session._view_plan = view_plan  # noqa: SLF001
+    session._discovery_path = (tmp_path / "discovery").resolve()  # noqa: SLF001
+    session._discovery = prior  # noqa: SLF001
+    proxy = _proxy()
+    monkeypatch.setattr(
+        coarse_module,
+        "read_initialization",
+        lambda _path: SimpleNamespace(observation=SimpleNamespace(proxy=proxy)),
+    )
+    monkeypatch.setattr(
+        coarse_module,
+        "read_view_plan",
+        lambda _path: SimpleNamespace(
+            result=SimpleNamespace(geometric_plan=SimpleNamespace(footprint_m=(0.3, 0.2)))
+        ),
+    )
+    monkeypatch.setattr(
+        coarse_module,
+        "read_coarse_scan_generation",
+        lambda _path: SimpleNamespace(generation_index=3),
+    )
+    calls: list[tuple[float, ...]] = []
+
+    def generate(*args: object, **kwargs: object) -> CoarseDiscoveryPlan:
+        del kwargs
+        calls.append(tuple(args[7]))  # type: ignore[arg-type]
+        return refreshed
+
+    monkeypatch.setattr(coarse_module, "generate_fin_discovery_plan", generate)
+
+    def write(output: Path, *_args: object, **_kwargs: object) -> Path:
+        output.mkdir(parents=True)
+        (output / "discovery.json").write_text("{}\n", encoding="utf-8")
+        return output.resolve()
+
+    monkeypatch.setattr(coarse_module, "_write_discovery_plan_asset", write)
+
+    session.refresh_discovery(
+        current_joint_positions_rad=(0.2,) * 6,
+        reachability_checker=_Reachable(),
+    )
+
+    assert calls == [(0.2,) * 6]
+    assert session.discovery_plan is refreshed
+    assert session._discovery_path is not None  # noqa: SLF001
+    assert session._discovery_path.parent.name == "fin_discovery_revisions"  # noqa: SLF001
 
 
 def test_operator_bootstrap_side_is_automatic_after_proxy_exists() -> None:

@@ -293,8 +293,9 @@ tracking supervision, endpoint convergence, and stop/stationarity checks remain 
 
 The recursive continuous proof remains an offline acceptance and diagnostic facility. A
 sampled online result carries its own integrity hash and cannot be presented as a continuous
-certificate. Guarded execution accepts either explicit contract and revalidates only a new
-live-start bridge with the same mode bound into the permit.
+certificate. D027 supersedes the former live-start bridge: execution now requires the live
+state to remain inside HoloRobot's 0.001 rad start tolerance and never executes an unplanned
+bridge.
 
 ## D022 — Bind occupancy once per path and use HoloRobot's effective resolution
 
@@ -463,3 +464,35 @@ so the eiai `_003` acceptance remains the current binding. The operator console 
 the complete approved-cycle scope and reports its live runner phase every five seconds;
 typed execution blockers are preserved instead of being replaced by a generic outer
 message.
+
+## D028 — Re-evaluate state-dependent NBV and keep recoverable failures recoverable
+
+Date: 2026-09-04
+
+Status: accepted; full offline regression complete, physical verification pending
+
+The experiment objective is not to execute a fixed first-view plan. It is to select new
+blade/fin information whose IK is valid from the current stopped robot posture and whose
+complete route is safe. Therefore an IK verdict computed at the first operator view cannot
+remain the authority after the arm moves. Every stopped posture now creates or reuses one
+immutable fin-discovery revision. Candidate pose semantics remain stable, but the chosen IK
+branch and endpoint-collision result are re-evaluated. The accepting coarse generation
+records the exact revision; schema-5 promotion may not change it without a new view.
+
+Candidate-family enumeration is breadth-first across configured tilt, wrist roll, azimuth,
+and optical distance. IK branches are consumed lazily in HoloRobot seed order and stop at
+the first endpoint-clear solution. These changes remove false `UNREACHABLE` results and
+unnecessary solves; they do not treat IK failure as gain and do not bypass endpoint or path
+collision.
+
+`MOTION_BLOCKED` means automatic motion cannot proceed with the current stopped posture and
+map, not that the experiment evidence is corrupt. It is now exposed as a manual
+`SAFETY_REFRESH` attention point. The operator may reposition the stopped arm, capture one
+occupancy-only frame, and let the system discard/recompute the stale proposal. Corrupt
+assets, failed event persistence, unconfirmed emergency stop, and invalid science evidence
+remain terminal.
+
+One planning/preflight turn is bounded to 30 seconds and experimental segment execution
+always receives a finite watchdog. Read-only supervision is best effort. This bounds user
+waiting without weakening any motion-safety threshold or truncating the selector's declared
+candidate family silently.

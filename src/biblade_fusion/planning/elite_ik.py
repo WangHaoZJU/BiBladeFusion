@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
+from collections.abc import Iterator
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -188,8 +189,7 @@ class _HoloRobotMdhIkSolver:
         target_base_t_flange: PoseSE3,
         seed: NDArray[np.float64],
     ) -> NDArray[np.float64] | None:
-        solutions = self.solve_all(target_base_t_flange, seed)
-        return solutions[0] if solutions else None
+        return next(iter(self.iter_solutions(target_base_t_flange, seed)), None)
 
     def solve_all(
         self,
@@ -202,6 +202,22 @@ class _HoloRobotMdhIkSolver:
         if cached is not None:
             self._cache.move_to_end(key)
             return cached
+        return tuple(self.iter_solutions(target_base_t_flange, seed))
+
+    def iter_solutions(
+        self,
+        target_base_t_flange: PoseSE3,
+        seed: NDArray[np.float64],
+    ) -> Iterator[NDArray[np.float64]]:
+        """Yield HoloRobot-ordered branches so a clear first branch can stop work."""
+
+        key = tuple(round(float(value), 9) for value in target_base_t_flange.matrix.ravel())
+        key += tuple(round(float(value), 6) for value in seed)
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            yield from cached
+            return
         candidates = (
             seed,
             *_holorobot_near_seed_perturbations(seed),
@@ -227,15 +243,8 @@ class _HoloRobotMdhIkSolver:
                     for item in solutions
                 ):
                     solutions.append(normalized)
-        result = tuple(
-            sorted(
-                solutions,
-                key=lambda item: (
-                    float(np.max(np.abs(item - seed))),
-                    float(np.sum(np.abs(item - seed))),
-                ),
-            )
-        )
+                    yield normalized
+        result = tuple(solutions)
         self._cache[key] = result
         self._cache.move_to_end(key)
         while len(self._cache) > 1024:
@@ -297,20 +306,29 @@ class _HoloRobotPinocchioIkSolver:
         target_base_t_flange: PoseSE3,
         seed: NDArray[np.float64],
     ) -> NDArray[np.float64] | None:
-        solutions = self.solve_all(target_base_t_flange, seed)
-        return solutions[0] if solutions else None
+        return next(iter(self.iter_solutions(target_base_t_flange, seed)), None)
 
     def solve_all(
         self,
         target_base_t_flange: PoseSE3,
         seed: NDArray[np.float64],
     ) -> tuple[NDArray[np.float64], ...]:
+        return tuple(self.iter_solutions(target_base_t_flange, seed))
+
+    def iter_solutions(
+        self,
+        target_base_t_flange: PoseSE3,
+        seed: NDArray[np.float64],
+    ) -> Iterator[NDArray[np.float64]]:
+        """Yield nearby branches lazily in the proven HoloRobot seed order."""
+
         key = tuple(round(float(value), 9) for value in target_base_t_flange.matrix.ravel())
         key += tuple(round(float(value), 6) for value in seed)
         cached = self._cache.get(key)
         if cached is not None:
             self._cache.move_to_end(key)
-            return cached
+            yield from cached
+            return
 
         candidates = (
             seed,
@@ -331,10 +349,8 @@ class _HoloRobotPinocchioIkSolver:
             seen.add(seed_key)
             solution = self._solve_single(target, controller_seed)
             if solution is not None:
-                # A seed sweep is useful only if every distinct branch survives it.
-                # Returning the first converged branch made a collision-blocked wrist
-                # posture look like an IK failure even when another HoloRobot seed
-                # converged to a clear posture for the same camera pose.
+                # Consumers may stop after the first clear endpoint.  If it is
+                # blocked, iteration continues through the bounded HoloRobot seeds.
                 normalized = _nearest_equivalent_joints(
                     solution,
                     seed,
@@ -345,16 +361,9 @@ class _HoloRobotPinocchioIkSolver:
                     for item in solutions
                 ):
                     solutions.append(normalized)
+                    yield normalized
 
-        result = tuple(
-            sorted(
-                solutions,
-                key=lambda item: (
-                    float(np.max(np.abs(item - seed))),
-                    float(np.sum(np.abs(item - seed))),
-                ),
-            )
-        )
+        result = tuple(solutions)
 
         self._cache[key] = result
         self._cache.move_to_end(key)
@@ -588,3 +597,37 @@ class EliteCs68IkChecker:
             )
             for solution in solutions
         )
+
+    def iter_checks(self, base_t_left_ir: PoseSE3) -> Iterator[ReachabilityResult]:
+        """Yield IK branches lazily for endpoint-collision-aware selection."""
+
+        if self._uses_vendor_solver or (
+            base_t_left_ir.parent_frame != "base"
+            or not base_t_left_ir.child_frame.endswith("left_ir")
+        ):
+            yield self.check(base_t_left_ir)
+            return
+        canonical = PoseSE3("base", "left_ir", base_t_left_ir.matrix)
+        target = canonical.compose(self._flange_t_left_ir.inverse())
+        yielded = False
+        try:
+            for solution in self._solver.iter_solutions(target, self._near):
+                yielded = True
+                yield ReachabilityResult(
+                    ReachabilityState.REACHABLE,
+                    f"{self._solver_label} endpoint IK solution found; collision and "
+                    "trajectory remain unchecked",
+                    solution,
+                )
+        except Exception as exc:
+            yield ReachabilityResult(
+                ReachabilityState.UNKNOWN,
+                f"{self._solver_label} IK call failed: {exc}",
+            )
+            return
+        if not yielded:
+            yield ReachabilityResult(
+                ReachabilityState.UNREACHABLE,
+                f"{self._solver_label} IK found no endpoint solution across "
+                "the bounded seed sweep",
+            )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
+from itertools import product
 from math import cos, radians, sin
 from time import monotonic
 from typing import Literal
@@ -251,6 +252,80 @@ def evaluate_multi_seed_ik(
         )
         return MultiSeedIkEvaluation(result, (), None, (result.message,))
 
+    # The production HoloRobot adapter exposes its ordered seed sweep lazily.
+    # Validate each branch immediately and stop on the first clear endpoint;
+    # continue only when the preceding mathematical solution collides.  Generic
+    # injected checkers keep the legacy collect-and-rank behavior below.
+    if endpoint_validator is not None and len(checkers) == 1:
+        iter_checks = getattr(checkers[0], "iter_checks", None)
+        if callable(iter_checks):
+            outcomes: list[ReachabilityResult] = []
+            solutions: list[NDArray[np.float64]] = []
+            blocking: list[tuple[str, ...]] = []
+            for outcome in iter_checks(pose):
+                outcomes.append(outcome)
+                if (
+                    outcome.state is not ReachabilityState.REACHABLE
+                    or outcome.joint_positions_rad is None
+                ):
+                    continue
+                solution = outcome.joint_positions_rad
+                check = endpoint_validator(solution)
+                if type(check) is not EndpointConfigurationCheck:
+                    raise TypeError(
+                        "endpoint validator must return EndpointConfigurationCheck"
+                    )
+                solutions.append(solution)
+                blocking.append(check.blocking_reasons)
+                if check.clear:
+                    chosen = len(solutions) - 1
+                    result = ReachabilityResult(
+                        ReachabilityState.REACHABLE,
+                        f"{len(solutions)} IK solution(s) evaluated in HoloRobot seed "
+                        "order; first endpoint-collision-clear branch selected; "
+                        "trajectory remains unchecked",
+                        solution,
+                    )
+                    return MultiSeedIkEvaluation(
+                        result,
+                        tuple(solutions),
+                        chosen,
+                        tuple(item.message for item in outcomes),
+                        True,
+                        tuple(blocking),
+                    )
+            messages = tuple(item.message for item in outcomes)
+            if solutions:
+                unique_reasons = tuple(
+                    dict.fromkeys(
+                        reason for branch in blocking for reason in branch
+                    )
+                )
+                result = ReachabilityResult(
+                    ReachabilityState.UNREACHABLE,
+                    f"{len(solutions)} IK solution(s) found, but every endpoint is "
+                    f"collision blocked: {' | '.join(unique_reasons)}",
+                )
+                return MultiSeedIkEvaluation(
+                    result,
+                    tuple(solutions),
+                    None,
+                    messages,
+                    True,
+                    tuple(blocking),
+                )
+            state = (
+                ReachabilityState.UNKNOWN
+                if any(item.state is ReachabilityState.UNKNOWN for item in outcomes)
+                else ReachabilityState.UNREACHABLE
+            )
+            result = ReachabilityResult(
+                state,
+                "no IK solution found in bounded HoloRobot seed sweep: "
+                + " | ".join(messages),
+            )
+            return MultiSeedIkEvaluation(result, (), None, messages)
+
     outcomes_list: list[ReachabilityResult] = []
     for checker in checkers:
         check_all = getattr(checker, "check_all", None)
@@ -430,46 +505,73 @@ def generate_adaptive_candidate_family(
     tangent_x, tangent_y = _tangent_basis(nominal)
     distances = _distance_samples(nominal.standoff_distance_m, config)
     family = []
-    if config.sampling_order == "tilt_major":
-        parameter_order = (
-            (tilt, distance_index, distance)
-            for tilt in config.tilt_samples_deg
-            for distance_index, distance in enumerate(distances)
+    tilts = config.tilt_samples_deg
+    rolls = config.roll_samples_deg
+
+    def azimuths_for(tilt: float) -> tuple[float, ...]:
+        return (0.0,) if tilt == 0.0 else config.azimuth_samples_deg
+
+    # A bounded IK budget must be a representative prefix of the search space.
+    # Lexicographic Cartesian products starved real runs: 32 attempts could all
+    # share one tilt/roll or one distance.  Seed each independent dimension first,
+    # then expand the remaining Cartesian product in diagonal shells.
+    ordered_indices: list[tuple[int, int, int, int]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+
+    def add(indices: tuple[int, int, int, int]) -> None:
+        if indices not in seen:
+            seen.add(indices)
+            ordered_indices.append(indices)
+
+    add((0, 0, 0, 0))
+    for tilt_index in range(1, len(tilts)):
+        add((0, tilt_index, 0, 0))
+    for roll_index in range(1, len(rolls)):
+        add((0, 0, 0, roll_index))
+    azimuth_anchor = next(
+        (index for index, tilt in enumerate(tilts) if tilt != 0.0),
+        0,
+    )
+    for azimuth_index in range(1, len(azimuths_for(tilts[azimuth_anchor]))):
+        add((0, azimuth_anchor, azimuth_index, 0))
+    # Distance indices 1 and 2 are the first inward/outward samples whenever both
+    # lie inside the sensor limits.  Cover them before deeper expansions.
+    for distance_index in range(1, min(3, len(distances))):
+        add((distance_index, 0, 0, 0))
+
+    remaining = []
+    for distance_index, tilt_index, roll_index in product(
+        range(len(distances)),
+        range(len(tilts)),
+        range(len(rolls)),
+    ):
+        for azimuth_index in range(len(azimuths_for(tilts[tilt_index]))):
+            indices = (distance_index, tilt_index, azimuth_index, roll_index)
+            if indices in seen:
+                continue
+            remaining.append(indices)
+    remaining.sort(
+        key=lambda item: (
+            sum(item),
+            max(item),
+            item[0] if config.sampling_order == "distance_major" else item[1],
+            item[1] if config.sampling_order == "distance_major" else item[0],
+            item[2],
+            item[3],
         )
-    else:
-        parameter_order = (
-            (tilt, distance_index, distance)
-            for distance_index, distance in enumerate(distances)
-            for tilt in config.tilt_samples_deg
+    )
+    ordered_indices.extend(remaining)
+
+    ordered_parameters = (
+        (
+            tilts[tilt_index],
+            distance_index,
+            distances[distance_index],
+            azimuths_for(tilts[tilt_index])[azimuth_index],
+            rolls[roll_index],
         )
-    # Explore pose directions and optical distances before spending work on
-    # alternate wrist rolls.  The old inner-roll order could burn four expensive
-    # IK solves at each nearly identical direction and reach useful back-side
-    # distances only after hundreds of attempts.
-    directional_parameters = []
-    for tilt, distance_index, distance in parameter_order:
-        azimuths = (0.0,) if tilt == 0.0 else config.azimuth_samples_deg
-        for azimuth in azimuths:
-            directional_parameters.append((tilt, distance_index, distance, azimuth))
-    # Fin discovery is wrist-orientation sensitive: at the nominal distance its
-    # bounded first pass must cover every requested tilt *and* roll before it
-    # spends the remaining budget on distance expansion.  The former global
-    # roll-major order could consume all 32 IK attempts at roll=0 and then claim
-    # that an "angle/distance/roll" family was unreachable without trying a
-    # single alternate wrist roll.  Ordinary surface families retain their
-    # direction-first breadth because they also carry many azimuth samples.
-    if config.ranking_mode == "fin_discovery":
-        ordered_parameters = (
-            (tilt, distance_index, distance, azimuth, roll)
-            for tilt, distance_index, distance, azimuth in directional_parameters
-            for roll in config.roll_samples_deg
-        )
-    else:
-        ordered_parameters = (
-            (tilt, distance_index, distance, azimuth, roll)
-            for roll in config.roll_samples_deg
-            for tilt, distance_index, distance, azimuth in directional_parameters
-        )
+        for distance_index, tilt_index, azimuth_index, roll_index in ordered_indices
+    )
     for sequence_index, (
         tilt,
         distance_index,

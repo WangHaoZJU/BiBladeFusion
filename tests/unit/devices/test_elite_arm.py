@@ -1040,6 +1040,64 @@ def test_prepare_servoj_stream_primes_with_long_hold_timeout() -> None:
     assert write[1] == 3000
 
 
+def test_prepare_servoj_stream_recovers_one_transient_startup_write() -> None:
+    arm, sdk = enabled_arm()
+    assert sdk.driver is not None
+    calls = 0
+
+    def transient_write(command, timeout_ms, *flags):
+        nonlocal calls
+        calls += 1
+        sdk.driver.calls.append(("writeServoj", (command, timeout_ms, flags)))
+        if calls == 1:
+            sdk.driver.connected = False
+            return False
+        return True
+
+    sdk.driver.writeServoj = transient_write
+
+    arm._guarded_prepare_servoj_stream(
+        dt_s=0.004,
+        expected_stop_generation=arm.stop_generation,
+        capability=_GUARDED_MOTION_CAPABILITY,
+    )
+
+    writes = [value for name, value in sdk.driver.calls if name == "writeServoj"]
+    assert len(writes) == 2
+    assert writes[0][0] == writes[1][0]
+    assert any(name == "sendExternalControlScript" for name, _ in sdk.driver.calls)
+
+
+def test_prepare_servoj_recovery_never_overrides_a_concurrent_stop() -> None:
+    arm, sdk = enabled_arm()
+    assert sdk.driver is not None
+    approved_generation = arm.stop_generation
+    original_reverse_check = arm._ensure_driver_reverse_connected
+    sdk.driver.servoj_result = False
+    reverse_checks = 0
+
+    def stop_before_reconnect() -> None:
+        nonlocal reverse_checks
+        reverse_checks += 1
+        if reverse_checks > 1:
+            arm.stop()
+        original_reverse_check()
+
+    arm._ensure_driver_reverse_connected = stop_before_reconnect  # type: ignore[method-assign]
+
+    with pytest.raises(RobotMotionInterruptedError, match="stop generation changed"):
+        arm._guarded_prepare_servoj_stream(
+            dt_s=0.004,
+            expected_stop_generation=approved_generation,
+            capability=_GUARDED_MOTION_CAPABILITY,
+        )
+
+    assert arm.stop_snapshot == (approved_generation + 1, True)
+    assert [name for name, _ in sdk.driver.calls if name == "writeServoj"] == [
+        "writeServoj"
+    ]
+
+
 def test_guarded_endpoint_settle_reuses_holorobot_hold_before_stop() -> None:
     arm, sdk = enabled_arm()
     target = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5)
@@ -1085,6 +1143,47 @@ def test_stream_servoj_writes_every_command_with_short_timeout() -> None:
     assert result.commands_sent == 3
     assert [value[1] for value in writes] == [500, 500, 500]
     assert result.timing_summary["planned_dt_s"] == 0.004
+
+
+def test_stream_servoj_recovers_only_the_unchanged_first_command() -> None:
+    arm, sdk = enabled_arm()
+    assert sdk.driver is not None
+    calls = 0
+
+    def transient_write(command, timeout_ms, *flags):
+        nonlocal calls
+        calls += 1
+        sdk.driver.calls.append(("writeServoj", (command, timeout_ms, flags)))
+        if calls == 1:
+            sdk.driver.connected = False
+            return False
+        return True
+
+    sdk.driver.writeServoj = transient_write
+    stream = ServoJStream(
+        commands=(
+            (0.0, 0.1, 0.2, 0.3, 0.4, 0.5),
+            (0.01, 0.1, 0.2, 0.3, 0.4, 0.5),
+        ),
+        dt_s=0.004,
+    )
+
+    result = arm._guarded_stream_servoj(
+        stream,
+        capability=_GUARDED_MOTION_CAPABILITY,
+        expected_stop_generation=arm.stop_generation,
+        config=ServoJStreamConfig(
+            dt_s=0.004,
+            tracking_check_every_n_commands=99,
+        ),
+    )
+
+    writes = [value for name, value in sdk.driver.calls if name == "writeServoj"]
+    assert result.ok is True
+    assert result.commands_sent == 2
+    assert len(writes) == 3
+    assert writes[0][0] == writes[1][0] == list(stream.commands[0])
+    assert any(name == "sendExternalControlScript" for name, _ in sdk.driver.calls)
 
 
 def test_stream_servoj_checks_execution_deadline_inside_command_loop() -> None:

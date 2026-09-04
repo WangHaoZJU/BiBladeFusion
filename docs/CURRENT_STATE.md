@@ -430,3 +430,57 @@ remains applicable. Code regression is complete; the first physical motion on th
 is still pending. The final local result is `1252 passed, 3 skipped`; the skips are the
 same optional vale PyTorch/Open3D tests, and the focused motion/state-machine suite reports
 `276 passed`. Ruff and `git diff --check` pass.
+
+## 10. D028 full-chain audit and current result
+
+The HoloRobot-first audit was split across motion execution, candidate/IK planning, and
+coarse-to-fine/state-machine persistence. It found that the active route planner itself
+was already straight-first with bounded RRTConnect, but several surrounding layers could
+still multiply latency or turn a recoverable condition into a complete failed run.
+
+The following corrections are now code-verified:
+
+1. ServoJ preparation and the first unchanged stream command receive one bounded reverse-
+   connection recovery, matching HoloRobot's persistent external-control boundary. Later
+   stream commands are never retried because their execution state is ambiguous.
+2. IK solutions are yielded in HoloRobot seed order and endpoint collision is checked
+   immediately. A clear first branch stops the solve; a colliding branch cannot hide a
+   later clear branch.
+3. Every bounded adaptive candidate prefix now covers tilt, roll, azimuth and inward/
+   outward distance before expanding the Cartesian product. The former first-32 prefix
+   could falsely test only one narrow part of the configured family.
+4. Fin discovery is no longer frozen at the first-view joint posture. After each accepted
+   stop, a new immutable discovery revision is evaluated from the latest joints. The next
+   generation binds the exact revision used, while initialization, proxy and view plan
+   remain append-only.
+5. Absence of a complete initial opposing fin pair no longer suppresses an otherwise
+   informative, endpoint-feasible normal view. Actual bilateral/two-face fin evidence is
+   still required at schema-5 promotion.
+6. Read-only live timeline/GUI failures disable that observer with a warning and cannot
+   abort science, occupancy or motion. Authoritative checkpoint callbacks remain strict.
+7. A path-blocked coarse run now requests an operator-positioned `SAFETY_REFRESH` instead
+   of stopping the whole experiment. The stale proposal is discarded, the refresh updates
+   occupancy only, and IK/NBV/path selection restarts from the new stopped posture.
+8. One NBV selection plus its selector-bounded path queue has a 30-second responsiveness
+   watchdog. Experimental motion also has a finite duration derived from the approved
+   ServoJ stream and existing controller/settle limits when release timing is bypassed.
+9. `scan doctor` now parses the ES68 kinematics and stereo calibration, checks calibration
+   resolution, probes the RealSense Python API, and treats a configured-but-missing OMPL
+   fallback as failure. Malformed assets fail before output reservation or hardware open.
+
+No IK, collision, UNKNOWN, clearance, tracking, operator approval, or final bilateral-fin
+gate was relaxed. Original URDF/STL collision geometry and the accepted static-free/
+occupancy contract remain authoritative.
+
+Current offline result:
+
+```text
+ruff: all checks passed
+full suite: 1271 passed, 3 skipped in 98.95 s
+focused planning/runtime/storage suite: passed
+physical single-view -> first motion -> automatic next capture: still pending on eiai
+```
+
+The three skips are local-environment probes requiring PyTorch/Open3D on vale. eiai must
+still pass `scan doctor` and one guarded physical segment; an offline suite cannot prove
+camera transport, controller state, workcell placement, or physical collision clearance.

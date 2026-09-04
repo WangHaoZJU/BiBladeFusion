@@ -85,7 +85,18 @@ class RollSensitiveChecker:
         return ReachabilityResult(ReachabilityState.UNREACHABLE, "nominal wrist branch fails")
 
 
-def test_family_starts_at_ideal_then_explores_distance_before_wrist_roll() -> None:
+class LazyBranchChecker:
+    def __init__(self, branches: tuple[np.ndarray, ...]) -> None:
+        self.branches = branches
+        self.yielded = 0
+
+    def iter_checks(self, _pose: PoseSE3):
+        for branch in self.branches:
+            self.yielded += 1
+            yield ReachabilityResult(ReachabilityState.REACHABLE, "branch", branch)
+
+
+def test_family_starts_at_ideal_then_stratifies_each_search_dimension() -> None:
     config = AdaptiveViewSearchConfig(
         distance_step_m=0.05,
         maximum_distance_expansions=1,
@@ -100,8 +111,12 @@ def test_family_starts_at_ideal_then_explores_distance_before_wrist_roll() -> No
     second_parameters, second = family[1]
     assert first_parameters == first_parameters.__class__(0.30, 0.0, 0.0, 0.0, 0)
     assert second_parameters.roll_deg == 0.0
-    assert second_parameters.distance_m == pytest.approx(0.25)
-    assert second_parameters.tilt_deg == 0.0
+    assert second_parameters.distance_m == pytest.approx(0.30)
+    assert second_parameters.tilt_deg == 30.0
+    prefix = [item for item, _candidate in family[:8]]
+    assert {item.roll_deg for item in prefix} == {0.0, 45.0}
+    assert {item.distance_m for item in prefix} == {0.25, 0.30, 0.35}
+    assert {item.azimuth_deg for item in prefix} == {0.0, 90.0}
     np.testing.assert_allclose(first.base_t_left_ir.translation_m, [0.0, 0.0, 0.31])
     for candidate in (first, second):
         view = candidate.patch.target_m - candidate.base_t_left_ir.translation_m
@@ -166,6 +181,27 @@ def test_multi_seed_ik_rejects_pose_when_every_branch_collides() -> None:
     assert evaluation.result.state is ReachabilityState.UNREACHABLE
     assert evaluation.chosen_solution_index is None
     assert "every endpoint is collision blocked" in evaluation.result.message
+
+
+def test_lazy_ik_stops_at_first_clear_endpoint_but_skips_colliding_branch() -> None:
+    branches = tuple(np.full(6, value) for value in (0.1, 0.2, 0.3))
+    checker = LazyBranchChecker(branches)
+
+    evaluation = evaluate_multi_seed_ik(
+        make_nominal().base_t_left_ir,
+        (checker,),
+        np.zeros(6),
+        lambda joints: (
+            EndpointConfigurationCheck(False, ("wrist_collision",))
+            if np.allclose(joints, branches[0])
+            else EndpointConfigurationCheck(True)
+        ),
+    )
+
+    assert checker.yielded == 2
+    assert len(evaluation.solutions_rad) == 2
+    assert evaluation.chosen_solution_index == 1
+    np.testing.assert_allclose(evaluation.result.joint_positions_rad, branches[1])
 
 
 def test_search_never_escapes_configured_outer_workspace() -> None:
@@ -233,7 +269,7 @@ def test_fin_search_samples_every_tilt_at_nominal_distance_and_prefers_45_deg() 
     assert result.recommended.parameters.tilt_deg == 45.0
 
 
-def test_fin_search_covers_wrist_rolls_before_distance_expansion() -> None:
+def test_fin_search_prefix_covers_tilt_roll_and_both_distance_directions() -> None:
     config = AdaptiveViewSearchConfig(
         maximum_distance_expansions=1,
         tilt_samples_deg=(15.0, 45.0),
@@ -255,17 +291,36 @@ def test_fin_search_covers_wrist_rolls_before_distance_expansion() -> None:
         config,
     )
 
-    assert [item.parameters.distance_m for item in result.attempts] == [0.30] * 8
-    assert [item.parameters.roll_deg for item in result.attempts] == [
-        0.0,
-        45.0,
-        -45.0,
-        90.0,
-        0.0,
-        45.0,
-        -45.0,
-        90.0,
+    parameters = [item.parameters for item in result.attempts]
+    assert {item.tilt_deg for item in parameters} == {15.0, 45.0}
+    assert {item.roll_deg for item in parameters} == {0.0, 45.0, -45.0, 90.0}
+    assert {round(item.distance_m, 2) for item in parameters} == {0.26, 0.30, 0.34}
+
+
+def test_realistic_32_attempt_prefix_never_starves_adaptive_dimensions() -> None:
+    config = AdaptiveViewSearchConfig(
+        maximum_distance_expansions=3,
+        tilt_samples_deg=(45.0, 30.0, 60.0, 20.0, 15.0, 10.0),
+        azimuth_samples_deg=(0.0, 22.5, -22.5, 45.0, -45.0, 67.5, -67.5),
+        roll_samples_deg=(0.0, 45.0, -45.0, 90.0),
+        maximum_ik_attempts_per_family=32,
+        ranking_mode="fin_discovery",
+        sampling_order="distance_major",
+    )
+
+    prefix = [
+        parameters
+        for parameters, _candidate in generate_adaptive_candidate_family(
+            make_nominal(), config
+        )[:32]
     ]
+
+    assert {item.tilt_deg for item in prefix} == set(config.tilt_samples_deg)
+    assert {item.roll_deg for item in prefix} == set(config.roll_samples_deg)
+    assert {item.azimuth_deg for item in prefix} == set(config.azimuth_samples_deg)
+    distances = {round(item.distance_m, 2) for item in prefix}
+    assert 0.26 in distances
+    assert 0.34 in distances
 
 
 def test_report_is_json_serializable_and_explicitly_non_executable() -> None:

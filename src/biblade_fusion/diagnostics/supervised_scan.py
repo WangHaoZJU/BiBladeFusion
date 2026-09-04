@@ -12,7 +12,11 @@ from importlib import import_module
 from pathlib import Path
 from typing import Literal
 
-from biblade_fusion.calibration import load_hand_eye_calibration
+from biblade_fusion.calibration import (
+    load_cs68_kinematics,
+    load_hand_eye_calibration,
+    load_stereo_calibration,
+)
 from biblade_fusion.core.settings import AppSettings
 from biblade_fusion.diagnostics.types import CheckLevel, CheckResult
 from biblade_fusion.perception.stereo import run_foundation_stereo_doctor
@@ -58,6 +62,38 @@ def _elite_sdk_check(settings: AppSettings) -> CheckResult:
         "supervised_scan_elite_sdk",
         CheckLevel.PASS,
         "Elite SDK module is importable",
+        {
+            "module": str(getattr(module, "__file__", "unknown")),
+            "motion_authorized": False,
+            "hardware_connection_attempted": False,
+        },
+    )
+
+
+def _realsense_sdk_check(_settings: AppSettings) -> CheckResult:
+    """Verify the camera runtime before any pipeline or USB endpoint is opened."""
+
+    try:
+        module = import_module("pyrealsense2")
+        missing_api = tuple(
+            name for name in ("pipeline", "config", "stream", "format")
+            if not hasattr(module, name)
+        )
+        if missing_api:
+            raise AttributeError(
+                "pyrealsense2 lacks required API symbols: " + ", ".join(missing_api)
+            )
+    except Exception as exc:
+        return CheckResult(
+            "supervised_scan_realsense_sdk",
+            CheckLevel.FAIL,
+            f"failed to load the D435i runtime: {exc}",
+            {"motion_authorized": False, "hardware_connection_attempted": False},
+        )
+    return CheckResult(
+        "supervised_scan_realsense_sdk",
+        CheckLevel.PASS,
+        "RealSense SDK module and required API are available",
         {
             "module": str(getattr(module, "__file__", "unknown")),
             "motion_authorized": False,
@@ -148,10 +184,23 @@ def _policy_check(settings: AppSettings) -> CheckResult:
 
 def _science_geometry_check(settings: AppSettings) -> CheckResult:
     missing: list[str] = []
+    details: dict[str, object] = {"motion_authorized": False}
     if settings.kinematics.model_path is None:
         missing.append("kinematics.model_path")
     elif not settings.kinematics.model_path.is_file():
         missing.append("kinematics.model_path:file_missing")
+    else:
+        try:
+            model = load_cs68_kinematics(settings.kinematics.model_path)
+            details.update(
+                {
+                    "kinematics_path": str(settings.kinematics.model_path.resolve()),
+                    "kinematics_source": model.source,
+                }
+            )
+        except Exception as exc:
+            missing.append("kinematics.model_path:semantic_invalid")
+            details["kinematics_error"] = f"{type(exc).__name__}: {exc}"
     if settings.view_planning.standoff_distance_m is None:
         missing.append("view_planning.standoff_distance_m")
     if settings.view_planning.adaptive_standoff_enabled and (
@@ -169,7 +218,7 @@ def _science_geometry_check(settings: AppSettings) -> CheckResult:
             if missing
             else "standoff, workspace, and controller-specific IK inputs are configured"
         ),
-        {"missing": missing, "motion_authorized": False},
+        {**details, "missing": missing},
     )
 
 
@@ -252,6 +301,20 @@ def _calibration_check(settings: AppSettings) -> CheckResult:
         )
     assert stereo_path is not None and hand_eye_path is not None
     try:
+        stereo = load_stereo_calibration(stereo_path)
+        expected_size = (
+            settings.realsense.infrared_width,
+            settings.realsense.infrared_height,
+        )
+        left_size = (stereo.left.width, stereo.left.height)
+        right_size = (stereo.right.width, stereo.right.height)
+        if left_size != expected_size or right_size != expected_size:
+            raise ValueError(
+                "configured IR calibration/stream resolution mismatch: "
+                f"left={left_size[0]}x{left_size[1]}, "
+                f"right={right_size[0]}x{right_size[1]}, "
+                f"configured={expected_size[0]}x{expected_size[1]}"
+            )
         hand_eye = load_hand_eye_calibration(settings.hand_eye)
         hand_eye.require_flange_primary()
     except Exception as exc:
@@ -259,7 +322,7 @@ def _calibration_check(settings: AppSettings) -> CheckResult:
         return CheckResult(
             "supervised_scan_calibration",
             CheckLevel.FAIL,
-            "hand-eye asset failed semantic validation",
+            "stereo or hand-eye asset failed semantic validation",
             details,
         )
     details.update(
@@ -343,9 +406,8 @@ def _collision_backend_check(settings: AppSettings) -> CheckResult:
     ):
         return CheckResult(
             "supervised_scan_holorobot_single_arm",
-            CheckLevel.WARN,
-            "straight HoloRobot preflight is available, but the configured bounded "
-            "RRTConnect fallback is not installed",
+            CheckLevel.FAIL,
+            "bounded RRTConnect is enabled in configuration but OMPL is not installed",
             details,
         )
     return CheckResult(
@@ -434,6 +496,7 @@ def run_supervised_scan_readiness(
     ]
     return [
         _elite_sdk_check(settings),
+        _realsense_sdk_check(settings),
         _policy_check(settings),
         _science_geometry_check(settings),
         _static_free_acceptance_check(settings),
