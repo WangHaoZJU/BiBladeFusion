@@ -265,6 +265,27 @@ def test_diagnostic_trace_preserves_rejected_sampler_timing(tmp_path: Path) -> N
     assert reread.file_sha256 == stored.file_sha256
 
 
+def test_diagnostic_trace_accepts_one_non_authoritative_exposure_sample(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"status":"completed"}\n', encoding="utf-8")
+    trace = (_state(1.0),)
+
+    stored = write_inference_stationarity_trace(
+        tmp_path / "inference_stationarity_trace.json",
+        view_id="front-short-exposure",
+        sequence_index=0,
+        trace=trace,
+        source_session_manifest=manifest,
+        sampler_diagnostics={"retained_sample_count": 1},
+    )
+
+    reread = read_inference_stationarity_trace(stored.path)
+    assert len(reread.trace) == 1
+    assert reread.trace[0].monotonic_time_ns == trace[0].monotonic_time_ns
+
+
 def test_diagnostic_trace_is_hashed_and_write_once(tmp_path: Path) -> None:
     manifest = tmp_path / "manifest.json"
     manifest.write_text('{"status":"completed"}\n', encoding="utf-8")

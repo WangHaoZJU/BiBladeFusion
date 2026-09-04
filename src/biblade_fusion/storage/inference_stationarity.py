@@ -169,8 +169,13 @@ def _state_from_payload(payload: object, *, schema_version: int) -> RobotState:
 
 
 def _diagnostic_trace(states: tuple[RobotState, ...]) -> tuple[RobotState, ...]:
-    if len(states) < 3:
-        raise ValueError("stationarity diagnostic trace requires at least three states")
+    # This artifact preserves the independent exposure sampler for diagnostics;
+    # it is deliberately not the stationarity authority.  The camera acquisition
+    # contributes its exact before/selected/after bracket later, and that merged
+    # authoritative trace still requires at least three distinct states.  A short
+    # exposure may therefore contain only one independent RTSI sample.
+    if not states:
+        raise ValueError("stationarity diagnostic trace requires at least one state")
     previous_host_ns = states[0].monotonic_time_ns
     previous_controller_s = float(states[0].controller_time_s)
     for state in states[1:]:
