@@ -232,7 +232,7 @@ def test_scientific_gain_weights_are_normalized() -> None:
     assert config.coverage_weight + config.quality_recovery_weight == pytest.approx(1.0)
 
 
-def test_legacy_ranked_path_preflight_limit_is_parseable_but_bounded() -> None:
+def test_legacy_ranked_path_preflight_limit_is_parseable() -> None:
     assert StopAndCaptureConfig().maximum_ranked_preflight_candidates == 3
     with pytest.raises(ValidationError, match="greater than or equal to 1"):
         StopAndCaptureConfig(maximum_ranked_preflight_candidates=0)

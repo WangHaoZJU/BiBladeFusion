@@ -1608,6 +1608,7 @@ def test_blocked_highest_gain_candidate_falls_back_to_next_safe_path(
         mapping_counts=[3],
         target=_target(),
         event_sink=sink,
+        coordinator_updates={"maximum_ranked_preflight_candidates": 1},
     )
     selector = RankedSelector()
     safety = PathSelectiveSafety(

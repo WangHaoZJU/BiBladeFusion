@@ -1696,12 +1696,13 @@ class StopScanCoordinator:
                     raise BladePlanningAssetError("Incomplete selector decision has no target")
                 live_state = self._robot.read_state()
                 self._raise_if_stop_requested()
-                # HoloRobot plans one bounded single-arm goal at a time.  Preserve
-                # science ranking, but cap online preflight work so a large NBV set
-                # cannot silently turn one operator cycle into minutes of checking.
-                candidate_queue = selection.preflight_candidates[
-                    : self._config.maximum_ranked_preflight_candidates
-                ]
+                # The selector already owns and bounds the candidate family.  Preserve
+                # its science order and inspect the complete queue, exactly as the
+                # HoloRobot single-arm fallback does for alternative goal solutions.
+                # ``maximum_ranked_preflight_candidates`` is a legacy parse-only key:
+                # truncating here made a cycle report "no safe path" while later,
+                # already-generated candidates were in fact collision-free.
+                candidate_queue = selection.preflight_candidates
                 rejected: list[tuple[str, tuple[str, ...]]] = []
                 prepared: _PreparedSegmentExecution | None = None
                 selected_for_motion: NextViewSelection | None = None
@@ -1733,9 +1734,10 @@ class StopScanCoordinator:
                             "science_rank": science_rank,
                             "ranked_candidate_count": len(selection.preflight_candidates),
                             "preflight_candidate_limit": len(candidate_queue),
-                            "configured_preflight_candidate_limit": (
+                            "legacy_configured_preflight_candidate_limit": (
                                 self._config.maximum_ranked_preflight_candidates
                             ),
+                            "complete_bounded_candidate_queue_checked": True,
                             "final_target": proposal.final_target,
                             "surface_generation_id": proposal.surface_generation_id,
                             "reference_model_sha256": proposal.reference_model_sha256,

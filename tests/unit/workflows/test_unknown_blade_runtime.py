@@ -663,6 +663,35 @@ def test_one_operator_view_enters_active_coarse_bootstrap_without_claiming_map_r
     assert map_ready_checks == []
 
 
+def test_active_runner_block_reason_is_preserved_in_outer_runtime(tmp_path: Path) -> None:
+    runtime, runner, _session = _runtime(
+        tmp_path,
+        bootstrap_motion_ready_after=1,
+    )
+    runtime.start()
+    runtime.capture_operator_view(view_id="single-initial-view")
+
+    reason = "no_candidate_passed_preflight:environment_occupancy_unknown:wrist_3_link_0"
+
+    def blocked_run_until_attention(*, maximum_steps: int = 32):
+        assert maximum_steps > 0
+        runner._status = _status(
+            tmp_path,
+            ExperimentDisposition.BLOCKED,
+            phase="aborted",
+            cycle=1,
+            blocking=(reason,),
+        )
+        return runner._status
+
+    runner.run_until_attention = blocked_run_until_attention  # type: ignore[method-assign]
+
+    snapshot = runtime.advance_to_attention()
+
+    assert snapshot.phase is UnknownBladeRuntimePhase.BLOCKED
+    assert snapshot.blocking_reason == reason
+
+
 def test_operator_bootstrap_capture_can_directly_activate_ready_schema5(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -23,7 +23,10 @@ from biblade_fusion.robotics import (
     Es68PinocchioCollisionChecker,
     OccupancyRobotCollisionChecker,
 )
-from biblade_fusion.robotics.motion_preflight import HOLOROBOT_SEGMENT_SAMPLES
+from biblade_fusion.robotics.motion_preflight import (
+    HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD,
+    HOLOROBOT_NATIVE_SEGMENT_SAMPLES,
+)
 from biblade_fusion.storage import (
     read_coarse_model_summary,
     read_static_free_acceptance,
@@ -297,7 +300,10 @@ def _collision_backend_check(settings: AppSettings) -> CheckResult:
                 "robot_geometry_hash": checker.robot_geometry_hash,
                 "motion_model_contract_hash": checker.motion_model_contract_hash,
                 "online_path_validation_mode": HOLOROBOT_SAMPLED_VALIDATION,
-                "online_segment_samples": HOLOROBOT_SEGMENT_SAMPLES,
+                "holorobot_native_segment_samples": HOLOROBOT_NATIVE_SEGMENT_SAMPLES,
+                "online_effective_maximum_sample_step_rad": (
+                    HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD
+                ),
                 "offline_continuous_swept_mesh_supported": mesh_supported,
                 "offline_continuous_swept_occupancy_supported": occupancy_supported,
             }

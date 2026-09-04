@@ -1103,8 +1103,8 @@ class StopAndCaptureConfig(BaseModel):
         ge=1,
         le=100,
         description=(
-            "Maximum number of science-ranked endpoints checked in one online "
-            "HoloRobot-style planning cycle."
+            "Deprecated compatibility field. The complete candidate queue already "
+            "bounded by the active NBV selector is checked in science-rank order."
         ),
     )
     allow_single_view_bootstrap_motion: bool = False

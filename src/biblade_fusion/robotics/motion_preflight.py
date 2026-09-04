@@ -13,10 +13,9 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from biblade_fusion.devices.robot.streaming import ServoJStream, ServoJStreamConfig
-from biblade_fusion.diagnostics.performance_timing import performance_timed
+from biblade_fusion.diagnostics.performance_timing import performance_span, performance_timed
 from biblade_fusion.robotics.occupancy_collision import (
     JointPathOccupancyCollisionReport,
-    OccupancyCollisionCheckResult,
     OccupancyRobotCollisionChecker,
 )
 from biblade_fusion.robotics.pinocchio_collision import (
@@ -37,8 +36,12 @@ class MotionPreflightStatus(StrEnum):
 
 
 CONTINUOUS_INTERVAL_VALIDATION = "continuous_interval_v1"
-HOLOROBOT_SAMPLED_VALIDATION = "holorobot_sampled_joint_v1"
-HOLOROBOT_SEGMENT_SAMPLES = 5
+HOLOROBOT_SAMPLED_VALIDATION = "holorobot_sampled_joint_v2"
+HOLOROBOT_NATIVE_MAX_JOINT_STEP_RAD = 0.1
+HOLOROBOT_NATIVE_SEGMENT_SAMPLES = 5
+HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD = (
+    HOLOROBOT_NATIVE_MAX_JOINT_STEP_RAD / (HOLOROBOT_NATIVE_SEGMENT_SAMPLES - 1)
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,17 +136,20 @@ def _canonical_sha256(payload: dict[str, Any]) -> str:
 def _holorobot_sampled_configurations(
     waypoints: tuple[tuple[float, ...], ...],
     *,
-    segment_samples: int = HOLOROBOT_SEGMENT_SAMPLES,
+    maximum_sample_step_rad: float = HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD,
 ) -> tuple[tuple[tuple[float, ...], float], ...]:
-    """Mirror HoloRobot's fail-fast ``check_segment`` sampling contract.
+    """Match HoloRobot's effective ES68 resolution without double sampling.
 
-    HoloRobot first interpolates a joint path at ``max_joint_step_rad`` and then
-    checks five evenly spaced states on every adjacent segment.  Shared segment
-    endpoints are emitted once here; this is geometrically identical while
-    avoiding duplicate URDF/FCL and occupancy queries.
+    HoloRobot's ES68 profile uses a 0.1-rad planner step and five evenly spaced
+    ``check_segment`` states, giving a worst-case 0.025-rad sample interval.
+    BiBladeFusion waypoints are already interpolated at 0.02 rad by default, so
+    checking every waypoint is slightly denser than HoloRobot.  Subdivide only
+    when a caller supplies a coarser waypoint path.
     """
 
-    samples = max(2, int(segment_samples))
+    sample_step = float(maximum_sample_step_rad)
+    if not math.isfinite(sample_step) or sample_step <= 0.0:
+        raise ValueError("HoloRobot effective sample step must be finite and positive")
     if not waypoints:
         return ()
     segment_count = max(1, len(waypoints) - 1)
@@ -151,8 +157,12 @@ def _holorobot_sampled_configurations(
     for segment_index, (start, goal) in enumerate(
         zip(waypoints[:-1], waypoints[1:], strict=True)
     ):
-        for sample_index in range(1, samples):
-            alpha = sample_index / (samples - 1)
+        maximum_delta = max(
+            abs(end - begin) for begin, end in zip(start, goal, strict=True)
+        )
+        subdivisions = max(1, math.ceil(maximum_delta / sample_step))
+        for sample_index in range(1, subdivisions + 1):
+            alpha = sample_index / subdivisions
             configuration = tuple(
                 begin + alpha * (end - begin)
                 for begin, end in zip(start, goal, strict=True)
@@ -172,7 +182,7 @@ def _holorobot_sampled_evidence_payload(
     collision_diagnostics = collision.result.diagnostics
     occupancy_diagnostics = occupancy.result.diagnostics
     return {
-        "schema": "biblade_fusion.holorobot_sampled_path_evidence.v1",
+        "schema": "biblade_fusion.holorobot_sampled_path_evidence.v2",
         "method": HOLOROBOT_SAMPLED_VALIDATION,
         "trajectory_sha256": _joint_path_sha256(
             preflight.start_joint_positions_rad,
@@ -180,7 +190,9 @@ def _holorobot_sampled_evidence_payload(
         ),
         "maximum_joint_step_rad": collision.maximum_joint_step_rad,
         "occupancy_maximum_joint_step_rad": occupancy.maximum_joint_step_rad,
-        "segment_samples": HOLOROBOT_SEGMENT_SAMPLES,
+        "holorobot_native_max_joint_step_rad": HOLOROBOT_NATIVE_MAX_JOINT_STEP_RAD,
+        "holorobot_native_segment_samples": HOLOROBOT_NATIVE_SEGMENT_SAMPLES,
+        "effective_maximum_sample_step_rad": HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD,
         "mesh_sample_count": collision.sample_count,
         "occupancy_sample_count": occupancy.sample_count,
         "collision_model_binding": [
@@ -211,8 +223,8 @@ def _holorobot_sampled_evidence_valid(preflight: JointMotionPreflight) -> bool:
     payload = _holorobot_sampled_evidence_payload(preflight)
     if collision is None or occupancy is None or payload is None:
         return False
-    expected_sample_count = 1 + max(1, len(preflight.planning_waypoints) - 1) * (
-        HOLOROBOT_SEGMENT_SAMPLES - 1
+    expected_sample_count = len(
+        _holorobot_sampled_configurations(preflight.planning_waypoints)
     )
     evidence_sha256 = preflight.path_validation_evidence_sha256
     return bool(
@@ -230,10 +242,10 @@ def _holorobot_sampled_evidence_valid(preflight: JointMotionPreflight) -> bool:
             rel_tol=0.0,
             abs_tol=0.0,
         )
-        and collision.result.diagnostics.get("segment_samples")
-        == HOLOROBOT_SEGMENT_SAMPLES
-        and occupancy.result.diagnostics.get("segment_samples")
-        == HOLOROBOT_SEGMENT_SAMPLES
+        and collision.result.diagnostics.get("effective_maximum_sample_step_rad")
+        == HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD
+        and occupancy.result.diagnostics.get("effective_maximum_sample_step_rad")
+        == HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD
         and collision.result.diagnostics.get("path_validation_mode")
         == HOLOROBOT_SAMPLED_VALIDATION
         and occupancy.result.diagnostics.get("path_validation_mode")
@@ -439,7 +451,9 @@ def _sample_mesh_path_holorobot_style(
                     **result.diagnostics,
                     "path_validation_mode": HOLOROBOT_SAMPLED_VALIDATION,
                     "sampled_path_verified": False,
-                    "segment_samples": HOLOROBOT_SEGMENT_SAMPLES,
+                    "effective_maximum_sample_step_rad": (
+                        HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD
+                    ),
                 },
             )
             return JointPathMeshCollisionReport(
@@ -458,7 +472,7 @@ def _sample_mesh_path_holorobot_style(
             **last_result.diagnostics,
             "path_validation_mode": HOLOROBOT_SAMPLED_VALIDATION,
             "sampled_path_verified": True,
-            "segment_samples": HOLOROBOT_SEGMENT_SAMPLES,
+            "effective_maximum_sample_step_rad": HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD,
             "sample_count": len(sampled),
         },
     )
@@ -480,54 +494,23 @@ def _sample_occupancy_path_holorobot_style(
     required_freshness_horizon_s: float,
 ) -> JointPathOccupancyCollisionReport:
     sampled = _holorobot_sampled_configurations(waypoints)
-    expected_evidence = None
-    last_result: OccupancyCollisionCheckResult | None = None
-    for sample_index, (configuration, fraction) in enumerate(sampled):
-        result = occupancy_checker.check(
-            configuration,
-            expected_evidence=expected_evidence,
-            required_freshness_horizon_s=required_freshness_horizon_s,
-        )
-        last_result = result
-        if expected_evidence is None and result.evidence is not None:
-            expected_evidence = result.evidence
-        if result.status is not CollisionCheckStatus.CLEAR:
-            enriched = replace(
-                result,
-                diagnostics={
-                    **result.diagnostics,
-                    "path_validation_mode": HOLOROBOT_SAMPLED_VALIDATION,
-                    "sampled_path_verified": False,
-                    "segment_samples": HOLOROBOT_SEGMENT_SAMPLES,
-                },
-            )
-            return JointPathOccupancyCollisionReport(
-                status=result.status,
-                sample_count=sample_index + 1,
-                blocked_sample_index=sample_index,
-                blocked_path_fraction=fraction,
-                result=enriched,
-                maximum_joint_step_rad=maximum_joint_step_rad,
-            )
-    if last_result is None:
-        raise ValueError("HoloRobot sampled occupancy path contains no configurations")
-    clear = replace(
-        last_result,
-        diagnostics={
-            **last_result.diagnostics,
-            "path_validation_mode": HOLOROBOT_SAMPLED_VALIDATION,
-            "sampled_path_verified": True,
-            "segment_samples": HOLOROBOT_SEGMENT_SAMPLES,
-            "sample_count": len(sampled),
-        },
-    )
-    return JointPathOccupancyCollisionReport(
-        status=CollisionCheckStatus.CLEAR,
-        sample_count=len(sampled),
-        blocked_sample_index=None,
-        blocked_path_fraction=None,
-        result=clear,
+    report = occupancy_checker.check_sampled_configurations(
+        tuple(configuration for configuration, _fraction in sampled),
+        tuple(fraction for _configuration, fraction in sampled),
         maximum_joint_step_rad=maximum_joint_step_rad,
+        required_freshness_horizon_s=required_freshness_horizon_s,
+    )
+    return replace(
+        report,
+        result=replace(
+            report.result,
+            diagnostics={
+                **report.result.diagnostics,
+                "effective_maximum_sample_step_rad": (
+                    HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD
+                ),
+            },
+        ),
     )
 
 
@@ -656,21 +639,22 @@ def preflight_linear_joint_motion(
             continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
             path_validation_mode=validation_mode,
         )
-    if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
-        collision = _sample_mesh_path_holorobot_style(
-            collision_checker,
-            waypoints,
-            maximum_joint_step_rad=maximum_joint_step_rad,
-        )
-    else:
-        collision = collision_checker.check_path(
-            start,
-            goal,
-            maximum_joint_step_rad=maximum_joint_step_rad,
-            maximum_joint_path_deviation_rad=uncertainty_tuple,
-            motion_envelope_acceptance_id=acceptance_id,
-            motion_envelope_metadata_sha256=acceptance_metadata_sha256,
-        )
+    with performance_span("planning.mesh_collision_preflight"):
+        if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
+            collision = _sample_mesh_path_holorobot_style(
+                collision_checker,
+                waypoints,
+                maximum_joint_step_rad=maximum_joint_step_rad,
+            )
+        else:
+            collision = collision_checker.check_path(
+                start,
+                goal,
+                maximum_joint_step_rad=maximum_joint_step_rad,
+                maximum_joint_path_deviation_rad=uncertainty_tuple,
+                motion_envelope_acceptance_id=acceptance_id,
+                motion_envelope_metadata_sha256=acceptance_metadata_sha256,
+            )
     if collision.status is not CollisionCheckStatus.CLEAR:
         reasons = collision.result.blocking_reasons or (
             f"collision_status:{collision.status.value}",
@@ -712,14 +696,15 @@ def preflight_linear_joint_motion(
             continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
             path_validation_mode=validation_mode,
         )
-    velocities = collision_checker.kinematic_model.joint_velocity_limits_rad_s()
-    stream = _velocity_limited_stream(
-        waypoints,
-        maximum_velocity_rad_s=velocities,
-        dt_s=servoj_dt_s,
-        speed_scaling=speed_scaling,
-        velocity_margin=velocity_margin,
-    )
+    with performance_span("planning.servoj_stream_generation"):
+        velocities = collision_checker.kinematic_model.joint_velocity_limits_rad_s()
+        stream = _velocity_limited_stream(
+            waypoints,
+            maximum_velocity_rad_s=velocities,
+            dt_s=servoj_dt_s,
+            speed_scaling=speed_scaling,
+            velocity_margin=velocity_margin,
+        )
     stream_duration_s = max(0, len(stream.commands) - 1) * stream.dt_s
     required_freshness_horizon_s = stream_duration_s + freshness_margin_s
     diagnostics["planned_servoj_duration_s"] = stream_duration_s
@@ -731,20 +716,21 @@ def preflight_linear_joint_motion(
             or occupancy_checker.motion_envelope_acceptance_id != acceptance_id
         ):
             raise ValueError("Mesh and occupancy preflight motion envelopes differ")
-        if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
-            occupancy = _sample_occupancy_path_holorobot_style(
-                occupancy_checker,
-                waypoints,
-                maximum_joint_step_rad=maximum_joint_step_rad,
-                required_freshness_horizon_s=required_freshness_horizon_s,
-            )
-        else:
-            occupancy = occupancy_checker.check_path(
-                start,
-                goal,
-                maximum_joint_step_rad=maximum_joint_step_rad,
-                required_freshness_horizon_s=required_freshness_horizon_s,
-            )
+        with performance_span("planning.occupancy_collision_preflight"):
+            if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
+                occupancy = _sample_occupancy_path_holorobot_style(
+                    occupancy_checker,
+                    waypoints,
+                    maximum_joint_step_rad=maximum_joint_step_rad,
+                    required_freshness_horizon_s=required_freshness_horizon_s,
+                )
+            else:
+                occupancy = occupancy_checker.check_path(
+                    start,
+                    goal,
+                    maximum_joint_step_rad=maximum_joint_step_rad,
+                    required_freshness_horizon_s=required_freshness_horizon_s,
+                )
         if occupancy.status is not CollisionCheckStatus.CLEAR:
             reasons = occupancy.result.blocking_reasons or (
                 f"occupancy_status:{occupancy.status.value}",

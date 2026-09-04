@@ -975,134 +975,305 @@ class OccupancyRobotCollisionChecker:
         required_freshness_horizon_s: float = 0.0,
     ) -> OccupancyCollisionCheckResult:
         try:
-            snapshot = self.snapshot_provider()
-            evidence = occupancy_evidence_from_snapshot(
-                snapshot,
-                now_utc=self.utc_clock(),
-                max_age_s=self.maximum_map_age_s,
-                authorization_started_at_utc=self.authorization_started_at_utc,
+            snapshot, evidence = self._bind_snapshot(
+                expected_evidence=expected_evidence,
                 required_freshness_horizon_s=required_freshness_horizon_s,
-                verified_robot_geometry_hash=self.verified_robot_geometry_hash,
-                semantic_attestation=self.semantic_attestation,
-                allow_mapping_prefix=(
-                    self.allow_mapping_prefix_in_accepted_static_free
-                ),
             )
-            self._assert_static_free_acceptance_context(evidence)
-            if expected_evidence is not None and evidence.binding != expected_evidence.binding:
-                raise OccupancyEvidenceError(
-                    "occupancy_snapshot_changed_before_query:"
-                    f"expected={expected_evidence.sequence}:{expected_evidence.content_hash}:"
-                    f"current={evidence.sequence}:{evidence.content_hash}"
-                )
-            geometries = self._robot_collision_geometries(joint_positions_rad)
-            reasons: list[str] = []
-            query_diagnostics: list[dict[str, Any]] = []
-            for placed in geometries:
-                uncertainty = self.robot_checker.geometry_displacement_bound_m(
-                    placed.geometry_index,
-                    self.accepted_joint_uncertainty_rad,
-                )
-                required_distance = self.additional_clearance_m + uncertainty
-                query = self._query_robot_geometry(
-                    snapshot,
-                    placed,
-                    required_distance_m=required_distance,
-                )
-                state = self._validate_query_result(query)
-                query_diagnostics.append(
-                    {
-                        "geometry": placed.geometry_name,
-                        "state": state,
-                        "geometry_representation": "original_urdf_collision_stl",
-                        "required_distance_m": required_distance,
-                        "occupied_count": int(query.occupied_count),
-                        "unknown_count": int(query.unknown_count),
-                        "free_count": int(query.free_count),
-                        "accepted_unknown_count": int(getattr(query, "accepted_unknown_count", 0)),
-                        "outside_grid_unknown_count": int(
-                            getattr(query, "outside_grid_unknown_count", 0)
-                        ),
-                        "outside_acceptance_unknown_count": int(
-                            getattr(query, "outside_acceptance_unknown_count", 0)
-                        ),
-                        "separated_dangerous_count": int(
-                            query.separated_dangerous_count
-                        ),
-                        "distance_query_count": int(query.distance_query_count),
-                        "minimum_dangerous_distance_m": (
-                            query.minimum_dangerous_distance_m
-                        ),
-                        "blocking_voxel_index": query.blocking_voxel_index,
-                        "queried_count": int(query.queried_count),
-                    }
-                )
-                if state == OccupancyQueryState.FREE.value and not bool(query.blocked):
-                    continue
-                if state == OccupancyQueryState.OCCUPIED.value:
-                    reason = f"environment_occupancy_occupied:{placed.geometry_name}"
-                elif state == OccupancyQueryState.UNKNOWN.value:
-                    reason = f"environment_occupancy_unknown:{placed.geometry_name}"
-                else:
-                    reason = (
-                        "environment_occupancy_invalid_query_state:"
-                        f"{placed.geometry_name}:{state}"
-                    )
-                reasons.append(reason)
+            result = self._check_bound_configuration(
+                snapshot,
+                evidence,
+                joint_positions_rad,
+                required_freshness_horizon_s=required_freshness_horizon_s,
+            )
             self.assert_current_evidence(
                 evidence,
                 required_freshness_horizon_s=required_freshness_horizon_s,
             )
-            return OccupancyCollisionCheckResult(
-                status=(CollisionCheckStatus.BLOCKED if reasons else CollisionCheckStatus.CLEAR),
-                blocking_reasons=tuple(reasons),
-                evidence=evidence,
-                checked_geometry_count=len(geometries),
-                diagnostics={
-                    "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
-                    "occupancy_policy_contract_hash": self.policy_contract_hash,
-                    "robot_motion_bound_contract_sha256": (
-                        self.robot_checker.geometry_motion_bound_contract_sha256
-                    ),
-                    "unknown_policy": "conservative",
-                    "robot_geometry": "original_urdf_collision_stl",
-                    "additional_clearance_m": self.additional_clearance_m,
-                    "required_freshness_horizon_s": required_freshness_horizon_s,
-                    "continuous_swept_volume_verified": False,
-                    "semantic_attestation_valid": evidence.semantic_attestation_valid,
-                    "semantic_attestation_hash": evidence.semantic_attestation_hash,
-                    "queries": query_diagnostics,
-                    "motion_authorized": False,
-                },
+            return result
+        except (OccupancyEvidenceError, TypeError, ValueError, RuntimeError) as exc:
+            return self._unknown_result(f"occupancy_checker_error:{exc}")
+        except Exception as exc:  # pragma: no cover - fail closed across plugin boundaries
+            return self._unknown_result(
+                f"occupancy_query_failed:{type(exc).__name__}:{exc}"
+            )
+
+    def check_sampled_configurations(
+        self,
+        configurations: Sequence[Sequence[float]],
+        path_fractions: Sequence[float],
+        *,
+        maximum_joint_step_rad: float,
+        required_freshness_horizon_s: float = 0.0,
+    ) -> JointPathOccupancyCollisionReport:
+        """Check a sampled path while hashing and binding its immutable map once.
+
+        The public :meth:`check` method intentionally verifies snapshot integrity
+        before and after one independent query.  Calling it once per HoloRobot path
+        sample used to recompute the complete voxel-set SHA-256 twice per sample.
+        A path is one transaction: bind once, query every sampled pose against that
+        exact frozen object, then verify the publisher still exposes the same map.
+        """
+
+        samples = tuple(tuple(float(value) for value in item) for item in configurations)
+        fractions = tuple(float(value) for value in path_fractions)
+        step = float(maximum_joint_step_rad)
+        if not samples or len(samples) != len(fractions):
+            raise ValueError("sampled occupancy path requires aligned non-empty inputs")
+        if any(len(item) != 6 or not np.isfinite(item).all() for item in samples):
+            raise ValueError("sampled occupancy path configurations must be finite six-vectors")
+        if not np.isfinite(fractions).all() or any(
+            fraction < 0.0 or fraction > 1.0 for fraction in fractions
+        ):
+            raise ValueError("sampled occupancy path fractions must be finite in [0, 1]")
+        if any(
+            later < earlier
+            for earlier, later in zip(fractions, fractions[1:], strict=False)
+        ):
+            raise ValueError("sampled occupancy path fractions must be monotonic")
+        if not math.isfinite(step) or step <= 0.0:
+            raise ValueError("maximum_joint_step_rad must be finite and positive")
+        try:
+            snapshot, evidence = self._bind_snapshot(
+                expected_evidence=None,
+                required_freshness_horizon_s=required_freshness_horizon_s,
             )
         except (OccupancyEvidenceError, TypeError, ValueError, RuntimeError) as exc:
-            return OccupancyCollisionCheckResult(
-                status=CollisionCheckStatus.UNKNOWN,
-                blocking_reasons=(f"occupancy_checker_error:{exc}",),
-                evidence=None,
-                checked_geometry_count=0,
-                diagnostics={
-                    "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
-                    "occupancy_policy_contract_hash": self.policy_contract_hash,
-                    "unknown_policy": "conservative",
-                    "continuous_swept_volume_verified": False,
-                    "motion_authorized": False,
-                },
+            result = self._unknown_result(f"occupancy_checker_error:{exc}")
+            return JointPathOccupancyCollisionReport(
+                status=result.status,
+                sample_count=0,
+                blocked_sample_index=0,
+                blocked_path_fraction=0.0,
+                result=result,
+                maximum_joint_step_rad=step,
             )
-        except Exception as exc:  # pragma: no cover - fail closed across plugin boundaries
-            return OccupancyCollisionCheckResult(
-                status=CollisionCheckStatus.UNKNOWN,
-                blocking_reasons=(f"occupancy_query_failed:{type(exc).__name__}:{exc}",),
-                evidence=None,
-                checked_geometry_count=0,
-                diagnostics={
-                    "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
-                    "occupancy_policy_contract_hash": self.policy_contract_hash,
-                    "unknown_policy": "conservative",
-                    "continuous_swept_volume_verified": False,
-                    "motion_authorized": False,
-                },
+
+        last_result: OccupancyCollisionCheckResult | None = None
+        for sample_index, (configuration, fraction) in enumerate(
+            zip(samples, fractions, strict=True)
+        ):
+            try:
+                result = self._check_bound_configuration(
+                    snapshot,
+                    evidence,
+                    configuration,
+                    required_freshness_horizon_s=required_freshness_horizon_s,
+                )
+            except (OccupancyEvidenceError, TypeError, ValueError, RuntimeError) as exc:
+                result = self._unknown_result(
+                    f"occupancy_checker_error:{exc}",
+                    evidence=evidence,
+                )
+            except Exception as exc:  # pragma: no cover - plugin boundary
+                result = self._unknown_result(
+                    f"occupancy_query_failed:{type(exc).__name__}:{exc}",
+                    evidence=evidence,
+                )
+            last_result = result
+            if result.status is not CollisionCheckStatus.CLEAR:
+                try:
+                    self.assert_current_evidence(
+                        evidence,
+                        required_freshness_horizon_s=required_freshness_horizon_s,
+                    )
+                except OccupancyEvidenceError as exc:
+                    result = self._unknown_result(
+                        f"occupancy_checker_error:{exc}",
+                        evidence=evidence,
+                    )
+                return self._finish_sampled_path(
+                    result,
+                    sample_count=sample_index + 1,
+                    blocked_sample_index=sample_index,
+                    blocked_path_fraction=fraction,
+                    maximum_joint_step_rad=step,
+                    total_sample_count=len(samples),
+                )
+
+        assert last_result is not None
+        try:
+            self.assert_current_evidence(
+                evidence,
+                required_freshness_horizon_s=required_freshness_horizon_s,
             )
+        except OccupancyEvidenceError as exc:
+            changed = self._unknown_result(
+                f"occupancy_checker_error:{exc}",
+                evidence=evidence,
+            )
+            return self._finish_sampled_path(
+                changed,
+                sample_count=len(samples),
+                blocked_sample_index=len(samples) - 1,
+                blocked_path_fraction=fractions[-1],
+                maximum_joint_step_rad=step,
+                total_sample_count=len(samples),
+            )
+        return self._finish_sampled_path(
+            last_result,
+            sample_count=len(samples),
+            blocked_sample_index=None,
+            blocked_path_fraction=None,
+            maximum_joint_step_rad=step,
+            total_sample_count=len(samples),
+        )
+
+    def _bind_snapshot(
+        self,
+        *,
+        expected_evidence: OccupancyMapEvidence | None,
+        required_freshness_horizon_s: float,
+    ) -> tuple[OccupancySnapshot, OccupancyMapEvidence]:
+        snapshot = self.snapshot_provider()
+        evidence = occupancy_evidence_from_snapshot(
+            snapshot,
+            now_utc=self.utc_clock(),
+            max_age_s=self.maximum_map_age_s,
+            authorization_started_at_utc=self.authorization_started_at_utc,
+            required_freshness_horizon_s=required_freshness_horizon_s,
+            verified_robot_geometry_hash=self.verified_robot_geometry_hash,
+            semantic_attestation=self.semantic_attestation,
+            allow_mapping_prefix=self.allow_mapping_prefix_in_accepted_static_free,
+        )
+        self._assert_static_free_acceptance_context(evidence)
+        if expected_evidence is not None and evidence.binding != expected_evidence.binding:
+            raise OccupancyEvidenceError(
+                "occupancy_snapshot_changed_before_query:"
+                f"expected={expected_evidence.sequence}:{expected_evidence.content_hash}:"
+                f"current={evidence.sequence}:{evidence.content_hash}"
+            )
+        return snapshot, evidence
+
+    def _check_bound_configuration(
+        self,
+        snapshot: OccupancySnapshot,
+        evidence: OccupancyMapEvidence,
+        joint_positions_rad: Sequence[float],
+        *,
+        required_freshness_horizon_s: float,
+    ) -> OccupancyCollisionCheckResult:
+        geometries = self._robot_collision_geometries(joint_positions_rad)
+        reasons: list[str] = []
+        query_diagnostics: list[dict[str, Any]] = []
+        for placed in geometries:
+            uncertainty = self.robot_checker.geometry_displacement_bound_m(
+                placed.geometry_index,
+                self.accepted_joint_uncertainty_rad,
+            )
+            required_distance = self.additional_clearance_m + uncertainty
+            query = self._query_robot_geometry(
+                snapshot,
+                placed,
+                required_distance_m=required_distance,
+            )
+            state = self._validate_query_result(query)
+            query_diagnostics.append(
+                {
+                    "geometry": placed.geometry_name,
+                    "state": state,
+                    "geometry_representation": "original_urdf_collision_stl",
+                    "required_distance_m": required_distance,
+                    "occupied_count": int(query.occupied_count),
+                    "unknown_count": int(query.unknown_count),
+                    "free_count": int(query.free_count),
+                    "accepted_unknown_count": int(query.accepted_unknown_count),
+                    "outside_grid_unknown_count": int(query.outside_grid_unknown_count),
+                    "outside_acceptance_unknown_count": int(
+                        query.outside_acceptance_unknown_count
+                    ),
+                    "separated_dangerous_count": int(query.separated_dangerous_count),
+                    "distance_query_count": int(query.distance_query_count),
+                    "minimum_dangerous_distance_m": query.minimum_dangerous_distance_m,
+                    "blocking_voxel_index": query.blocking_voxel_index,
+                    "queried_count": int(query.queried_count),
+                }
+            )
+            if state == OccupancyQueryState.FREE.value and not bool(query.blocked):
+                continue
+            if state == OccupancyQueryState.OCCUPIED.value:
+                reason = f"environment_occupancy_occupied:{placed.geometry_name}"
+            elif state == OccupancyQueryState.UNKNOWN.value:
+                reason = f"environment_occupancy_unknown:{placed.geometry_name}"
+            else:
+                reason = (
+                    "environment_occupancy_invalid_query_state:"
+                    f"{placed.geometry_name}:{state}"
+                )
+            reasons.append(reason)
+        return OccupancyCollisionCheckResult(
+            status=(CollisionCheckStatus.BLOCKED if reasons else CollisionCheckStatus.CLEAR),
+            blocking_reasons=tuple(reasons),
+            evidence=evidence,
+            checked_geometry_count=len(geometries),
+            diagnostics={
+                "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
+                "occupancy_policy_contract_hash": self.policy_contract_hash,
+                "robot_motion_bound_contract_sha256": (
+                    self.robot_checker.geometry_motion_bound_contract_sha256
+                ),
+                "unknown_policy": "conservative",
+                "robot_geometry": "original_urdf_collision_stl",
+                "additional_clearance_m": self.additional_clearance_m,
+                "required_freshness_horizon_s": required_freshness_horizon_s,
+                "continuous_swept_volume_verified": False,
+                "semantic_attestation_valid": evidence.semantic_attestation_valid,
+                "semantic_attestation_hash": evidence.semantic_attestation_hash,
+                "queries": query_diagnostics,
+                "motion_authorized": False,
+            },
+        )
+
+    def _unknown_result(
+        self,
+        reason: str,
+        *,
+        evidence: OccupancyMapEvidence | None = None,
+    ) -> OccupancyCollisionCheckResult:
+        return OccupancyCollisionCheckResult(
+            status=CollisionCheckStatus.UNKNOWN,
+            blocking_reasons=(reason,),
+            evidence=evidence,
+            checked_geometry_count=0,
+            diagnostics={
+                "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
+                "occupancy_policy_contract_hash": self.policy_contract_hash,
+                "unknown_policy": "conservative",
+                "continuous_swept_volume_verified": False,
+                "motion_authorized": False,
+            },
+        )
+
+    @staticmethod
+    def _finish_sampled_path(
+        result: OccupancyCollisionCheckResult,
+        *,
+        sample_count: int,
+        blocked_sample_index: int | None,
+        blocked_path_fraction: float | None,
+        maximum_joint_step_rad: float,
+        total_sample_count: int,
+    ) -> JointPathOccupancyCollisionReport:
+        clear = result.status is CollisionCheckStatus.CLEAR
+        enriched = OccupancyCollisionCheckResult(
+            status=result.status,
+            blocking_reasons=result.blocking_reasons,
+            evidence=result.evidence,
+            checked_geometry_count=result.checked_geometry_count,
+            diagnostics={
+                **result.diagnostics,
+                "path_validation_mode": "holorobot_sampled_joint_v2",
+                "sampled_path_verified": clear,
+                "sample_count": total_sample_count,
+            },
+        )
+        return JointPathOccupancyCollisionReport(
+            status=result.status,
+            sample_count=sample_count,
+            blocked_sample_index=blocked_sample_index,
+            blocked_path_fraction=blocked_path_fraction,
+            result=enriched,
+            maximum_joint_step_rad=maximum_joint_step_rad,
+        )
 
     def check_path(
         self,

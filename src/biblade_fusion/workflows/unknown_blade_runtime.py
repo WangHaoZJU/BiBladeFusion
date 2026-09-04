@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from typing import Literal, Protocol
 from uuid import uuid4
 
@@ -1434,7 +1434,10 @@ class UnknownBladeSupervisedRuntime:
         if self._stop_requested.is_set():
             self._set_phase(UnknownBladeRuntimePhase.STOPPED)
         elif status.disposition is ExperimentDisposition.BLOCKED:
-            self._block("active supervised runner entered a blocked state")
+            reasons = status.blocking_reasons or (
+                "active supervised runner entered a blocked state",
+            )
+            self._block("; ".join(reasons))
         elif status.disposition is ExperimentDisposition.COMPLETE:
             if (
                 self._phase is UnknownBladeRuntimePhase.FINE_SCAN
@@ -2539,9 +2542,34 @@ def run_unknown_blade_operator_console(
             if status.phase in {"bootstrap_motion_ready", "map_ready"}:
                 output_fn(
                     "Planning next view with HoloRobot single-arm sampling "
-                    "(ranked candidates are bounded; collision checks fail fast)..."
+                    "(complete selector-bounded queue; collision checks fail fast)..."
                 )
-            runtime.advance_to_attention()
+            planning_started = time.monotonic()
+            planning_finished = Event()
+
+            def report_planning_progress(
+                finished: Event = planning_finished,
+                started: float = planning_started,
+            ) -> None:
+                while not finished.wait(10.0):
+                    elapsed = time.monotonic() - started
+                    output_fn(f"Planning/preflight still running: {elapsed:.1f} s")
+
+            progress_thread = Thread(
+                target=report_planning_progress,
+                name="bbf-planning-progress",
+                daemon=True,
+            )
+            progress_thread.start()
+            try:
+                runtime.advance_to_attention()
+            finally:
+                planning_finished.set()
+                progress_thread.join(timeout=0.1)
+                output_fn(
+                    "Planning/preflight finished in "
+                    f"{time.monotonic() - planning_started:.2f} s."
+                )
             continue
         output_fn("Runtime reached an unsupported attention state and stopped fail-closed.")
         runtime.request_stop(f"unsupported operator disposition: {status.disposition.value}")

@@ -504,6 +504,7 @@ stop_and_capture:
   maximum_segment_joint_delta_rad: null
   # Deprecated compatibility key. Runtime preflights the complete bounded,
   # science-ranked queue until one continuously safe endpoint is found.
+  # Deprecated compatibility key. The selector's complete bounded queue is checked.
   maximum_ranked_preflight_candidates: 3
   # May use a verified MAPPING prefix only inside immutable accepted-free regions.
   allow_single_view_bootstrap_motion: false

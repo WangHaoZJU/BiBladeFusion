@@ -185,8 +185,9 @@ The normal transition is:
 ```text
 bootstrap_motion_ready/map_ready
   -> "Planning next view with HoloRobot single-arm sampling ..."
-  -> at most 3 science-ranked candidates on the current eiai configuration
-  -> fixed joint-step interpolation, 5 samples per segment, first collision exits
+  -> complete NBV-selector-bounded queue in unchanged science-rank order
+  -> 0.02-rad pre-interpolated waypoints (finer than HoloRobot's effective 0.025 rad),
+     first collision exits
   -> waiting_approval
   -> exact EXECUTE token entered
   -> permit consumed, then permit-bound power/brake preparation
@@ -200,7 +201,10 @@ bootstrap_motion_ready/map_ready
 The planning line must be followed by either `waiting_approval` or a typed candidate
 rejection; it no longer starts a recursive six-dimensional certificate. The active checks
 still use original URDF/STL robot geometry and conservative occupancy. `sampled` does not
-mean collision checking is disabled.
+mean collision checking is disabled. One path hashes/binds its immutable occupancy at the
+two transaction boundaries; it does not re-hash the whole map for every robot pose. The
+legacy `maximum_ranked_preflight_candidates` value is ignored: the selector has already
+bounded the queue, and stopping after three can discard a safe fourth or fifth path.
 
 Paste the entire exact token, including `EXECUTE`, once. After Enter, a short preparation
 interval is expected while the driver connects and controller state is established. The

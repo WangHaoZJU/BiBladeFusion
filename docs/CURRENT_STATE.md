@@ -236,8 +236,10 @@ The 2026-09-04 regression corrected the common causes rather than adding more de
     incidence is information-ranked, wrist rolls are interleaved, and a symmetric camera
     pair is no longer required.
 13. online path validation no longer runs the recursive six-dimensional continuous
-    interval certificate. It reuses HoloRobot's fixed-step joint interpolation, five
-    samples per segment, and fail-fast collision contract. Exact URDF/STL robot geometry,
+    interval certificate. It reuses HoloRobot's fixed-step, fail-fast collision contract.
+    HoloRobot's deployed ES68 resolution is `0.1 rad / (5 - 1) = 0.025 rad`; the already
+    interpolated BiBladeFusion path is checked at its finer `0.02 rad` waypoints rather
+    than being accidentally subdivided by five again. Exact URDF/STL robot geometry,
     UNKNOWN-as-blocked occupancy, map/hash binding, approval, ServoJ tracking stop, and
     endpoint settling remain active. Adjacent same-state occupancy voxels are represented
     as exact X-axis run boxes to remove per-voxel FCL calls without using link spheres.
@@ -265,8 +267,8 @@ wall time: 0.78 s
 
 It selected independently feasible front/back adaptive views. Online path preflight now
 checks the same straight joint-space route with HoloRobot's bounded sampled-segment
-contract and tries no more than the configured top three science endpoints. It does not
-yet synthesize a curved RRT/OMPL route around an obstacle to the same endpoint. The former
+contract and walks the selector's complete bounded science-ranked queue until the first
+safe path. It does not yet synthesize a curved RRT/OMPL route around an obstacle to the same endpoint. The former
 recursive interval proof remains available for offline acceptance/diagnostics but is no
 longer called by the active NBV loop.
 
@@ -287,10 +289,31 @@ with no dangerous run requiring an FCL distance call. This demonstrates removal 
 per-voxel Python/FCL loop for accepted-free space; it is not a substitute for timing the
 next real eiai occupancy map and complete candidate path.
 
+The 2026-09-04 11:25 physical attempt reached `bootstrap_motion_ready`, remained inside
+planning/preflight, and terminated after about five minutes with the outer runtime hiding
+the concrete inner blocker as `active supervised runner entered a blocked state`. Code
+inspection found two deterministic multipliers in the online occupancy path: every sampled
+pose recomputed the complete immutable occupancy SHA-256 before and after its query, and a
+path already interpolated at `0.02 rad` was subdivided into five samples per small segment.
+The current correction binds/hashes one immutable snapshot once at path entry and once at
+path exit, checks all poses directly against that bound object, uses the `0.02 rad`
+waypoints without redundant subdivision, and preserves the inner candidate/preflight
+reason in the terminal.
+
+The exact 11:25 occupancy snapshot (`200 x 110 x 110`, 154,867 accumulated FREE votes,
+1,694 occupied voxels) and the three attempted joint endpoints were replayed locally with
+the production ES68+D435i STL model. The corrected preflights took `1.84 s`, `1.67 s`, and
+`3.19 s` instead of about `10.27 s`, `9.45 s`, and `86.29 s`. More importantly, the event
+record showed seven ranked candidates while the legacy configured limit stopped after
+three. Replaying the four untried front-fin paths found two clear paths in `2.05 s` and
+`4.85 s`. The legacy `maximum_ranked_preflight_candidates: 3` field is therefore parse-only;
+the already-bounded selector queue is no longer truncated. This correction is not yet
+physically verified.
+
 ## 7. Required next action and regression result
 
 The next action is exactly one fresh eiai physical validation after pulling the
-HoloRobot sampled-path correction that follows `d3c13c0`, using the runbook and a new
+bound-snapshot/effective-resolution correction that follows `701eb09`, using the runbook and a new
 `run_id`. Do not change placement, acceptance assets, or safety geometry before this test.
 After the approval token, verify one reverse connection, one complete viewpoint motion,
 endpoint settle, `writeIdle`, sampled stationary pose, and transition to the next capture.
@@ -306,7 +329,7 @@ full physical single-view-to-motion workflow: hardware verification pending
 Using the main source tree with the available local test environment:
 
 ```text
-full suite: 1227 passed, 3 skipped in 96.58 s
+full suite: 1229 passed, 3 skipped in 97.27 s
 ruff: all checks passed
 ```
 

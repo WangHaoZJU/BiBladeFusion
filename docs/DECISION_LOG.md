@@ -273,14 +273,15 @@ construction.
 
 Date: 2026-09-04
 
-Status: accepted; offline verified, physical verification pending
+Status: partially superseded by D022/D023; recursive online proof removal remains accepted
 
 The active NBV loop no longer runs BiBladeFusion's recursive continuous-interval mesh and
 occupancy certificates. It now mirrors HoloRobot's `ConservativeJointPlanner`: interpolate
 the straight joint path at `motion_preflight.maximum_joint_step_rad`, check five evenly
 spaced configurations per adjacent segment, and reject immediately on the first non-clear
 result. At most `stop_and_capture.maximum_ranked_preflight_candidates` endpoints are checked
-in one operator cycle.
+in one operator cycle. That final limit is superseded by D023 because it truncated an
+already-bounded selector queue.
 
 This change does not restore the former large link spheres. Self-collision still uses the
 hash-bound ES68+D435i URDF and original collision STL meshes. Environment checks still use
@@ -294,3 +295,54 @@ The recursive continuous proof remains an offline acceptance and diagnostic faci
 sampled online result carries its own integrity hash and cannot be presented as a continuous
 certificate. Guarded execution accepts either explicit contract and revalidates only a new
 live-start bridge with the same mode bound into the permit.
+
+## D022 — Bind occupancy once per path and use HoloRobot's effective resolution
+
+Date: 2026-09-04
+
+Status: accepted; offline verified, physical verification pending
+
+The 11:25 eiai attempt proved that D021 had replaced the recursive certificate but had
+still composed two independently reasonable layers incorrectly. BiBladeFusion called the
+single-pose occupancy API at every sampled path state; that API deliberately recomputed
+and rechecked the entire immutable occupancy hash for an independent query. It therefore
+hashed the same map twice per pose. It also interpolated the path at `0.02 rad` and then
+applied HoloRobot's five samples to each already-small segment.
+
+One online path is now one immutable occupancy transaction: recompute and bind the map at
+entry, query all sampled robot poses against that exact frozen object, and recompute once
+at exit (or before returning the first blocker). No map identity, UNKNOWN policy,
+clearance, original-STL query, or fail-fast behavior is removed.
+
+HoloRobot's deployed ES68 profile uses `max_joint_step_rad=0.1` and five endpoint-inclusive
+samples, whose worst effective spacing is `0.025 rad`. BiBladeFusion's existing
+`motion_preflight.maximum_joint_step_rad=0.02` is already finer. Online validation now
+checks those pre-interpolated waypoints directly and subdivides only if a supplied path is
+coarser than `0.025 rad`. The evidence schema is `holorobot_sampled_joint_v2` so old and
+new semantics cannot be confused. The recursive certificate remains offline-only.
+
+The outer unknown-blade runtime must preserve the inner runner's typed blocking reasons;
+generic `active supervised runner entered a blocked state` output is no longer acceptable.
+Segment timing diagnostics separately record mesh collision, ServoJ generation, and
+occupancy collision spans for the next hardware result.
+
+## D023 — Do not truncate the selector's bounded fallback queue
+
+Date: 2026-09-04
+
+Status: accepted; exact eiai artifact replay verified, physical verification pending
+
+The 11:25 eiai event ledger contained seven science-ranked endpoint-feasible candidates,
+but the coordinator tried only three because
+`stop_and_capture.maximum_ranked_preflight_candidates` was set to three. The first two
+straight paths had exact STL self-clearance blockers and the third crossed UNKNOWN with
+`wrist_2_link_0`; the coordinator then declared the cycle blocked without inspecting four
+already-generated alternatives.
+
+Replay against the exact immutable occupancy snapshot found two collision-free paths among
+those four alternatives. Therefore the NBV selector, not a second coordinator limit, owns
+candidate-family boundedness. The coordinator now checks the complete returned queue in
+unchanged science-gain order and accepts the first safe route. It remains fail-fast within
+each route, never relaxes a collision threshold, and never generates new unbounded
+candidates. The legacy configuration key stays parseable so reviewed deployment files do
+not break, but it no longer discards valid fallback paths.

@@ -14,6 +14,7 @@ from biblade_fusion.robotics import (
     OccupancyRobotCollisionChecker,
     preflight_linear_joint_motion,
 )
+from biblade_fusion.robotics import occupancy_collision as occupancy_collision_module
 from biblade_fusion.robotics.motion_preflight import HOLOROBOT_SAMPLED_VALIDATION
 
 
@@ -152,14 +153,44 @@ def test_online_holorobot_preflight_samples_segments_without_continuous_proof(
     assert report.continuous_occupancy_sweep_required is False
     assert report.collision is not None
     assert report.occupancy is not None
-    assert report.collision.sample_count == 13
-    assert report.occupancy.sample_count == 13
+    assert report.collision.sample_count == 4
+    assert report.occupancy.sample_count == 4
     assert report.collision.proof_evidence is None
     assert report.occupancy.proof_evidence is None
     assert report.path_validation_evidence_sha256 is not None
 
     tampered = replace(report, path_validation_evidence_sha256="0" * 64)
     assert tampered.ready_for_approval is False
+
+
+def test_online_holorobot_preflight_hashes_occupancy_once_at_each_boundary(
+    checker,
+    occupancy_checker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = occupancy_collision_module.compute_content_hash
+    calls = 0
+
+    def counted(snapshot):
+        nonlocal calls
+        calls += 1
+        return original(snapshot)
+
+    monkeypatch.setattr(occupancy_collision_module, "compute_content_hash", counted)
+
+    report = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        (0.05, -0.04, 0.03, -0.02, 0.01, 0.0),
+        collision_checker=checker,
+        occupancy_checker=occupancy_checker,
+        maximum_joint_step_rad=0.02,
+        path_validation_mode=HOLOROBOT_SAMPLED_VALIDATION,
+    )
+
+    assert report.ready_for_approval is True
+    assert report.occupancy is not None
+    assert report.occupancy.sample_count == 4
+    assert calls == 2
 
 
 def test_folded_goal_is_blocked_before_trajectory_generation(checker) -> None:
