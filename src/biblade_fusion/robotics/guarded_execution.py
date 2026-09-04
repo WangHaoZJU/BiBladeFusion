@@ -43,6 +43,8 @@ from biblade_fusion.robotics.pinocchio_collision import (
     Es68PinocchioCollisionChecker,
 )
 
+_HOLOROBOT_PLAN_START_TOLERANCE_RAD = 1e-3
+
 
 def _is_sha256_digest(value: object) -> bool:
     text = str(value)
@@ -258,7 +260,7 @@ class GuardedEliteExecutor:
         occupancy_checker: OccupancyRobotCollisionChecker,
         *,
         permit_lifetime_s: float = 30.0,
-        live_start_tolerance_rad: float = 0.01,
+        live_start_tolerance_rad: float = _HOLOROBOT_PLAN_START_TOLERANCE_RAD,
         execution_freshness_margin_s: float = 1.0,
         clock=time.monotonic,
     ) -> None:

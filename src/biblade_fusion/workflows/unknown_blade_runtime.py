@@ -1213,7 +1213,10 @@ class UnknownBladeSupervisedRuntime:
             self._coarse_adapter.reject_staged_cycle()
             raise
         if status.disposition is ExperimentDisposition.BLOCKED:
-            return self._block("approved segment execution was blocked")
+            reasons = status.blocking_reasons or (
+                "approved segment execution was blocked without a typed reason",
+            )
+            return self._block("; ".join(reasons))
         if status.disposition is ExperimentDisposition.COMPLETE:
             self._apply_terminal_status(status)
             return self.snapshot
@@ -2666,7 +2669,42 @@ def run_unknown_blade_operator_console(
             if command.lower() == "q":
                 runtime.request_stop("operator requested stop")
             elif command == expected:
-                runtime.execute_exact_approval(command)
+                output_fn(
+                    "Approval accepted. Running one guarded HoloRobot ServoJ leg, "
+                    "one writeIdle/settle boundary, automatic capture/inference, "
+                    "then bounded planning to the next attention point..."
+                )
+                cycle_started = time.monotonic()
+                cycle_finished = Event()
+
+                def report_approved_cycle_progress(
+                    finished: Event = cycle_finished,
+                    started: float = cycle_started,
+                ) -> None:
+                    while not finished.wait(5.0):
+                        current = runtime.snapshot
+                        elapsed = time.monotonic() - started
+                        output_fn(
+                            "Approved cycle still running: "
+                            f"{elapsed:.1f} s, runner={current.runner_status.phase}, "
+                            f"disposition={current.runner_status.disposition.value}"
+                        )
+
+                cycle_progress_thread = Thread(
+                    target=report_approved_cycle_progress,
+                    name="bbf-approved-cycle-progress",
+                    daemon=True,
+                )
+                cycle_progress_thread.start()
+                try:
+                    runtime.execute_exact_approval(command)
+                finally:
+                    cycle_finished.set()
+                    cycle_progress_thread.join(timeout=0.1)
+                    output_fn(
+                        "Approved cycle finished in "
+                        f"{time.monotonic() - cycle_started:.2f} s."
+                    )
             else:
                 output_fn("Token mismatch; motion was not requested.")
             continue

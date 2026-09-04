@@ -827,6 +827,10 @@ def test_bootstrap_then_one_complete_viewpoint_motion_requires_new_capture(
 
     perception.infer_and_update = infer_with_coarse_science  # type: ignore[method-assign]
     coordinator.capture_infer_update()
+    # Segment execution already issued HoloRobot's writeIdle boundary and the
+    # coordinator already proved its settled interval.  Automatic capture must
+    # not send a second stop command for the same boundary.
+    assert stop.calls == 4
     assert perception.captures[-1] == expected_capture
     assert perception.capture_requests[-1] == (
         expected_capture,
@@ -834,6 +838,29 @@ def test_bootstrap_then_one_complete_viewpoint_motion_requires_new_capture(
     )
     assert coordinator.checkpoint.phase is StopScanPhase.MAP_READY
     assert len(perception.committed) == 4
+
+
+def test_post_motion_capture_rejects_changed_stop_generation(tmp_path: Path) -> None:
+    coordinator, source, _, _, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3, 3],
+        target=_target(),
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    coordinator.prepare_next_segment()
+    coordinator.execute_approved(
+        operator_id="operator",
+        confirmation="EXECUTE synthetic",
+    )
+    assert coordinator.checkpoint.phase is StopScanPhase.AWAITING_CAPTURE
+
+    source.stop()
+
+    with pytest.raises(StopScanBlocked, match="stop generation/latch changed"):
+        coordinator.capture_infer_update()
+
+    assert coordinator.checkpoint.phase is StopScanPhase.FAILED
 
 
 def test_one_formal_coarse_view_enables_restricted_bootstrap_preflight(

@@ -273,6 +273,14 @@ elapsed enable/recovery time cannot retroactively expire an already consumed per
 separately configured measured segment-duration watchdog may still stop a genuinely
 overlong move.
 
+The live joints must remain within HoloRobot's `0.001 rad` plan-start tolerance from the
+stored preflight start. Once the approved segment succeeds, there is exactly one normal
+`writeIdle(0)` and one full settled window. The automatic capture reuses that boundary only
+while the expected view/purpose and stop generation/latch are unchanged; it must not print
+a second reverse-port recovery or issue a second stop for the same leg. The console prints
+an `Approved cycle still running` line every five seconds with the current runner phase, so
+motion, settling, inference and subsequent planning are no longer one opaque wait.
+
 Keep a hand on the physical emergency stop. Abort on unexpected physical motion, cable
 pull, loss of visibility, or approach to the blade/fixture that disagrees with the
 displayed plan.

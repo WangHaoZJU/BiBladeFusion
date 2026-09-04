@@ -405,3 +405,28 @@ offline reproduction:
 tests added and results:
 next single action:
 ```
+
+## 9. D027 control-boundary regression
+
+The next optimization target remains candidate quality only after one normal physical
+motion succeeds. A fresh HoloRobot comparison found that the active planner, multi-branch
+Pinocchio IK, straight-first/bounded-RRT route order, velocity/acceleration timing, ServoJ
+stream loop, endpoint feedback hold, and `writeIdle` segment boundary are aligned.
+
+Two remaining runtime deviations were corrected:
+
+- guarded execution now uses HoloRobot's `0.001 rad` plan-start tolerance instead of
+  `0.01 rad`, preventing a collision-validated but non-streamed start bridge from becoming
+  the first ServoJ command jump;
+- automatic post-motion capture reuses the already completed segment-boundary stationary
+  evidence and unchanged stop generation, rather than issuing a second `writeIdle` and
+  repeating the same settled interval.
+
+The outer runtime preserves the runner's exact execution blocker and the console reports
+progress every five seconds across guarded enable, ServoJ, settle, capture/inference and
+the next bounded plan. No candidate-generation, IK, collision, UNKNOWN, clearance,
+tracking, or acceptance threshold changed. The eiai `_003` motion-envelope asset therefore
+remains applicable. Code regression is complete; the first physical motion on this change
+is still pending. The final local result is `1252 passed, 3 skipped`; the skips are the
+same optional vale PyTorch/Open3D tests, and the focused motion/state-machine suite reports
+`276 passed`. Ruff and `git diff --check` pass.

@@ -451,7 +451,15 @@ def test_execute_revalidation_is_bounded_by_geometric_legs_not_servoj_ticks(
         joint_positions_rad=np.full(6, 0.002),
         enabled=False,
     )
-    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    # Exercise the optional bridge path explicitly.  Production uses HoloRobot's
+    # stricter 1e-3 rad plan-start tolerance and therefore never reaches this
+    # compatibility branch for a 0.002 rad drift.
+    executor = GuardedEliteExecutor(
+        arm,
+        checker,
+        occupancy_checker,
+        live_start_tolerance_rad=0.01,
+    )
     permit = executor.authorize(
         clear_preflight,
         operator_id="operator-a",
@@ -1034,6 +1042,26 @@ def test_live_start_mismatch_blocks_before_driver_prepare(
     assert arm.streamed is False
     assert arm.resumed is False
     assert arm.events == ["read_state"]
+
+
+def test_default_live_start_tolerance_matches_holorobot(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm(joint_positions_rad=np.full(6, 0.002))
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    with pytest.raises(RobotCommandError, match="0.002000 rad"):
+        executor.execute(clear_preflight, permit)
+
+    assert arm.events == ["read_state"]
+    assert arm.resumed is False
+    assert arm.prepared is False
+    assert arm.streamed is False
 
 
 def test_expired_permit_is_consumed_without_motion(

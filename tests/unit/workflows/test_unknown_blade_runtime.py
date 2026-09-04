@@ -125,8 +125,14 @@ class _FakeCoarseSession:
         self.live_readback_calls = 0
         self.last_accepted_coarse_view: Path | None = None
 
-    def stage_operator_capture(self, *, seed=None, operator_side=None) -> None:
-        del seed, operator_side
+    def stage_operator_capture(
+        self,
+        *,
+        seed=None,
+        seed_provider=None,
+        operator_side=None,
+    ) -> None:
+        del seed, seed_provider, operator_side
         self.stage_operator_calls += 1
 
     def stage_selected_capture(self, selection, *, seed=None) -> None:
@@ -891,6 +897,34 @@ def test_candidate_auto_capture_requires_one_accepted_coarse_cycle(
     assert session.reject_calls >= 1
 
 
+def test_exact_approval_preserves_typed_execution_blocker(tmp_path: Path) -> None:
+    runtime, runner, _ = _runtime(tmp_path)
+    runtime.start()
+    for _ in range(3):
+        runtime.capture_operator_view()
+    runtime.advance_to_attention()
+
+    def block_execution(_approval):
+        runner._status = _status(
+            tmp_path,
+            ExperimentDisposition.BLOCKED,
+            phase="aborted",
+            blocking=("single_segment_execution_failed:RobotCommandError:synthetic",),
+            stop_requested=True,
+            stop_acknowledged=True,
+        )
+        return runner._status
+
+    runner.execute_approved_segment = block_execution  # type: ignore[method-assign]
+
+    snapshot = runtime.execute_exact_approval("EXECUTE abcdef123456")
+
+    assert snapshot.phase is UnknownBladeRuntimePhase.BLOCKED
+    assert snapshot.blocking_reason == (
+        "single_segment_execution_failed:RobotCommandError:synthetic"
+    )
+
+
 def test_successful_transit_capture_retains_same_staged_coarse_target(
     tmp_path: Path,
 ) -> None:
@@ -960,6 +994,23 @@ def test_console_q_stops_without_capture_or_motion(tmp_path: Path) -> None:
     assert runner.execute_count == 0
     assert runner.stop_count == 1
     assert any("Read-only GUI" in line for line in output)
+
+
+def test_console_reports_approved_cycle_scope_and_duration(tmp_path: Path) -> None:
+    runtime, runner, _ = _runtime(tmp_path)
+    commands = iter(("c", "c", "c", "EXECUTE abcdef123456", "q"))
+    output: list[str] = []
+
+    result = run_unknown_blade_operator_console(
+        runtime,
+        input_fn=lambda _prompt: next(commands),
+        output_fn=output.append,
+    )
+
+    assert result == 0
+    assert runner.execute_count == 1
+    assert any("Approval accepted" in line for line in output)
+    assert any("Approved cycle finished in" in line for line in output)
 
 
 def test_formal_bootstrap_annotation_loader_accepts_exactly_one_blade_polygon(

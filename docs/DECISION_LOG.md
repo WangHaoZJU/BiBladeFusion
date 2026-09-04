@@ -430,3 +430,36 @@ verbatim; arithmetic interpolation is used only for interior samples. Sampled co
 poses and ServoJ segment endpoints follow the same rule. This is the necessary adaptation
 around HoloRobot's interpolation helper because HoloRobot does not impose BiBladeFusion's
 strict tuple/hash boundary.
+
+## D027 — Use HoloRobot's exact motion-start boundary and one stop per executed leg
+
+Date: 2026-09-04
+
+Status: accepted; code regression complete, physical verification pending
+
+The experiment must first execute a normal first viewpoint motion before candidate-family
+optimization resumes. A control-chain comparison found two BiBladeFusion-only deviations
+after planning had already succeeded.
+
+First, HoloRobot rejects a plan when the current joints differ from its stored start by
+more than `1e-3 rad`; the guarded BiBladeFusion executor allowed `1e-2 rad`. Although the
+larger live-start bridge was collision-checked, it was not inserted into the
+time-parameterized ServoJ stream, so the first planned command could still introduce the
+unexecuted jump. The production default is now the same `1e-3 rad` as HoloRobot. The
+existing measured collision uncertainty remains unchanged and still covers this smaller
+state mismatch.
+
+Second, successful execution already performed endpoint feedback settling, one
+`writeIdle(0)`, and one full sampled stationary interval. The immediately following
+automatic capture issued another `writeIdle(0)` and repeated the same one-second settled
+window. The automatic capture now reuses the exact preceding evidence only when its view
+ID, capture purpose, immutable stop generation, and stop latch still match. Bootstrap and
+operator-repositioned captures continue to establish their own stop and settled window;
+any changed stop generation blocks capture.
+
+This removes no IK, collision, occupancy UNKNOWN, tracking, endpoint, approval, or camera
+stationarity gate. It changes no reviewed numeric configuration or motion-envelope hash,
+so the eiai `_003` acceptance remains the current binding. The operator console now names
+the complete approved-cycle scope and reports its live runner phase every five seconds;
+typed execution blockers are preserved instead of being replaced by a generic outer
+message.

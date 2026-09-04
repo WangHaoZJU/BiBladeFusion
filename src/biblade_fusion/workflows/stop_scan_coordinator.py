@@ -1210,6 +1210,16 @@ class _OperationFinalizer:
     linearized: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _PostMotionCaptureReadiness:
+    """One already-settled segment boundary awaiting its automatic capture."""
+
+    view_id: str
+    purpose: CapturePurpose
+    stop_generation: int
+    stationarity: StationarityEvidence
+
+
 class StopScanCoordinator:
     """Synchronous stop/infer/map/one-leg/stop coordinator.
 
@@ -1306,6 +1316,7 @@ class StopScanCoordinator:
         self._prepared: _PreparedSegmentExecution | None = None
         self._expected_capture_view_id: str | None = None
         self._expected_capture_purpose: CapturePurpose | None = None
+        self._post_motion_capture_readiness: _PostMotionCaptureReadiness | None = None
         self._run_reference_model_sha256: str | None = None
         self._run_selection_policy_sha256: str | None = None
         self._blocking_reasons: tuple[str, ...] = ()
@@ -1357,6 +1368,7 @@ class StopScanCoordinator:
                 self._stop_request_reason = None
                 self._stop_transport_acknowledged = False
                 self._stop_stationarity_evidence = None
+            self._post_motion_capture_readiness = None
             self._transition(
                 StopScanPhase.BOOTSTRAP_MAP_REQUIRED,
                 "run_started",
@@ -1419,17 +1431,32 @@ class StopScanCoordinator:
             self._blocking_reasons = ()
             captured: CapturedStopScanView | None = None
             try:
-                # Terminate any previously running external-control program before
-                # trying to prove a stationary acquisition window.  This also makes
-                # bootstrap capture obey the same stop boundary as post-motion views.
-                self._robot.stop()
-                self._raise_if_stop_requested()
-                self._transition(
-                    StopScanPhase.WAITING_SETTLED,
-                    "capture_stop_asserted_wait_settled",
-                    {},
-                )
-                settled = self._wait_until_settled(None)
+                readiness = self._post_motion_capture_readiness
+                if capture_phase is StopScanPhase.AWAITING_CAPTURE and readiness is not None:
+                    settled = self._reuse_post_motion_capture_readiness(
+                        readiness,
+                        view_id=selected_view_id,
+                        purpose=purpose,
+                    )
+                    self._transition(
+                        StopScanPhase.WAITING_SETTLED,
+                        "capture_reused_segment_boundary_stationarity",
+                        {
+                            "stop_generation": readiness.stop_generation,
+                            "stationarity": _stationarity_payload(settled),
+                        },
+                    )
+                else:
+                    # Operator/bootstrap captures do not own a preceding segment
+                    # boundary.  Establish one stop and one complete settled window.
+                    self._robot.stop()
+                    self._raise_if_stop_requested()
+                    self._transition(
+                        StopScanPhase.WAITING_SETTLED,
+                        "capture_stop_asserted_wait_settled",
+                        {},
+                    )
+                    settled = self._wait_until_settled(None)
                 self._raise_if_stop_requested()
                 self._transition(
                     StopScanPhase.CAPTURING,
@@ -1564,6 +1591,7 @@ class StopScanCoordinator:
                 self._observation = result
                 self._expected_capture_view_id = None
                 self._expected_capture_purpose = None
+                self._post_motion_capture_readiness = None
                 self._cycle_index += 1
                 self._blocking_reasons = next_blocking_reasons
                 self._bootstrap_motion_active = (
@@ -1575,6 +1603,7 @@ class StopScanCoordinator:
                     self._perception.cancel_pending_capture(captured)
                 self._observation = None
                 self._observation_generation_id = None
+                self._post_motion_capture_readiness = None
                 self._blocking_reasons = (str(exc),)
                 self._transition(
                     StopScanPhase.ABORTED,
@@ -1587,6 +1616,7 @@ class StopScanCoordinator:
                     self._perception.cancel_pending_capture(captured)
                 self._observation = None
                 self._observation_generation_id = None
+                self._post_motion_capture_readiness = None
                 self._blocking_reasons = (f"perception_cycle_failed:{type(exc).__name__}:{exc}",)
                 self._transition(
                     StopScanPhase.FAILED,
@@ -2011,6 +2041,19 @@ class StopScanCoordinator:
                     )
                     settled = self._wait_until_settled(prepared.proposal.goal_joint_positions_rad)
                     self._raise_if_stop_requested()
+                    stop_generation, stopped = self._robot.stop_snapshot
+                    if (
+                        type(stop_generation) is not int
+                        or stop_generation < 0
+                        or type(stopped) is not bool
+                    ):
+                        raise StopScanBlocked(
+                            "segment-boundary stop snapshot has an invalid contract"
+                        )
+                    if not stopped:
+                        raise StopScanBlocked(
+                            "segment-boundary stationarity lacks the robot stop latch"
+                        )
             except BaseException as exc:
                 terminal_error: BaseException = exc
                 try:
@@ -2024,6 +2067,7 @@ class StopScanCoordinator:
                             (stop_error,),
                         )
                 self._prepared = None
+                self._post_motion_capture_readiness = None
                 if isinstance(terminal_error, EmergencyStopUnconfirmedError):
                     operation_error = terminal_error.operation_error
                     self._blocking_reasons = (
@@ -2062,6 +2106,12 @@ class StopScanCoordinator:
                 CapturePurpose.CANDIDATE
                 if prepared.proposal.final_target
                 else CapturePurpose.TRANSIT
+            )
+            self._post_motion_capture_readiness = _PostMotionCaptureReadiness(
+                view_id=self._expected_capture_view_id,
+                purpose=self._expected_capture_purpose,
+                stop_generation=stop_generation,
+                stationarity=settled,
             )
             self._prepared = None
             self._blocking_reasons = ()
@@ -2114,6 +2164,7 @@ class StopScanCoordinator:
         # linearization lock.  A blocked publisher/asset commit therefore cannot
         # delay the operator's stop command.
         self._stop_requested.set()
+        self._post_motion_capture_readiness = None
         stop_error: BaseException | None = None
         try:
             self._robot.stop()
@@ -2178,6 +2229,37 @@ class StopScanCoordinator:
             ),
             require_stop_latch=True,
         )
+
+    def _reuse_post_motion_capture_readiness(
+        self,
+        readiness: _PostMotionCaptureReadiness,
+        *,
+        view_id: str,
+        purpose: CapturePurpose,
+    ) -> StationarityEvidence:
+        """Reuse the one settled stop boundary immediately preceding auto-capture.
+
+        HoloRobot ends a successful ServoJ leg with one ``writeIdle``.  The
+        coordinator has already sampled a full settled interval after that exact
+        stop.  Reissuing ``writeIdle`` and waiting through the same interval again
+        is neither a new motion proof nor a camera requirement; on the deployed
+        controller it also creates an unnecessary second transport failure point.
+        The immutable local stop generation proves that no guarded command was
+        resumed between the boundary and this automatic capture.
+        """
+
+        if readiness.view_id != view_id or readiness.purpose is not purpose:
+            raise StopScanBlocked(
+                "post-motion capture identity differs from its settled segment boundary"
+            )
+        snapshot = self._robot.stop_snapshot
+        if snapshot != (readiness.stop_generation, True):
+            raise StopScanBlocked(
+                "post-motion stop generation/latch changed before automatic capture"
+            )
+        if not isinstance(readiness.stationarity, StationarityEvidence):
+            raise StopScanBlocked("post-motion capture lacks typed stationarity evidence")
+        return readiness.stationarity
 
     @staticmethod
     def _capture_purpose_for(
