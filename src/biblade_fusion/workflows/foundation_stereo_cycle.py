@@ -169,9 +169,9 @@ class _PendingPerceptionCommit:
 class FoundationStereoOccupancyCycleEngine:
     """Capture one immutable session, infer once, and rebuild a fresh map window.
 
-    The engine owns no motion interface.  A continuous sampler records read-only robot
-    state while the main thread performs FoundationStereo inference.  The coordinator
-    validates the returned trace and its capture-state binding before publishing the map.
+    The engine owns no motion interface.  Robot state is sampled only across camera
+    exposure; expensive stereo inference, map rebuilding, and artifact writes happen
+    after that short stationarity window has closed.
     """
 
     def __init__(
@@ -280,6 +280,8 @@ class FoundationStereoOccupancyCycleEngine:
         self._pending_key: tuple[str, int] | None = None
         self._pending_attempt_root: Path | None = None
         self._pending_sampler: RobotStateSampler | None = None
+        self._pending_stationarity_trace: tuple[RobotState, ...] | None = None
+        self._pending_sampler_diagnostics: dict[str, object] | None = None
         self._pending_commit: _PendingPerceptionCommit | None = None
         self._poisoned_reason: str | None = None
 
@@ -456,7 +458,10 @@ class FoundationStereoOccupancyCycleEngine:
             else _RobotStateSampler(
                 self._state_source,
                 self._settings.stop_and_capture.settle_poll_period_s,
-                prefer_fifo=self._settings.stop_and_capture.enabled,
+                # The production process already owns the configured scheduler.
+                # HoloRobot-style state reads share the persistent RTSI connection;
+                # a short sleeping evidence thread must not mutate process policy.
+                prefer_fifo=False,
             )
         )
         with self._pending_lock:
@@ -474,6 +479,8 @@ class FoundationStereoOccupancyCycleEngine:
             self._pending_key = key
             self._pending_attempt_root = cycle_root
             self._pending_sampler = sampler
+            self._pending_stationarity_trace = None
+            self._pending_sampler_diagnostics = None
         writer: SessionWriter | None = None
         try:
             logical_root.mkdir(parents=True, exist_ok=True)
@@ -483,12 +490,25 @@ class FoundationStereoOccupancyCycleEngine:
                 self._settings,
                 label=f"cycle_{sequence_index:06d}_{safe_view}_attempt_{attempt_id}",
             )
-            # Sampling starts before camera exposure and remains active across raw
-            # persistence, FoundationStereo, map rebuild, and evidence persistence.
+            # This is the only strict stationarity window: immediately before,
+            # during, and immediately after exposure.  Inference and ray integration
+            # cannot invalidate pixels that were already acquired while stopped.
             sampler.start()
             bundle = self._acquirer.capture(view_id, sequence_index)
             if (bundle.view_id, bundle.sequence_index) != key:
                 raise FoundationStereoCycleError("Acquirer changed the requested capture identity")
+            with performance_span("stationarity.exposure_sampler_finish"):
+                stationarity_trace = _ordered_unique_robot_states(
+                    sampler.finish(),
+                    minimum_count=1,
+                )
+            with self._pending_lock:
+                if self._pending_key != key or self._pending_sampler is not sampler:
+                    raise FoundationStereoCycleError(
+                        "Capture stationarity ownership changed during exposure"
+                    )
+                self._pending_stationarity_trace = stationarity_trace
+                self._pending_sampler_diagnostics = sampler.diagnostics
             writer.write_bundle(bundle)
             writer.close("completed")
         except BaseException:
@@ -516,7 +536,7 @@ class FoundationStereoOccupancyCycleEngine:
         self,
         captured: CapturedStopScanView | None = None,
     ) -> None:
-        """Cancel and join the continuous sampler for an uncommitted transaction."""
+        """Cancel or clear the exposure sampler for an uncommitted transaction."""
 
         expected = (
             None if captured is None else (captured.bundle.view_id, captured.bundle.sequence_index)
@@ -593,12 +613,18 @@ class FoundationStereoOccupancyCycleEngine:
                 self._pending_key != key
                 or self._pending_attempt_root != captured.cycle_root
                 or self._pending_sampler is None
+                or self._pending_stationarity_trace is None
+                or self._pending_sampler_diagnostics is None
             ):
                 raise FoundationStereoCycleError(
                     "Captured attempt is not the engine's active logical transaction"
                 )
         sampler = self._require_pending_sampler(key)
-        sampler_finished = False
+        independent_trace = self._pending_stationarity_trace
+        sampler_diagnostics = self._pending_sampler_diagnostics
+        assert independent_trace is not None
+        assert sampler_diagnostics is not None
+        sampler_finished = True
         try:
             if self._science_authority is not None:
                 # This check is intentionally adjacent to the actual backend call.
@@ -726,9 +752,6 @@ class FoundationStereoOccupancyCycleEngine:
                     updates[-1],
                     occupancy_path,
                 )
-            with performance_span("stationarity.sampler_finish"):
-                independent_trace = _ordered_unique_robot_states(sampler.finish())
-            sampler_finished = True
             with performance_span("stationarity.trace_write"):
                 write_inference_stationarity_trace(
                     captured.cycle_root / "inference_stationarity_trace.json",
@@ -736,7 +759,7 @@ class FoundationStereoOccupancyCycleEngine:
                     sequence_index=captured.bundle.sequence_index,
                     trace=independent_trace,
                     source_session_manifest=captured.raw_session_path / "manifest.json",
-                    sampler_diagnostics=sampler.diagnostics,
+                    sampler_diagnostics=sampler_diagnostics,
                 )
             capture_states = (
                 captured.bundle.robot_state_before,
@@ -1189,7 +1212,7 @@ class FoundationStereoOccupancyCycleEngine:
         sampled_trace: tuple[RobotState, ...],
         capture_states: tuple[RobotState, ...],
     ) -> None:
-        """Bind the independent trace to the main RTSI camera bracket."""
+        """Bind the exposure trace to the exact camera-state bracket."""
 
         maximum_time_delta_s = (
             self._settings.stop_and_capture.maximum_robot_state_staleness_s
@@ -1207,7 +1230,7 @@ class FoundationStereoOccupancyCycleEngine:
             )
             if controller_delta_s > maximum_time_delta_s:
                 raise FoundationStereoCycleError(
-                    "Independent RTSI trace does not bracket camera state "
+                    "Exposure robot-state trace does not bracket camera state "
                     f"{capture_index}: nearest controller delta "
                     f"{controller_delta_s:.9g} s exceeds {maximum_time_delta_s:.9g} s"
                 )
@@ -1238,7 +1261,7 @@ class FoundationStereoOccupancyCycleEngine:
                 or tcp_rotation_delta_rad > acquisition.max_tcp_rotation_delta_rad
             ):
                 raise FoundationStereoCycleError(
-                    "Independent RTSI trace differs from camera bracket state "
+                    "Exposure robot-state trace differs from camera bracket state "
                     f"{capture_index}: joint={joint_delta_rad:.9g} rad, "
                     f"tcp_translation={tcp_translation_delta_m:.9g} m, "
                     f"tcp_rotation={tcp_rotation_delta_rad:.9g} rad"
@@ -1250,7 +1273,7 @@ class FoundationStereoOccupancyCycleEngine:
                 != captured.safety_status.strip().upper()
             ):
                 raise FoundationStereoCycleError(
-                    "Independent RTSI trace controller state differs from camera "
+                    "Exposure robot-state trace controller state differs from camera "
                     f"bracket state {capture_index}"
                 )
 
@@ -1263,6 +1286,8 @@ class FoundationStereoOccupancyCycleEngine:
                 self._pending_sampler = None
                 self._pending_key = None
                 self._pending_attempt_root = None
+                self._pending_stationarity_trace = None
+                self._pending_sampler_diagnostics = None
 
     def _stage_pending_commit(
         self,
@@ -1288,6 +1313,8 @@ class FoundationStereoOccupancyCycleEngine:
             self._pending_sampler = None
             self._pending_key = None
             self._pending_attempt_root = None
+            self._pending_stationarity_trace = None
+            self._pending_sampler_diagnostics = None
             self._pending_commit = pending
 
     def _cancel_pending_sampler_instance(
@@ -1516,7 +1543,7 @@ def _safe_name(value: str) -> str:
 
 
 class _RobotStateSampler:
-    """Read-only trace spanning exposure, inference, and occupancy reconstruction."""
+    """Read-only trace spanning only the camera exposure window."""
 
     def __init__(
         self,
@@ -1593,7 +1620,10 @@ class _RobotStateSampler:
             self._trace.append(self._source.read_state())
         except BaseException as exc:
             raise FoundationStereoCycleError("Post-transaction robot state is unavailable") from exc
-        return _ordered_unique_robot_states(tuple(self._trace))
+        # The camera acquisition contributes its exact before/selected/after
+        # bracket separately.  One independent sample is sufficient here; the
+        # merged authoritative exposure trace still requires three states.
+        return _ordered_unique_robot_states(tuple(self._trace), minimum_count=1)
 
     def cancel(self) -> None:
         """Stop sampling without asserting that the transaction was stationary."""

@@ -18,7 +18,7 @@ import math
 import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -30,10 +30,10 @@ import numpy as np
 
 from biblade_fusion.acquisition import SynchronizedAcquirer
 from biblade_fusion.calibration import load_cs68_kinematics, load_hand_eye_calibration
+from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import AppSettings
 from biblade_fusion.devices.depth_camera import RealSenseD435i
 from biblade_fusion.devices.robot import EliteArm
-from biblade_fusion.devices.robot.elite_rtsi_sampler import EliteRtsiProcessSampler
 from biblade_fusion.devices.thermal_camera import NullThermalCamera
 from biblade_fusion.diagnostics.performance_timing import (
     activate_performance_timing,
@@ -52,6 +52,7 @@ from biblade_fusion.planning import (
     BladeSide,
     EliteCs68IkChecker,
     EndpointConfigurationCheck,
+    evaluate_multi_seed_ik,
 )
 from biblade_fusion.robotics import (
     BootstrapSafeStateEvidence,
@@ -60,6 +61,7 @@ from biblade_fusion.robotics import (
     Es68D435iCollisionResources,
     Es68KinematicModel,
     Es68PinocchioCollisionChecker,
+    load_es68_flange_t_tcp,
     wait_until_bootstrap_safe_state,
     wait_until_settled,
 )
@@ -115,10 +117,12 @@ from biblade_fusion.workflows.stop_scan_coordinator import (
     CapturedStopScanView,
     GuardedSegmentSafetyFactory,
     NextViewSelection,
+    NextViewTarget,
     OccupancyBinding,
     OccupancyGeneration,
     OccupancyGenerationPublisher,
     PerceptionCycleResult,
+    RankedNextViewCandidate,
     StopScanPhase,
 )
 from biblade_fusion.workflows.supervised_experiment import (
@@ -495,6 +499,73 @@ class CompletedUnknownBladeRuntime:
         return self._snapshot
 
 
+def _rebind_coarse_selection_to_current_stop(
+    selection: NextViewSelection,
+    *,
+    current_joint_positions_rad: np.ndarray,
+    reachability_checker: EliteCs68IkChecker,
+    flange_t_tcp: PoseSE3,
+    flange_t_left_ir: PoseSE3,
+    endpoint_validator: Callable[[np.ndarray], EndpointConfigurationCheck],
+) -> NextViewSelection:
+    """Re-solve science-ranked endpoints from the actual current stopped posture."""
+
+    current = np.asarray(current_joint_positions_rad, dtype=np.float64)
+    if current.shape != (6,) or not np.isfinite(current).all():
+        raise UnknownBladeRuntimeError(
+            "Current stopped robot posture is not a finite six-joint vector"
+        )
+    rebound: list[RankedNextViewCandidate] = []
+    rejected: list[str] = []
+    for ranked in selection.preflight_candidates:
+        base_t_tcp = PoseSE3(
+            "base",
+            "tcp",
+            ranked.target.base_t_tcp_matrix,
+        )
+        base_t_left_ir = base_t_tcp.compose(flange_t_tcp.inverse()).compose(
+            flange_t_left_ir
+        )
+        evaluation = evaluate_multi_seed_ik(
+            base_t_left_ir,
+            (reachability_checker,),
+            current,
+            endpoint_validator,
+        )
+        chosen_index = evaluation.chosen_solution_index
+        if chosen_index is None:
+            rejected.append(
+                f"{ranked.target.view_id}: {evaluation.result.message}"
+            )
+            continue
+        joints = evaluation.solutions_rad[chosen_index]
+        target = NextViewTarget(
+            view_id=ranked.target.view_id,
+            joint_positions_rad=tuple(float(value) for value in joints),
+            base_t_tcp_matrix=ranked.target.base_t_tcp_matrix,
+        )
+        diagnostics = (
+            *ranked.diagnostics,
+            "ik_rebound_to_current_stop=true",
+            f"ik_branch_count={len(evaluation.solutions_rad)}",
+            f"ik_selected_branch={chosen_index}",
+        )
+        rebound.append(RankedNextViewCandidate(target, diagnostics))
+
+    if not rebound:
+        summary = " | ".join(rejected[:3]) or "no ranked endpoint was supplied"
+        raise UnknownBladeRuntimeError(
+            "No science-ranked coarse endpoint remains IK/collision feasible from "
+            f"the current stopped posture: {summary}"
+        )
+    return replace(
+        selection,
+        target=rebound[0].target,
+        diagnostics=rebound[0].diagnostics,
+        ranked_candidates=tuple(rebound),
+    )
+
+
 class CoarseSessionNextViewAdapter:
     """Bind one coarse session to coordinator selection and accepted-cycle callbacks.
 
@@ -503,8 +574,17 @@ class CoarseSessionNextViewAdapter:
     from silently selecting a different endpoint midway through the route.
     """
 
-    def __init__(self, session: _CoarseSession) -> None:
+    def __init__(
+        self,
+        session: _CoarseSession,
+        *,
+        selection_rebinder: Callable[
+            [NextViewSelection, PerceptionCycleResult], NextViewSelection
+        ]
+        | None = None,
+    ) -> None:
         self._session = session
+        self._selection_rebinder = selection_rebinder
         self._pending_selection: NextViewSelection | None = None
         self._last_transition: CoarsePhaseTransition | None = None
         self._accepted_cycle_count = 0
@@ -626,7 +706,7 @@ class CoarseSessionNextViewAdapter:
         observation: PerceptionCycleResult,
         generation: OccupancyGeneration,
     ) -> NextViewSelection:
-        del observation, generation
+        del generation
         if self._pending_selection is not None:
             return self._pending_selection
         if (
@@ -642,6 +722,8 @@ class CoarseSessionNextViewAdapter:
             raise UnknownBladeRuntimeError(
                 "Coarse completion must be promoted through the schema-5 gate"
             )
+        if self._selection_rebinder is not None:
+            selection = self._selection_rebinder(selection, observation)
         binding = (
             selection.reference_model_sha256,
             selection.selection_policy_sha256,
@@ -2022,12 +2104,21 @@ def open_production_unknown_blade_runtime(
         stack.callback(camera.close)
         thermal = NullThermalCamera()
         state = arm.read_state()
-        reachability = EliteCs68IkChecker(
-            load_cs68_kinematics(model_path),
-            hand_eye,
-            state.joint_positions_rad,
-            settings.kinematics,
-            pinocchio_model=collision_checker.pinocchio_model,
+        kinematic_model = load_cs68_kinematics(model_path)
+
+        def runtime_reachability_checker(
+            seed: np.ndarray,
+        ) -> EliteCs68IkChecker:
+            return EliteCs68IkChecker(
+                kinematic_model,
+                hand_eye,
+                seed,
+                settings.kinematics,
+                pinocchio_model=collision_checker.pinocchio_model,
+            )
+
+        reachability = runtime_reachability_checker(
+            np.asarray(state.joint_positions_rad, dtype=np.float64)
         )
 
         def endpoint_collision_check(
@@ -2059,7 +2150,33 @@ def open_production_unknown_blade_runtime(
                 else None
             ),
         )
-        coarse_adapter = CoarseSessionNextViewAdapter(coarse_session)
+        flange_t_tcp = load_es68_flange_t_tcp()
+        flange_t_left_ir = hand_eye.require_flange_primary()
+
+        def rebind_coarse_selection(
+            selection: NextViewSelection,
+            observation: PerceptionCycleResult,
+        ) -> NextViewSelection:
+            trace = observation.inference_robot_state_trace
+            current = (
+                trace[-1].joint_positions_rad
+                if trace
+                else observation.stationarity_reference.joint_positions_rad
+            )
+            checker = runtime_reachability_checker(current.copy())
+            return _rebind_coarse_selection_to_current_stop(
+                selection,
+                current_joint_positions_rad=current,
+                reachability_checker=checker,
+                flange_t_tcp=flange_t_tcp,
+                flange_t_left_ir=flange_t_left_ir,
+                endpoint_validator=endpoint_collision_check,
+            )
+
+        coarse_adapter = CoarseSessionNextViewAdapter(
+            coarse_session,
+            selection_rebinder=rebind_coarse_selection,
+        )
         acquirer = SynchronizedAcquirer(
             arm,
             camera,
@@ -2067,12 +2184,6 @@ def open_production_unknown_blade_runtime(
             settings.acquisition,
             require_thermal=False,
         )
-
-        def robot_state_sampler_factory() -> EliteRtsiProcessSampler:
-            return EliteRtsiProcessSampler(
-                settings.robot,
-                evidence_period_s=settings.stop_and_capture.settle_poll_period_s,
-            )
 
         coarse_engine = FoundationStereoOccupancyCycleEngine(
             settings=coarse_settings,
@@ -2086,7 +2197,6 @@ def open_production_unknown_blade_runtime(
             coarse_science_preflighter=coarse_session.preflight_engine_cycle,
             science_authority=science_authority,
             science_authority_settings=science_authority_settings,
-            robot_state_sampler_factory=robot_state_sampler_factory,
         )
         publisher = OccupancyGenerationPublisher()
 
@@ -2245,7 +2355,6 @@ def open_production_unknown_blade_runtime(
                     accepted_coverage_path=accepted_coverage,
                     science_authority=science_authority,
                     science_authority_settings=science_authority_settings,
-                    robot_state_sampler_factory=robot_state_sampler_factory,
                 )
             )
             selector = BladeCoverageNextViewSelector.from_settings(
@@ -2255,6 +2364,7 @@ def open_production_unknown_blade_runtime(
                 science_authority=science_authority,
                 experimental=experimental,
                 endpoint_validator=endpoint_collision_check,
+                reachability_factory=runtime_reachability_checker,
             )
             # Coarse and fine coordinators are distinct motion authorities.  Fine
             # may reuse verified perception sources, but it must publish its own

@@ -412,6 +412,7 @@ class BladeCoverageNextViewSelector:
         science_authority: ScienceAcceptanceAuthority | None,
         experimental: bool = False,
         endpoint_validator: EndpointConfigurationValidator | None = None,
+        reachability_factory: ReachabilityFactory | None = None,
     ) -> BladeCoverageNextViewSelector:
         """Build the production selector without connecting to the robot."""
 
@@ -471,6 +472,7 @@ class BladeCoverageNextViewSelector:
             view_planning_config=settings.view_planning,
             point_cloud_config=settings.point_cloud,
             endpoint_validator=endpoint_validator,
+            reachability_factory=reachability_factory,
         )
 
     @property

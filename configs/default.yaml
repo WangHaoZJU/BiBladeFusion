@@ -441,6 +441,9 @@ motion_preflight:
   servoj_dt_s: 0.004
   speed_scaling: 0.08
   velocity_margin: 0.8
+  # Reviewed ES68 acceleration limits from HoloRobot's hardware profile. These
+  # participate in the immutable motion-control contract.
+  maximum_joint_acceleration_rad_s2: [4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
   # HoloRobot composite planner: a straight path remains primary. RRTConnect is
   # attempted once, with this strict budget, only when both endpoints are clear
   # but the direct route is blocked. Missing optional OMPL bindings do not weaken

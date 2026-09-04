@@ -290,17 +290,18 @@ def test_independent_sampler_trace_is_bound_to_camera_rtsi_states(
         )
 
 
-def test_capture_uses_injected_process_sampler_boundary(tmp_path: Path) -> None:
+def test_capture_closes_injected_sampler_at_exposure_boundary(tmp_path: Path) -> None:
     engine, _ = _capture_engine(tmp_path)
 
     class StubSampler:
         def __init__(self) -> None:
             self.started = False
+            self.finished = False
             self.cancelled = False
 
         @property
         def is_alive(self) -> bool:
-            return self.started and not self.cancelled
+            return self.started and not self.finished and not self.cancelled
 
         @property
         def diagnostics(self) -> dict[str, object]:
@@ -310,6 +311,7 @@ def test_capture_uses_injected_process_sampler_boundary(tmp_path: Path) -> None:
             self.started = True
 
         def finish(self) -> tuple[RobotState, ...]:
+            self.finished = True
             return (_state(1), _state(2), _state(3))
 
         def cancel(self) -> None:
@@ -320,6 +322,8 @@ def test_capture_uses_injected_process_sampler_boundary(tmp_path: Path) -> None:
 
     captured = engine.capture("process-boundary", 0, purpose=CapturePurpose.BOOTSTRAP)
     assert sampler.started is True
+    assert sampler.finished is True
+    assert sampler.is_alive is False
     engine.cancel_pending_capture(captured)
     assert sampler.cancelled is True
 

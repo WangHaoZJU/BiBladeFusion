@@ -322,7 +322,7 @@ class _HoloRobotPinocchioIkSolver:
             target_base_t_flange.translation_m,
         )
         seen: set[tuple[float, ...]] = set()
-        result: tuple[NDArray[np.float64], ...] = ()
+        solutions: list[NDArray[np.float64]] = []
         for candidate in candidates:
             controller_seed = self._clamp(candidate)
             seed_key = tuple(round(float(value), 6) for value in controller_seed)
@@ -331,8 +331,30 @@ class _HoloRobotPinocchioIkSolver:
             seen.add(seed_key)
             solution = self._solve_single(target, controller_seed)
             if solution is not None:
-                result = (solution,)
-                break
+                # A seed sweep is useful only if every distinct branch survives it.
+                # Returning the first converged branch made a collision-blocked wrist
+                # posture look like an IK failure even when another HoloRobot seed
+                # converged to a clear posture for the same camera pose.
+                normalized = _nearest_equivalent_joints(
+                    solution,
+                    seed,
+                    self._joint_limits,
+                )
+                if not any(
+                    np.allclose(normalized, item, atol=1e-5, rtol=0.0)
+                    for item in solutions
+                ):
+                    solutions.append(normalized)
+
+        result = tuple(
+            sorted(
+                solutions,
+                key=lambda item: (
+                    float(np.max(np.abs(item - seed))),
+                    float(np.sum(np.abs(item - seed))),
+                ),
+            )
+        )
 
         self._cache[key] = result
         self._cache.move_to_end(key)

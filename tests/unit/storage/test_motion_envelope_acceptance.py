@@ -130,6 +130,23 @@ def test_motion_control_contract_excludes_path_search_policy() -> None:
     assert motion_control_contract_for_settings(changed) == baseline
 
 
+def test_motion_control_contract_binds_joint_acceleration_limits() -> None:
+    settings = load_settings("configs/default.yaml")
+    changed = settings.model_copy(
+        update={
+            "motion_preflight": settings.motion_preflight.model_copy(
+                update={
+                    "maximum_joint_acceleration_rad_s2": (3.0,) * 6,
+                }
+            )
+        }
+    )
+
+    assert motion_control_contract_for_settings(changed) != (
+        motion_control_contract_for_settings(settings)
+    )
+
+
 def test_motion_envelope_acceptance_rejects_unmeasured_or_unchecked_values(
     tmp_path: Path,
 ) -> None:

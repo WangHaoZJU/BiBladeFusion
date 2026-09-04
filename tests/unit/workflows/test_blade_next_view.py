@@ -114,16 +114,21 @@ def test_selector_factory_binds_the_correct_terminal_finalizer(
 
     monkeypatch.setattr(BladeCoverageNextViewSelector, "__init__", fake_init)
 
+    def reachability_factory(_seed):
+        return object()
+
     BladeCoverageNextViewSelector.from_settings(
         load_settings("configs/default.yaml"),
         None,  # type: ignore[arg-type]
         reference_coarse_model=reference,
         science_authority=None if experimental else object(),  # type: ignore[arg-type]
         experimental=experimental,
+        reachability_factory=reachability_factory,
     )
     finalizer = captured["fine_finalizer"]
 
     assert callable(finalizer)
+    assert captured["reachability_factory"] is reachability_factory
     assert finalizer("state") == expected  # type: ignore[operator]
     assert calls == [(expected, "state")]
 

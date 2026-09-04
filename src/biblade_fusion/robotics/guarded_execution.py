@@ -1001,6 +1001,12 @@ class GuardedEliteExecutor:
                     servoj_dt_s=stream.dt_s,
                     speed_scaling=float(preflight.diagnostics["speed_scaling"]),
                     velocity_margin=float(preflight.diagnostics["velocity_margin"]),
+                    maximum_joint_acceleration_rad_s2=tuple(
+                        float(value)
+                        for value in preflight.diagnostics[
+                            "maximum_joint_acceleration_rad_s2"
+                        ]
+                    ),
                     execution_freshness_margin_s=self._execution_freshness_margin_s,
                     servoj_runtime_config=preflight.servoj_runtime_config,
                     accepted_joint_uncertainty_rad=uncertainty,

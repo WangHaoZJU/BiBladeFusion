@@ -243,6 +243,9 @@ def _derive_candidate(
         servoj_dt_s=motion_config.servoj_dt_s,
         speed_scaling=motion_config.speed_scaling,
         velocity_margin=motion_config.velocity_margin,
+        maximum_joint_acceleration_rad_s2=(
+            motion_config.maximum_joint_acceleration_rad_s2
+        ),
     )
     collision = preflight.collision
     proof = collision.proof_evidence if collision is not None else None

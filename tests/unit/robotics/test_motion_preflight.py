@@ -93,7 +93,7 @@ def test_real_mesh_checker_produces_swept_volume_evidence() -> None:
     assert report.ready_for_approval is False
 
 
-def test_clear_preflight_builds_velocity_limited_servoj_stream(
+def test_clear_preflight_builds_holorobot_dynamically_limited_servoj_stream(
     checker, occupancy_checker
 ) -> None:
     report = preflight_linear_joint_motion(
@@ -131,6 +131,19 @@ def test_clear_preflight_builds_velocity_limited_servoj_stream(
         axis=0,
     )
     assert np.all(observed_velocity <= maximum_velocity * 0.08 * 0.8 + 1e-12)
+    minimum_acceleration_duration_s = 2.0 * np.sqrt(0.05 / (4.0 * 0.08 * 0.8))
+    actual_duration_s = (
+        len(report.servoj_stream.commands) - 1
+    ) * report.servoj_stream.dt_s
+    assert actual_duration_s >= minimum_acceleration_duration_s
+    assert actual_duration_s < minimum_acceleration_duration_s + 0.004 + 1e-12
+    assert (
+        report.diagnostics["trajectory_generator"]
+        == "holorobot_velocity_acceleration_limited_servoj_v2"
+    )
+    assert report.diagnostics["servoj_path_knot_count"] == 2
+    assert report.diagnostics["limiting_constraint"] == "acceleration"
+    assert "acceleration_limits_unavailable" not in report.warnings
 
 
 def test_online_holorobot_preflight_samples_segments_without_continuous_proof(

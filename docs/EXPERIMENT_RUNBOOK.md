@@ -68,6 +68,24 @@ print('elite sdk: OK')
 "
 ```
 
+### 2.1 D025 motion-contract migration
+
+After pulling D025, ensure `configs/local.yaml` contains the reviewed HoloRobot ES68
+acceleration vector:
+
+```yaml
+motion_preflight:
+  maximum_joint_acceleration_rad_s2: [4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
+```
+
+This changes the immutable motion-control contract. The old
+`es68_d435i_motion_envelope_002` path/ID must not be relabelled as current. Complete the
+motion-envelope acceptance procedure for this slower velocity-and-acceleration-limited
+stream, record a new immutable output, and replace both
+`motion_envelope_acceptance_path` and `motion_envelope_acceptance_id` in
+`configs/local.yaml`. Do not start a moving run while `scan doctor` reports a contract
+mismatch.
+
 ## 3. Non-moving readiness check
 
 ```bash
@@ -210,6 +228,7 @@ The normal transition is:
 bootstrap_motion_ready/map_ready
   -> "Planning next view with HoloRobot single-arm composite planning ..."
   -> complete NBV-selector-bounded queue in unchanged science-rank order
+  -> re-solve each ranked camera pose from the latest stopped joint posture
   -> every IK branch receives a fail-fast exact URDF/STL endpoint check
   -> straight 0.02-rad route first (finer than HoloRobot's effective 0.025 rad)
   -> if endpoints are clear and only the route interior is blocked, one bounded
@@ -218,7 +237,7 @@ bootstrap_motion_ready/map_ready
   -> exact EXECUTE token entered
   -> permit consumed, then permit-bound power/brake preparation
   -> one reverse-control session opened at approved resume
-  -> one ServoJ segment
+  -> one velocity-and-acceleration-limited ServoJ segment
   -> final approved endpoint held until RTSI joint feedback converges
   -> HoloRobot-compatible writeIdle stop latch and sampled stationary confirmation
   -> next capture
@@ -259,6 +278,12 @@ completion sends `writeIdle(0)` and deliberately does not call Dashboard `stopPr
 so it must not create the former close/reconnect cycle. A sampled RTSI `runtime_state`
 may remain `PLAYING`; the unchanged stop generation/latch plus bounded joint/TCP samples
 is the stop-and-capture authority.
+
+Each perception cycle should reuse that existing EliteArm RTSI connection. A second
+process-isolated RTSI sampler must not connect for FoundationStereo. Strict stationarity
+sampling ends immediately after the synchronized camera bracket; inference, CUDA ray
+integration, and artifact writes run afterward and are not part of the exposure-stability
+window.
 
 ## 6. Read-only live supervision
 

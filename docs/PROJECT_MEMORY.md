@@ -69,12 +69,21 @@ poses. Runtime IK reuses the same Pinocchio/URDF kinematic model already loaded 
 ES68 collision assembly and the bounded neighboring-seed pattern proven in HoloRobot.
 Every distinct IK branch is endpoint-collision checked before choosing the nearest clear
 solution; the nearest mathematical solution is not privileged when it collides.
+The selector's stored joint endpoint is provisional: immediately before path
+preflight, every science-ranked camera pose is solved again using the latest stopped
+robot posture. A solution generated from the first-view posture must never be carried
+unchanged across later accepted motions.
 
 After endpoint filtering, motion follows HoloRobot's single-arm composite order: try the
 conservative straight joint route first, then invoke one tightly bounded RRTConnect search
 only for a true interior path obstruction. UNKNOWN evidence and invalid endpoints are not
 planning problems and must fail fast. Every detour is resampled and fully rechecked before
 operator approval.
+
+ServoJ timing follows HoloRobot's per-segment dynamic rule: scaled joint velocity and
+acceleration limits both contribute a minimum duration. Collision sampling waypoints may
+be dense, but redundant collinear samples are removed from the timing polyline so they do
+not create artificial stop/start acceleration penalties. Path corners remain intact.
 
 There is no scientific reason to prescribe one narrow standoff interval when the actual
 requirements are stereo depth validity, sufficient projected support, collision-free
@@ -177,6 +186,12 @@ or a repeated internal validation step must not block merely because an arbitrar
 threshold was chosen. Time limits used to detect a real hang must cover measured normal
 execution with margin and must not invalidate a static map solely because computation
 took longer.
+
+The strict robot-stationarity evidence window surrounds camera exposure only. The
+FoundationStereo forward pass, occupancy ray integration, and artifact persistence happen
+after that window and cannot retroactively invalidate an already stopped image. Production
+sampling shares EliteArm's persistent, serialized RTSI state source; it must not open a new
+robot connection for every perception cycle.
 
 ## 8. Paper narrative
 

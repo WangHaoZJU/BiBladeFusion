@@ -375,3 +375,33 @@ joint-step contract, checked again in full against exact robot geometry and one 
 occupancy transaction, converted into the existing velocity-limited ServoJ stream, and
 bound into path evidence by a waypoint SHA-256. No collision threshold, UNKNOWN policy,
 operator approval, tracking stop, or stationarity gate is relaxed.
+
+## D025 — Rebind IK at each stop and reuse HoloRobot motion/sampling semantics
+
+Date: 2026-09-04
+
+Status: accepted; offline verified, physical verification pending
+
+D024 described multi-branch endpoint filtering, but the concrete Pinocchio adapter still
+stopped after its first converged seed. It now retains every distinct branch from the
+bounded HoloRobot seed family, normalizes branches around the current posture, and passes
+all of them to the exact endpoint collision gate. In addition, coarse science-ranked
+camera poses are solved again from the most recent accepted stopped-state trace before
+path preflight. A joint endpoint cached at the initial view is no longer treated as valid
+after the arm has moved. Fine NBV already rebuilt its checker from the current stopped
+trace; production now injects the same already-loaded Pinocchio/URDF model there as well,
+instead of silently falling back to the separate MDH implementation.
+
+ServoJ command generation now copies HoloRobot's velocity-and-acceleration segment timing
+rule. The reviewed ES68 acceleration vector is `[4, 4, 4, 4, 4, 4] rad/s^2` and is part of
+the immutable motion-control contract. Redundant collinear collision samples are removed
+only from the timing polyline; all geometric corners and the separately verified collision
+path remain unchanged. Execution reconstructs and compares the exact stream before a
+permit can be used.
+
+The production perception cycle no longer creates one process-isolated RTSI connection
+per frame or keeps that sampler alive through FoundationStereo and occupancy work. A short
+read-only sampler shares EliteArm's persistent, locked RTSI state source and is closed
+immediately after the camera bracket. Stationarity validation remains strict over exposure,
+while later inference, ray integration, and disk persistence are outside that physical
+window. This removes a non-physical failure mode without weakening capture stability.

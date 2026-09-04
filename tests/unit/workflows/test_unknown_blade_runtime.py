@@ -12,7 +12,12 @@ import biblade_fusion.workflows.unknown_blade_runtime as runtime_module
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import load_settings
 from biblade_fusion.devices.robot.base import RobotState
-from biblade_fusion.planning import BladeSide
+from biblade_fusion.planning import (
+    BladeSide,
+    EndpointConfigurationCheck,
+    ReachabilityResult,
+    ReachabilityState,
+)
 from biblade_fusion.robotics.stationarity import (
     BootstrapSafeStateEvidence,
     StationarityEvidence,
@@ -37,11 +42,26 @@ from biblade_fusion.workflows.unknown_blade_runtime import (
     UnknownBladeRuntimeError,
     UnknownBladeRuntimePhase,
     UnknownBladeSupervisedRuntime,
+    _rebind_coarse_selection_to_current_stop,
     load_unknown_blade_resume_plan,
     open_production_unknown_blade_runtime,
     run_unknown_blade_operator_console,
     unknown_blade_runtime_readiness,
 )
+
+
+class _SingleBranchChecker:
+    def __init__(self, joints: np.ndarray) -> None:
+        self.joints = joints
+
+    def check_all(self, _pose: PoseSE3):
+        return (
+            ReachabilityResult(
+                ReachabilityState.REACHABLE,
+                "current-stop branch",
+                self.joints,
+            ),
+        )
 
 
 def _selection(
@@ -153,6 +173,26 @@ def test_coarse_target_is_stable_across_transit_capture(tmp_path: Path) -> None:
     assert session.select_calls == 1
     assert session.stage_selected_calls == 1
     assert session.accept_calls == 0
+
+
+def test_coarse_selection_rebinds_ik_to_current_stopped_posture() -> None:
+    selection = _selection("coarse-current-stop")
+    current = np.array([0.4, -0.7, 0.8, -1.0, 0.3, 0.2])
+    rebound_joints = current + np.array([0.01, 0.0, -0.01, 0.0, 0.0, 0.0])
+
+    rebound = _rebind_coarse_selection_to_current_stop(
+        selection,
+        current_joint_positions_rad=current,
+        reachability_checker=_SingleBranchChecker(rebound_joints),
+        flange_t_tcp=PoseSE3.identity("flange", "tcp"),
+        flange_t_left_ir=PoseSE3.identity("flange", "left_ir"),
+        endpoint_validator=lambda _joints: EndpointConfigurationCheck(True),
+    )
+
+    assert rebound.target is not None
+    np.testing.assert_allclose(rebound.target.joint_positions_rad, rebound_joints)
+    assert "ik_rebound_to_current_stop=true" in rebound.diagnostics
+    assert rebound.ranked_candidates[0].target == rebound.target
 
 
 def test_coarse_adapter_restages_the_path_safe_ranked_fallback(tmp_path: Path) -> None:
@@ -1941,7 +1981,11 @@ def test_experimental_open_keeps_science_authority_and_settings_unbound(
     monkeypatch.setattr(runtime_module, "_bootstrap_foreground_config", lambda _settings: object())
     monkeypatch.setattr(runtime_module, "CoarseSciencePolicy", lambda **_kwargs: object())
     monkeypatch.setattr(runtime_module, "CoarseScienceSession", lambda **_kwargs: coarse_session)
-    monkeypatch.setattr(runtime_module, "CoarseSessionNextViewAdapter", lambda _session: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "CoarseSessionNextViewAdapter",
+        lambda _session, **_kwargs: object(),
+    )
     monkeypatch.setattr(runtime_module, "SynchronizedAcquirer", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(
         runtime_module,

@@ -305,6 +305,12 @@ def _collision_backend_check(settings: AppSettings) -> CheckResult:
                 "online_effective_maximum_sample_step_rad": (
                     HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD
                 ),
+                "servoj_trajectory_generator": (
+                    "holorobot_velocity_acceleration_limited_servoj_v2"
+                ),
+                "maximum_joint_acceleration_rad_s2": list(
+                    settings.motion_preflight.maximum_joint_acceleration_rad_s2
+                ),
                 "offline_continuous_swept_mesh_supported": mesh_supported,
                 "offline_continuous_swept_occupancy_supported": occupancy_supported,
                 "online_composite_planner_enabled": (

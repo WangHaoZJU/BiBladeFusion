@@ -183,6 +183,9 @@ def preflight_view_sequence_motion(
             servoj_dt_s=config.servoj_dt_s,
             speed_scaling=config.speed_scaling,
             velocity_margin=config.velocity_margin,
+            maximum_joint_acceleration_rad_s2=(
+                config.maximum_joint_acceleration_rad_s2
+            ),
             execution_freshness_margin_s=execution_freshness_margin_s,
             accepted_joint_uncertainty_rad=accepted_joint_uncertainty_rad,
             motion_envelope_acceptance_id=motion_envelope_acceptance_id,
@@ -376,6 +379,9 @@ def preflight_live_joint_segment(
         servoj_dt_s=config.servoj_dt_s,
         speed_scaling=config.speed_scaling,
         velocity_margin=config.velocity_margin,
+        maximum_joint_acceleration_rad_s2=(
+            config.maximum_joint_acceleration_rad_s2
+        ),
         execution_freshness_margin_s=execution_freshness_margin_s,
         accepted_joint_uncertainty_rad=accepted_joint_uncertainty_rad,
         motion_envelope_acceptance_id=motion_envelope_acceptance_id,

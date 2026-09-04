@@ -293,14 +293,60 @@ def _linear_waypoints(
     )
 
 
-def _velocity_limited_stream(
+@dataclass(frozen=True, slots=True)
+class _TimeParameterizedServoJ:
+    stream: ServoJStream
+    knot_count: int
+    minimum_duration_s: float
+    limiting_segment_index: int | None
+    limiting_joint_index: int | None
+    limiting_constraint: str | None
+
+
+def _servoj_geometric_knots(
+    waypoints: tuple[tuple[float, ...], ...],
+) -> tuple[tuple[float, ...], ...]:
+    """Remove only redundant collinear samples; preserve every path corner."""
+
+    if len(waypoints) < 2:
+        raise ValueError("ServoJ path requires at least two waypoints")
+    knots: list[tuple[float, ...]] = [waypoints[0]]
+    for middle, following in zip(waypoints[1:-1], waypoints[2:], strict=True):
+        previous = knots[-1]
+        incoming = np.asarray(middle, dtype=np.float64) - np.asarray(
+            previous, dtype=np.float64
+        )
+        outgoing = np.asarray(following, dtype=np.float64) - np.asarray(
+            middle, dtype=np.float64
+        )
+        incoming_norm = float(np.linalg.norm(incoming))
+        outgoing_norm = float(np.linalg.norm(outgoing))
+        if incoming_norm <= 1e-12:
+            continue
+        if outgoing_norm > 1e-12 and np.allclose(
+            incoming / incoming_norm,
+            outgoing / outgoing_norm,
+            rtol=0.0,
+            atol=1e-9,
+        ):
+            continue
+        knots.append(middle)
+    if knots[-1] != waypoints[-1]:
+        knots.append(waypoints[-1])
+    return tuple(knots)
+
+
+def _time_parameterized_servoj_stream(
     waypoints: tuple[tuple[float, ...], ...],
     *,
     maximum_velocity_rad_s: tuple[float, ...],
+    maximum_acceleration_rad_s2: tuple[float, ...],
     dt_s: float,
     speed_scaling: float,
     velocity_margin: float,
-) -> ServoJStream:
+) -> _TimeParameterizedServoJ:
+    """Apply HoloRobot's velocity/acceleration duration rule to a joint polyline."""
+
     if not math.isfinite(dt_s) or dt_s <= 0.0:
         raise ValueError("ServoJ dt_s must be finite and positive")
     if not math.isfinite(speed_scaling) or not 0.0 < speed_scaling <= 1.0:
@@ -310,20 +356,50 @@ def _velocity_limited_stream(
     velocities = np.asarray(maximum_velocity_rad_s, dtype=np.float64)
     if velocities.shape != (6,) or not np.isfinite(velocities).all() or np.any(velocities <= 0.0):
         raise ValueError("Joint velocity limits must be a finite positive six-vector")
-    maximum_steps = tuple(
-        velocity * dt_s * speed_scaling * velocity_margin for velocity in maximum_velocity_rad_s
-    )
-    commands: list[tuple[float, ...]] = [waypoints[0]]
-    for start, goal in zip(waypoints[:-1], waypoints[1:], strict=True):
-        count = max(
-            1,
-            math.ceil(
-                max(
-                    abs(end - begin) / maximum_steps[index]
-                    for index, (begin, end) in enumerate(zip(start, goal, strict=True))
-                )
-            ),
-        )
+    accelerations = np.asarray(maximum_acceleration_rad_s2, dtype=np.float64)
+    if (
+        accelerations.shape != (6,)
+        or not np.isfinite(accelerations).all()
+        or np.any(accelerations <= 0.0)
+    ):
+        raise ValueError("Joint acceleration limits must be a finite positive six-vector")
+    knots = _servoj_geometric_knots(waypoints)
+    scale = speed_scaling * velocity_margin
+    commands: list[tuple[float, ...]] = [knots[0]]
+    minimum_duration_s = 0.0
+    limiting_segment_index: int | None = None
+    limiting_joint_index: int | None = None
+    limiting_constraint: str | None = None
+    largest_segment_minimum_s = -1.0
+    for segment_index, (start, goal) in enumerate(
+        zip(knots[:-1], knots[1:], strict=True)
+    ):
+        segment_minimum_s = 0.0
+        segment_joint_index: int | None = None
+        segment_constraint: str | None = None
+        for joint_index, (begin, end) in enumerate(zip(start, goal, strict=True)):
+            delta = abs(end - begin)
+            if delta <= 1e-12:
+                continue
+            velocity_duration_s = delta / (velocities[joint_index] * scale)
+            acceleration_duration_s = 2.0 * math.sqrt(
+                delta / (accelerations[joint_index] * scale)
+            )
+            if velocity_duration_s > segment_minimum_s:
+                segment_minimum_s = velocity_duration_s
+                segment_joint_index = joint_index
+                segment_constraint = "velocity"
+            if acceleration_duration_s > segment_minimum_s:
+                segment_minimum_s = acceleration_duration_s
+                segment_joint_index = joint_index
+                segment_constraint = "acceleration"
+        minimum_duration_s += segment_minimum_s
+        if segment_minimum_s > largest_segment_minimum_s:
+            largest_segment_minimum_s = segment_minimum_s
+            limiting_segment_index = segment_index
+            limiting_joint_index = segment_joint_index
+            limiting_constraint = segment_constraint
+        count = max(1, math.ceil(segment_minimum_s / dt_s - 1e-12))
         commands.extend(
             tuple(
                 begin + sample / count * (end - begin)
@@ -333,7 +409,14 @@ def _velocity_limited_stream(
         )
     stream = ServoJStream(commands=tuple(commands), dt_s=dt_s)
     stream.validate()
-    return stream
+    return _TimeParameterizedServoJ(
+        stream=stream,
+        knot_count=len(knots),
+        minimum_duration_s=minimum_duration_s,
+        limiting_segment_index=limiting_segment_index,
+        limiting_joint_index=limiting_joint_index,
+        limiting_constraint=limiting_constraint,
+    )
 
 
 def validate_preflight_servoj_contract(
@@ -355,7 +438,10 @@ def validate_preflight_servoj_contract(
         "holorobot_composite_ompl_rrtconnect",
     }:
         raise ValueError("Unsupported motion preflight planner contract")
-    if preflight.diagnostics.get("trajectory_generator") != "holorobot_velocity_limited_servoj":
+    if (
+        preflight.diagnostics.get("trajectory_generator")
+        != "holorobot_velocity_acceleration_limited_servoj_v2"
+    ):
         raise ValueError("Unsupported motion trajectory-generator contract")
 
     def diagnostic_float(name: str) -> float:
@@ -371,6 +457,16 @@ def validate_preflight_servoj_contract(
     dt_s = diagnostic_float("servoj_dt_s")
     speed_scaling = diagnostic_float("speed_scaling")
     velocity_margin = diagnostic_float("velocity_margin")
+    acceleration = np.asarray(
+        preflight.diagnostics.get("maximum_joint_acceleration_rad_s2"),
+        dtype=np.float64,
+    )
+    if (
+        acceleration.shape != (6,)
+        or not np.isfinite(acceleration).all()
+        or np.any(acceleration <= 0.0)
+    ):
+        raise ValueError("Motion preflight acceleration limits are invalid")
     freshness_margin = diagnostic_float("execution_freshness_margin_s")
     if freshness_margin < 0.0:
         raise ValueError("Execution freshness margin must be non-negative")
@@ -447,13 +543,31 @@ def validate_preflight_servoj_contract(
             raise ValueError("OMPL motion preflight waypoint identity changed")
     if preflight.planning_waypoints != expected_waypoints:
         raise ValueError("Motion preflight waypoints do not reproduce")
-    expected_stream = _velocity_limited_stream(
+    expected_timing = _time_parameterized_servoj_stream(
         expected_waypoints,
         maximum_velocity_rad_s=(collision_checker.kinematic_model.joint_velocity_limits_rad_s()),
+        maximum_acceleration_rad_s2=tuple(float(value) for value in acceleration),
         dt_s=dt_s,
         speed_scaling=speed_scaling,
         velocity_margin=velocity_margin,
     )
+    expected_stream = expected_timing.stream
+    if preflight.diagnostics.get("servoj_path_knot_count") != expected_timing.knot_count:
+        raise ValueError("Motion preflight ServoJ knot count does not reproduce")
+    if not math.isclose(
+        diagnostic_float("minimum_dynamic_duration_s"),
+        expected_timing.minimum_duration_s,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("Motion preflight dynamic duration does not reproduce")
+    for name, expected in (
+        ("limiting_segment_index", expected_timing.limiting_segment_index),
+        ("limiting_joint_index", expected_timing.limiting_joint_index),
+        ("limiting_constraint", expected_timing.limiting_constraint),
+    ):
+        if preflight.diagnostics.get(name) != expected:
+            raise ValueError(f"Motion preflight diagnostic {name} does not reproduce")
     stream = preflight.servoj_stream
     if stream is None:
         raise ValueError("Motion preflight lacks a ServoJ stream")
@@ -575,6 +689,9 @@ def _preflight_joint_waypoints(
     servoj_dt_s: float = 0.004,
     speed_scaling: float = 0.08,
     velocity_margin: float = 0.8,
+    maximum_joint_acceleration_rad_s2: tuple[
+        float, float, float, float, float, float
+    ] = (4.0, 4.0, 4.0, 4.0, 4.0, 4.0),
     execution_freshness_margin_s: float = 1.0,
     servoj_runtime_config: ServoJStreamConfig | None = None,
     accepted_joint_uncertainty_rad: tuple[float, float, float, float, float, float] = (
@@ -653,11 +770,14 @@ def _preflight_joint_waypoints(
         require_continuous_occupancy_sweep = False
     diagnostics = {
         "planner": planner,
-        "trajectory_generator": "holorobot_velocity_limited_servoj",
+        "trajectory_generator": "holorobot_velocity_acceleration_limited_servoj_v2",
         "maximum_joint_step_rad": maximum_joint_step_rad,
         "servoj_dt_s": servoj_dt_s,
         "speed_scaling": speed_scaling,
         "velocity_margin": velocity_margin,
+        "maximum_joint_acceleration_rad_s2": list(
+            maximum_joint_acceleration_rad_s2
+        ),
         "execution_freshness_margin_s": freshness_margin_s,
         "require_occupancy": bool(require_occupancy),
         "require_swept_mesh": bool(require_swept_mesh),
@@ -750,15 +870,22 @@ def _preflight_joint_waypoints(
         )
     with performance_span("planning.servoj_stream_generation"):
         velocities = collision_checker.kinematic_model.joint_velocity_limits_rad_s()
-        stream = _velocity_limited_stream(
+        timing = _time_parameterized_servoj_stream(
             waypoints,
             maximum_velocity_rad_s=velocities,
+            maximum_acceleration_rad_s2=maximum_joint_acceleration_rad_s2,
             dt_s=servoj_dt_s,
             speed_scaling=speed_scaling,
             velocity_margin=velocity_margin,
         )
+        stream = timing.stream
     stream_duration_s = max(0, len(stream.commands) - 1) * stream.dt_s
     required_freshness_horizon_s = stream_duration_s + freshness_margin_s
+    diagnostics["servoj_path_knot_count"] = timing.knot_count
+    diagnostics["minimum_dynamic_duration_s"] = timing.minimum_duration_s
+    diagnostics["limiting_segment_index"] = timing.limiting_segment_index
+    diagnostics["limiting_joint_index"] = timing.limiting_joint_index
+    diagnostics["limiting_constraint"] = timing.limiting_constraint
     diagnostics["planned_servoj_duration_s"] = stream_duration_s
     diagnostics["required_freshness_horizon_s"] = required_freshness_horizon_s
     occupancy: JointPathOccupancyCollisionReport | None = None
@@ -852,12 +979,10 @@ def _preflight_joint_waypoints(
         blocking_reasons=(),
         warnings=(
             (
-                "acceleration_limits_unavailable",
                 "online_path_uses_holorobot_fixed_step_segment_sampling",
             )
             if validation_mode == HOLOROBOT_SAMPLED_VALIDATION
             else (
-                "acceleration_limits_unavailable",
                 *(
                     ()
                     if require_occupancy
@@ -1032,6 +1157,9 @@ def preflight_linear_joint_motion(
     servoj_dt_s: float = 0.004,
     speed_scaling: float = 0.08,
     velocity_margin: float = 0.8,
+    maximum_joint_acceleration_rad_s2: tuple[
+        float, float, float, float, float, float
+    ] = (4.0, 4.0, 4.0, 4.0, 4.0, 4.0),
     execution_freshness_margin_s: float = 1.0,
     servoj_runtime_config: ServoJStreamConfig | None = None,
     accepted_joint_uncertainty_rad: tuple[float, float, float, float, float, float] = (
@@ -1070,6 +1198,7 @@ def preflight_linear_joint_motion(
         "servoj_dt_s": servoj_dt_s,
         "speed_scaling": speed_scaling,
         "velocity_margin": velocity_margin,
+        "maximum_joint_acceleration_rad_s2": maximum_joint_acceleration_rad_s2,
         "execution_freshness_margin_s": execution_freshness_margin_s,
         "servoj_runtime_config": servoj_runtime_config,
         "accepted_joint_uncertainty_rad": accepted_joint_uncertainty_rad,

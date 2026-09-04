@@ -300,6 +300,9 @@ def prepare_motion_envelope_commissioning_trial(
         servoj_dt_s=settings.motion_preflight.servoj_dt_s,
         speed_scaling=settings.motion_preflight.speed_scaling,
         velocity_margin=settings.motion_preflight.velocity_margin,
+        maximum_joint_acceleration_rad_s2=(
+            settings.motion_preflight.maximum_joint_acceleration_rad_s2
+        ),
     )
     collision = preflight.collision
     if (
@@ -345,6 +348,9 @@ def reverse_motion_envelope_commissioning_trial(
         servoj_dt_s=settings.motion_preflight.servoj_dt_s,
         speed_scaling=settings.motion_preflight.speed_scaling,
         velocity_margin=settings.motion_preflight.velocity_margin,
+        maximum_joint_acceleration_rad_s2=(
+            settings.motion_preflight.maximum_joint_acceleration_rad_s2
+        ),
     )
     collision = preflight.collision
     if (
@@ -574,6 +580,9 @@ def execute_motion_envelope_commissioning_trial(
             servoj_dt_s=settings.motion_preflight.servoj_dt_s,
             speed_scaling=settings.motion_preflight.speed_scaling,
             velocity_margin=settings.motion_preflight.velocity_margin,
+            maximum_joint_acceleration_rad_s2=(
+                settings.motion_preflight.maximum_joint_acceleration_rad_s2
+            ),
         )
         if (
             live_preflight.status is not MotionPreflightStatus.CLEAR

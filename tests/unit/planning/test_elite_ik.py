@@ -221,3 +221,27 @@ def test_holorobot_pinocchio_solver_reproduces_reachable_urdf_pose() -> None:
         target.matrix,
         atol=1e-3,
     )
+
+
+def test_holorobot_pinocchio_seed_sweep_retains_all_distinct_branches(
+    monkeypatch,
+) -> None:
+    pinocchio_model = PinocchioCs68Model.from_urdf(
+        Cs68ModelResources.packaged().urdf_path
+    )
+    solver = _HoloRobotPinocchioIkSolver(pinocchio_model)
+    seed = np.array([0.2, -1.1, 1.0, -0.8, 0.4, 0.15])
+    calls: list[np.ndarray] = []
+
+    def solve_from_every_seed(_target, controller_seed):
+        calls.append(controller_seed.copy())
+        return controller_seed.copy()
+
+    monkeypatch.setattr(solver, "_solve_single", solve_from_every_seed)
+
+    solutions = solver.solve_all(PoseSE3.identity("base", "flange"), seed)
+
+    assert len(calls) > 1
+    assert len(solutions) > 1
+    np.testing.assert_allclose(solutions[0], seed)
+    assert any(np.allclose(item, calls[1]) for item in solutions)
