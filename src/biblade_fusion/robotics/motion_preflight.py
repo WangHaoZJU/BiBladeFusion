@@ -1345,6 +1345,21 @@ def preflight_linear_joint_motion(
             diagnostics=fallback.diagnostics,
         )
 
+    # The concrete OMPL adapter anchors these values exactly.  Keep this
+    # boundary defensive so a malformed or third-party planner result becomes a
+    # typed rejected candidate instead of aborting the complete scan runtime.
+    if (
+        len(fallback.waypoints) < 2
+        or fallback.waypoints[0] != start
+        or fallback.waypoints[-1] != goal
+    ):
+        return _with_failed_fallback(
+            primary,
+            status=HoloRobotJointPlanStatus.PATH_BLOCKED,
+            reasons=("ompl_path_endpoint_contract_mismatch",),
+            diagnostics=fallback.diagnostics,
+        )
+
     verified = _preflight_joint_waypoints(
         start,
         goal,

@@ -112,6 +112,35 @@ def resample_joint_path(
     return tuple(result)
 
 
+def _anchor_ompl_solution_endpoints(
+    positions: tuple[tuple[float, ...], ...],
+    *,
+    start: tuple[float, ...],
+    goal: tuple[float, ...],
+) -> tuple[tuple[tuple[float, ...], ...], float, float]:
+    """Restore the exact authoritative endpoints after OMPL/simplifier roundoff.
+
+    OMPL stores states in its own floating representation and PathSimplifier may
+    return numerically equivalent endpoint values that are not tuple-identical to
+    the requested robot states.  The downstream preflight deliberately binds the
+    exact current/goal vectors, so anchor them before resampling.  Every resulting
+    segment is still checked in full by the caller.
+    """
+
+    if len(positions) < 2:
+        raise ValueError("OMPL solution requires at least start and goal")
+    start_drift = max(
+        abs(actual - expected)
+        for actual, expected in zip(positions[0], start, strict=True)
+    )
+    goal_drift = max(
+        abs(actual - expected)
+        for actual, expected in zip(positions[-1], goal, strict=True)
+    )
+    anchored = (start, *positions[1:-1], goal)
+    return anchored, start_drift, goal_drift
+
+
 _OmplValidityChecker: type[Any] | None = None
 
 
@@ -243,6 +272,9 @@ def plan_holorobot_rrtconnect(
         tuple(float(path.getState(index)[joint]) for joint in range(6))
         for index in range(path.getStateCount())
     )
+    raw, raw_start_drift_rad, raw_goal_drift_rad = (
+        _anchor_ompl_solution_endpoints(raw, start=start, goal=goal)
+    )
     waypoints = resample_joint_path(
         raw,
         maximum_joint_step_rad=config.maximum_joint_step_rad,
@@ -257,6 +289,9 @@ def plan_holorobot_rrtconnect(
             "simplify_path": config.simplify_path,
             "raw_waypoint_count": len(raw),
             "resampled_waypoint_count": len(waypoints),
+            "exact_endpoints_anchored": True,
+            "raw_start_drift_rad": raw_start_drift_rad,
+            "raw_goal_drift_rad": raw_goal_drift_rad,
             "elapsed_s": max(0.0, float(monotonic_clock()) - started),
         },
     )

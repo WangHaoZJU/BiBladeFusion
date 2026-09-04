@@ -326,6 +326,58 @@ def test_online_holorobot_preflight_does_not_send_unknown_state_to_ompl(
     assert report.diagnostics["fallback_reason"] == "not_an_interior_path_block"
 
 
+def test_online_holorobot_preflight_rejects_malformed_fallback_without_raising(
+    checker,
+    occupancy_checker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_check = checker.check
+
+    def corridor_check(configuration):
+        result = original_check(configuration)
+        joint_0 = float(np.asarray(configuration, dtype=np.float64)[0])
+        if 0.035 <= joint_0 <= 0.075:
+            return replace(
+                result,
+                status=CollisionCheckStatus.BLOCKED,
+                blocking_reasons=("synthetic_joint_corridor",),
+            )
+        return result
+
+    def malformed_rrtconnect(start, goal, **_kwargs):
+        return HoloRobotJointPlan(
+            HoloRobotJointPlanStatus.CLEAR,
+            waypoints=(
+                tuple(value + 1e-12 for value in start),
+                goal,
+            ),
+            diagnostics={"planner": "malformed_rrtconnect"},
+        )
+
+    monkeypatch.setattr(checker, "check", corridor_check)
+    monkeypatch.setattr(motion_preflight_module, "ompl_available", lambda: True)
+    monkeypatch.setattr(
+        motion_preflight_module,
+        "plan_holorobot_rrtconnect",
+        malformed_rrtconnect,
+    )
+
+    report = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        (0.1, 0.0, 0.0, 0.0, 0.0, 0.0),
+        collision_checker=checker,
+        occupancy_checker=occupancy_checker,
+        maximum_joint_step_rad=0.02,
+        path_validation_mode=HOLOROBOT_SAMPLED_VALIDATION,
+        enable_ompl_fallback=True,
+    )
+
+    assert report.status is MotionPreflightStatus.BLOCKED
+    assert "ompl_fallback:ompl_path_endpoint_contract_mismatch" in (
+        report.blocking_reasons
+    )
+
+
 def test_folded_goal_is_blocked_before_trajectory_generation(checker) -> None:
     report = preflight_linear_joint_motion(
         (0.0,) * 6,
