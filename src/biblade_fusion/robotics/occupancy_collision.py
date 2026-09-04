@@ -407,6 +407,7 @@ class BoundOccupancyConfigurationQuery:
                 self.evidence,
                 joint_positions_rad,
                 required_freshness_horizon_s=self.required_freshness_horizon_s,
+                stop_on_first_block=True,
             )
         except (OccupancyEvidenceError, TypeError, ValueError, RuntimeError) as exc:
             return self.checker._unknown_result(
@@ -1132,6 +1133,7 @@ class OccupancyRobotCollisionChecker:
                     evidence,
                     configuration,
                     required_freshness_horizon_s=required_freshness_horizon_s,
+                    stop_on_first_block=True,
                 )
             except (OccupancyEvidenceError, TypeError, ValueError, RuntimeError) as exc:
                 result = self._unknown_result(
@@ -1225,6 +1227,7 @@ class OccupancyRobotCollisionChecker:
         joint_positions_rad: Sequence[float],
         *,
         required_freshness_horizon_s: float,
+        stop_on_first_block: bool = False,
     ) -> OccupancyCollisionCheckResult:
         geometries = self._robot_collision_geometries(joint_positions_rad)
         reasons: list[str] = []
@@ -1274,11 +1277,18 @@ class OccupancyRobotCollisionChecker:
                     f"{placed.geometry_name}:{state}"
                 )
             reasons.append(reason)
+            # Match HoloRobot's online state/path behavior: one unsafe robot
+            # geometry is already a complete veto.  Evaluating all remaining
+            # STLs only enriches diagnostics and made a known-invalid eiai goal
+            # spend 20.94 seconds in one occupancy call.  Standalone diagnostic
+            # queries keep the all-geometry default.
+            if stop_on_first_block:
+                break
         return OccupancyCollisionCheckResult(
             status=(CollisionCheckStatus.BLOCKED if reasons else CollisionCheckStatus.CLEAR),
             blocking_reasons=tuple(reasons),
             evidence=evidence,
-            checked_geometry_count=len(geometries),
+            checked_geometry_count=len(query_diagnostics),
             diagnostics={
                 "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
                 "occupancy_policy_contract_hash": self.policy_contract_hash,
@@ -1289,6 +1299,7 @@ class OccupancyRobotCollisionChecker:
                 "robot_geometry": "original_urdf_collision_stl",
                 "additional_clearance_m": self.additional_clearance_m,
                 "required_freshness_horizon_s": required_freshness_horizon_s,
+                "fail_fast": bool(stop_on_first_block),
                 "continuous_swept_volume_verified": False,
                 "semantic_attestation_valid": evidence.semantic_attestation_valid,
                 "semantic_attestation_hash": evidence.semantic_attestation_hash,

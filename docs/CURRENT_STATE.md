@@ -88,20 +88,18 @@ Five accepted-static-free AABBs cover the workspace before/after the target in `
 the negative/positive `y` sides of the target column, and above the target envelope.
 They do not override OCCUPIED voxels.
 
-### 2.3 Previous motion envelope; new binding required
+### 2.3 Current motion envelope
 
 ```text
-path: data/acceptance/es68_d435i_motion_envelope_002
-id:   39b675eca06390f8b99a1a18b0b3743e084c42df2c821ed67d0901d4c231a240
-metadata SHA-256: 8655a35a4c450be96ae563e3b832063a8a7468b62aab087aee6c6c887580af2f
+path: data/acceptance/es68_d435i_motion_envelope_003
+id:   262bce5520f9c916c5ad260247e365e9fde62976d8f050dc3d1bb9295348f814
+metadata SHA-256: 4743a08df49b3e844852d6afe83109829f7ae648d01472bb8cb30ae4af17e272
 ```
 
-The eiai configuration parser confirmed both path and ID against the preceding
-velocity-only ServoJ control contract. D025 adds the reviewed HoloRobot acceleration
-limits to command time parameterization and therefore intentionally changes the immutable
-motion-control hash. `_002` is historical evidence and must not be rebound silently. After
-pulling D025, record or commission a new motion-envelope acceptance and put its new path
-and ID in `configs/local.yaml` before expecting `scan doctor` to pass.
+The operator recorded `_003` after D025 added the reviewed HoloRobot acceleration limits
+to command time parameterization. `configs/local.yaml` was updated with this path and ID,
+and the subsequent eiai `scan doctor` passed the motion/collision contract. `_002` remains
+historical evidence and must not be rebound as current.
 
 ### 2.4 Runtime configuration facts last confirmed
 
@@ -336,20 +334,43 @@ three. Replaying the four untried front-fin paths found two clear paths in `2.05
 the already-bounded selector queue is no longer truncated. This correction is not yet
 physically verified.
 
+The 2026-09-04 15:44 physical attempt
+`planning-test-20260904-154403` ran main commit `c9f141e`. No robot motion occurred. It
+reused the unchanged first-view ROI, completed perception, and reached the HoloRobot
+single-arm planning path. Exact persisted timing evidence separates the 38.41-second
+operator wait as follows:
+
+```text
+next-view selection and current-stop IK rebind: 10.658 s
+candidate 1 mesh path check:                 4.081 s
+candidate 1 occupancy path check:           20.938 s
+candidate 2 failure before collision:        0.032 s
+RRTConnect calls:                                 0
+```
+
+Candidate 1 was rejected at its occupancy goal with UNKNOWN/occupied robot-link results,
+but the goal query evaluated all remaining STLs after the first blocker. Candidate 2 then
+hit `ValueError: motion planning waypoints must preserve exact start and goal`. Replaying
+the recorded current state and candidate vector reproduced the cause: interpolation
+changed two goal components by `1.11e-16 rad`. D026 preserves exact endpoint tuples at
+every interpolation boundary and makes bound online occupancy queries stop on their first
+blocking geometry. This is code-verified; the timing improvement and first physical motion
+remain unverified.
+
 ## 7. Required next action and regression result
 
-The next action is one fresh eiai physical validation after pulling D025, explicitly
-configuring the six ES68 acceleration limits, replacing the now-stale `_002`
-motion-envelope binding with a newly recorded or commissioned acceptance, installing the
-optional pinned OMPL wheel, and passing `scan doctor`. Use the runbook and a new `run_id`;
-do not change placement, static-free evidence, or safety geometry before this test.
-After the approval token, verify one reverse connection, one complete viewpoint motion,
+The next action is one fresh eiai physical validation after pulling the D026 endpoint and
+fail-fast correction. The existing `_003` motion envelope remains the current binding;
+D026 changes neither ServoJ limits nor collision thresholds. Use the runbook and a new
+`run_id`; because the 15:44 attempt caused no motion and the operator reported no scene
+change, its first-view ROI may be reused only while that remains physically true. After
+the approval token, verify one reverse connection, one complete viewpoint motion,
 endpoint settle, `writeIdle`, sampled stationary pose, and transition to the next capture.
 
 Current status is:
 
 ```text
-offline/code regression: complete for D025
+offline/code regression: complete for D026
 real-data view planning: complete (0.78 s)
 full physical single-view-to-motion workflow: hardware verification pending
 ```
@@ -357,8 +378,8 @@ full physical single-view-to-motion workflow: hardware verification pending
 Using the main source tree with the available local test environment:
 
 ```text
-full suite: 1241 passed, 3 skipped in 101.60 s
-IK/motion/perception/runtime/doctor focus: 128 passed
+full suite: 1248 passed, 3 skipped in 101.41 s
+D026 endpoint/occupancy focus: 51 passed
 real OMPL binding probe: clear detour, maximum resampled step below 0.02 rad
 ruff: all checks passed
 ```

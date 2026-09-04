@@ -107,8 +107,13 @@ def resample_joint_path(
                 begin + sample_index / subdivisions * (end - begin)
                 for begin, end in zip(start, goal, strict=True)
             )
-            for sample_index in range(1, subdivisions + 1)
+            for sample_index in range(1, subdivisions)
         )
+        # Keep the authoritative OMPL knot object itself.  Recomputing it as
+        # ``start + 1.0 * (goal - start)`` is only numerically equivalent and
+        # can differ by one ULP, which violates the downstream hash-bound
+        # start/goal identity contract.
+        result.append(goal)
     return tuple(result)
 
 

@@ -215,6 +215,36 @@ def test_occupied_and_unknown_voxels_block(
     assert any(item.startswith(reason) for item in result.blocking_reasons)
 
 
+def test_sampled_online_path_stops_after_first_blocking_robot_geometry(
+    checker,
+    occupancy_snapshot,
+) -> None:
+    snapshot = replace(
+        occupancy_snapshot,
+        free_indices=frozenset(),
+        free_observation_counts=(),
+        occupied_indices=frozenset({(0, 0, 0)}),
+        content_hash="",
+    )
+    occupancy = _checker(checker, snapshot)
+
+    diagnostic = occupancy.check((0.0,) * 6)
+    sampled = occupancy.check_sampled_configurations(
+        ((0.0,) * 6,),
+        (1.0,),
+        maximum_joint_step_rad=0.02,
+        precheck_last_configuration=True,
+    )
+
+    assert diagnostic.status is CollisionCheckStatus.BLOCKED
+    assert diagnostic.checked_geometry_count == 7
+    assert len(diagnostic.blocking_reasons) > 1
+    assert sampled.status is CollisionCheckStatus.BLOCKED
+    assert sampled.result.checked_geometry_count == 1
+    assert len(sampled.result.blocking_reasons) == 1
+    assert sampled.result.diagnostics["fail_fast"] is True
+
+
 @pytest.mark.parametrize("map_state", [OccupancyMapState.MAPPING, OccupancyMapState.STALE])
 def test_non_ready_snapshot_fails_closed(
     checker, occupancy_snapshot, map_state

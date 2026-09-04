@@ -22,6 +22,34 @@ def test_resample_joint_path_bounds_every_joint_step() -> None:
     assert np.max(np.abs(np.diff(np.asarray(path), axis=0))) <= 0.02 + 1e-12
 
 
+def test_resample_joint_path_preserves_non_roundtrip_endpoints_exactly() -> None:
+    # Exact current/second-candidate values from eiai run 20260904-154403.
+    start = (
+        3.730406882746599,
+        -1.9797451813057478,
+        2.0486613457022487,
+        -2.1954989556796836,
+        -2.3957606731844585,
+        0.04446818819510244,
+    )
+    goal = (
+        2.222969603714759,
+        -0.6791357028298824,
+        0.6931105273199415,
+        -0.32997941109973894,
+        -0.7822934511109221,
+        -2.3323404458280432,
+    )
+
+    path = resample_joint_path(
+        (start, goal),
+        maximum_joint_step_rad=0.02,
+    )
+
+    assert path[0] == start
+    assert path[-1] == goal
+
+
 def test_ompl_solution_endpoints_are_reanchored_to_exact_robot_targets() -> None:
     start = (0.1, -0.2, 0.3, -0.4, 0.5, -0.6)
     goal = (0.7, -0.8, 0.9, -1.0, 1.1, -1.2)

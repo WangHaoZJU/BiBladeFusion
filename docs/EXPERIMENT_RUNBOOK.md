@@ -243,6 +243,16 @@ bootstrap_motion_ready/map_ready
   -> next capture
 ```
 
+Straight and OMPL interpolation retain the exact current-state and selected-IK tuples at
+their boundaries. They never recreate a boundary with floating-point arithmetic. This is
+required by the waypoint/hash identity check and prevents the one-ULP endpoint failure
+observed in `planning-test-20260904-154403`.
+
+Bound online occupancy checks stop at the first blocking robot STL, matching HoloRobot's
+fail-fast motion contract. A standalone diagnostic pose query may still enumerate all
+blocking links. The difference is diagnostic completeness only: either result is a hard
+motion veto, and no threshold or UNKNOWN policy changes.
+
 The planning line must be followed by either `waiting_approval` or a typed candidate
 rejection; it no longer starts a recursive six-dimensional certificate. The active checks
 still use original URDF/STL robot geometry and conservative occupancy. `sampled` does not

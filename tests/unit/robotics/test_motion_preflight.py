@@ -24,6 +24,9 @@ from biblade_fusion.robotics.holorobot_joint_planner import (
 )
 from biblade_fusion.robotics.motion_preflight import (
     HOLOROBOT_SAMPLED_VALIDATION,
+    _holorobot_sampled_configurations,
+    _linear_waypoints,
+    _time_parameterized_servoj_stream,
     validate_preflight_servoj_contract,
 )
 
@@ -34,6 +37,58 @@ class _SyntheticSweptEs68Checker(Es68PinocchioCollisionChecker):
             super().check_path(*args, **kwargs),
             continuous_swept_volume_verified=True,
         )
+
+
+def test_linear_waypoints_preserve_non_roundtrip_endpoints_exactly() -> None:
+    # Exact current/second-candidate values from eiai run 20260904-154403.
+    start = (
+        3.730406882746599,
+        -1.9797451813057478,
+        2.0486613457022487,
+        -2.1954989556796836,
+        -2.3957606731844585,
+        0.04446818819510244,
+    )
+    goal = (
+        2.222969603714759,
+        -0.6791357028298824,
+        0.6931105273199415,
+        -0.32997941109973894,
+        -0.7822934511109221,
+        -2.3323404458280432,
+    )
+
+    waypoints = _linear_waypoints(
+        start,
+        goal,
+        maximum_joint_step_rad=0.02,
+    )
+
+    assert waypoints[0] is start
+    assert waypoints[-1] is goal
+    assert waypoints[0] == start
+    assert waypoints[-1] == goal
+
+
+def test_sampling_and_servoj_preserve_non_roundtrip_goal_exactly() -> None:
+    start = (-2.9, 0.0, 0.0, 0.0, 0.0, 0.0)
+    goal = (-0.9, 0.0, 0.0, 0.0, 0.0, 0.0)
+    waypoints = (start, goal)
+
+    sampled = _holorobot_sampled_configurations(waypoints)
+    timing = _time_parameterized_servoj_stream(
+        waypoints,
+        maximum_velocity_rad_s=(1.0,) * 6,
+        maximum_acceleration_rad_s2=(4.0,) * 6,
+        dt_s=0.004,
+        speed_scaling=0.08,
+        velocity_margin=0.8,
+    )
+
+    assert sampled[0][0] == start
+    assert sampled[-1][0] == goal
+    assert timing.stream.commands[0] == start
+    assert timing.stream.commands[-1] == goal
 
 
 @pytest.fixture(scope="module")

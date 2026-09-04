@@ -405,3 +405,28 @@ read-only sampler shares EliteArm's persistent, locked RTSI state source and is 
 immediately after the camera bracket. Stationarity validation remains strict over exposure,
 while later inference, ray integration, and disk persistence are outside that physical
 window. This removes a non-physical failure mode without weakening capture stability.
+
+## D026 — Preserve authoritative endpoints and fail fast within online occupancy queries
+
+Date: 2026-09-04
+
+Status: accepted; exact eiai failure reproduced, code verified, physical verification pending
+
+The `planning-test-20260904-154403` run used `c9f141e`. Its first rejected candidate
+spent 4.08 seconds in mesh checking and 20.94 seconds in occupancy checking even though
+the prechecked goal pose was already unsafe. The occupancy result continued evaluating
+all remaining robot STLs after the first blocking link, producing six diagnostic reasons.
+HoloRobot's online collision contract stops on the first unsafe geometry because one is
+already a complete motion veto. Bound online state/path queries now do the same; standalone
+diagnostic pose checks still inspect every geometry. No occupancy classification,
+clearance, UNKNOWN policy, map binding, or robot STL is changed.
+
+The following candidate then failed before collision checking because path interpolation
+recomputed its exact goal as `start + 1.0 * (goal - start)`. For the recorded eiai joint
+vectors, two components changed by one ULP (`1.11e-16 rad`). That is physically zero but
+violates BiBladeFusion's exact waypoint/hash identity contract. Both straight and OMPL
+resampling now keep the authoritative start, intermediate OMPL knots, and goal tuples
+verbatim; arithmetic interpolation is used only for interior samples. Sampled collision
+poses and ServoJ segment endpoints follow the same rule. This is the necessary adaptation
+around HoloRobot's interpolation helper because HoloRobot does not impose BiBladeFusion's
+strict tuple/hash boundary.

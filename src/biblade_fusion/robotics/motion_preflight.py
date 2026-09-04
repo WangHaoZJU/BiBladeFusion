@@ -176,7 +176,7 @@ def _holorobot_sampled_configurations(
             abs(end - begin) for begin, end in zip(start, goal, strict=True)
         )
         subdivisions = max(1, math.ceil(maximum_delta / sample_step))
-        for sample_index in range(1, subdivisions + 1):
+        for sample_index in range(1, subdivisions):
             alpha = sample_index / subdivisions
             configuration = tuple(
                 begin + alpha * (end - begin)
@@ -184,6 +184,7 @@ def _holorobot_sampled_configurations(
             )
             fraction = (segment_index + alpha) / segment_count
             result.append((configuration, fraction))
+        result.append((goal, (segment_index + 1) / segment_count))
     return tuple(result)
 
 
@@ -285,12 +286,16 @@ def _linear_waypoints(
         raise ValueError("maximum_joint_step_rad must be finite and positive")
     maximum_delta = max(abs(end - begin) for begin, end in zip(start, goal, strict=True))
     segments = max(1, math.ceil(maximum_delta / maximum_joint_step_rad))
-    return tuple(
+    interior = tuple(
         tuple(
             begin + index / segments * (end - begin) for begin, end in zip(start, goal, strict=True)
         )
-        for index in range(segments + 1)
+        for index in range(1, segments)
     )
+    # Preserve the exact current-state and selected-IK tuples.  Computing the
+    # boundaries through interpolation can change a component by one ULP and
+    # make a valid path fail the identity/hash contract before motion.
+    return (start, *interior, goal)
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,8 +410,9 @@ def _time_parameterized_servoj_stream(
                 begin + sample / count * (end - begin)
                 for begin, end in zip(start, goal, strict=True)
             )
-            for sample in range(1, count + 1)
+            for sample in range(1, count)
         )
+        commands.append(goal)
     stream = ServoJStream(commands=tuple(commands), dt_s=dt_s)
     stream.validate()
     return _TimeParameterizedServoJ(
