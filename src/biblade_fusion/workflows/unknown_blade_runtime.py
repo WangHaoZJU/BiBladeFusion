@@ -2536,6 +2536,11 @@ def run_unknown_blade_operator_console(
                 output_fn("Token mismatch; motion was not requested.")
             continue
         if status.disposition is ExperimentDisposition.READY:
+            if status.phase in {"bootstrap_motion_ready", "map_ready"}:
+                output_fn(
+                    "Planning next view with HoloRobot single-arm sampling "
+                    "(ranked candidates are bounded; collision checks fail fast)..."
+                )
             runtime.advance_to_attention()
             continue
         output_fn("Runtime reached an unsupported attention state and stopped fail-closed.")

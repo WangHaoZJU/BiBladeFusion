@@ -22,6 +22,7 @@ from biblade_fusion.robotics import (
     load_es68_flange_t_tcp,
     preflight_linear_joint_motion,
 )
+from biblade_fusion.robotics.motion_preflight import CONTINUOUS_INTERVAL_VALIDATION
 from biblade_fusion.workflows.path_validation import PathSequenceError
 
 
@@ -342,6 +343,7 @@ def preflight_live_joint_segment(
     ),
     motion_envelope_acceptance_id: str | None = None,
     motion_envelope_metadata_sha256: str | None = None,
+    path_validation_mode: str = CONTINUOUS_INTERVAL_VALIDATION,
 ) -> LiveJointSegmentPreflight:
     """Preflight exactly one receding-horizon segment from measured live joints.
 
@@ -374,6 +376,7 @@ def preflight_live_joint_segment(
         accepted_joint_uncertainty_rad=accepted_joint_uncertainty_rad,
         motion_envelope_acceptance_id=motion_envelope_acceptance_id,
         motion_envelope_metadata_sha256=motion_envelope_metadata_sha256,
+        path_validation_mode=path_validation_mode,
     )
     endpoint = None
     if final_target:

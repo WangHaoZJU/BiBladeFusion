@@ -71,6 +71,9 @@ Required before proceeding:
 
 - Elite SDK, FoundationStereo dependencies, CUDA, CUDA DDA, collision backends,
   calibration, static-free acceptance, and coarse-to-fine policy pass.
+- `supervised_scan_holorobot_single_arm` must report the fixed-step sampled online
+  contract. Offline continuous-proof capability may still appear in JSON details, but it
+  is not executed by the online NBV loop.
 - xFormers and FlashAttention warnings are optional acceleration warnings.
 - `Motion authorized: no; hardware acceptance is a separate gate` is an informational
   release statement in experimental mode; it is not itself the runtime failure.
@@ -180,10 +183,13 @@ systemd-run` receives the command. A missing or empty value must be treated as a
 The normal transition is:
 
 ```text
-bootstrap_motion_ready
+bootstrap_motion_ready/map_ready
+  -> "Planning next view with HoloRobot single-arm sampling ..."
+  -> at most 3 science-ranked candidates on the current eiai configuration
+  -> fixed joint-step interpolation, 5 samples per segment, first collision exits
   -> waiting_approval
   -> exact EXECUTE token entered
-  -> permit consumed, then permit-bound power/brake preparation and one path revalidation
+  -> permit consumed, then permit-bound power/brake preparation
   -> one reverse-control session opened at approved resume
   -> one ServoJ segment
   -> final approved endpoint held until RTSI joint feedback converges
@@ -191,11 +197,18 @@ bootstrap_motion_ready
   -> next capture
 ```
 
+The planning line must be followed by either `waiting_approval` or a typed candidate
+rejection; it no longer starts a recursive six-dimensional certificate. The active checks
+still use original URDF/STL robot geometry and conservative occupancy. `sampled` does not
+mean collision checking is disabled.
+
 Paste the entire exact token, including `EXECUTE`, once. After Enter, a short preparation
-interval is expected while the driver connects, controller state is established, and the
-bound path is checked once. Permit lifetime is checked when the token is consumed; elapsed
-enable/recovery time cannot retroactively expire an already consumed permit. A separately
-configured measured segment-duration watchdog may still stop a genuinely overlong move.
+interval is expected while the driver connects and controller state is established. The
+full already-bound path is not proved again; only a changed live-start bridge is checked in
+the same HoloRobot sampled mode. Permit lifetime is checked when the token is consumed;
+elapsed enable/recovery time cannot retroactively expire an already consumed permit. A
+separately configured measured segment-duration watchdog may still stop a genuinely
+overlong move.
 
 Keep a hand on the physical emergency stop. Abort on unexpected physical motion, cable
 pull, loss of visibility, or approach to the blade/fixture that disagrees with the

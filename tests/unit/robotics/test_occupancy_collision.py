@@ -53,7 +53,7 @@ def test_original_robot_stls_clear_on_known_free_map(
     assert result.checked_sphere_count == 7
     assert len(result.diagnostics["queries"]) == 7
     assert result.diagnostics["backend"] == (
-        "hppfcl_original_stl_vs_occupancy_voxel_boxes"
+        "hppfcl_original_stl_vs_exact_voxel_run_union"
     )
     assert all(
         item["geometry_representation"] == "original_urdf_collision_stl"

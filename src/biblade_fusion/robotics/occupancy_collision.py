@@ -705,10 +705,11 @@ def occupancy_evidence_from_snapshot(
 class OccupancyRobotCollisionChecker:
     """Query original URDF collision STLs against immutable occupancy voxels.
 
-    HPP-FCL measures each moving collision geometry directly against dangerous
-    voxel boxes.  Local AABBs are used only as a broad-phase enumeration bound;
-    they never decide collision.  The fixed base geometry is excluded because its
-    designed support contact cannot change during a robot motion segment.
+    HPP-FCL measures each moving collision geometry against exact unions of
+    dangerous voxel cells.  Adjacent same-state cells may be represented as one
+    axis-aligned run box; the robot remains its original STL and AABBs never decide
+    collision.  Fixed base geometry is excluded because its designed support
+    contact cannot change during a robot motion segment.
     """
 
     robot_checker: Cs68PinocchioCollisionChecker
@@ -734,6 +735,16 @@ class OccupancyRobotCollisionChecker:
     motion_envelope_acceptance_id: str | None = None
     motion_envelope_metadata_sha256: str | None = None
     utc_clock: Callable[[], datetime] = field(default=lambda: datetime.now(UTC), repr=False)
+    _voxel_classification_content_hash: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _voxel_classification: np.ndarray | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.maximum_map_age_s is not None and (
@@ -858,9 +869,9 @@ class OccupancyRobotCollisionChecker:
         """Identity of every occupancy-query rule relevant to motion safety."""
 
         payload = {
-            "schema": "biblade_fusion.occupancy_robot_collision_policy.v7",
-            "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
-            "path_semantic": "adaptive_exact_stl_voxel_distance_sweep",
+            "schema": "biblade_fusion.occupancy_robot_collision_policy.v8",
+            "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
+            "path_semantic": "sampled_or_offline_continuous_original_stl_clearance",
             "continuous_swept_volume_supported": (self.continuous_swept_volume_supported),
             "robot_geometry_hash": self.verified_robot_geometry_hash,
             "robot_motion_bound_contract_sha256": (
@@ -1048,7 +1059,7 @@ class OccupancyRobotCollisionChecker:
                 evidence=evidence,
                 checked_geometry_count=len(geometries),
                 diagnostics={
-                    "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
+                    "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
                     "occupancy_policy_contract_hash": self.policy_contract_hash,
                     "robot_motion_bound_contract_sha256": (
                         self.robot_checker.geometry_motion_bound_contract_sha256
@@ -1071,7 +1082,7 @@ class OccupancyRobotCollisionChecker:
                 evidence=None,
                 checked_geometry_count=0,
                 diagnostics={
-                    "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
+                    "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
                     "occupancy_policy_contract_hash": self.policy_contract_hash,
                     "unknown_policy": "conservative",
                     "continuous_swept_volume_verified": False,
@@ -1085,7 +1096,7 @@ class OccupancyRobotCollisionChecker:
                 evidence=None,
                 checked_geometry_count=0,
                 diagnostics={
-                    "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
+                    "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
                     "occupancy_policy_contract_hash": self.policy_contract_hash,
                     "unknown_policy": "conservative",
                     "continuous_swept_volume_verified": False,
@@ -1160,7 +1171,7 @@ class OccupancyRobotCollisionChecker:
                 evidence=None,
                 checked_geometry_count=0,
                 diagnostics={
-                    "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
+                    "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
                     "occupancy_policy_contract_hash": self.policy_contract_hash,
                     "continuous_swept_volume_verified": False,
                     "motion_authorized": False,
@@ -1296,7 +1307,7 @@ class OccupancyRobotCollisionChecker:
                 evidence=bound_evidence,
                 checked_geometry_count=checked_geometries,
                 diagnostics={
-                    "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
+                    "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
                     "occupancy_policy_contract_hash": self.policy_contract_hash,
                     "robot_motion_bound_contract_sha256": motion_bound_hash,
                     "path_semantic": evidence.method,
@@ -1422,7 +1433,7 @@ class OccupancyRobotCollisionChecker:
             evidence=bound_evidence,
             checked_geometry_count=checked_geometries,
             diagnostics={
-                "backend": "hppfcl_original_stl_vs_occupancy_voxel_boxes",
+                "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
                 "occupancy_policy_contract_hash": self.policy_contract_hash,
                 "robot_motion_bound_contract_sha256": motion_bound_hash,
                 "unknown_policy": "conservative",
@@ -1513,7 +1524,13 @@ class OccupancyRobotCollisionChecker:
         *,
         required_distance_m: float,
     ) -> _RobotGeometryVoxelQuery:
-        """Measure the original collision STL against every potentially dangerous voxel."""
+        """Measure the original STL against exact unions of dangerous voxel runs.
+
+        Adjacent voxels with the same conservative state are merged only along X.
+        The resulting boxes cover exactly the same occupied/unknown volume, so this
+        removes per-voxel FCL calls without replacing the robot by a sphere or
+        weakening UNKNOWN-as-blocked semantics.
+        """
 
         try:
             import hppfcl
@@ -1534,7 +1551,6 @@ class OccupancyRobotCollisionChecker:
         ) + margin
         lower = np.floor((broadphase_minimum - origin) / voxel_size).astype(np.int64) - 1
         upper = np.floor((broadphase_maximum - origin) / voxel_size).astype(np.int64) + 1
-        voxel_geometry = hppfcl.Box(voxel_size, voxel_size, voxel_size)
         distance_request = hppfcl.DistanceRequest()
         occupied = 0
         unknown = 0
@@ -1547,59 +1563,171 @@ class OccupancyRobotCollisionChecker:
         minimum_dangerous_distance = math.inf
         blocking_voxel: tuple[int, int, int] | None = None
         tolerance = 1e-9
-        for index_value in np.ndindex(
-            *(int(upper[axis] - lower[axis] + 1) for axis in range(3))
-        ):
-            index = tuple(
-                int(lower[axis] + index_value[axis]) for axis in range(3)
+        # 0=in-grid UNKNOWN, 1=FREE, 2=OCCUPIED, 3=accepted UNKNOWN,
+        # 4=out-of-grid UNKNOWN.  Keeping 0 and 4 distinct preserves diagnostics
+        # and prevents run merging across the workspace boundary.
+        local_shape = tuple(int(upper[axis] - lower[axis] + 1) for axis in range(3))
+        local = np.full(local_shape, 4, dtype=np.uint8)
+        grid = self._classification_grid(snapshot)
+        clipped_lower = np.maximum(lower, 0)
+        clipped_upper = np.minimum(upper, np.asarray(snapshot.grid_shape) - 1)
+        if np.all(clipped_lower <= clipped_upper):
+            source_slices = tuple(
+                slice(int(clipped_lower[axis]), int(clipped_upper[axis]) + 1)
+                for axis in range(3)
             )
-            state = _enum_value(snapshot.state_at_index(index))
-            if state == OccupancyQueryState.FREE.value:
-                free += 1
-                continue
-            accepted = state == OccupancyQueryState.UNKNOWN.value and any(
-                region.contains_voxel(snapshot, index)
-                for region in self.accepted_static_free_aabbs
-            )
-            if accepted:
-                accepted_unknown += 1
-                continue
-            center = origin + (np.asarray(index, dtype=np.float64) + 0.5) * voxel_size
-            voxel_transform = hppfcl.Transform3f(np.eye(3), center)
-            distance_result = hppfcl.DistanceResult()
-            distance = float(
-                hppfcl.distance(
-                    placed.collision_geometry,
-                    placed.transform_base,
-                    voxel_geometry,
-                    voxel_transform,
-                    distance_request,
-                    distance_result,
+            target_slices = tuple(
+                slice(
+                    int(clipped_lower[axis] - lower[axis]),
+                    int(clipped_upper[axis] - lower[axis]) + 1,
                 )
+                for axis in range(3)
             )
-            distance_queries += 1
-            if not math.isfinite(distance):
-                raise ValueError(
-                    f"non-finite STL-to-voxel distance for {placed.geometry_name}"
-                )
-            if distance < -1e100:
-                # BVH/primitive penetration may use the lowest representable
-                # double as a collision sentinel rather than a signed depth.
-                distance = 0.0
-            minimum_dangerous_distance = min(minimum_dangerous_distance, distance)
-            if distance > margin + tolerance:
-                separated_dangerous += 1
+            local[target_slices] = grid[source_slices]
+        tolerance = max(1e-12, voxel_size * 1e-9)
+        for region in self.accepted_static_free_aabbs:
+            region_lower = np.asarray(
+                [
+                    math.ceil(
+                        (region.minimum_m[axis] - tolerance - origin[axis])
+                        / voxel_size
+                    )
+                    for axis in range(3)
+                ],
+                dtype=np.int64,
+            )
+            region_upper = np.asarray(
+                [
+                    math.floor(
+                        (region.maximum_m[axis] + tolerance - origin[axis])
+                        / voxel_size
+                        - 1.0
+                    )
+                    for axis in range(3)
+                ],
+                dtype=np.int64,
+            )
+            accepted_lower = np.maximum(lower, region_lower)
+            accepted_upper = np.minimum(upper, region_upper)
+            if np.any(accepted_lower > accepted_upper):
                 continue
-            if state == OccupancyQueryState.OCCUPIED.value:
-                occupied += 1
-            else:
-                unknown += 1
-                if snapshot.index_in_bounds(index):
-                    outside_acceptance_unknown += 1
-                else:
-                    outside_grid_unknown += 1
-            if blocking_voxel is None:
-                blocking_voxel = index
+            accepted_slices = tuple(
+                slice(
+                    int(accepted_lower[axis] - lower[axis]),
+                    int(accepted_upper[axis] - lower[axis]) + 1,
+                )
+                for axis in range(3)
+            )
+            accepted_view = local[accepted_slices]
+            accepted_view[(accepted_view == 0) | (accepted_view == 4)] = 3
+
+        free = int(np.count_nonzero(local == 1))
+        accepted_unknown = int(np.count_nonzero(local == 3))
+        for local_y in range(local_shape[1]):
+            for local_z in range(local_shape[2]):
+                row = local[:, local_y, local_z]
+                local_x = 0
+                while local_x < local_shape[0]:
+                    category = int(row[local_x])
+                    if category in {1, 3}:
+                        local_x += 1
+                        continue
+                    run_start = local_x
+                    local_x += 1
+                    while local_x < local_shape[0] and int(row[local_x]) == category:
+                        local_x += 1
+                    run_length = local_x - run_start
+                    first_index = np.asarray(
+                        (
+                            int(lower[0] + run_start),
+                            int(lower[1] + local_y),
+                            int(lower[2] + local_z),
+                        ),
+                        dtype=np.int64,
+                    )
+                    dimensions = np.asarray(
+                        (run_length * voxel_size, voxel_size, voxel_size),
+                        dtype=np.float64,
+                    )
+                    center = origin + first_index * voxel_size + dimensions / 2.0
+                    voxel_geometry = hppfcl.Box(*dimensions)
+                    voxel_transform = hppfcl.Transform3f(np.eye(3), center)
+                    distance_result = hppfcl.DistanceResult()
+                    distance = float(
+                        hppfcl.distance(
+                            placed.collision_geometry,
+                            placed.transform_base,
+                            voxel_geometry,
+                            voxel_transform,
+                            distance_request,
+                            distance_result,
+                        )
+                    )
+                    distance_queries += 1
+                    if not math.isfinite(distance):
+                        raise ValueError(
+                            f"non-finite STL-to-voxel-run distance for {placed.geometry_name}"
+                        )
+                    if distance < -1e100:
+                        distance = 0.0
+                    minimum_dangerous_distance = min(
+                        minimum_dangerous_distance,
+                        distance,
+                    )
+                    if distance > margin + tolerance:
+                        separated_dangerous += run_length
+                        continue
+                    # A merged run proves clear with one distance call.  If it is
+                    # close, refine only that rare run to retain exact diagnostic
+                    # voxel counts and the true first blocking voxel.
+                    for run_offset in range(run_length):
+                        index_array = first_index + np.asarray(
+                            (run_offset, 0, 0),
+                            dtype=np.int64,
+                        )
+                        if run_length == 1:
+                            voxel_distance = distance
+                        else:
+                            voxel_center = origin + (
+                                index_array.astype(np.float64) + 0.5
+                            ) * voxel_size
+                            voxel_result = hppfcl.DistanceResult()
+                            voxel_distance = float(
+                                hppfcl.distance(
+                                    placed.collision_geometry,
+                                    placed.transform_base,
+                                    hppfcl.Box(voxel_size, voxel_size, voxel_size),
+                                    hppfcl.Transform3f(np.eye(3), voxel_center),
+                                    distance_request,
+                                    voxel_result,
+                                )
+                            )
+                            distance_queries += 1
+                            if voxel_distance < -1e100:
+                                voxel_distance = 0.0
+                            if not math.isfinite(voxel_distance):
+                                raise ValueError(
+                                    "non-finite STL-to-voxel distance for "
+                                    f"{placed.geometry_name}"
+                                )
+                            minimum_dangerous_distance = min(
+                                minimum_dangerous_distance,
+                                voxel_distance,
+                            )
+                        if voxel_distance > margin + tolerance:
+                            separated_dangerous += 1
+                            continue
+                        index = tuple(int(value) for value in index_array)
+                        if category == 2:
+                            occupied += 1
+                        else:
+                            unknown += 1
+                            if category == 4:
+                                outside_grid_unknown += 1
+                            else:
+                                outside_acceptance_unknown += 1
+                        if blocking_voxel is None:
+                            blocking_voxel = index
         queried = (
             occupied
             + unknown
@@ -1633,6 +1761,24 @@ class OccupancyRobotCollisionChecker:
             blocking_voxel_index=blocking_voxel,
             queried_count=queried,
         )
+
+    def _classification_grid(self, snapshot: OccupancySnapshot) -> np.ndarray:
+        cached = self._voxel_classification
+        if (
+            cached is not None
+            and self._voxel_classification_content_hash == snapshot.content_hash
+        ):
+            return cached
+        grid = np.zeros(snapshot.grid_shape, dtype=np.uint8)
+        if snapshot.free_indices:
+            indices = np.asarray(tuple(snapshot.free_indices), dtype=np.int64)
+            grid[indices[:, 0], indices[:, 1], indices[:, 2]] = 1
+        if snapshot.occupied_indices:
+            indices = np.asarray(tuple(snapshot.occupied_indices), dtype=np.int64)
+            grid[indices[:, 0], indices[:, 1], indices[:, 2]] = 2
+        self._voxel_classification_content_hash = snapshot.content_hash
+        self._voxel_classification = grid
+        return grid
 
     def _robot_collision_geometries(
         self, joint_positions_rad: Sequence[float]

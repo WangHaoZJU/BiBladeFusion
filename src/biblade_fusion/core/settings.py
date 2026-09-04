@@ -1078,7 +1078,7 @@ class StopAndCaptureConfig(BaseModel):
     ``maximum_segment_joint_delta_rad`` is retained only so reviewed deployment files
     from the early receding-horizon implementation remain loadable.  It no longer
     truncates a planned viewpoint motion: ``motion_preflight.maximum_joint_step_rad``
-    controls internal trajectory sampling and continuous collision proof instead.
+    controls HoloRobot-style internal trajectory and segment sampling instead.
     Native RealSense depth is deliberately not selectable; this coordinator has one
     scientific/safety depth backend, FoundationStereo.
     """
@@ -1103,8 +1103,8 @@ class StopAndCaptureConfig(BaseModel):
         ge=1,
         le=100,
         description=(
-            "Deprecated compatibility field. All science-ranked endpoint candidates "
-            "are preflighted until a continuously safe path is found."
+            "Maximum number of science-ranked endpoints checked in one online "
+            "HoloRobot-style planning cycle."
         ),
     )
     allow_single_view_bootstrap_motion: bool = False

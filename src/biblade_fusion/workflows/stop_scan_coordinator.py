@@ -1,10 +1,10 @@
 """Serial FoundationStereo stop-and-capture coordination for one viewpoint motion.
 
 This module deliberately exposes no raw robot command.  It composes the existing
-full semantic occupancy reader, one-leg preflight, guarded executor, and stationarity
-gate into a receding-horizon state machine.  Both continuous proofs remain bound to
-the exact path, geometry, occupancy generation, and safety policy used for a segment;
-any missing or stale evidence blocks before the driver call.
+full semantic occupancy reader, HoloRobot-style one-leg preflight, guarded executor,
+and stationarity gate into a receding-horizon state machine.  Online motion uses the
+same fixed-step, sampled-segment, fail-fast contract as HoloRobot's single-arm
+planner while binding the result to exact robot geometry and one occupancy generation.
 """
 
 from __future__ import annotations
@@ -58,6 +58,7 @@ from biblade_fusion.robotics.guarded_execution import (
     EmergencyStopUnconfirmedError,
     GuardedArm,
 )
+from biblade_fusion.robotics.motion_preflight import HOLOROBOT_SAMPLED_VALIDATION
 from biblade_fusion.robotics.stationarity import (
     StationarityEvidence,
     validate_stationary_trace,
@@ -952,6 +953,10 @@ class GuardedSegmentSafetyFactory:
         )
         self._motion_envelope = motion_envelope_acceptance
         self._utc_clock = utc_clock
+        self._occupancy_checker_cache: tuple[
+            str,
+            OccupancyRobotCollisionChecker,
+        ] | None = None
         self._accepted_static_free_aabbs = tuple(
             AcceptedStaticFreeAabb(
                 name=volume.name,
@@ -1091,34 +1096,9 @@ class GuardedSegmentSafetyFactory:
                 raise StopScanBlocked("Bootstrap mapping prefix has no verified source view")
         elif generation.snapshot.map_state is not OccupancyMapState.MAP_READY:
             raise StopScanBlocked("Ordinary segment preflight requires MAP_READY occupancy")
-        occupancy_checker = OccupancyRobotCollisionChecker(
-            self._collision_checker,
-            self._publisher.current_snapshot,
-            maximum_map_age_s=self._occupancy_config.maximum_map_age_s,
-            authorization_started_at_utc=self._publisher.current_published_at_utc,
-            additional_clearance_m=(
-                self._occupancy_config.obstacle_inflation_m
-                + self._collision_checker.minimum_clearance_m
-            ),
-            accepted_static_free_aabbs=self._accepted_static_free_aabbs,
-            accepted_static_free_acceptance_id=(
-                self._occupancy_config.accepted_static_free_acceptance_id
-            ),
-            accepted_static_free_mapping_context_hash=(
-                generation.snapshot.mapping_context_hash
-                if self._occupancy_config.accepted_static_free_aabbs
-                else None
-            ),
-            allow_mapping_prefix_in_accepted_static_free=(
-                proposal.bootstrap_mapping_prefix
-            ),
-            semantic_attestation=generation.mapping.semantic_attestation,
-            accepted_joint_uncertainty_rad=(
-                self._motion_envelope.accepted_joint_uncertainty_rad
-            ),
-            motion_envelope_acceptance_id=self._motion_envelope.acceptance_id,
-            motion_envelope_metadata_sha256=self._motion_envelope.metadata_sha256,
-            utc_clock=self._utc_clock,
+        occupancy_checker = self._occupancy_checker_for_generation(
+            generation,
+            allow_mapping_prefix=proposal.bootstrap_mapping_prefix,
         )
         live = preflight_live_joint_segment(
             proposal.start_joint_positions_rad,
@@ -1137,6 +1117,7 @@ class GuardedSegmentSafetyFactory:
             ),
             motion_envelope_acceptance_id=self._motion_envelope.acceptance_id,
             motion_envelope_metadata_sha256=self._motion_envelope.metadata_sha256,
+            path_validation_mode=HOLOROBOT_SAMPLED_VALIDATION,
         )
         bound_preflight = replace(
             live.preflight,
@@ -1161,6 +1142,49 @@ class GuardedSegmentSafetyFactory:
                 ),
             )
         return _PreparedSegmentExecution(proposal, bound_preflight, executor)
+
+    def _occupancy_checker_for_generation(
+        self,
+        generation: OccupancyGeneration,
+        *,
+        allow_mapping_prefix: bool,
+    ) -> OccupancyRobotCollisionChecker:
+        cache_key = (
+            f"{generation.generation_id}:"
+            f"{int(bool(allow_mapping_prefix))}"
+        )
+        cached = self._occupancy_checker_cache
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        checker = OccupancyRobotCollisionChecker(
+            self._collision_checker,
+            self._publisher.current_snapshot,
+            maximum_map_age_s=self._occupancy_config.maximum_map_age_s,
+            authorization_started_at_utc=self._publisher.current_published_at_utc,
+            additional_clearance_m=(
+                self._occupancy_config.obstacle_inflation_m
+                + self._collision_checker.minimum_clearance_m
+            ),
+            accepted_static_free_aabbs=self._accepted_static_free_aabbs,
+            accepted_static_free_acceptance_id=(
+                self._occupancy_config.accepted_static_free_acceptance_id
+            ),
+            accepted_static_free_mapping_context_hash=(
+                generation.snapshot.mapping_context_hash
+                if self._occupancy_config.accepted_static_free_aabbs
+                else None
+            ),
+            allow_mapping_prefix_in_accepted_static_free=allow_mapping_prefix,
+            semantic_attestation=generation.mapping.semantic_attestation,
+            accepted_joint_uncertainty_rad=(
+                self._motion_envelope.accepted_joint_uncertainty_rad
+            ),
+            motion_envelope_acceptance_id=self._motion_envelope.acceptance_id,
+            motion_envelope_metadata_sha256=self._motion_envelope.metadata_sha256,
+            utc_clock=self._utc_clock,
+        )
+        self._occupancy_checker_cache = (cache_key, checker)
+        return checker
 
 
 @dataclass(frozen=True, slots=True)
@@ -1672,11 +1696,12 @@ class StopScanCoordinator:
                     raise BladePlanningAssetError("Incomplete selector decision has no target")
                 live_state = self._robot.read_state()
                 self._raise_if_stop_requested()
-                # Path safety is a veto, not a reason to fail merely because the
-                # first three high-gain endpoints take blocked straight-line routes.
-                # Candidate generation is already bounded; examine the complete
-                # science-ranked set until one continuous path proves clear.
-                candidate_queue = selection.preflight_candidates
+                # HoloRobot plans one bounded single-arm goal at a time.  Preserve
+                # science ranking, but cap online preflight work so a large NBV set
+                # cannot silently turn one operator cycle into minutes of checking.
+                candidate_queue = selection.preflight_candidates[
+                    : self._config.maximum_ranked_preflight_candidates
+                ]
                 rejected: list[tuple[str, tuple[str, ...]]] = []
                 prepared: _PreparedSegmentExecution | None = None
                 selected_for_motion: NextViewSelection | None = None
@@ -1708,7 +1733,7 @@ class StopScanCoordinator:
                             "science_rank": science_rank,
                             "ranked_candidate_count": len(selection.preflight_candidates),
                             "preflight_candidate_limit": len(candidate_queue),
-                            "legacy_configured_preflight_limit_ignored": (
+                            "configured_preflight_candidate_limit": (
                                 self._config.maximum_ranked_preflight_candidates
                             ),
                             "final_target": proposal.final_target,
@@ -2587,8 +2612,8 @@ class StopScanCoordinator:
         # One scientific NBV is one approved motion and one stopped capture.  The
         # historical coordinator confused a 0.02-rad collision sampling interval
         # with a physical receding-horizon leg and could turn one view into hundreds
-        # of stop/reconstruct/replan cycles.  Trajectory interpolation and continuous
-        # swept-volume proof remain the responsibility of motion preflight.
+        # of stop/reconstruct/replan cycles.  HoloRobot-style trajectory interpolation
+        # and sampled segment collision checks remain internal to motion preflight.
         goal = final
         final_target = True
         capture_view_id = target.view_id

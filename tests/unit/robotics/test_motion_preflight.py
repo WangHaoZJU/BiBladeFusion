@@ -14,6 +14,7 @@ from biblade_fusion.robotics import (
     OccupancyRobotCollisionChecker,
     preflight_linear_joint_motion,
 )
+from biblade_fusion.robotics.motion_preflight import HOLOROBOT_SAMPLED_VALIDATION
 
 
 class _SyntheticSweptEs68Checker(Es68PinocchioCollisionChecker):
@@ -119,6 +120,46 @@ def test_clear_preflight_builds_velocity_limited_servoj_stream(
         axis=0,
     )
     assert np.all(observed_velocity <= maximum_velocity * 0.08 * 0.8 + 1e-12)
+
+
+def test_online_holorobot_preflight_samples_segments_without_continuous_proof(
+    checker,
+    occupancy_checker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def continuous_proof_must_not_run(*_args, **_kwargs):
+        pytest.fail("online HoloRobot mode must not run recursive continuous proof")
+
+    monkeypatch.setattr(checker, "check_path", continuous_proof_must_not_run)
+    monkeypatch.setattr(
+        occupancy_checker,
+        "check_path",
+        continuous_proof_must_not_run,
+    )
+
+    report = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        (0.05, -0.04, 0.03, -0.02, 0.01, 0.0),
+        collision_checker=checker,
+        occupancy_checker=occupancy_checker,
+        maximum_joint_step_rad=0.02,
+        path_validation_mode=HOLOROBOT_SAMPLED_VALIDATION,
+    )
+
+    assert report.ready_for_approval is True
+    assert report.path_validation_mode == HOLOROBOT_SAMPLED_VALIDATION
+    assert report.swept_mesh_required is False
+    assert report.continuous_occupancy_sweep_required is False
+    assert report.collision is not None
+    assert report.occupancy is not None
+    assert report.collision.sample_count == 13
+    assert report.occupancy.sample_count == 13
+    assert report.collision.proof_evidence is None
+    assert report.occupancy.proof_evidence is None
+    assert report.path_validation_evidence_sha256 is not None
+
+    tampered = replace(report, path_validation_evidence_sha256="0" * 64)
+    assert tampered.ready_for_approval is False
 
 
 def test_folded_goal_is_blocked_before_trajectory_generation(checker) -> None:

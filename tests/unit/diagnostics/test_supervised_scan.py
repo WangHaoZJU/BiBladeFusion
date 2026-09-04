@@ -114,8 +114,13 @@ def test_collision_backend_audit_checks_both_real_backend_contracts(monkeypatch)
     )
 
     assert result.level is CheckLevel.PASS
-    assert result.details["continuous_swept_mesh_supported"] is True
-    assert result.details["continuous_swept_occupancy_supported"] is True
+    assert result.name == "supervised_scan_holorobot_single_arm"
+    assert result.details["online_path_validation_mode"] == (
+        "holorobot_sampled_joint_v1"
+    )
+    assert result.details["online_segment_samples"] == 5
+    assert result.details["offline_continuous_swept_mesh_supported"] is True
+    assert result.details["offline_continuous_swept_occupancy_supported"] is True
     assert result.details["motion_authorized"] is False
 
 

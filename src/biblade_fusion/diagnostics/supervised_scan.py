@@ -17,11 +17,13 @@ from biblade_fusion.core.settings import AppSettings
 from biblade_fusion.diagnostics.types import CheckLevel, CheckResult
 from biblade_fusion.perception.stereo import run_foundation_stereo_doctor
 from biblade_fusion.robotics import (
+    HOLOROBOT_SAMPLED_VALIDATION,
     AcceptedStaticFreeAabb,
     Es68D435iCollisionResources,
     Es68PinocchioCollisionChecker,
     OccupancyRobotCollisionChecker,
 )
+from biblade_fusion.robotics.motion_preflight import HOLOROBOT_SEGMENT_SAMPLES
 from biblade_fusion.storage import (
     read_coarse_model_summary,
     read_static_free_acceptance,
@@ -294,29 +296,32 @@ def _collision_backend_check(settings: AppSettings) -> CheckResult:
                 "model_id": template.model_id,
                 "robot_geometry_hash": checker.robot_geometry_hash,
                 "motion_model_contract_hash": checker.motion_model_contract_hash,
-                "continuous_swept_mesh_supported": mesh_supported,
-                "continuous_swept_occupancy_supported": occupancy_supported,
+                "online_path_validation_mode": HOLOROBOT_SAMPLED_VALIDATION,
+                "online_segment_samples": HOLOROBOT_SEGMENT_SAMPLES,
+                "offline_continuous_swept_mesh_supported": mesh_supported,
+                "offline_continuous_swept_occupancy_supported": occupancy_supported,
             }
         )
     except Exception as exc:
         details["error"] = f"{type(exc).__name__}: {exc}"
         return CheckResult(
-            "supervised_scan_continuous_collision",
+            "supervised_scan_holorobot_single_arm",
             CheckLevel.FAIL,
             "ES68+D435i collision backend could not be constructed",
             details,
         )
     if not mesh_supported or not occupancy_supported:
         return CheckResult(
-            "supervised_scan_continuous_collision",
+            "supervised_scan_holorobot_single_arm",
             CheckLevel.FAIL,
             "one or both conservative continuous sweep proofs are unavailable",
             details,
         )
     return CheckResult(
-        "supervised_scan_continuous_collision",
+        "supervised_scan_holorobot_single_arm",
         CheckLevel.PASS,
-        "both conservative continuous sweep proof backends are available",
+        "HoloRobot fixed-step sampled single-arm preflight is configured; exact "
+        "URDF/STL backends are available",
         details,
     )
 

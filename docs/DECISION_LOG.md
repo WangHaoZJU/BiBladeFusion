@@ -141,7 +141,7 @@ offline reproduction, and focused control-lifecycle tests are complete.
 
 Date: 2026-09-03
 
-Status: accepted; offline verified, physical verification pending
+Status: partially superseded by D021; complete-viewpoint semantics retained
 
 Guarded enable prepares power, brakes, speed scaling, and the driver object but does not
 launch an external-control script while the software stop latch is still held. The fresh
@@ -193,11 +193,10 @@ Date: 2026-09-04
 Status: accepted; offline verified, physical verification pending
 
 The coordinator no longer converts `maximum_segment_joint_delta_rad=0.02` into artificial
-intermediate captures. It proves and executes the complete joint-linear path to a viewpoint;
-`motion_preflight.maximum_joint_step_rad` remains only an internal interpolation/proof
-interval. The complete bounded science-ranked queue receives the same hard path veto, rather
-than stopping after an arbitrary top three. Curved obstacle-avoiding planning is explicitly
-outside the current implementation.
+intermediate captures. It executes one complete joint-linear path to a viewpoint;
+`motion_preflight.maximum_joint_step_rad` remains internal interpolation. D021 supersedes
+the continuous-proof and complete-queue clauses: online validation now follows HoloRobot's
+sampled segment contract and observes the configured ranked-candidate work bound.
 
 ## D016 — Live occupancy reuses verified work without weakening disk replay
 
@@ -269,3 +268,29 @@ Replay of the synchronized attempt-09 proxy changed back-side pair availability 
 to one complete pair. With the production Pinocchio checker, fin-discovery planning took
 about 1.17 seconds, excluding the Pinocchio model load already paid by runtime collision
 construction.
+
+## D021 — Online motion reuses HoloRobot's sampled single-arm contract
+
+Date: 2026-09-04
+
+Status: accepted; offline verified, physical verification pending
+
+The active NBV loop no longer runs BiBladeFusion's recursive continuous-interval mesh and
+occupancy certificates. It now mirrors HoloRobot's `ConservativeJointPlanner`: interpolate
+the straight joint path at `motion_preflight.maximum_joint_step_rad`, check five evenly
+spaced configurations per adjacent segment, and reject immediately on the first non-clear
+result. At most `stop_and_capture.maximum_ranked_preflight_candidates` endpoints are checked
+in one operator cycle.
+
+This change does not restore the former large link spheres. Self-collision still uses the
+hash-bound ES68+D435i URDF and original collision STL meshes. Environment checks still use
+the immutable occupancy snapshot, accepted static-free contract, conservative UNKNOWN
+policy, obstacle/uncertainty clearance, and original robot STL. For speed, adjacent
+same-state voxels along X are merged into an exactly equivalent union box before FCL
+distance queries. Operator approval, map/model hashes, one-shot permit consumption, ServoJ
+tracking supervision, endpoint convergence, and stop/stationarity checks remain required.
+
+The recursive continuous proof remains an offline acceptance and diagnostic facility. A
+sampled online result carries its own integrity hash and cannot be presented as a continuous
+certificate. Guarded execution accepts either explicit contract and revalidates only a new
+live-start bridge with the same mode bound into the permit.

@@ -25,7 +25,10 @@ from biblade_fusion.devices.robot.streaming import (
     StreamServoJResult,
 )
 from biblade_fusion.robotics.motion_preflight import (
+    CONTINUOUS_INTERVAL_VALIDATION,
+    HOLOROBOT_SAMPLED_VALIDATION,
     JointMotionPreflight,
+    preflight_linear_joint_motion,
     validate_preflight_servoj_contract,
 )
 from biblade_fusion.robotics.occupancy_collision import (
@@ -242,6 +245,7 @@ class MotionExecutionPermit:
     stop_latched: bool
     issued_monotonic_s: float
     expires_monotonic_s: float
+    path_validation_mode: str = CONTINUOUS_INTERVAL_VALIDATION
 
 
 class GuardedEliteExecutor:
@@ -394,11 +398,14 @@ class GuardedEliteExecutor:
             occupancy_semantic_verifier_contract_hash=str(evidence.semantic_verifier_contract_hash),
             occupancy_semantic_attestation_hash=str(evidence.semantic_attestation_hash),
             occupancy_policy_contract_hash=(self._occupancy_checker.policy_contract_hash),
-            continuous_occupancy_sweep_verified=True,
+            continuous_occupancy_sweep_verified=(
+                preflight.path_validation_mode == CONTINUOUS_INTERVAL_VALIDATION
+            ),
             stop_generation=stop_generation,
             stop_latched=True,
             issued_monotonic_s=issued,
             expires_monotonic_s=expires,
+            path_validation_mode=preflight.path_validation_mode,
         )
         # A frozen dataclass prevents ordinary assignment, but it is not a
         # security boundary: object.__setattr__ can still mutate an instance.
@@ -477,7 +484,11 @@ class GuardedEliteExecutor:
             or permit.occupancy_semantic_attestation_hash
             != expected_occupancy.semantic_attestation_hash
             or permit.occupancy_policy_contract_hash != self._occupancy_checker.policy_contract_hash
-            or permit.continuous_occupancy_sweep_verified is not True
+            or permit.path_validation_mode != preflight.path_validation_mode
+            or permit.continuous_occupancy_sweep_verified
+            is not (
+                preflight.path_validation_mode == CONTINUOUS_INTERVAL_VALIDATION
+            )
         ):
             raise RobotCommandError("motion execution permit occupancy binding mismatch")
         state = self._arm.read_state()
@@ -821,21 +832,36 @@ class GuardedEliteExecutor:
         self, preflight: JointMotionPreflight
     ) -> OccupancyMapEvidence:
         report = preflight.occupancy
-        if (
+        common_invalid = (
             not preflight.occupancy_required
             or report is None
             or report.status is not CollisionCheckStatus.CLEAR
             or report.evidence is None
             or not report.evidence.semantic_attestation_valid
-            or not preflight.continuous_occupancy_sweep_required
-            or not report.continuous_swept_volume_evidence_valid
-            or report.proof_evidence is None
-            or not report.proof_evidence.matches_path(
-                preflight.start_joint_positions_rad,
-                preflight.goal_joint_positions_rad,
-            )
-        ):
-            raise RobotCommandError("motion preflight lacks continuous occupancy-sweep evidence")
+        )
+        if common_invalid:
+            raise RobotCommandError("motion preflight lacks clear occupancy evidence")
+        if preflight.path_validation_mode == CONTINUOUS_INTERVAL_VALIDATION:
+            if (
+                not preflight.continuous_occupancy_sweep_required
+                or not report.continuous_swept_volume_evidence_valid
+                or report.proof_evidence is None
+                or not report.proof_evidence.matches_path(
+                    preflight.start_joint_positions_rad,
+                    preflight.goal_joint_positions_rad,
+                )
+            ):
+                raise RobotCommandError(
+                    "motion preflight lacks continuous occupancy-sweep evidence"
+                )
+        elif preflight.path_validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
+            if not preflight.ready_for_approval:
+                raise RobotCommandError(
+                    "motion preflight lacks bound HoloRobot sampled occupancy evidence"
+                )
+        else:
+            raise RobotCommandError("motion preflight path-validation mode is unsupported")
+        assert report is not None and report.evidence is not None
         expected = report.evidence
         checker_attestation = self._occupancy_checker.semantic_attestation
         if (
@@ -874,16 +900,24 @@ class GuardedEliteExecutor:
         collision = preflight.collision
         if collision is None or collision.status is not CollisionCheckStatus.CLEAR:
             raise RobotCommandError("motion preflight lacks clear mesh-collision evidence")
-        if (
-            not preflight.swept_mesh_required
-            or not collision.continuous_swept_volume_evidence_valid
-            or collision.proof_evidence is None
-            or not collision.proof_evidence.matches_path(
-                preflight.start_joint_positions_rad,
-                preflight.goal_joint_positions_rad,
-            )
-        ):
-            raise RobotCommandError("motion preflight lacks continuous swept-mesh evidence")
+        if preflight.path_validation_mode == CONTINUOUS_INTERVAL_VALIDATION:
+            if (
+                not preflight.swept_mesh_required
+                or not collision.continuous_swept_volume_evidence_valid
+                or collision.proof_evidence is None
+                or not collision.proof_evidence.matches_path(
+                    preflight.start_joint_positions_rad,
+                    preflight.goal_joint_positions_rad,
+                )
+            ):
+                raise RobotCommandError("motion preflight lacks continuous swept-mesh evidence")
+        elif preflight.path_validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
+            if not preflight.ready_for_approval:
+                raise RobotCommandError(
+                    "motion preflight lacks bound HoloRobot sampled mesh evidence"
+                )
+        else:
+            raise RobotCommandError("motion preflight path-validation mode is unsupported")
         diagnostics = collision.result.diagnostics
         binding = (
             diagnostics.get("model"),
@@ -914,16 +948,13 @@ class GuardedEliteExecutor:
         preflight: JointMotionPreflight,
         expected_occupancy: OccupancyMapEvidence,
     ) -> None:
-        """Recheck the live-start bridge into the bound linear ServoJ path.
+        """Recheck the live-start bridge with the preflight's bound path mode.
 
         ``validate_preflight_servoj_contract`` has already reproduced the stream
-        and proved that every command lies on the conservative linear path from
-        the preflight start to goal.  Re-running continuous collision proofs for
-        every 4 ms command or the already-proved full path adds no geometric
-        coverage and can consume the entire one-shot permit before controller
-        enable.  Only the live-state correction into the reproduced first command
-        is new geometry; the immutable preflight proof covers that command through
-        the reproduced goal.
+        and proved that every command lies on the linear path from preflight start
+        to goal.  The full path is not checked again.  Only a new live-state bridge
+        is validated, using either archived continuous proof semantics or the
+        online HoloRobot sampled-segment semantics recorded in the permit.
         """
 
         try:
@@ -954,12 +985,45 @@ class GuardedEliteExecutor:
             np.abs(np.asarray(live_start_tuple) - np.asarray(stream.commands[0]))
             <= np.asarray(uncertainty)
         ):
-            # The accepted robust swept-volume proof already covers this exact
-            # live start; recomputing even a zero-length bridge is redundant.
+            # The accepted tracking envelope already covers this live start for
+            # either the archived continuous proof or the online sampled path.
             return
         chain = (live_start_tuple, stream.commands[0])
         freshness_horizon = self._required_freshness_horizon_s(preflight)
         for segment_index, (start, goal) in enumerate(zip(chain[:-1], chain[1:], strict=True)):
+            if preflight.path_validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
+                bridge = preflight_linear_joint_motion(
+                    start,
+                    goal,
+                    collision_checker=self._collision_checker,
+                    occupancy_checker=self._occupancy_checker,
+                    maximum_joint_step_rad=maximum_step,
+                    servoj_dt_s=stream.dt_s,
+                    speed_scaling=float(preflight.diagnostics["speed_scaling"]),
+                    velocity_margin=float(preflight.diagnostics["velocity_margin"]),
+                    execution_freshness_margin_s=self._execution_freshness_margin_s,
+                    servoj_runtime_config=preflight.servoj_runtime_config,
+                    accepted_joint_uncertainty_rad=uncertainty,
+                    motion_envelope_acceptance_id=acceptance_id,
+                    motion_envelope_metadata_sha256=metadata_sha256,
+                    path_validation_mode=HOLOROBOT_SAMPLED_VALIDATION,
+                )
+                if not bridge.ready_for_approval or bridge.occupancy is None:
+                    reasons = ", ".join(bridge.blocking_reasons) or (
+                        "holorobot_sampled_bridge_not_clear"
+                    )
+                    raise RobotCommandError(
+                        "live collision revalidation blocked HoloRobot sampled bridge "
+                        f"{segment_index}: {reasons}"
+                    )
+                if (
+                    bridge.occupancy.evidence is None
+                    or bridge.occupancy.evidence.binding != expected_occupancy.binding
+                ):
+                    raise RobotCommandError(
+                        "live HoloRobot sampled bridge used a different occupancy snapshot"
+                    )
+                continue
             live_collision = self._collision_checker.check_path(
                 start,
                 goal,

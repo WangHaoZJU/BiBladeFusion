@@ -28,6 +28,7 @@ from biblade_fusion.robotics import (
     preflight_linear_joint_motion,
 )
 from biblade_fusion.robotics.guarded_execution import EmergencyStopUnconfirmedError
+from biblade_fusion.robotics.motion_preflight import HOLOROBOT_SAMPLED_VALIDATION
 from biblade_fusion.robotics.occupancy_collision import (
     _issue_occupancy_semantic_attestation,
 )
@@ -311,6 +312,33 @@ def test_authorization_requires_exact_preflight_bound_confirmation(
         confirmation=prompt,
     )
     assert permit.preflight_fingerprint.startswith(prompt.removeprefix("EXECUTE "))
+
+
+def test_guarded_execution_accepts_bound_holorobot_sampled_path(
+    checker,
+    occupancy_checker,
+) -> None:
+    preflight = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        (0.03, -0.02, 0.01, 0.0, 0.0, 0.0),
+        collision_checker=checker,
+        occupancy_checker=occupancy_checker,
+        path_validation_mode=HOLOROBOT_SAMPLED_VALIDATION,
+    )
+    arm = FakeGuardedArm()
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(preflight),
+    )
+
+    result = executor.execute(preflight, permit)
+
+    assert result.ok is True
+    assert permit.path_validation_mode == HOLOROBOT_SAMPLED_VALIDATION
+    assert permit.continuous_occupancy_sweep_verified is False
+    assert arm.events[-4:] == ["prepare", "stream", "endpoint_settle", "stop"]
 
 
 def test_authorization_requires_atomic_stopped_snapshot(

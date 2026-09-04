@@ -27,6 +27,8 @@ from biblade_fusion.robotics.guarded_execution import (
     MotionExecutionPermit,
 )
 from biblade_fusion.robotics.motion_preflight import (
+    CONTINUOUS_INTERVAL_VALIDATION,
+    HOLOROBOT_SAMPLED_VALIDATION,
     JointMotionPreflight,
     MotionPreflightStatus,
     preflight_linear_joint_motion,
@@ -80,6 +82,8 @@ __all__ = [
     "Es68D435iCollisionTemplate",
     "Es68ModelResources",
     "GuardedEliteExecutor",
+    "CONTINUOUS_INTERVAL_VALIDATION",
+    "HOLOROBOT_SAMPLED_VALIDATION",
     "JointPathMeshCollisionReport",
     "JointMotionPreflight",
     "MotionPreflightStatus",

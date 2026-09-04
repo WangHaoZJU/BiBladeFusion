@@ -104,7 +104,7 @@ The eiai configuration parser confirmed both path and ID. `scan doctor --mode un
 
 ```text
 adaptive IK search: enabled
-legacy maximum ranked preflight candidates: parsed but ignored
+maximum ranked online preflight candidates: 3
 legacy maximum segment joint delta: parsed but ignored
 single-view bootstrap motion: enabled
 projected ROI: dilation 12 px, minimum 100 reference points,
@@ -113,9 +113,10 @@ occupancy ray integration: deterministic CUDA DDA
 ```
 
 The online contract now treats the declared workspace as a hard outer boundary, searches
-at most 32 IK poses / 1.5 s per candidate family, preflights the complete bounded science
-queue, and moves directly to one selected viewpoint. `motion_preflight.maximum_joint_step_rad`
-is only an internal interpolation/collision-proof interval.
+at most 32 IK poses / 1.5 s per candidate family, preflights at most the configured top
+three science candidates, and moves directly to one selected viewpoint.
+`motion_preflight.maximum_joint_step_rad` is only an internal HoloRobot interpolation and
+sampled-collision interval.
 
 Run commands on eiai must use `/usr/bin/env -u PYTHONPATH` because ROS Humble's Python
 3.10 Pinocchio/HPP-FCL packages otherwise shadow the Python 3.12 virtual environment.
@@ -218,10 +219,10 @@ The 2026-09-04 regression corrected the common causes rather than adding more de
 5. online IK reuses the already loaded Pinocchio/URDF collision model and HoloRobot's
    neighboring-seed sweep; analytic MDH remains the offline fallback and KDL is not the
    normal path;
-6. one NBV is one complete viewpoint path and one capture; the legacy 0.02 rad setting no
-   longer triggers intermediate reconstruction cycles;
-7. all bounded science-ranked endpoints receive path preflight, so an unsafe top result
-   does not hide a safe lower-ranked view;
+6. one NBV is one complete viewpoint path and one capture; the legacy 0.02 rad setting is
+   HoloRobot-style joint interpolation, not an intermediate reconstruction trigger;
+7. each online cycle checks at most `maximum_ranked_preflight_candidates` science-ranked
+   endpoints (currently 3 on eiai), so a large NBV set cannot create an unbounded pause;
 8. incremental occupancy reuses an unchanged verified prefix and the live writer does not
    immediately replay identical rays. Sliding/replacement windows and cross-process reads
    remain strict full rebuild/replay;
@@ -234,6 +235,12 @@ The 2026-09-04 regression corrected the common causes rather than adding more de
 12. opposing fin candidates retain the required sign but may share a tangential bias;
     incidence is information-ranked, wrist rolls are interleaved, and a symmetric camera
     pair is no longer required.
+13. online path validation no longer runs the recursive six-dimensional continuous
+    interval certificate. It reuses HoloRobot's fixed-step joint interpolation, five
+    samples per segment, and fail-fast collision contract. Exact URDF/STL robot geometry,
+    UNKNOWN-as-blocked occupancy, map/hash binding, approval, ServoJ tracking stop, and
+    endpoint settling remain active. Adjacent same-state occupancy voxels are represented
+    as exact X-axis run boxes to remove per-voxel FCL calls without using link spheres.
 
 The previous KDL `-5` flood and the multi-minute source replay are therefore not expected
 on the new normal path. This is an offline conclusion, not a claim that the physical arm
@@ -256,12 +263,12 @@ IK endpoint feasible: 2
 wall time: 0.78 s
 ```
 
-It selected independently feasible front/back adaptive views. That closes the known
-planning-time regression. Current path planning proves straight joint-space motion and
-tries alternative science endpoints; it does not yet synthesize a curved RRT/OMPL route
-around an obstacle to the same endpoint. HoloRobot's optional OMPL implementation was
-inspected, but direct transplantation would not preserve BiBladeFusion's continuous
-uncertainty-bound per-leg evidence and OMPL is absent from the validated dependency set.
+It selected independently feasible front/back adaptive views. Online path preflight now
+checks the same straight joint-space route with HoloRobot's bounded sampled-segment
+contract and tries no more than the configured top three science endpoints. It does not
+yet synthesize a curved RRT/OMPL route around an obstacle to the same endpoint. The former
+recursive interval proof remains available for offline acceptance/diagnostics but is no
+longer called by the active NBV loop.
 
 One offline replay of an old occupancy artifact took about 64 s and correctly failed
 because the artifact was rendered with Open3D while the current local environment selected
@@ -273,10 +280,17 @@ attempt-09 real proxy. The previous symmetric policy produced zero complete back
 The signed common-bias policy plus production Pinocchio checker produced one complete back
 pair in about 1.17 s; all IK, workspace and later motion gates remain unchanged.
 
+A local occupancy regression probe used the operator-reported first-view joint vector,
+the accepted 2.0 x 1.1 x 1.1 m workspace partition, a conservative UNKNOWN map, and the
+production ES68+D435i STL model. One pose classified 179,154 broad-phase voxels in 0.0143 s
+with no dangerous run requiring an FCL distance call. This demonstrates removal of the
+per-voxel Python/FCL loop for accepted-free space; it is not a substitute for timing the
+next real eiai occupancy map and complete candidate path.
+
 ## 7. Required next action and regression result
 
 The next action is exactly one fresh eiai physical validation after pulling the
-post-`5fd885e` fin-discovery correction, using the runbook and a new
+HoloRobot sampled-path correction that follows `d3c13c0`, using the runbook and a new
 `run_id`. Do not change placement, acceptance assets, or safety geometry before this test.
 After the approval token, verify one reverse connection, one complete viewpoint motion,
 endpoint settle, `writeIdle`, sampled stationary pose, and transition to the next capture.
@@ -292,7 +306,7 @@ full physical single-view-to-motion workflow: hardware verification pending
 Using the main source tree with the available local test environment:
 
 ```text
-full suite: 1225 passed, 3 skipped in 103.80 s
+full suite: 1227 passed, 3 skipped in 96.58 s
 ruff: all checks passed
 ```
 

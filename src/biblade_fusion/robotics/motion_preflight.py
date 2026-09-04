@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -14,12 +16,15 @@ from biblade_fusion.devices.robot.streaming import ServoJStream, ServoJStreamCon
 from biblade_fusion.diagnostics.performance_timing import performance_timed
 from biblade_fusion.robotics.occupancy_collision import (
     JointPathOccupancyCollisionReport,
+    OccupancyCollisionCheckResult,
     OccupancyRobotCollisionChecker,
 )
 from biblade_fusion.robotics.pinocchio_collision import (
+    CollisionCheckResult,
     CollisionCheckStatus,
     Cs68PinocchioCollisionChecker,
     JointPathMeshCollisionReport,
+    _joint_path_sha256,
 )
 from biblade_fusion.robotics.provenance import robot_stack_provenance
 
@@ -29,6 +34,11 @@ class MotionPreflightStatus(StrEnum):
     BLOCKED = "blocked"
     CHECKER_UNAVAILABLE = "checker_unavailable"
     INVALID_CONTRACT = "invalid_contract"
+
+
+CONTINUOUS_INTERVAL_VALIDATION = "continuous_interval_v1"
+HOLOROBOT_SAMPLED_VALIDATION = "holorobot_sampled_joint_v1"
+HOLOROBOT_SEGMENT_SAMPLES = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,21 +60,16 @@ class JointMotionPreflight:
     swept_mesh_required: bool = True
     continuous_occupancy_sweep_required: bool = True
     approval_required: bool = True
+    path_validation_mode: str = CONTINUOUS_INTERVAL_VALIDATION
+    path_validation_evidence_sha256: str | None = None
 
     @property
     def ready_for_approval(self) -> bool:
-        return (
+        common = (
             self.status is MotionPreflightStatus.CLEAR
             and self.servoj_stream is not None
             and self.collision is not None
             and self.collision.status is CollisionCheckStatus.CLEAR
-            and self.swept_mesh_required
-            and self.collision.continuous_swept_volume_evidence_valid
-            and self.collision.proof_evidence is not None
-            and self.collision.proof_evidence.matches_path(
-                self.start_joint_positions_rad,
-                self.goal_joint_positions_rad,
-            )
             and self.collision.result.diagnostics.get("model") == "elite_es68"
             and bool(self.collision.result.diagnostics.get("robot_geometry_hash"))
             and bool(self.collision.result.diagnostics.get("motion_model_contract_hash"))
@@ -73,17 +78,34 @@ class JointMotionPreflight:
             and self.occupancy.status is CollisionCheckStatus.CLEAR
             and self.occupancy.evidence is not None
             and self.occupancy.evidence.semantic_attestation_valid
-            and self.continuous_occupancy_sweep_required
-            and self.occupancy.continuous_swept_volume_evidence_valid
-            and self.occupancy.proof_evidence is not None
-            and self.occupancy.proof_evidence.matches_path(
-                self.start_joint_positions_rad,
-                self.goal_joint_positions_rad,
-            )
             and bool(self.occupancy.result.diagnostics.get("occupancy_policy_contract_hash"))
             and self.servoj_runtime_config is not None
             and self.approval_required
         )
+        if not common:
+            return False
+        if self.path_validation_mode == CONTINUOUS_INTERVAL_VALIDATION:
+            return bool(
+                self.swept_mesh_required
+                and self.collision is not None
+                and self.collision.continuous_swept_volume_evidence_valid
+                and self.collision.proof_evidence is not None
+                and self.collision.proof_evidence.matches_path(
+                    self.start_joint_positions_rad,
+                    self.goal_joint_positions_rad,
+                )
+                and self.continuous_occupancy_sweep_required
+                and self.occupancy is not None
+                and self.occupancy.continuous_swept_volume_evidence_valid
+                and self.occupancy.proof_evidence is not None
+                and self.occupancy.proof_evidence.matches_path(
+                    self.start_joint_positions_rad,
+                    self.goal_joint_positions_rad,
+                )
+            )
+        if self.path_validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
+            return _holorobot_sampled_evidence_valid(self)
+        return False
 
     @property
     def motion_authorized(self) -> bool:
@@ -95,6 +117,132 @@ def _joint_vector(values: ArrayLike, *, label: str) -> tuple[float, ...]:
     if vector.shape != (6,) or not np.isfinite(vector).all():
         raise ValueError(f"{label} must be a finite ES68 six-vector")
     return tuple(float(value) for value in vector)
+
+
+def _canonical_sha256(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _holorobot_sampled_configurations(
+    waypoints: tuple[tuple[float, ...], ...],
+    *,
+    segment_samples: int = HOLOROBOT_SEGMENT_SAMPLES,
+) -> tuple[tuple[tuple[float, ...], float], ...]:
+    """Mirror HoloRobot's fail-fast ``check_segment`` sampling contract.
+
+    HoloRobot first interpolates a joint path at ``max_joint_step_rad`` and then
+    checks five evenly spaced states on every adjacent segment.  Shared segment
+    endpoints are emitted once here; this is geometrically identical while
+    avoiding duplicate URDF/FCL and occupancy queries.
+    """
+
+    samples = max(2, int(segment_samples))
+    if not waypoints:
+        return ()
+    segment_count = max(1, len(waypoints) - 1)
+    result: list[tuple[tuple[float, ...], float]] = [(waypoints[0], 0.0)]
+    for segment_index, (start, goal) in enumerate(
+        zip(waypoints[:-1], waypoints[1:], strict=True)
+    ):
+        for sample_index in range(1, samples):
+            alpha = sample_index / (samples - 1)
+            configuration = tuple(
+                begin + alpha * (end - begin)
+                for begin, end in zip(start, goal, strict=True)
+            )
+            fraction = (segment_index + alpha) / segment_count
+            result.append((configuration, fraction))
+    return tuple(result)
+
+
+def _holorobot_sampled_evidence_payload(
+    preflight: JointMotionPreflight,
+) -> dict[str, Any] | None:
+    collision = preflight.collision
+    occupancy = preflight.occupancy
+    if collision is None or occupancy is None or occupancy.evidence is None:
+        return None
+    collision_diagnostics = collision.result.diagnostics
+    occupancy_diagnostics = occupancy.result.diagnostics
+    return {
+        "schema": "biblade_fusion.holorobot_sampled_path_evidence.v1",
+        "method": HOLOROBOT_SAMPLED_VALIDATION,
+        "trajectory_sha256": _joint_path_sha256(
+            preflight.start_joint_positions_rad,
+            preflight.goal_joint_positions_rad,
+        ),
+        "maximum_joint_step_rad": collision.maximum_joint_step_rad,
+        "occupancy_maximum_joint_step_rad": occupancy.maximum_joint_step_rad,
+        "segment_samples": HOLOROBOT_SEGMENT_SAMPLES,
+        "mesh_sample_count": collision.sample_count,
+        "occupancy_sample_count": occupancy.sample_count,
+        "collision_model_binding": [
+            collision_diagnostics.get("model"),
+            collision_diagnostics.get("collision_model_id"),
+            collision_diagnostics.get("robot_geometry_hash"),
+            collision_diagnostics.get("motion_model_contract_hash"),
+        ],
+        "occupancy_binding": list(occupancy.evidence.binding),
+        "occupancy_policy_contract_hash": occupancy_diagnostics.get(
+            "occupancy_policy_contract_hash"
+        ),
+        "motion_envelope_acceptance_id": preflight.diagnostics.get(
+            "motion_envelope_acceptance_id"
+        ),
+        "motion_envelope_metadata_sha256": preflight.diagnostics.get(
+            "motion_envelope_metadata_sha256"
+        ),
+        "accepted_joint_uncertainty_rad": preflight.diagnostics.get(
+            "accepted_joint_uncertainty_rad"
+        ),
+    }
+
+
+def _holorobot_sampled_evidence_valid(preflight: JointMotionPreflight) -> bool:
+    collision = preflight.collision
+    occupancy = preflight.occupancy
+    payload = _holorobot_sampled_evidence_payload(preflight)
+    if collision is None or occupancy is None or payload is None:
+        return False
+    expected_sample_count = 1 + max(1, len(preflight.planning_waypoints) - 1) * (
+        HOLOROBOT_SEGMENT_SAMPLES - 1
+    )
+    evidence_sha256 = preflight.path_validation_evidence_sha256
+    return bool(
+        not preflight.swept_mesh_required
+        and not preflight.continuous_occupancy_sweep_required
+        and collision.proof_evidence is None
+        and not collision.continuous_swept_volume_verified
+        and occupancy.proof_evidence is None
+        and not occupancy.continuous_swept_volume_verified
+        and collision.sample_count == expected_sample_count
+        and occupancy.sample_count == expected_sample_count
+        and math.isclose(
+            collision.maximum_joint_step_rad,
+            occupancy.maximum_joint_step_rad,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        )
+        and collision.result.diagnostics.get("segment_samples")
+        == HOLOROBOT_SEGMENT_SAMPLES
+        and occupancy.result.diagnostics.get("segment_samples")
+        == HOLOROBOT_SEGMENT_SAMPLES
+        and collision.result.diagnostics.get("path_validation_mode")
+        == HOLOROBOT_SAMPLED_VALIDATION
+        and occupancy.result.diagnostics.get("path_validation_mode")
+        == HOLOROBOT_SAMPLED_VALIDATION
+        and collision.result.diagnostics.get("sampled_path_verified") is True
+        and occupancy.result.diagnostics.get("sampled_path_verified") is True
+        and isinstance(evidence_sha256, str)
+        and evidence_sha256 == _canonical_sha256(payload)
+    )
 
 
 def _linear_waypoints(
@@ -273,6 +421,116 @@ def validate_preflight_servoj_contract(
     return expected_stream
 
 
+def _sample_mesh_path_holorobot_style(
+    collision_checker: Cs68PinocchioCollisionChecker,
+    waypoints: tuple[tuple[float, ...], ...],
+    *,
+    maximum_joint_step_rad: float,
+) -> JointPathMeshCollisionReport:
+    sampled = _holorobot_sampled_configurations(waypoints)
+    last_result: CollisionCheckResult | None = None
+    for sample_index, (configuration, fraction) in enumerate(sampled):
+        result = collision_checker.check(configuration)
+        last_result = result
+        if result.status is not CollisionCheckStatus.CLEAR:
+            enriched = replace(
+                result,
+                diagnostics={
+                    **result.diagnostics,
+                    "path_validation_mode": HOLOROBOT_SAMPLED_VALIDATION,
+                    "sampled_path_verified": False,
+                    "segment_samples": HOLOROBOT_SEGMENT_SAMPLES,
+                },
+            )
+            return JointPathMeshCollisionReport(
+                status=result.status,
+                sample_count=sample_index + 1,
+                blocked_sample_index=sample_index,
+                blocked_path_fraction=fraction,
+                result=enriched,
+                maximum_joint_step_rad=maximum_joint_step_rad,
+            )
+    if last_result is None:
+        raise ValueError("HoloRobot sampled path contains no configurations")
+    clear = replace(
+        last_result,
+        diagnostics={
+            **last_result.diagnostics,
+            "path_validation_mode": HOLOROBOT_SAMPLED_VALIDATION,
+            "sampled_path_verified": True,
+            "segment_samples": HOLOROBOT_SEGMENT_SAMPLES,
+            "sample_count": len(sampled),
+        },
+    )
+    return JointPathMeshCollisionReport(
+        status=CollisionCheckStatus.CLEAR,
+        sample_count=len(sampled),
+        blocked_sample_index=None,
+        blocked_path_fraction=None,
+        result=clear,
+        maximum_joint_step_rad=maximum_joint_step_rad,
+    )
+
+
+def _sample_occupancy_path_holorobot_style(
+    occupancy_checker: OccupancyRobotCollisionChecker,
+    waypoints: tuple[tuple[float, ...], ...],
+    *,
+    maximum_joint_step_rad: float,
+    required_freshness_horizon_s: float,
+) -> JointPathOccupancyCollisionReport:
+    sampled = _holorobot_sampled_configurations(waypoints)
+    expected_evidence = None
+    last_result: OccupancyCollisionCheckResult | None = None
+    for sample_index, (configuration, fraction) in enumerate(sampled):
+        result = occupancy_checker.check(
+            configuration,
+            expected_evidence=expected_evidence,
+            required_freshness_horizon_s=required_freshness_horizon_s,
+        )
+        last_result = result
+        if expected_evidence is None and result.evidence is not None:
+            expected_evidence = result.evidence
+        if result.status is not CollisionCheckStatus.CLEAR:
+            enriched = replace(
+                result,
+                diagnostics={
+                    **result.diagnostics,
+                    "path_validation_mode": HOLOROBOT_SAMPLED_VALIDATION,
+                    "sampled_path_verified": False,
+                    "segment_samples": HOLOROBOT_SEGMENT_SAMPLES,
+                },
+            )
+            return JointPathOccupancyCollisionReport(
+                status=result.status,
+                sample_count=sample_index + 1,
+                blocked_sample_index=sample_index,
+                blocked_path_fraction=fraction,
+                result=enriched,
+                maximum_joint_step_rad=maximum_joint_step_rad,
+            )
+    if last_result is None:
+        raise ValueError("HoloRobot sampled occupancy path contains no configurations")
+    clear = replace(
+        last_result,
+        diagnostics={
+            **last_result.diagnostics,
+            "path_validation_mode": HOLOROBOT_SAMPLED_VALIDATION,
+            "sampled_path_verified": True,
+            "segment_samples": HOLOROBOT_SEGMENT_SAMPLES,
+            "sample_count": len(sampled),
+        },
+    )
+    return JointPathOccupancyCollisionReport(
+        status=CollisionCheckStatus.CLEAR,
+        sample_count=len(sampled),
+        blocked_sample_index=None,
+        blocked_path_fraction=None,
+        result=clear,
+        maximum_joint_step_rad=maximum_joint_step_rad,
+    )
+
+
 @performance_timed("planning.preflight_linear_joint_motion")
 def preflight_linear_joint_motion(
     start_joint_positions_rad: ArrayLike,
@@ -300,6 +558,7 @@ def preflight_linear_joint_motion(
     ),
     motion_envelope_acceptance_id: str | None = None,
     motion_envelope_metadata_sha256: str | None = None,
+    path_validation_mode: str = CONTINUOUS_INTERVAL_VALIDATION,
 ) -> JointMotionPreflight:
     """Plan, collision-check, and time-parameterize one conservative linear joint leg."""
 
@@ -350,6 +609,15 @@ def preflight_linear_joint_motion(
     elif acceptance_id is not None or acceptance_metadata_sha256 is not None:
         raise ValueError("Motion-envelope hashes cannot bind a zero uncertainty vector")
     uncertainty_tuple = tuple(float(value) for value in uncertainty)
+    validation_mode = str(path_validation_mode).strip()
+    if validation_mode not in {
+        CONTINUOUS_INTERVAL_VALIDATION,
+        HOLOROBOT_SAMPLED_VALIDATION,
+    }:
+        raise ValueError(f"Unsupported path_validation_mode: {validation_mode!r}")
+    if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
+        require_swept_mesh = False
+        require_continuous_occupancy_sweep = False
     diagnostics = {
         "planner": "holorobot_conservative_linear_joint",
         "trajectory_generator": "holorobot_velocity_limited_servoj",
@@ -364,6 +632,7 @@ def preflight_linear_joint_motion(
         "motion_envelope_acceptance_id": acceptance_id,
         "motion_envelope_metadata_sha256": acceptance_metadata_sha256,
         "accepted_joint_uncertainty_rad": list(uncertainty_tuple),
+        "path_validation_mode": validation_mode,
         "provenance": robot_stack_provenance(),
         "motion_authorized": False,
     }
@@ -385,15 +654,23 @@ def preflight_linear_joint_motion(
             occupancy_required=bool(require_occupancy),
             swept_mesh_required=bool(require_swept_mesh),
             continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
+            path_validation_mode=validation_mode,
         )
-    collision = collision_checker.check_path(
-        start,
-        goal,
-        maximum_joint_step_rad=maximum_joint_step_rad,
-        maximum_joint_path_deviation_rad=uncertainty_tuple,
-        motion_envelope_acceptance_id=acceptance_id,
-        motion_envelope_metadata_sha256=acceptance_metadata_sha256,
-    )
+    if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
+        collision = _sample_mesh_path_holorobot_style(
+            collision_checker,
+            waypoints,
+            maximum_joint_step_rad=maximum_joint_step_rad,
+        )
+    else:
+        collision = collision_checker.check_path(
+            start,
+            goal,
+            maximum_joint_step_rad=maximum_joint_step_rad,
+            maximum_joint_path_deviation_rad=uncertainty_tuple,
+            motion_envelope_acceptance_id=acceptance_id,
+            motion_envelope_metadata_sha256=acceptance_metadata_sha256,
+        )
     if collision.status is not CollisionCheckStatus.CLEAR:
         reasons = collision.result.blocking_reasons or (
             f"collision_status:{collision.status.value}",
@@ -412,6 +689,7 @@ def preflight_linear_joint_motion(
             occupancy_required=bool(require_occupancy),
             swept_mesh_required=bool(require_swept_mesh),
             continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
+            path_validation_mode=validation_mode,
         )
     if require_swept_mesh and not (
         collision.continuous_swept_volume_evidence_valid
@@ -432,6 +710,7 @@ def preflight_linear_joint_motion(
             occupancy_required=bool(require_occupancy),
             swept_mesh_required=True,
             continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
+            path_validation_mode=validation_mode,
         )
     velocities = collision_checker.kinematic_model.joint_velocity_limits_rad_s()
     stream = _velocity_limited_stream(
@@ -452,12 +731,20 @@ def preflight_linear_joint_motion(
             or occupancy_checker.motion_envelope_acceptance_id != acceptance_id
         ):
             raise ValueError("Mesh and occupancy preflight motion envelopes differ")
-        occupancy = occupancy_checker.check_path(
-            start,
-            goal,
-            maximum_joint_step_rad=maximum_joint_step_rad,
-            required_freshness_horizon_s=required_freshness_horizon_s,
-        )
+        if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
+            occupancy = _sample_occupancy_path_holorobot_style(
+                occupancy_checker,
+                waypoints,
+                maximum_joint_step_rad=maximum_joint_step_rad,
+                required_freshness_horizon_s=required_freshness_horizon_s,
+            )
+        else:
+            occupancy = occupancy_checker.check_path(
+                start,
+                goal,
+                maximum_joint_step_rad=maximum_joint_step_rad,
+                required_freshness_horizon_s=required_freshness_horizon_s,
+            )
         if occupancy.status is not CollisionCheckStatus.CLEAR:
             reasons = occupancy.result.blocking_reasons or (
                 f"occupancy_status:{occupancy.status.value}",
@@ -476,6 +763,7 @@ def preflight_linear_joint_motion(
                 occupancy_required=bool(require_occupancy),
                 swept_mesh_required=bool(require_swept_mesh),
                 continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
+                path_validation_mode=validation_mode,
             )
         if require_continuous_occupancy_sweep and not (
             occupancy.continuous_swept_volume_evidence_valid
@@ -496,6 +784,7 @@ def preflight_linear_joint_motion(
                 occupancy_required=bool(require_occupancy),
                 swept_mesh_required=bool(require_swept_mesh),
                 continuous_occupancy_sweep_required=True,
+                path_validation_mode=validation_mode,
             )
     elif require_occupancy:
         return JointMotionPreflight(
@@ -512,8 +801,9 @@ def preflight_linear_joint_motion(
             occupancy_required=True,
             swept_mesh_required=bool(require_swept_mesh),
             continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
+            path_validation_mode=validation_mode,
         )
-    return JointMotionPreflight(
+    preflight = JointMotionPreflight(
         status=MotionPreflightStatus.CLEAR,
         start_joint_positions_rad=start,
         goal_joint_positions_rad=goal,
@@ -523,36 +813,57 @@ def preflight_linear_joint_motion(
         occupancy=occupancy,
         blocking_reasons=(),
         warnings=(
-            "acceleration_limits_unavailable",
-            *(() if require_occupancy else ("occupancy_disabled_offline_diagnostic_only",)),
-            *(
-                ()
-                if require_swept_mesh
-                else ("continuous_swept_mesh_disabled_offline_diagnostic_only",)
-            ),
-            *(
-                ()
-                if require_continuous_occupancy_sweep
-                else ("continuous_swept_occupancy_disabled_offline_diagnostic_only",)
-            ),
-            *(
-                ()
-                if require_occupancy
-                else ("continuous_swept_occupancy_unavailable_offline_diagnostic_only",)
-            ),
-            *(
-                ()
-                if (
-                    occupancy is not None
-                    and occupancy.evidence is not None
-                    and occupancy.evidence.semantic_attestation_valid
-                )
-                else ("occupancy_semantic_attestation_unavailable_diagnostic_only",)
-            ),
+            (
+                "acceleration_limits_unavailable",
+                "online_path_uses_holorobot_fixed_step_segment_sampling",
+            )
+            if validation_mode == HOLOROBOT_SAMPLED_VALIDATION
+            else (
+                "acceleration_limits_unavailable",
+                *(
+                    ()
+                    if require_occupancy
+                    else ("occupancy_disabled_offline_diagnostic_only",)
+                ),
+                *(
+                    ()
+                    if require_swept_mesh
+                    else ("continuous_swept_mesh_disabled_offline_diagnostic_only",)
+                ),
+                *(
+                    ()
+                    if require_continuous_occupancy_sweep
+                    else ("continuous_swept_occupancy_disabled_offline_diagnostic_only",)
+                ),
+                *(
+                    ()
+                    if require_occupancy
+                    else ("continuous_swept_occupancy_unavailable_offline_diagnostic_only",)
+                ),
+                *(
+                    ()
+                    if (
+                        occupancy is not None
+                        and occupancy.evidence is not None
+                        and occupancy.evidence.semantic_attestation_valid
+                    )
+                    else ("occupancy_semantic_attestation_unavailable_diagnostic_only",)
+                ),
+            )
         ),
         diagnostics=diagnostics,
         servoj_runtime_config=runtime_config,
         occupancy_required=bool(require_occupancy),
         swept_mesh_required=bool(require_swept_mesh),
         continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
+        path_validation_mode=validation_mode,
     )
+    if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
+        payload = _holorobot_sampled_evidence_payload(preflight)
+        if payload is None:
+            raise ValueError("HoloRobot sampled preflight lacks bound collision evidence")
+        preflight = replace(
+            preflight,
+            path_validation_evidence_sha256=_canonical_sha256(payload),
+        )
+    return preflight
