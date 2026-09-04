@@ -539,8 +539,9 @@ class _FakeRunner:
         self._status = _status(
             self.tmp_path,
             ExperimentDisposition.NEEDS_CAPTURE,
-            phase="bootstrap_map_required",
+            phase="motion_blocked",
             cycle=self.capture_count,
+            blocking=("recovery_requires_fresh_safety_refresh",),
         )
         return self._status
 
@@ -638,6 +639,7 @@ def _runtime(
     experimental: bool = False,
     monotonic_clock=None,
     bootstrap_motion_ready_after: int | None = None,
+    initial_operator_bootstrap_views: int = 0,
 ) -> tuple[UnknownBladeSupervisedRuntime, _FakeRunner, _FakeCoarseSession]:
     session = _FakeCoarseSession(tmp_path, transitions=transitions)
     adapter = CoarseSessionNextViewAdapter(session)
@@ -699,6 +701,7 @@ def _runtime(
         recovered_fine_runner=recovered_fine_runner,
         maximum_schema5_handoff_duration_s=maximum_schema5_handoff_duration_s,
         experimental=experimental,
+        initial_operator_bootstrap_views=initial_operator_bootstrap_views,
         **runtime_kwargs,
     )
     return runtime, runner, session
@@ -1658,7 +1661,27 @@ def test_resume_requires_fresh_stop_and_discards_pending_motion_authority(
     assert confirmation.physical_stop_confirmed is True
     assert confirmation.discard_pending_motion is True
     assert snapshot.runner_status.disposition is ExperimentDisposition.NEEDS_CAPTURE
+    assert snapshot.runner_status.phase == "motion_blocked"
     assert active.execute_count == 0
+
+
+def test_coarse_resume_requests_safety_refresh_without_second_hard_roi(
+    tmp_path: Path,
+) -> None:
+    runtime, coarse, session = _runtime(
+        tmp_path,
+        resume_phase=UnknownBladeResumePhase.COARSE,
+        initial_operator_bootstrap_views=1,
+    )
+
+    snapshot = runtime.start()
+
+    assert snapshot.phase is UnknownBladeRuntimePhase.COARSE_SCAN
+    assert snapshot.operator_bootstrap_views == 1
+    assert snapshot.runner_status.phase == "motion_blocked"
+    assert snapshot.runner_status.disposition is ExperimentDisposition.NEEDS_CAPTURE
+    assert coarse.capture_count == 0
+    assert session.stage_operator_calls == 0
 
 
 def test_prepared_resume_starts_new_fine_run_then_binds_it(
@@ -2220,6 +2243,59 @@ def test_production_open_checks_readiness_before_hardware_or_output(
 
     assert calls == ["readiness"]
     assert not output.exists()
+
+
+def test_experimental_open_allows_verified_coarse_resume_before_hardware(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "experimental-resume"
+    root.mkdir()
+    plan = UnknownBladeResumePlan(
+        experiment_root=root.resolve(),
+        experiment_id="runtime-test",
+        phase=UnknownBladeResumePhase.COARSE,
+        coarse_run_root=(root / "runs" / "coarse").resolve(),
+        coarse_generation_path=(root / "coarse-generation").resolve(),
+        placement_id="blade-placement-test",
+    )
+    calls: list[bool] = []
+
+    class ExpectedReadiness(Exception):
+        pass
+
+    monkeypatch.setattr(runtime_module, "load_unknown_blade_resume_plan", lambda _root: plan)
+
+    def stop_after_readiness(_settings, *, require_release_acceptance: bool) -> None:
+        calls.append(require_release_acceptance)
+        raise ExpectedReadiness
+
+    monkeypatch.setattr(
+        runtime_module,
+        "require_unknown_blade_runtime_ready",
+        stop_after_readiness,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "EliteArm",
+        lambda _settings: (_ for _ in ()).throw(
+            AssertionError("readiness must finish before hardware construction")
+        ),
+    )
+
+    with (
+        pytest.raises(ExpectedReadiness),
+        open_production_unknown_blade_runtime(
+            load_settings("configs/default.yaml"),
+            output_root=root,
+            operator_id="operator-1",
+            resume=True,
+            experimental=True,
+        ),
+    ):
+        raise AssertionError("context must not open")
+
+    assert calls == [False]
 
 
 @pytest.mark.parametrize(

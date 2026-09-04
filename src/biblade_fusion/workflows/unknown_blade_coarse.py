@@ -13,18 +13,20 @@ import json
 import re
 import shutil
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from math import atan2, cos, degrees, radians, sin, sqrt
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import cv2
 import numpy as np
 
 from biblade_fusion.calibration import HandEyeCalibration
+from biblade_fusion.core.planning_deadline import require_planning_time
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     AppSettings,
@@ -68,10 +70,12 @@ from biblade_fusion.planning import (
     EvaluatedCandidate,
     FilteredViewPlan,
     ReachabilityChecker,
+    ReachabilityResult,
     SurfacePatch,
     adaptive_view_search_payload,
     coverage_observation_id,
     create_coverage_ledger,
+    evaluate_multi_seed_ik,
     filter_candidate_views,
     search_adaptive_candidate_family,
     select_uncovered_candidates,
@@ -220,6 +224,7 @@ class CoarseDiscoveryPlan:
     policy_sha256: str
     adaptive_searches: tuple[AdaptiveFinDiscoverySearch, ...] = ()
     current_joint_positions_rad: tuple[float, float, float, float, float, float] | None = None
+    normal_evaluations: tuple[EvaluatedCandidate, ...] = ()
 
     @property
     def endpoint_feasible(self) -> tuple[EvaluatedCandidate, ...]:
@@ -228,6 +233,14 @@ class CoarseDiscoveryPlan:
     @property
     def motion_authorized(self) -> bool:
         return False
+
+
+@dataclass(frozen=True, slots=True)
+class _FixedReachabilityChecker:
+    result: ReachabilityResult
+
+    def check(self, _base_t_left_ir: PoseSE3) -> ReachabilityResult:
+        return self.result
 
 
 @dataclass(frozen=True, slots=True)
@@ -640,6 +653,8 @@ def generate_fin_discovery_plan(
         tuple[float, float, float, float, float, float] | None
     ) = None,
     endpoint_validator: EndpointConfigurationValidator | None = None,
+    *,
+    normal_candidates: Sequence[CandidateView] = (),
 ) -> CoarseDiscoveryPlan:
     """Generate paired +/- oblique targets about both unknown fin axes.
 
@@ -656,14 +671,21 @@ def generate_fin_discovery_plan(
     angle = radians(policy.discovery_tilt_deg)
     candidates: list[CandidateView] = []
     extents = (float(proxy.extents_m[0]), float(proxy.extents_m[1]))
-    for side, side_sign in ((BladeSide.FRONT, 1.0), (BladeSide.BACK, -1.0)):
-        normal = side_sign * front_normal
-        target = proxy.center_m + normal * float(proxy.extents_m[2]) / 2.0
-        for axis_name, direction, preferred_x in (
-            ("major", major, minor),
-            ("minor", minor, major),
-        ):
-            for sign_name, lateral_sign in (("negative", -1.0), ("positive", 1.0)):
+    # Breadth-first semantic order: establish opposing major-axis evidence on
+    # both blade sides before spending budget on the orthogonal fallback axis.
+    # A side-major nested loop let four slow front families consume the useful
+    # planning window before any back candidate was even attempted.
+    for axis_name, direction, preferred_x in (
+        ("major", major, minor),
+        ("minor", minor, major),
+    ):
+        for sign_name, lateral_sign in (("negative", -1.0), ("positive", 1.0)):
+            for side, side_sign in ((BladeSide.FRONT, 1.0), (BladeSide.BACK, -1.0)):
+                require_planning_time(
+                    f"before fin-discovery geometry {side.value}:{axis_name}:{sign_name}"
+                )
+                normal = side_sign * front_normal
+                target = proxy.center_m + normal * float(proxy.extents_m[2]) / 2.0
                 view_id = f"{side.value}_fin_discovery_{axis_name}_{sign_name}"
                 position = (
                     target
@@ -708,6 +730,9 @@ def generate_fin_discovery_plan(
             )
         evaluated = []
         for candidate in candidates:
+            require_planning_time(
+                f"before fin-discovery adaptive family {candidate.view_id}"
+            )
             search_config = _fin_discovery_search_config(
                 candidate,
                 planning_config,
@@ -752,6 +777,9 @@ def generate_fin_discovery_plan(
         () if adaptive_enabled else planning_config.paired_fin_discovery_fallbacks
     )
     for fallback_index, fallback in enumerate(fallbacks, start=1):
+        require_planning_time(
+            f"before explicit fin-discovery fallback {fallback_index}"
+        )
         side = BladeSide(fallback.side)
         interim = CoarseDiscoveryPlan(FilteredViewPlan(tuple(evaluated), ()), "pending")
         if _paired_discovery_ids(interim, side):
@@ -779,33 +807,90 @@ def generate_fin_discovery_plan(
         )
         evaluated.extend(checked.candidates)
     filtered = FilteredViewPlan(tuple(evaluated), ())
-    canonical = json.dumps(
-        {
-            "algorithm": (
-                "adaptive_bilateral_paired_oblique_fin_discovery_v4"
-                if adaptive_enabled
-                else "explicit_bilateral_paired_oblique_fin_discovery_v3"
-            ),
-            "ik_branch_collision_filter_enabled": endpoint_validator is not None,
-            "policy": asdict(policy),
-            "view_planning": planning_config.model_dump(mode="json"),
-            "view_filter": filter_config.model_dump(mode="json"),
-            "candidate_poses": {
-                item.candidate.view_id: item.candidate.base_t_left_ir.matrix.tolist()
-                for item in filtered.candidates
-            },
-            "candidate_status": {
-                item.candidate.view_id: item.status.value for item in filtered.candidates
-            },
-            "joint_positions_rad": {
-                item.candidate.view_id: (
+    normal_evaluations: tuple[EvaluatedCandidate, ...] = ()
+    if normal_candidates:
+        if current_joint_positions_rad is None:
+            raise UnknownBladeCoarseError(
+                "Stopped-posture normal endpoint evaluation requires current joints"
+            )
+        geometry = filter_candidate_views(
+            tuple(normal_candidates),
+            proxy,
+            filter_config,
+            None,
+            deduplicate=False,
+        )
+        refreshed: list[EvaluatedCandidate] = []
+        for item in geometry.candidates:
+            require_planning_time(
+                f"before stopped-posture normal evaluation {item.candidate.view_id}"
+            )
+            if item.status is CandidateStatus.REJECTED:
+                refreshed.append(item)
+                continue
+            ik = evaluate_multi_seed_ik(
+                item.candidate.base_t_left_ir,
+                (reachability_checker,),
+                current_joint_positions_rad,
+                endpoint_validator,
+            )
+            refreshed.append(
+                filter_candidate_views(
+                    (item.candidate,),
+                    proxy,
+                    filter_config,
+                    _FixedReachabilityChecker(ik.result),
+                    deduplicate=False,
+                ).candidates[0]
+            )
+        normal_evaluations = tuple(refreshed)
+
+    canonical_payload: dict[str, object] = {
+        "algorithm": (
+            "adaptive_bilateral_paired_oblique_fin_discovery_v4"
+            if adaptive_enabled
+            else "explicit_bilateral_paired_oblique_fin_discovery_v3"
+        ),
+        "ik_branch_collision_filter_enabled": endpoint_validator is not None,
+        "policy": asdict(policy),
+        "view_planning": planning_config.model_dump(mode="json"),
+        "view_filter": filter_config.model_dump(mode="json"),
+        "candidate_poses": {
+            item.candidate.view_id: item.candidate.base_t_left_ir.matrix.tolist()
+            for item in filtered.candidates
+        },
+        "candidate_status": {
+            item.candidate.view_id: item.status.value for item in filtered.candidates
+        },
+        "joint_positions_rad": {
+            item.candidate.view_id: (
+                item.joint_positions_rad.tolist()
+                if item.joint_positions_rad is not None
+                else None
+            )
+            for item in filtered.candidates
+        },
+    }
+    if normal_evaluations:
+        assert current_joint_positions_rad is not None
+        canonical_payload["current_joint_positions_rad"] = list(
+            current_joint_positions_rad
+        )
+        canonical_payload["stopped_posture_normal_candidates"] = {
+            item.candidate.view_id: {
+                "base_T_left_ir": item.candidate.base_t_left_ir.matrix.tolist(),
+                "status": item.status.value,
+                "reasons": list(item.reasons),
+                "joint_positions_rad": (
                     item.joint_positions_rad.tolist()
                     if item.joint_positions_rad is not None
                     else None
-                )
-                for item in filtered.candidates
-            },
-        },
+                ),
+            }
+            for item in normal_evaluations
+        }
+    canonical = json.dumps(
+        canonical_payload,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
@@ -814,7 +899,8 @@ def generate_fin_discovery_plan(
         filtered,
         hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
         tuple(adaptive_searches),
-        current_joint_positions_rad if adaptive_enabled else None,
+        current_joint_positions_rad if adaptive_enabled or normal_evaluations else None,
+        normal_evaluations,
     )
 
 
@@ -1199,19 +1285,124 @@ def _candidate_attempts(
     return attempts
 
 
+def _resolve_immutable_directory_record(record: dict[str, object]) -> Path:
+    """Resolve one hash-bound directory record without replaying its payload.
+
+    Ranking runs on every stopped cycle.  Re-reading every predecessor through
+    the full coarse-generation reader would replay all masks and coverage at
+    quadratic cost, so discovery provenance is walked through the already
+    hash-bound generation chain and only its small JSON authorities are read.
+    """
+
+    raw_root = Path(str(record["root"]))
+    root = raw_root.resolve()
+    relative = Path(str(record["authority"]))
+    authority = (root / relative).resolve()
+    if (
+        not raw_root.is_absolute()
+        or raw_root != root
+        or relative.is_absolute()
+        or not authority.is_relative_to(root)
+        or not authority.is_file()
+        or _sha256(authority) != str(record["sha256"])
+        or authority.stat().st_size != int(record["size_bytes"])
+    ):
+        raise UnknownBladeCoarseError("Coarse discovery provenance changed")
+    return root
+
+
+def _accepted_discovery_target_poses(
+    generation: StoredCoarseScanGeneration,
+) -> dict[Path, PoseSE3]:
+    """Recover each accepted fin target from its own stopped-posture revision."""
+
+    views_by_root = {item.root.resolve(): item for item in generation.views}
+    expected: dict[Path, PoseSE3] = {}
+    payload = generation.metadata
+    expected_index = generation.generation_index
+    while True:
+        if (
+            payload.get("artifact_kind") != "biblade_fusion.coarse_scan_generation"
+            or int(payload["generation_index"]) != expected_index
+        ):
+            raise UnknownBladeCoarseError("Coarse generation provenance is malformed")
+        current_roots = tuple(
+            Path(str(record["root"])).resolve() for record in payload["views"]
+        )
+        previous_record = payload["previous_generation"]
+        previous_payload: dict[str, Any] | None = None
+        if previous_record is None:
+            appended_roots = current_roots
+        else:
+            previous_root = _resolve_immutable_directory_record(previous_record)
+            previous_payload = json.loads(
+                (previous_root / "generation.json").read_text(encoding="utf-8")
+            )
+            previous_roots = tuple(
+                Path(str(record["root"])).resolve()
+                for record in previous_payload["views"]
+            )
+            if current_roots == previous_roots:
+                appended_roots = ()
+            elif current_roots[:-1] == previous_roots:
+                appended_roots = current_roots[-1:]
+            else:
+                raise UnknownBladeCoarseError(
+                    "Coarse generation discovery provenance is not append-only"
+                )
+        fin_views = tuple(
+            views_by_root[root]
+            for root in appended_roots
+            if root in views_by_root
+            and views_by_root[root].target_kind.startswith("fin_discovery_")
+        )
+        if fin_views:
+            discovery_record = payload["sources"]["discovery_plan"]
+            discovery_root = _resolve_immutable_directory_record(discovery_record)
+            discovery_payload = json.loads(
+                (discovery_root / "discovery.json").read_text(encoding="utf-8")
+            )
+            candidates = {
+                str(candidate["view_id"]): candidate
+                for candidate in discovery_payload["candidates"]
+            }
+            for view in fin_views:
+                candidate = candidates.get(view.target_view_id)
+                if candidate is None or candidate.get("status") != "endpoint_feasible":
+                    raise UnknownBladeCoarseError(
+                        "Accepted fin view is not bound to an endpoint-feasible "
+                        "stopped-posture discovery revision"
+                    )
+                expected[view.root.resolve()] = PoseSE3(
+                    "base",
+                    f"{view.target_view_id}_left_ir",
+                    np.asarray(candidate["base_T_left_ir"], dtype=np.float64),
+                )
+        if previous_payload is None:
+            break
+        payload = previous_payload
+        expected_index -= 1
+    return expected
+
+
 def _verified_discovery_ids(
     generation: StoredCoarseScanGeneration,
     discovery: CoarseDiscoveryPlan,
     policy: CoarseSciencePolicy,
 ) -> frozenset[str]:
-    candidates = {item.candidate.view_id: item for item in discovery.endpoint_feasible}
+    del discovery
+    if not any(
+        str(getattr(view, "target_kind", "")).startswith("fin_discovery_")
+        for view in generation.views
+    ):
+        return frozenset()
+    target_poses = _accepted_discovery_target_poses(generation)
     verified: set[str] = set()
     for view in generation.views:
-        candidate = candidates.get(view.target_view_id)
-        if candidate is None or not view.target_kind.startswith("fin_discovery_"):
+        expected = target_poses.get(view.root.resolve())
+        if expected is None or not view.target_kind.startswith("fin_discovery_"):
             continue
         actual = view.reconstructed.view.base_t_left_ir
-        expected = candidate.candidate.base_t_left_ir
         if (
             np.linalg.norm(actual.translation_m - expected.translation_m)
             <= policy.maximum_discovery_translation_error_m
@@ -1219,6 +1410,16 @@ def _verified_discovery_ids(
         ):
             verified.add(view.target_view_id)
     return frozenset(verified)
+
+
+def _verified_discovery_semantics(
+    verified_ids: frozenset[str] | set[str],
+) -> frozenset[tuple[BladeSide, str, str, str]]:
+    return frozenset(
+        identity
+        for view_id in verified_ids
+        if (identity := _discovery_view_identity(view_id)) is not None
+    )
 
 
 def _paired_discovery_ids(
@@ -1284,8 +1485,15 @@ def _missing_discovery_pair_error(
             f" backed by {len(attempts)} pose samples across {len(traces)} families; "
             f"rolls={rolls}, azimuth_count={len(azimuths)}"
         )
+        terminations = tuple(
+            dict.fromkeys(trace.termination.value for trace in traces)
+        )
+        attempt_summary += f"; termination={list(terminations)}"
         if any(trace.truncated for trace in traces):
-            attempt_summary += "; bounded search prefix was truncated"
+            attempt_summary += (
+                "; bounded search stopped before exhausting its pose family, "
+                "so this is not proof that every admissible endpoint is unreachable"
+            )
     return UnknownBladeCoarseError(
         f"No endpoint-feasible opposing fin-discovery pair exists on {side.value} "
         f"after {evaluation}; {attempt_summary}; "
@@ -1309,6 +1517,7 @@ def _rank_candidates(
 ) -> tuple[tuple[EvaluatedCandidate, CoarseDiscoveryGain], ...]:
     attempts = _candidate_attempts(generation)
     verified = _verified_discovery_ids(generation, discovery, policy)
+    verified_semantics = _verified_discovery_semantics(verified)
     discovery_by_id = {item.candidate.view_id: item for item in discovery.endpoint_feasible}
     coverage = read_coverage_ledger(generation.coverage_path).ledger
     side_view_counts = Counter(item.target_side for item in generation.views)
@@ -1324,21 +1533,28 @@ def _rank_candidates(
         if not pairs:
             missing_pair_sides.append(side)
             continue
-        complete = any(set(pair) <= verified for pair in pairs)
+        complete = any(
+            all(_discovery_view_identity(view_id) in verified_semantics for view_id in pair)
+            for pair in pairs
+        )
         if complete and not require_additional_fin_evidence:
             continue
         side_eligible = 0
         for pair in pairs:
             for view_id in pair:
+                identity = _discovery_view_identity(view_id)
+                assert identity is not None
                 if (
-                    view_id in verified
+                    identity in verified_semantics
                     or attempts.get(view_id, 0) >= policy.maximum_attempts_per_candidate
                 ):
                     continue
                 opposite = pair[1] if view_id == pair[0] else pair[0]
+                opposite_identity = _discovery_view_identity(opposite)
+                assert opposite_identity is not None
                 fin_evidence = (
                     1.0
-                    if opposite in verified
+                    if opposite_identity in verified_semantics
                     else policy.discovery_gain_fin_seed_value
                 )
                 eligible.append((discovery_by_id[view_id], fin_evidence))
@@ -1347,7 +1563,16 @@ def _rank_candidates(
             exhausted_pair_sides.append(side)
 
     plan_root = Path(str(generation.metadata["sources"]["view_plan"]["root"])).resolve()
-    reduced = select_uncovered_candidates(read_view_plan(plan_root).result.filtered_plan, coverage)
+    stored_normal_plan = read_view_plan(plan_root).result.filtered_plan
+    current_normal_plan = (
+        FilteredViewPlan(
+            discovery.normal_evaluations,
+            stored_normal_plan.duplicate_view_ids,
+        )
+        if discovery.normal_evaluations
+        else stored_normal_plan
+    )
+    reduced = select_uncovered_candidates(current_normal_plan, coverage)
     proxy_endpoint = {
         item.candidate.view_id: item
         for item in reduced.remaining
@@ -1538,9 +1763,13 @@ def finalize_coarse_generation(
         if count < policy.minimum_views_per_side:
             reasons.append(f"{side.value}_view_count={count}<{policy.minimum_views_per_side}")
     verified = _verified_discovery_ids(generation, discovery, policy)
+    verified_semantics = _verified_discovery_semantics(verified)
     for side in (BladeSide.FRONT, BladeSide.BACK):
         pairs = _paired_discovery_ids(discovery, side)
-        if not any(set(pair) <= verified for pair in pairs):
+        if not any(
+            all(_discovery_view_identity(view_id) in verified_semantics for view_id in pair)
+            for pair in pairs
+        ):
             reasons.append(f"{side.value} has no verified opposing oblique pair")
     coverage = read_coverage_ledger(generation.coverage_path).ledger
     if policy.require_complete_proxy_coverage and len(coverage.completed_patch_ids) != len(
@@ -1595,8 +1824,11 @@ def finalize_coarse_generation(
         )
         if missing_fin_sides:
             unused = {
-                item.candidate.view_id for item in discovery.endpoint_feasible
-            } - _verified_discovery_ids(generation, discovery, policy)
+                item.candidate.view_id
+                for item in discovery.endpoint_feasible
+                if _discovery_view_identity(item.candidate.view_id)
+                not in verified_semantics
+            }
             phase = CoarsePhase.COLLECTING_FIN_EVIDENCE if unused else CoarsePhase.BLOCKED
             return CoarsePhaseTransition(
                 phase,
@@ -1727,7 +1959,7 @@ def _write_discovery_plan_asset(
     temporary.mkdir()
     try:
         payload = {
-            "schema_version": 4,
+            "schema_version": 5,
             "artifact_kind": "biblade_fusion.coarse_fin_discovery_plan",
             "created_at_utc": datetime.now(UTC).isoformat(),
             "motion_authorized": False,
@@ -1758,6 +1990,21 @@ def _write_discovery_plan_asset(
                     ),
                 }
                 for item in discovery.filtered.candidates
+            ],
+            "normal_candidates": [
+                {
+                    "view_id": item.candidate.view_id,
+                    "side": item.candidate.patch.side.value,
+                    "base_T_left_ir": item.candidate.base_t_left_ir.matrix.tolist(),
+                    "status": item.status.value,
+                    "reasons": list(item.reasons),
+                    "joint_positions_rad": (
+                        item.joint_positions_rad.tolist()
+                        if item.joint_positions_rad is not None
+                        else None
+                    ),
+                }
+                for item in discovery.normal_evaluations
             ],
         }
         if discovery.adaptive_searches:
@@ -1801,13 +2048,13 @@ def _verify_discovery_plan_asset(
 ) -> None:
     payload = json.loads((path / "discovery.json").read_text(encoding="utf-8"))
     if (
-        payload.get("schema_version") not in {1, 2, 3, 4}
+        payload.get("schema_version") not in {1, 2, 3, 4, 5}
         or payload.get("artifact_kind") != "biblade_fusion.coarse_fin_discovery_plan"
         or payload.get("motion_authorized") is not False
         or payload.get("policy_sha256") != discovery.policy_sha256
     ):
         raise UnknownBladeCoarseError("Persisted coarse discovery policy changed")
-    if payload.get("schema_version") == 4:
+    if int(payload.get("schema_version", 0)) >= 4:
         expected_current = (
             list(discovery.current_joint_positions_rad)
             if discovery.current_joint_positions_rad is not None
@@ -1865,6 +2112,39 @@ def _verify_discovery_plan_asset(
             )
         ):
             raise UnknownBladeCoarseError(f"Coarse discovery candidate changed: {view_id}")
+    if int(payload["schema_version"]) >= 5:
+        expected_normal = {
+            item.candidate.view_id: item for item in discovery.normal_evaluations
+        }
+        normal_records = {
+            str(item["view_id"]): item for item in payload.get("normal_candidates", ())
+        }
+        if set(normal_records) != set(expected_normal):
+            raise UnknownBladeCoarseError(
+                "Coarse discovery stopped-posture normal identities changed"
+            )
+        for view_id, item in expected_normal.items():
+            record = normal_records[view_id]
+            joints = (
+                item.joint_positions_rad.tolist()
+                if item.joint_positions_rad is not None
+                else None
+            )
+            if (
+                record["side"] != item.candidate.patch.side.value
+                or record["status"] != item.status.value
+                or record["reasons"] != list(item.reasons)
+                or record["joint_positions_rad"] != joints
+                or not np.allclose(
+                    record["base_T_left_ir"],
+                    item.candidate.base_t_left_ir.matrix,
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+            ):
+                raise UnknownBladeCoarseError(
+                    f"Coarse discovery stopped-posture normal changed: {view_id}"
+                )
 
 
 class CoarseScienceSession:
@@ -1973,6 +2253,11 @@ class CoarseScienceSession:
             self._settings.point_cloud,
             current,
             self._endpoint_validator,
+            normal_candidates=(
+                stored_plan.result.geometric_plan.candidates
+                if int(discovery_payload.get("schema_version", 0)) >= 5
+                else ()
+            ),
         )
         _verify_discovery_plan_asset(
             discovery_path,
@@ -2034,6 +2319,7 @@ class CoarseScienceSession:
                 self._settings.point_cloud,
                 current,
                 self._endpoint_validator,
+                normal_candidates=view_plan.result.geometric_plan.candidates,
             )
         posture_sha256 = hashlib.sha256(
             json.dumps(current, separators=(",", ":"), allow_nan=False).encode("utf-8")
@@ -2503,6 +2789,7 @@ class CoarseScienceSession:
                     self._settings.point_cloud,
                     tuple(float(value) for value in observation.seed_joint_positions_rad),
                     self._endpoint_validator,
+                    normal_candidates=planning.geometric_plan.candidates,
                 )
             with performance_span("coarse.discovery_plan_write"):
                 discovery_path = _write_discovery_plan_asset(

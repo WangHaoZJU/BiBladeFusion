@@ -205,6 +205,18 @@ def test_adaptive_fin_discovery_keeps_opposing_semantics_without_locking_tilt() 
 
     assert len(result.adaptive_searches) == 8
     assert len(result.endpoint_feasible) == 8
+    assert [
+        trace.result.nominal_view_id for trace in result.adaptive_searches
+    ] == [
+        "front_fin_discovery_major_negative",
+        "back_fin_discovery_major_negative",
+        "front_fin_discovery_major_positive",
+        "back_fin_discovery_major_positive",
+        "front_fin_discovery_minor_negative",
+        "back_fin_discovery_minor_negative",
+        "front_fin_discovery_minor_positive",
+        "back_fin_discovery_minor_positive",
+    ]
     assert all(
         item.candidate.view_id.endswith("_adaptive_0000")
         for item in result.endpoint_feasible
@@ -717,7 +729,7 @@ def test_coarse_science_session_creates_proxy_plan_and_discovery_from_first_view
 
     monkeypatch.setattr(coarse_module, "write_initialization", write_initialization)
     planning = SimpleNamespace(
-        geometric_plan=SimpleNamespace(footprint_m=(0.3, 0.2)),
+        geometric_plan=SimpleNamespace(footprint_m=(0.3, 0.2), candidates=()),
         filtered_plan=FilteredViewPlan((), ()),
     )
     monkeypatch.setattr(coarse_module, "plan_initial_observation", lambda *_args: planning)
@@ -747,7 +759,7 @@ def test_coarse_science_session_creates_proxy_plan_and_discovery_from_first_view
     monkeypatch.setattr(
         coarse_module,
         "generate_fin_discovery_plan",
-        lambda *_args: discovery,
+        lambda *_args, **_kwargs: discovery,
     )
 
     def write_discovery(output: Path, *_args: object, **_kwargs: object) -> Path:
@@ -921,7 +933,12 @@ def test_discovery_is_re_evaluated_from_latest_stopped_posture(
         coarse_module,
         "read_view_plan",
         lambda _path: SimpleNamespace(
-            result=SimpleNamespace(geometric_plan=SimpleNamespace(footprint_m=(0.3, 0.2)))
+            result=SimpleNamespace(
+                geometric_plan=SimpleNamespace(
+                    footprint_m=(0.3, 0.2),
+                    candidates=(),
+                )
+            )
         ),
     )
     monkeypatch.setattr(
@@ -954,6 +971,305 @@ def test_discovery_is_re_evaluated_from_latest_stopped_posture(
     assert session.discovery_plan is refreshed
     assert session._discovery_path is not None  # noqa: SLF001
     assert session._discovery_path.parent.name == "fin_discovery_revisions"  # noqa: SLF001
+
+
+def test_normal_endpoint_rejected_at_bootstrap_can_enter_later_ranked_queue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proxy = _proxy()
+    target = proxy.center_m + np.asarray((0.0, 0.0, 0.005))
+    patch = SurfacePatch(
+        "front_patch",
+        coarse_module.BladeSide.FRONT,
+        0,
+        0,
+        target,
+        np.asarray((0.0, 0.0, 1.0)),
+        (0.10, 0.10),
+    )
+    normal = CandidateView(
+        "front_patch",
+        patch,
+        PoseSE3.from_rotation_translation(
+            "base",
+            "front_patch_left_ir",
+            np.diag((1.0, -1.0, -1.0)),
+            target + np.asarray((0.0, 0.0, 0.30)),
+        ),
+        0.30,
+        (0.10, 0.10),
+        1.0,
+        1.0,
+        "fixed_proxy_normal",
+    )
+    back_target = proxy.center_m - np.asarray((0.0, 0.0, 0.005))
+    back_patch = SurfacePatch(
+        "back_patch",
+        coarse_module.BladeSide.BACK,
+        0,
+        0,
+        back_target,
+        np.asarray((0.0, 0.0, -1.0)),
+        (0.10, 0.10),
+    )
+    back_normal = CandidateView(
+        "back_patch",
+        back_patch,
+        PoseSE3.from_rotation_translation(
+            "base",
+            "back_patch_left_ir",
+            np.diag((-1.0, -1.0, 1.0)),
+            back_target - np.asarray((0.0, 0.0, 0.30)),
+        ),
+        0.30,
+        (0.10, 0.10),
+        1.0,
+        1.0,
+        "fixed_proxy_normal",
+    )
+    planning = ViewPlanningConfig(standoff_distance_m=0.30)
+    filtering = ViewFilterConfig(
+        workspace=AxisAlignedBoxConfig(
+            name="cell",
+            minimum_m=(-1.0, -1.0, -0.5),
+            maximum_m=(1.0, 1.0, 1.5),
+        )
+    )
+    first = generate_fin_discovery_plan(
+        proxy,
+        (0.30, 0.20),
+        planning,
+        filtering,
+        CoarseSciencePolicy(),
+        _Unreachable(),
+        current_joint_positions_rad=(0.0,) * 6,
+        normal_candidates=(normal, back_normal),
+    )
+    second = generate_fin_discovery_plan(
+        proxy,
+        (0.30, 0.20),
+        planning,
+        filtering,
+        CoarseSciencePolicy(),
+        _Reachable(),
+        current_joint_positions_rad=(0.2,) * 6,
+        normal_candidates=(normal, back_normal),
+    )
+    same_endpoints_new_stop = generate_fin_discovery_plan(
+        proxy,
+        (0.30, 0.20),
+        planning,
+        filtering,
+        CoarseSciencePolicy(),
+        _Reachable(),
+        current_joint_positions_rad=(0.3,) * 6,
+        normal_candidates=(normal, back_normal),
+    )
+
+    assert first.normal_evaluations[0].status is CandidateStatus.REJECTED
+    assert second.normal_evaluations[0].status is CandidateStatus.ENDPOINT_FEASIBLE
+    assert same_endpoints_new_stop.policy_sha256 != second.policy_sha256
+
+    initialization = tmp_path / "initialization"
+    view_plan = tmp_path / "view-plan"
+    initialization.mkdir()
+    view_plan.mkdir()
+    (initialization / coarse_module.INITIALIZATION_METADATA_FILENAME).write_text(
+        "{}\n", encoding="utf-8"
+    )
+    (view_plan / "view_plan.json").write_text("{}\n", encoding="utf-8")
+    kinematics = tmp_path / "kinematics.yaml"
+    kinematics.write_text("model: test\n", encoding="utf-8")
+    discovery_root = coarse_module._write_discovery_plan_asset(  # noqa: SLF001
+        tmp_path / "discovery-revision",
+        second,
+        source_initialization=initialization,
+        source_view_plan=view_plan,
+        source_kinematics=kinematics,
+    )
+    payload = json.loads(
+        (discovery_root / "discovery.json").read_text(encoding="utf-8")
+    )
+    assert payload["schema_version"] == 5
+    assert len(payload["normal_candidates"]) == 2
+    coarse_module._verify_discovery_plan_asset(  # noqa: SLF001
+        discovery_root,
+        second,
+        source_initialization=initialization,
+        source_view_plan=view_plan,
+        source_kinematics=kinematics,
+    )
+
+    coverage = CoverageLedger(
+        (
+            PatchCoverage(
+                "front_patch",
+                coarse_module.BladeSide.FRONT,
+                0,
+                0,
+                np.zeros((2, 2), dtype=np.int64),
+            ),
+            PatchCoverage(
+                "back_patch",
+                coarse_module.BladeSide.BACK,
+                0,
+                0,
+                np.zeros((2, 2), dtype=np.int64),
+            ),
+        ),
+        (),
+        CoverageConfig(bins_per_axis=2, minimum_points_per_bin=1),
+        1,
+        1,
+    )
+    generation = SimpleNamespace(
+        views=(
+            SimpleNamespace(
+                target_view_id="operator_initial",
+                target_kind="operator_seed",
+                target_side=coarse_module.BladeSide.FRONT,
+            ),
+        ),
+        coverage_path=tmp_path / "coverage",
+        metadata={"sources": {"view_plan": {"root": str(tmp_path / "plan")}}},
+    )
+    monkeypatch.setattr(
+        coarse_module,
+        "read_coverage_ledger",
+        lambda _path: SimpleNamespace(ledger=coverage),
+    )
+    monkeypatch.setattr(
+        coarse_module,
+        "read_view_plan",
+        lambda _path: SimpleNamespace(
+            result=SimpleNamespace(
+                filtered_plan=FilteredViewPlan(first.normal_evaluations, ())
+            )
+        ),
+    )
+
+    ranked = coarse_module._rank_candidates(  # noqa: SLF001
+        generation,
+        second,
+        CoarseSciencePolicy(),
+        require_additional_fin_evidence=False,
+    )
+
+    assert "front_patch" in tuple(item[0].candidate.view_id for item in ranked)
+
+
+def test_verified_fin_evidence_uses_each_accepted_stopped_posture_revision(
+    tmp_path: Path,
+) -> None:
+    def record(root: Path, authority: str) -> dict[str, object]:
+        path = root / authority
+        return {
+            "root": str(root.resolve()),
+            "authority": authority,
+            "sha256": coarse_module._sha256(path),  # noqa: SLF001
+            "size_bytes": path.stat().st_size,
+        }
+
+    def discovery(name: str, view_id: str | None, pose: PoseSE3) -> Path:
+        root = tmp_path / name
+        root.mkdir()
+        candidates = []
+        if view_id is not None:
+            candidates.append(
+                {
+                    "view_id": view_id,
+                    "status": "endpoint_feasible",
+                    "base_T_left_ir": pose.matrix.tolist(),
+                }
+            )
+        (root / "discovery.json").write_text(
+            json.dumps({"candidates": candidates}) + "\n",
+            encoding="utf-8",
+        )
+        return root
+
+    negative_id = "front_fin_discovery_major_negative_adaptive_0003"
+    positive_id = "front_fin_discovery_major_positive_adaptive_0001"
+    negative_pose = PoseSE3.from_rotation_translation(
+        "base", "negative", np.eye(3), (0.1, 0.0, 0.7)
+    )
+    positive_pose = PoseSE3.from_rotation_translation(
+        "base", "positive", np.eye(3), (-0.1, 0.0, 0.7)
+    )
+    discovery0 = discovery("discovery-0", None, negative_pose)
+    discovery1 = discovery("discovery-1", negative_id, negative_pose)
+    # The latest posture no longer exposes the earlier negative endpoint.  Its
+    # already captured evidence must remain valid through the predecessor chain.
+    discovery2 = discovery("discovery-2", positive_id, positive_pose)
+
+    roots = tuple((tmp_path / f"view-{index}").resolve() for index in range(3))
+    for root in roots:
+        root.mkdir()
+
+    views = (
+        SimpleNamespace(
+            root=roots[0],
+            target_view_id="operator",
+            target_kind="operator_seed",
+            reconstructed=SimpleNamespace(
+                view=SimpleNamespace(base_t_left_ir=negative_pose)
+            ),
+        ),
+        SimpleNamespace(
+            root=roots[1],
+            target_view_id=negative_id,
+            target_kind="fin_discovery_major_negative",
+            reconstructed=SimpleNamespace(
+                view=SimpleNamespace(base_t_left_ir=negative_pose)
+            ),
+        ),
+        SimpleNamespace(
+            root=roots[2],
+            target_view_id=positive_id,
+            target_kind="fin_discovery_major_positive",
+            reconstructed=SimpleNamespace(
+                view=SimpleNamespace(base_t_left_ir=positive_pose)
+            ),
+        ),
+    )
+
+    previous_record = None
+    generation_payloads: list[dict[str, object]] = []
+    for index, source in enumerate((discovery0, discovery1, discovery2)):
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "artifact_kind": "biblade_fusion.coarse_scan_generation",
+            "generation_index": index,
+            "previous_generation": previous_record,
+            "sources": {"discovery_plan": record(source, "discovery.json")},
+            "views": [{"root": str(root)} for root in roots[: index + 1]],
+        }
+        generation_payloads.append(payload)
+        generation_root = tmp_path / f"generation-{index}"
+        generation_root.mkdir()
+        (generation_root / "generation.json").write_text(
+            json.dumps(payload) + "\n",
+            encoding="utf-8",
+        )
+        previous_record = record(generation_root, "generation.json")
+
+    generation = SimpleNamespace(
+        generation_index=2,
+        metadata=generation_payloads[-1],
+        views=views,
+    )
+    verified = coarse_module._verified_discovery_ids(  # noqa: SLF001
+        generation,
+        CoarseDiscoveryPlan(FilteredViewPlan((), ()), "a" * 64),
+        CoarseSciencePolicy(),
+    )
+
+    assert verified == {negative_id, positive_id}
+    assert coarse_module._verified_discovery_semantics(verified) == {  # noqa: SLF001
+        (coarse_module.BladeSide.FRONT, "major", "negative", "baseline"),
+        (coarse_module.BladeSide.FRONT, "major", "positive", "baseline"),
+    }
 
 
 def test_operator_bootstrap_side_is_automatic_after_proxy_exists() -> None:
@@ -1460,12 +1776,22 @@ def _patch_promotion_gates(
     monkeypatch.setattr(
         coarse_module,
         "_verified_discovery_ids",
-        lambda *_args: {"negative", "positive"},
+        lambda *_args: {
+            "front_fin_discovery_major_negative",
+            "front_fin_discovery_major_positive",
+            "back_fin_discovery_major_negative",
+            "back_fin_discovery_major_positive",
+        },
     )
     monkeypatch.setattr(
         coarse_module,
         "_paired_discovery_ids",
-        lambda *_args: (("negative", "positive"),),
+        lambda _discovery, side: (
+            (
+                f"{side.value}_fin_discovery_major_negative",
+                f"{side.value}_fin_discovery_major_positive",
+            ),
+        ),
     )
 
 

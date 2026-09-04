@@ -19,6 +19,10 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from biblade_fusion.calibration import Cs68KinematicsModel, HandEyeCalibration
+from biblade_fusion.core.planning_deadline import (
+    PlanningDeadlineExceeded,
+    require_planning_time,
+)
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import KinematicsConfig
 from biblade_fusion.devices.robot.conversions import se3_to_elite_kdl_pose
@@ -216,7 +220,9 @@ class _HoloRobotMdhIkSolver:
         cached = self._cache.get(key)
         if cached is not None:
             self._cache.move_to_end(key)
-            yield from cached
+            for solution in cached:
+                require_planning_time("while yielding cached MDH IK branches")
+                yield solution
             return
         candidates = (
             seed,
@@ -226,12 +232,14 @@ class _HoloRobotMdhIkSolver:
         seen: set[tuple[float, ...]] = set()
         solutions: list[NDArray[np.float64]] = []
         for candidate in candidates:
+            require_planning_time("before MDH IK seed")
             initial = self._clamp(candidate)
             seed_key = tuple(round(float(value), 6) for value in initial)
             if seed_key in seen:
                 continue
             seen.add(seed_key)
             solution = self._solve_single(target_base_t_flange, initial)
+            require_planning_time("after MDH IK seed")
             if solution is not None:
                 normalized = _nearest_equivalent_joints(
                     solution,
@@ -262,6 +270,7 @@ class _HoloRobotMdhIkSolver:
     ) -> NDArray[np.float64] | None:
         joints = seed.copy()
         for _ in range(max_iterations):
+            require_planning_time("during MDH IK iteration")
             current_pose, jacobian = _forward_pose_and_jacobian(self._model, joints)
             position_error = target.translation_m - current_pose.translation_m
             rotation_error = _so3_error(target.rotation, current_pose.rotation)
@@ -327,7 +336,9 @@ class _HoloRobotPinocchioIkSolver:
         cached = self._cache.get(key)
         if cached is not None:
             self._cache.move_to_end(key)
-            yield from cached
+            for solution in cached:
+                require_planning_time("while yielding cached Pinocchio IK branches")
+                yield solution
             return
 
         candidates = (
@@ -342,12 +353,14 @@ class _HoloRobotPinocchioIkSolver:
         seen: set[tuple[float, ...]] = set()
         solutions: list[NDArray[np.float64]] = []
         for candidate in candidates:
+            require_planning_time("before Pinocchio IK seed")
             controller_seed = self._clamp(candidate)
             seed_key = tuple(round(float(value), 6) for value in controller_seed)
             if seed_key in seen:
                 continue
             seen.add(seed_key)
             solution = self._solve_single(target, controller_seed)
+            require_planning_time("after Pinocchio IK seed")
             if solution is not None:
                 # Consumers may stop after the first clear endpoint.  If it is
                 # blocked, iteration continues through the bounded HoloRobot seeds.
@@ -382,6 +395,7 @@ class _HoloRobotPinocchioIkSolver:
     ) -> NDArray[np.float64] | None:
         configuration = self._model._to_configuration(controller_seed)
         for _ in range(maximum_iterations):
+            require_planning_time("during Pinocchio IK iteration")
             self._pin.forwardKinematics(self._model.model, self._data, configuration)
             self._pin.updateFramePlacements(self._model.model, self._data)
             current = self._data.oMf[self._model.tool_frame_id]
@@ -512,13 +526,17 @@ class EliteCs68IkChecker:
             self._flange_t_left_ir.inverse()
         )
         if not self._uses_vendor_solver:
+            require_planning_time("before HoloRobot IK solve")
             try:
                 solution = self._solver.solve(base_t_flange, self._near)
+            except PlanningDeadlineExceeded:
+                raise
             except Exception as exc:
                 return ReachabilityResult(
                     ReachabilityState.UNKNOWN,
                     f"{self._solver_label} IK call failed: {exc}",
                 )
+            require_planning_time("after HoloRobot IK solve")
             if solution is None:
                 return ReachabilityResult(
                     ReachabilityState.UNREACHABLE,
@@ -534,13 +552,17 @@ class EliteCs68IkChecker:
 
         base_t_tcp = base_t_flange.compose(self._flange_t_tcp)
         target = se3_to_elite_kdl_pose(base_t_tcp)
+        require_planning_time("before vendor KDL IK call")
         try:
             ok, solution, result = self._solver.getPositionIK(target, self._near)
+        except PlanningDeadlineExceeded:
+            raise
         except Exception as exc:
             return ReachabilityResult(
                 ReachabilityState.UNKNOWN,
                 f"Elite KDL IK call failed: {exc}",
             )
+        require_planning_time("after vendor KDL IK call")
         error = str(getattr(result, "kinematic_error", "unknown"))
         if not ok:
             return ReachabilityResult(
@@ -571,8 +593,11 @@ class EliteCs68IkChecker:
             return (self.check(base_t_left_ir),)
         canonical = PoseSE3("base", "left_ir", base_t_left_ir.matrix)
         target = canonical.compose(self._flange_t_left_ir.inverse())
+        require_planning_time("before complete HoloRobot IK branch sweep")
         try:
             solutions = self._solver.solve_all(target, self._near)
+        except PlanningDeadlineExceeded:
+            raise
         except Exception as exc:
             return (
                 ReachabilityResult(
@@ -580,6 +605,7 @@ class EliteCs68IkChecker:
                     f"{self._solver_label} IK call failed: {exc}",
                 ),
             )
+        require_planning_time("after complete HoloRobot IK branch sweep")
         if not solutions:
             return (
                 ReachabilityResult(
@@ -612,6 +638,7 @@ class EliteCs68IkChecker:
         yielded = False
         try:
             for solution in self._solver.iter_solutions(target, self._near):
+                require_planning_time("before yielding HoloRobot IK branch")
                 yielded = True
                 yield ReachabilityResult(
                     ReachabilityState.REACHABLE,
@@ -619,6 +646,8 @@ class EliteCs68IkChecker:
                     "trajectory remain unchecked",
                     solution,
                 )
+        except PlanningDeadlineExceeded:
+            raise
         except Exception as exc:
             yield ReachabilityResult(
                 ReachabilityState.UNKNOWN,

@@ -422,9 +422,6 @@ def scan_run_unknown(
     if not operator_id.strip():
         typer.echo("--operator-id must be non-empty.", err=True)
         raise typer.Exit(code=2)
-    if experimental and resume:
-        typer.echo("--experimental cannot be combined with --resume.", err=True)
-        raise typer.Exit(code=2)
     if not resume and (placement_id is None or not placement_id.strip()):
         typer.echo("--placement-id is required for a new physical run.", err=True)
         raise typer.Exit(code=2)

@@ -22,6 +22,10 @@ from biblade_fusion.calibration import (
     HandEyeCalibration,
     load_cs68_kinematics,
 )
+from biblade_fusion.core.planning_deadline import (
+    PlanningDeadlineExceeded,
+    require_planning_time,
+)
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     AppSettings,
@@ -811,6 +815,9 @@ class BladeCoverageNextViewSelector:
         rejected: list[str] = []
         flange_t_tcp = load_es68_flange_t_tcp()
         for item in candidates:
+            require_planning_time(
+                f"before fine-view FK verification {item.candidate.view_id}"
+            )
             joints = item.joint_positions_rad
             if item.status is not CandidateStatus.ENDPOINT_FEASIBLE or joints is None:
                 continue
@@ -1177,6 +1184,8 @@ class BladeCoverageNextViewSelector:
                 projection_poses=projection_poses,
                 deduplicate=False,
             )
+        except PlanningDeadlineExceeded:
+            raise
         except Exception as exc:
             raise BladePlanningAssetError(
                 f"Fine candidate geometry is inconsistent: {exc}"

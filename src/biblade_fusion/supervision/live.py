@@ -57,8 +57,11 @@ from biblade_fusion.supervision.experiment import (
 )
 from biblade_fusion.supervision.snapshot import (
     SUPERVISORY_SNAPSHOT_SCHEMA_VERSION,
+    CandidatePlanningSnapshot,
     EventRecord,
+    LivePlanningUpdate,
     OccupancySnapshot,
+    PlanningProgressSnapshot,
     PlanSnapshot,
     ReconstructionSnapshot,
     RobotSceneSnapshot,
@@ -68,6 +71,7 @@ from biblade_fusion.supervision.snapshot import (
     SupervisorySnapshot,
     TransformSnapshot,
     discover_supervisory_snapshots,
+    write_live_planning_update,
 )
 from biblade_fusion.supervision.storage import AtomicSupervisorySnapshotWriter
 from biblade_fusion.workflows.stop_scan_coordinator import (
@@ -762,6 +766,10 @@ class LiveSupervisionBridge:
                 f"Live display-source registry recovery failed: {exc}"
             ) from exc
         self._events: list[StopScanRunEvent] = []
+        self._planning_events: list[StopScanRunEvent] = []
+        self._planning_camera_pose_cache: dict[str, TransformSnapshot] = {}
+        self._phase_started_at_utc: datetime | None = None
+        self._latest_status: ExperimentStatusSnapshot | None = None
         self._next_sequence, self._existing_session_id = self._discover_timeline_state()
         self._verify_latest_timeline_bindings()
 
@@ -900,7 +908,7 @@ class LiveSupervisionBridge:
                 )
 
     def observe_event(self, event: StopScanRunEvent) -> None:
-        """Remember a verified event for the next immutable UI publication."""
+        """Remember an event and publish a lightweight, diagnostic-only update."""
 
         if type(event) is not StopScanRunEvent:
             raise LiveSupervisionError("Live supervision requires a typed run event")
@@ -914,6 +922,229 @@ class LiveSupervisionBridge:
             self._events.append(event)
             if len(self._events) > self._maximum_event_records:
                 self._events = self._events[-self._maximum_event_records :]
+            if (
+                event.event_type == "next_view_selection_started"
+                or (
+                    self._planning_events
+                    and event.cycle_index != self._planning_events[-1].cycle_index
+                )
+            ):
+                self._planning_events.clear()
+                self._planning_camera_pose_cache.clear()
+            self._planning_events.append(event)
+            event_time = datetime.fromisoformat(event.created_at_utc).astimezone(UTC)
+            if len(self._planning_events) == 1 or (
+                self._planning_events[-2].phase != event.phase
+            ):
+                self._phase_started_at_utc = event_time
+            self._publish_planning_sidecar_best_effort(event.run_id, event.event_sha256)
+
+    def _candidate_camera_pose(
+        self,
+        payload: dict[str, object],
+    ) -> TransformSnapshot | None:
+        state = self._perception
+        if state is None:
+            return None
+        identifier = str(payload.get("target_view_id", "")).strip()
+        if identifier in self._planning_camera_pose_cache:
+            return self._planning_camera_pose_cache[identifier]
+        joints = np.asarray(payload.get("target_joint_positions_rad"), dtype=np.float64)
+        if joints.shape != (6,) or not np.isfinite(joints).all():
+            return None
+        try:
+            current_flange = self._kinematics.forward_kinematics(
+                state.robot_joint_positions_rad
+            )
+            target_flange = self._kinematics.forward_kinematics(joints)
+            current_camera = np.asarray(state.camera_pose_matrix, dtype=np.float64)
+            target_camera = target_flange @ np.linalg.inv(current_flange) @ current_camera
+            pose = TransformSnapshot(
+                parent_frame="base",
+                child_frame="planned_left_rectified",
+                matrix=tuple(
+                    tuple(float(value) for value in row) for row in target_camera
+                ),
+            )
+            if identifier:
+                self._planning_camera_pose_cache[identifier] = pose
+            return pose
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            return None
+
+    @staticmethod
+    def _target_tcp_pose(payload: dict[str, object]) -> TransformSnapshot | None:
+        matrix = payload.get("target_base_t_tcp_matrix")
+        if matrix is None:
+            return None
+        try:
+            return TransformSnapshot(
+                parent_frame="base",
+                child_frame="planned_tcp",
+                matrix=matrix,
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _planning_progress(self, now: datetime) -> PlanningProgressSnapshot:
+        events = tuple(self._planning_events)
+        latest = events[-1] if events else None
+        status = self._latest_status
+        phase = (
+            latest.phase
+            if latest is not None
+            else status.phase
+            if status is not None
+            else "unknown"
+        )
+        disposition = (
+            status.disposition.value
+            if status is not None and status.phase == phase
+            else phase
+        )
+        phase_start = self._phase_started_at_utc
+        elapsed = (
+            max(0.0, (now - phase_start).total_seconds())
+            if phase_start is not None
+            else 0.0
+        )
+        queue_payload: list[dict[str, object]] = []
+        for event in reversed(events):
+            raw_queue = event.payload.get("ranked_candidate_queue")
+            if isinstance(raw_queue, list):
+                queue_payload = [item for item in raw_queue if isinstance(item, dict)]
+                break
+        candidates: dict[str, dict[str, object]] = {}
+        selection_duration_s: float | None = None
+        for item in queue_payload:
+            identifier = str(item.get("target_view_id", "")).strip()
+            if not identifier:
+                continue
+            candidates[identifier] = {
+                "candidate_id": identifier,
+                "rank": int(item.get("rank", len(candidates) + 1)),
+                "science_rank": int(item.get("science_rank", len(candidates) + 1)),
+                "science_score": item.get("science_score"),
+                "ik_status": "CLEAR",
+                "endpoint_status": "PENDING",
+                "straight_path_status": "PENDING",
+                "rrt_status": "PENDING",
+                "ik_duration_s": item.get("ik_duration_s"),
+                "endpoint_duration_s": None,
+                "straight_path_duration_s": None,
+                "target_camera_pose": self._candidate_camera_pose(item),
+                "target_tcp_pose": self._target_tcp_pose(item),
+                "diagnostics": tuple(str(value) for value in item.get("diagnostics", ())),
+            }
+        active_id: str | None = None
+        selected_id: str | None = None
+        selected_path_kind: str | None = None
+        planned_duration_s: float | None = None
+        waypoint_count: int | None = None
+        for event in events:
+            payload = event.payload
+            if event.event_type == "single_segment_preflight_started":
+                active_id = str(payload.get("target_view_id", "")) or None
+                selection_value = payload.get("selection_duration_s")
+                if isinstance(selection_value, (int, float)) and not isinstance(
+                    selection_value, bool
+                ):
+                    selection_duration_s = float(selection_value)
+                if active_id in candidates:
+                    candidates[active_id].update(
+                        endpoint_status="RUNNING",
+                        straight_path_status="RUNNING",
+                        rrt_status="PENDING",
+                    )
+            if event.event_type not in {
+                "ranked_candidate_preflight_rejected",
+                "single_segment_waiting_approval",
+            }:
+                continue
+            candidate_id = str(payload.get("target_view_id", ""))
+            summary = payload.get("preflight")
+            if candidate_id not in candidates or not isinstance(summary, dict):
+                continue
+            candidate = candidates[candidate_id]
+            for key in (
+                "endpoint_status",
+                "straight_path_status",
+                "rrt_status",
+                "ik_duration_s",
+                "endpoint_duration_s",
+                "straight_path_duration_s",
+                "total_duration_s",
+                "rrt_duration_s",
+                "blocking_reasons",
+            ):
+                if key in summary:
+                    candidate[key] = summary[key]
+            active_id = None
+            if event.event_type == "single_segment_waiting_approval":
+                selected_id = candidate_id
+                selected_path_kind = summary.get("selected_path_kind")
+                planned_duration_s = summary.get("planned_motion_duration_s")
+                waypoint_count = summary.get("planning_waypoint_count")
+        typed_candidates = tuple(
+            CandidatePlanningSnapshot(
+                **candidate,
+                active=identifier == active_id,
+                selected=identifier == selected_id,
+            )
+            for identifier, candidate in candidates.items()
+        )
+        return PlanningProgressSnapshot(
+            phase=phase,
+            disposition=disposition,
+            cycle_index=(
+                latest.cycle_index
+                if latest is not None
+                else status.cycle_index
+                if status
+                else 0
+            ),
+            phase_started_at_utc=phase_start,
+            phase_elapsed_s=elapsed,
+            selection_duration_s=selection_duration_s,
+            candidate_count=len(typed_candidates),
+            active_candidate_id=active_id,
+            selected_candidate_id=selected_id,
+            selected_path_kind=(str(selected_path_kind) if selected_path_kind else None),
+            planned_motion_duration_s=(
+                float(planned_duration_s)
+                if isinstance(planned_duration_s, (int, float))
+                and not isinstance(planned_duration_s, bool)
+                else None
+            ),
+            planning_waypoint_count=(
+                int(waypoint_count)
+                if isinstance(waypoint_count, int) and not isinstance(waypoint_count, bool)
+                else None
+            ),
+            latest_event_sha256=(latest.event_sha256 if latest is not None else None),
+            candidates=typed_candidates,
+        )
+
+    def _publish_planning_sidecar_best_effort(
+        self,
+        run_id: str,
+        latest_event_sha256: str,
+    ) -> None:
+        try:
+            now = self._utc_now()
+            write_live_planning_update(
+                self._root / "live_planning.json",
+                LivePlanningUpdate(
+                    generated_at_utc=now,
+                    source_session_id=run_id,
+                    latest_event_sha256=latest_event_sha256,
+                    planning=self._planning_progress(now),
+                ),
+            )
+        except Exception:
+            # A viewer-side progress file is not authority and must never disable
+            # capture, planning, approval, or guarded execution.
+            return
 
     def begin_new_event_stream(self, *, run_id: str) -> None:
         """Reset only phase-local run events while preserving read-only scene state.
@@ -939,6 +1170,10 @@ class LiveSupervisionBridge:
             if self._events and any(event.run_id != identity for event in self._events):
                 raise LiveSupervisionError("Cannot reset a live event stream for a different run")
             self._events.clear()
+            self._planning_events.clear()
+            self._planning_camera_pose_cache.clear()
+            self._phase_started_at_utc = None
+            self._latest_status = None
             self._prepared = None
             self._planned_joint_path = None
             self._existing_session_id = identity
@@ -1275,6 +1510,12 @@ class LiveSupervisionBridge:
         if any(event.run_id != status.run_id for event in self._events):
             raise LiveSupervisionError("Live events and experiment status use different runs")
         with self._lock:
+            self._latest_status = status
+            if self._events:
+                self._publish_planning_sidecar_best_effort(
+                    status.run_id,
+                    self._events[-1].event_sha256,
+                )
             stored, fail_closed_reason = self._publish_locked(status)
         if fail_closed_reason is not None:
             raise LiveSupervisionError(fail_closed_reason)
@@ -1752,6 +1993,7 @@ class LiveSupervisionBridge:
                         current_view_id=status.current_view_id,
                         next_view_id=status.proposed_view_id,
                         blocking_reasons=blocking_reasons,
+                        planning=self._planning_progress(now),
                     ),
                     assets=tuple(assets),
                     events=self._event_records(status, now),

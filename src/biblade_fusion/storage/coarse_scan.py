@@ -1235,16 +1235,22 @@ def read_coarse_scan_generation(path: str | Path) -> StoredCoarseScanGeneration:
             if not view_append and not phase_transition:
                 raise ValueError("coarse generation no longer appends its predecessor")
             previous_sources = previous_payload["sources"]
-            for source_name in ("initialization", "view_plan", "discovery_plan"):
+            for source_name in ("initialization", "view_plan"):
                 if (
                     Path(str(previous_sources[source_name]["root"])).resolve()
                     != Path(str(sources[source_name]["root"])).resolve()
                 ):
                     raise ValueError("coarse generation changed its proxy source")
+            discovery_changed = (
+                Path(str(previous_sources["discovery_plan"]["root"])).resolve()
+                != Path(str(sources["discovery_plan"]["root"])).resolve()
+            )
             previous_coverage = Path(str(previous_sources["coverage"]["root"])).resolve()
             if phase_transition:
                 if coarse_path is None or previous_sources["coarse_model"] is not None:
                     raise ValueError("invalid view-preserving coarse phase transition")
+                if discovery_changed:
+                    raise ValueError("schema-5 transition changed its discovery revision")
                 if coverage_path != previous_coverage:
                     raise ValueError("schema-5 transition changed proxy coverage")
             elif Path(str(coverage.metadata["previous_ledger"])).resolve() != previous_coverage:

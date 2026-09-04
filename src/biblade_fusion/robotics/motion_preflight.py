@@ -12,6 +12,10 @@ from typing import Any
 import numpy as np
 from numpy.typing import ArrayLike
 
+from biblade_fusion.core.planning_deadline import (
+    PlanningDeadlineExceeded,
+    require_planning_time,
+)
 from biblade_fusion.devices.robot.streaming import ServoJStream, ServoJStreamConfig
 from biblade_fusion.diagnostics.performance_timing import performance_span, performance_timed
 from biblade_fusion.robotics.holorobot_joint_planner import (
@@ -608,7 +612,9 @@ def _sample_mesh_path_holorobot_style(
     sampled = _holorobot_sampled_configurations(waypoints)
     last_result: CollisionCheckResult | None = None
     for sample_index, (configuration, fraction) in enumerate(sampled):
+        require_planning_time(f"before sampled mesh pose {sample_index}")
         result = collision_checker.check(configuration)
+        require_planning_time(f"after sampled mesh pose {sample_index}")
         last_result = result
         if result.status is not CollisionCheckStatus.CLEAR:
             enriched = replace(
@@ -717,6 +723,7 @@ def _preflight_joint_waypoints(
 ) -> JointMotionPreflight:
     """Collision-check and time-parameterize one already generated joint path."""
 
+    require_planning_time("before joint-path preflight")
     start = _joint_vector(start_joint_positions_rad, label="motion start")
     goal = _joint_vector(goal_joint_positions_rad, label="motion goal")
     waypoints = tuple(
@@ -818,6 +825,7 @@ def _preflight_joint_waypoints(
             path_validation_mode=validation_mode,
         )
     with performance_span("planning.mesh_collision_preflight"):
+        require_planning_time("before mesh collision preflight")
         if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
             collision = _sample_mesh_path_holorobot_style(
                 collision_checker,
@@ -833,6 +841,7 @@ def _preflight_joint_waypoints(
                 motion_envelope_acceptance_id=acceptance_id,
                 motion_envelope_metadata_sha256=acceptance_metadata_sha256,
             )
+        require_planning_time("after mesh collision preflight")
     if collision.status is not CollisionCheckStatus.CLEAR:
         reasons = collision.result.blocking_reasons or (
             f"collision_status:{collision.status.value}",
@@ -875,6 +884,7 @@ def _preflight_joint_waypoints(
             path_validation_mode=validation_mode,
         )
     with performance_span("planning.servoj_stream_generation"):
+        require_planning_time("before ServoJ time parameterization")
         velocities = collision_checker.kinematic_model.joint_velocity_limits_rad_s()
         timing = _time_parameterized_servoj_stream(
             waypoints,
@@ -885,6 +895,7 @@ def _preflight_joint_waypoints(
             velocity_margin=velocity_margin,
         )
         stream = timing.stream
+        require_planning_time("after ServoJ time parameterization")
     stream_duration_s = max(0, len(stream.commands) - 1) * stream.dt_s
     required_freshness_horizon_s = stream_duration_s + freshness_margin_s
     diagnostics["servoj_path_knot_count"] = timing.knot_count
@@ -902,6 +913,7 @@ def _preflight_joint_waypoints(
         ):
             raise ValueError("Mesh and occupancy preflight motion envelopes differ")
         with performance_span("planning.occupancy_collision_preflight"):
+            require_planning_time("before occupancy collision preflight")
             if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
                 occupancy = _sample_occupancy_path_holorobot_style(
                     occupancy_checker,
@@ -916,6 +928,7 @@ def _preflight_joint_waypoints(
                     maximum_joint_step_rad=maximum_joint_step_rad,
                     required_freshness_horizon_s=required_freshness_horizon_s,
                 )
+            require_planning_time("after occupancy collision preflight")
         if occupancy.status is not CollisionCheckStatus.CLEAR:
             reasons = occupancy.result.blocking_reasons or (
                 f"occupancy_status:{occupancy.status.value}",
@@ -1219,7 +1232,9 @@ def preflight_linear_joint_motion(
         path_validation_mode == HOLOROBOT_SAMPLED_VALIDATION
         and collision_checker is not None
     ):
+        require_planning_time("before goal mesh endpoint precheck")
         goal_mesh = collision_checker.check(goal)
+        require_planning_time("after goal mesh endpoint precheck")
         goal_mesh_report = JointPathMeshCollisionReport(
             status=goal_mesh.status,
             sample_count=1,
@@ -1312,12 +1327,16 @@ def preflight_linear_joint_motion(
             def state_validity(
                 configuration: tuple[float, ...],
             ) -> tuple[bool, tuple[str, ...]]:
+                require_planning_time("before RRT state mesh check")
                 mesh = collision_checker.check(configuration)
+                require_planning_time("after RRT state mesh check")
                 if mesh.status is not CollisionCheckStatus.CLEAR:
                     return False, mesh.blocking_reasons or (
                         f"mesh_collision_status:{mesh.status.value}",
                     )
+                require_planning_time("before RRT state occupancy check")
                 occupancy = bound_occupancy.check(configuration)
+                require_planning_time("after RRT state occupancy check")
                 if occupancy.status is not CollisionCheckStatus.CLEAR:
                     return False, occupancy.blocking_reasons or (
                         f"occupancy_status:{occupancy.status.value}",
@@ -1336,6 +1355,8 @@ def preflight_linear_joint_motion(
                     simplify_path=ompl_simplify_path,
                 ),
             )
+    except PlanningDeadlineExceeded:
+        raise
     except Exception as exc:
         return _with_failed_fallback(
             primary,

@@ -11,6 +11,10 @@ from typing import Literal, Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
+from biblade_fusion.core.planning_deadline import (
+    PlanningDeadlineExceeded,
+    require_planning_time,
+)
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import AxisAlignedBoxConfig, ViewFilterConfig
 from biblade_fusion.diagnostics.performance_timing import (
@@ -270,6 +274,7 @@ def filter_candidate_views(
     evaluated: list[EvaluatedCandidate] = []
     duplicates: list[str] = []
     for candidate in candidates:
+        require_planning_time(f"before candidate filter {candidate.view_id}")
         projection_pose = (
             projection_poses[candidate.view_id]
             if projection_poses is not None
@@ -322,6 +327,11 @@ def filter_candidate_views(
             try:
                 with performance_span("planning.reachability_check"):
                     result = reachability_checker.check(candidate.base_t_left_ir)
+                require_planning_time(
+                    f"after candidate reachability check {candidate.view_id}"
+                )
+            except PlanningDeadlineExceeded:
+                raise
             except Exception as exc:
                 reasons.append(f"robot endpoint reachability check failed: {exc}")
             else:

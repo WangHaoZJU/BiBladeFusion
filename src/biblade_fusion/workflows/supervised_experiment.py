@@ -87,7 +87,8 @@ class RecoveryConfirmation:
     """Human assertion required before restarting from append-only run evidence.
 
     Recovery never restores a motion permit or an in-flight segment.  The new
-    coordinator starts from bootstrap and must acquire fresh occupancy evidence.
+    coordinator starts from an occupancy-only safety refresh and must acquire fresh
+    current-workcell evidence before any new motion can be proposed.
     """
 
     operator_id: str
@@ -134,6 +135,8 @@ class _CoordinatorPort(Protocol):
     def checkpoint(self) -> StopScanCheckpoint: ...
 
     def start(self) -> StopScanCheckpoint: ...
+
+    def start_recovery(self) -> StopScanCheckpoint: ...
 
     def capture_infer_update(self, view_id: str | None = None) -> object: ...
 
@@ -311,6 +314,15 @@ class SupervisedExperimentRunner:
 
         writer = StopScanRunWriter.resume(run_root)
         previous = writer.events[-1] if writer.events else None
+        # A recovery attempt consumes a new logical capture sequence even when it
+        # stops before exposure.  Advancing beyond every persisted cycle avoids an
+        # ambiguous crash window between perception commit and its following event,
+        # and can never collide with an immutable FoundationStereo cycle directory.
+        recovery_cycle_index = (
+            max(event.cycle_index for event in writer.events) + 1
+            if writer.events
+            else 0
+        )
         sink = _StreamingRunEventSink(writer, event_callbacks)
         coordinator_kwargs: dict[str, Any] = {}
         if utc_clock is not None:
@@ -329,6 +341,7 @@ class SupervisedExperimentRunner:
             safety_factory=safety_factory,
             publisher=publisher,
             event_sink=sink,
+            initial_cycle_index=recovery_cycle_index,
             **coordinator_kwargs,
         )
         runner = cls(
@@ -343,7 +356,7 @@ class SupervisedExperimentRunner:
         )
         sink.append_event(
             phase=StopScanPhase.MOTION_BLOCKED.value,
-            cycle_index=(previous.cycle_index if previous is not None else 0),
+            cycle_index=recovery_cycle_index,
             event_type="recovery_confirmation_required",
             payload={
                 "previous_event_sha256": (previous.event_sha256 if previous is not None else None),
@@ -415,7 +428,7 @@ class SupervisedExperimentRunner:
         self,
         confirmation: RecoveryConfirmation,
     ) -> ExperimentStatusSnapshot:
-        """Discard all prior motion authority, then restart from a fresh bootstrap."""
+        """Discard all prior motion authority, then request a fresh safety refresh."""
 
         with self._exclusive_operation():
             if not self._recovery_required:
@@ -430,20 +443,21 @@ class SupervisedExperimentRunner:
                     "recovery_pending_motion_not_discarded",
                     event_type="recovery_rejected",
                 )
+            recovery_cycle_index = self._coordinator.checkpoint.cycle_index
             self._append_event(
                 phase=StopScanPhase.IDLE.value,
-                cycle_index=0,
+                cycle_index=recovery_cycle_index,
                 event_type="recovery_acknowledged",
                 payload={
                     "operator_id": confirmation.operator_id,
                     "pending_motion_restored": False,
-                    "requires_fresh_bootstrap_capture": True,
+                    "requires_fresh_safety_refresh_capture": True,
                 },
             )
             self._recovery_required = False
             self._runner_blocking_reasons = ()
             try:
-                self._coordinator.start()
+                self._coordinator.start_recovery()
             except BaseException as exc:
                 self._latch_exception("recovery_restart_failed", exc)
                 raise

@@ -261,8 +261,8 @@ An opposing fin pair constrains the sign of the fin-axis component; it does not 
 two camera positions symmetric about that axis. Candidate azimuth now searches the signed
 open half-plane, including common tangential bias, while distance, incidence and wrist
 roll remain variables. The first bounded pass ranks the 45-degree information optimum
-before lower-value tilts and interleaves wrist rolls. No IK, workspace, collision, or
-continuous-path gate is relaxed.
+before lower-value tilts and interleaves wrist rolls. No IK, workspace, endpoint-collision,
+or complete sampled-path gate is relaxed.
 
 Replay of the synchronized attempt-09 proxy changed back-side pair availability from zero
 to one complete pair. With the production Pinocchio checker, fin-discovery planning took
@@ -492,7 +492,76 @@ occupancy-only frame, and let the system discard/recompute the stale proposal. C
 assets, failed event persistence, unconfirmed emergency stop, and invalid science evidence
 remain terminal.
 
-One planning/preflight turn is bounded to 30 seconds and experimental segment execution
-always receives a finite watchdog. Read-only supervision is best effort. This bounds user
-waiting without weakening any motion-safety threshold or truncating the selector's declared
-candidate family silently.
+One planning/preflight turn has a 30-second responsiveness budget and experimental segment
+execution always receives a finite watchdog. D029 supersedes the original post-return-only
+planning check with a cooperative deadline and records the remaining native-call boundary.
+Read-only supervision is best effort. No motion-safety threshold or declared selector family
+is silently relaxed or truncated.
+
+## D029 — Share one cooperative deadline across NBV, IK, collision and RRT
+
+Date: 2026-09-04
+
+Status: accepted; full offline regression complete, physical verification pending
+
+A timeout checked only after `select_next` or path preflight returns does not limit the
+operator's wait. One absolute monotonic deadline now starts at the coordinator's planning
+transition and is inherited through the same-thread planning call chain. Candidate filters,
+coarse and fine candidate loops, adaptive pose families, HoloRobot MDH/Pinocchio seed and
+iteration loops, IK-branch endpoint checks, mesh/occupancy path samples, occupancy robot-STL
+and voxel-run queries, and OMPL state-validity callbacks poll that same deadline. OMPL solve
+and simplify receive the lesser of their local limit and the remaining total budget.
+
+Deadline exhaustion is a recoverable `MOTION_BLOCKED` result. It must not be reported as
+physical IK unreachability, low information gain, or a collision-free result. The complete
+selector-bounded queue and every safety threshold remain unchanged.
+
+This is cooperative cancellation, not asynchronous thread termination or a hard-real-time
+guarantee. A single Pinocchio operation, FCL collision/distance call, vendor KDL call,
+snapshot hash, large NumPy operation or robot-state read cannot be safely interrupted in
+the middle. Expiry is observed at the next surrounding check; therefore the practical upper
+bound is the configured 30 seconds plus at most one indivisible native call and its return
+latency. This boundary must remain visible in papers and operator documentation.
+
+## D030 — Resume from immutable science, and keep live planning visibility read-only
+
+Date: 2026-09-04
+
+Status: accepted; full offline regression complete, physical verification pending
+
+An interrupted experimental chain may resume only after its append-only outer handoff and
+coarse/fine authorities replay successfully. The new coordinator starts beyond every
+persisted cycle identity. It restores no proposal, permit, source window, stop latch or
+occupancy freshness. After a real stopped-state proof, one operator-positioned
+`SAFETY_REFRESH` rebuilds current occupancy and planning restarts from the current joints.
+Persisted blade science and the first hard ROI are retained; the safety refresh does not
+count as a blade measurement.
+
+The runtime publishes a small atomically replaced `live_planning.json` sidecar beside the
+immutable timeline. It contains only already-computed candidate ranking, gate status,
+available durations, blocking reasons, selected path and camera poses. The PySide viewer
+uses it to show candidate rows and current/queued/active/selected camera frusta. Missing
+evidence stays `UNKNOWN/PENDING`; the viewer never recomputes IK, collision or RRT and has
+no command route. Sidecar/viewer failure is isolated from science and motion. A later
+browser/SSE transport may reuse HoloRobot's read-only display subset, but no HoloRobot
+control endpoint may be copied into the experiment observer.
+
+## D031 — The online path-safety claim is the reviewed HoloRobot sampled contract
+
+Date: 2026-09-04
+
+Status: accepted; supersedes remaining project-memory wording that implied an online
+recursive continuous-sweep certificate
+
+The operator explicitly required the active motion path to reuse HoloRobot's single-arm
+logic instead of BiBladeFusion's independently built online continuous-certificate stack.
+The scientific requirement remains a safe complete route, but the implementation and paper
+claim must be precise: endpoints are checked with original URDF/STL geometry, the complete
+straight or RRTConnect waypoint path is sampled at the reviewed joint-step contract, every
+sample is checked against original robot meshes and bound conservative occupancy, and a
+non-clear sample vetoes motion. RRTConnect is used only for an interior straight-path block.
+
+The recursive interval/swept-volume implementation remains available for offline diagnosis
+and acceptance studies. It is not executed by the normal online NBV loop and must not be
+used to describe online evidence as a formal continuous certificate. This wording change
+does not relax UNKNOWN, clearance, endpoint, approval, tracking or stop requirements.

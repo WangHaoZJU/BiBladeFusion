@@ -19,7 +19,8 @@ The governing problem statement is:
 
 > Starting from the measurement needs of a thin-walled, double-sided, finned blade,
 > actively search for robot viewpoints that provide effective new information, admit an
-> IK solution, and have a safe continuous path.
+> IK solution, and have a collision-safe complete robot route under the reviewed
+> HoloRobot single-arm sampling contract.
 
 Fine multi-view fusion and thermal-field mapping are downstream consumers. They must not
 drive the design away from the viewpoint-planning problem.
@@ -36,9 +37,10 @@ The target workflow starts from one operator-selected initial view:
 5. Full-scene valid depth, after robot self-masking, initializes the safety occupancy
    evidence independently of the blade proxy.
 6. Coarse next-best-view selection ranks adaptive candidates by expected new blade/fin
-   information. IK, workspace, collision, and continuous-path checks veto invalid
-   candidates. One selected NBV produces one complete viewpoint motion and one capture;
-   trajectory interpolation is not a reason to reconstruct intermediate views.
+   information. IK, workspace, endpoint collision, and complete-path checks under the
+   reviewed HoloRobot sampled contract veto invalid candidates. One selected NBV produces
+   one complete viewpoint motion and one capture; trajectory interpolation is not a reason
+   to reconstruct intermediate views.
 7. During the single-view prefix, motion may use only UNKNOWN voxels wholly covered by
    an immutable accepted-static-free region. This does not claim that the map is ready.
 8. New stopped views are captured. From the second view onward, the blade ROI is produced
@@ -52,6 +54,22 @@ The target workflow starts from one operator-selected initial view:
 
 The present implementation may still expose intermediate operator approvals. Those are
 experimental control points, not the desired scientific workflow.
+
+### 2.1 Current implementation gaps relative to the desired end state
+
+The following are accepted commissioning boundaries, not completed research goals:
+
+- every automatically planned segment still requires an exact operator approval token;
+- online route safety uses HoloRobot's fixed-step sampled STL/occupancy checks, not the
+  earlier recursive mathematical continuous-sweep certificate; the recursive proof remains
+  offline diagnostic/acceptance evidence only;
+- the live supervisor is currently a local PySide read-only window; the remote-friendly
+  HoloRobot-style browser/SSE observer is not yet implemented;
+- the complete software chain is offline-regressed, but the current revision has not yet
+  completed a physical first NBV motion and automatic post-motion capture on eiai.
+
+These gaps must remain visible in acceptance reports and the paper. They may not be silently
+relabelled as finished capabilities.
 
 ## 3. Candidate viewpoint method
 
@@ -73,6 +91,11 @@ The selector's stored joint endpoint is provisional: immediately before path
 preflight, every science-ranked camera pose is solved again using the latest stopped
 robot posture. A solution generated from the first-view posture must never be carried
 unchanged across later accepted motions.
+
+This applies to both ordinary surface views and fin-discovery views. Camera-pose and
+scientific semantics may remain stable, but every accepted stopped posture owns a new
+immutable feasibility revision containing its IK branch and endpoint-collision verdict.
+Budget-truncated search is not evidence that the untested pose family is unreachable.
 
 After endpoint filtering, motion follows HoloRobot's single-arm composite order: try the
 conservative straight joint route first, then invoke one tightly bounded RRTConnect search
@@ -187,6 +210,12 @@ threshold was chosen. Time limits used to detect a real hang must cover measured
 execution with margin and must not invalidate a static map solely because computation
 took longer.
 
+One online NBV turn shares one absolute cooperative planning deadline across candidate
+generation, IK, endpoint checks, straight-path validation, occupancy queries and bounded
+RRT. Deadline expiry is a recoverable motion block, not an IK/collision/science verdict.
+It is not a hard-real-time guarantee: a single native Pinocchio/FCL/KDL/OMPL operation is
+observed at its next safe return boundary rather than being killed asynchronously.
+
 The strict robot-stationarity evidence window surrounds camera exposure only. The
 FoundationStereo forward pass, occupancy ray integration, and artifact persistence happen
 after that window and cannot retroactively invalidate an already stopped image. Production
@@ -237,6 +266,12 @@ HoloRobot, followed by an end-to-end timing and state-transition audit. The goal
 only correctness: the first-view-to-first-segment latency must be measured by phase, and
 duplicated reconstruction, IK, collision proof, connection setup, or state validation
 must be removed or cached where its bound inputs have not changed.
+
+Experiment visualization follows the same reuse rule. Prefer HoloRobot's browser/SSE and
+Three.js observation patterns for remote-friendly read-only display, but never transplant
+its command routes into the measurement supervisor. Visualization is diagnostic: failure
+must not stop science or motion, and missing evidence must stay unknown rather than being
+inferred.
 
 ## 10. Related authoritative project documents
 

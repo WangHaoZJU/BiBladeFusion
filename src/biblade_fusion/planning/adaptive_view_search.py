@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 from itertools import product
 from math import cos, radians, sin
 from time import monotonic
@@ -12,6 +13,7 @@ from typing import Literal
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from biblade_fusion.core.planning_deadline import require_planning_time
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import ViewFilterConfig
 from biblade_fusion.perception.proxy import BilateralBladeProxy
@@ -29,6 +31,22 @@ from biblade_fusion.planning.views import CandidateView
 
 class AdaptiveViewSearchError(ValueError):
     """An ideal view cannot define a finite deterministic search family."""
+
+
+class AdaptiveSearchTermination(StrEnum):
+    """Typed reason that a bounded pose-family search stopped.
+
+    A budget-limited prefix is not evidence that the remaining camera poses are
+    unreachable.  Keeping that distinction typed prevents the coarse selector
+    from reporting a physical IK failure when it merely exhausted an experiment-
+    time budget.
+    """
+
+    FAMILY_EXHAUSTED = "family_exhausted"
+    GENERATED_CANDIDATE_LIMIT = "generated_candidate_limit"
+    IK_ATTEMPT_LIMIT = "ik_attempt_limit"
+    DURATION_LIMIT = "duration_limit"
+    FEASIBLE_CANDIDATE_LIMIT = "feasible_candidate_limit"
 
 
 def _finite_tuple(values: Sequence[float], *, name: str) -> tuple[float, ...]:
@@ -192,6 +210,7 @@ class AdaptiveViewSearchResult:
     attempts: tuple[AdaptiveCandidateAttempt, ...]
     ranked_feasible: tuple[AdaptiveCandidateAttempt, ...]
     truncated: bool
+    termination: AdaptiveSearchTermination = AdaptiveSearchTermination.FAMILY_EXHAUSTED
 
     @property
     def recommended(self) -> AdaptiveCandidateAttempt | None:
@@ -263,6 +282,7 @@ def evaluate_multi_seed_ik(
             solutions: list[NDArray[np.float64]] = []
             blocking: list[tuple[str, ...]] = []
             for outcome in iter_checks(pose):
+                require_planning_time("while evaluating HoloRobot IK branches")
                 outcomes.append(outcome)
                 if (
                     outcome.state is not ReachabilityState.REACHABLE
@@ -270,7 +290,9 @@ def evaluate_multi_seed_ik(
                 ):
                     continue
                 solution = outcome.joint_positions_rad
+                require_planning_time("before IK endpoint collision check")
                 check = endpoint_validator(solution)
+                require_planning_time("after IK endpoint collision check")
                 if type(check) is not EndpointConfigurationCheck:
                     raise TypeError(
                         "endpoint validator must return EndpointConfigurationCheck"
@@ -328,11 +350,13 @@ def evaluate_multi_seed_ik(
 
     outcomes_list: list[ReachabilityResult] = []
     for checker in checkers:
+        require_planning_time("before endpoint IK checker")
         check_all = getattr(checker, "check_all", None)
         if callable(check_all):
             outcomes_list.extend(check_all(pose))
         else:
             outcomes_list.append(checker.check(pose))
+        require_planning_time("after endpoint IK checker")
     outcomes = tuple(outcomes_list)
     messages = tuple(outcome.message for outcome in outcomes)
     solutions = tuple(
@@ -344,7 +368,12 @@ def evaluate_multi_seed_ik(
     solution_blocking_reasons: tuple[tuple[str, ...], ...] = ()
     eligible = tuple(range(len(solutions)))
     if solutions and endpoint_validator is not None:
-        checks = tuple(endpoint_validator(solution) for solution in solutions)
+        checked_solutions = []
+        for solution in solutions:
+            require_planning_time("before IK endpoint collision check")
+            checked_solutions.append(endpoint_validator(solution))
+            require_planning_time("after IK endpoint collision check")
+        checks = tuple(checked_solutions)
         if any(type(check) is not EndpointConfigurationCheck for check in checks):
             raise TypeError("endpoint validator must return EndpointConfigurationCheck")
         solution_blocking_reasons = tuple(check.blocking_reasons for check in checks)
@@ -656,11 +685,14 @@ def search_adaptive_candidate_family(
     attempted_tilts: set[float] = set()
     search_started = float(monotonic_clock())
     ik_attempts = 0
+    termination = AdaptiveSearchTermination.FAMILY_EXHAUSTED
     for parameters, candidate in family:
-        if (
-            ik_attempts >= policy.maximum_ik_attempts_per_family
-            or float(monotonic_clock()) - search_started >= policy.maximum_search_duration_s
-        ):
+        require_planning_time(f"before adaptive pose {candidate.view_id}")
+        if ik_attempts >= policy.maximum_ik_attempts_per_family:
+            termination = AdaptiveSearchTermination.IK_ATTEMPT_LIMIT
+            break
+        if float(monotonic_clock()) - search_started >= policy.maximum_search_duration_s:
+            termination = AdaptiveSearchTermination.DURATION_LIMIT
             break
         attempted_tilts.add(parameters.tilt_deg)
         geometry = filter_candidate_views(
@@ -706,7 +738,20 @@ def search_adaptive_candidate_family(
                 len(feasible) >= policy.maximum_ik_feasible_candidates
                 and has_required_tilt_sampling
             ):
+                termination = AdaptiveSearchTermination.FEASIBLE_CANDIDATE_LIMIT
                 break
+
+    natural_family_size = sum(
+        len(policy.azimuth_samples_deg) if tilt != 0.0 else 1
+        for tilt in policy.tilt_samples_deg
+    ) * len(_distance_samples(nominal.standoff_distance_m, policy)) * len(
+        policy.roll_samples_deg
+    )
+    if (
+        termination is AdaptiveSearchTermination.FAMILY_EXHAUSTED
+        and len(family) < natural_family_size
+    ):
+        termination = AdaptiveSearchTermination.GENERATED_CANDIDATE_LIMIT
 
     ranked = tuple(
         sorted(
@@ -719,14 +764,13 @@ def search_adaptive_candidate_family(
             ),
         )
     )
-    truncated = len(attempts) < len(family) or (
-        len(family) >= policy.maximum_generated_candidates
-    )
+    truncated = termination is not AdaptiveSearchTermination.FAMILY_EXHAUSTED
     return AdaptiveViewSearchResult(
         nominal.view_id,
         tuple(attempts),
         ranked,
         truncated,
+        termination,
     )
 
 
@@ -797,6 +841,7 @@ def adaptive_view_search_payload(
             "attempt_count": len(result.attempts),
             "ik_feasible_count": len(result.ranked_feasible),
             "truncated": result.truncated,
+            "termination": result.termination.value,
             "recommended_view_id": (
                 recommended.evaluated.candidate.view_id if recommended else None
             ),

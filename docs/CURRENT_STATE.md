@@ -462,7 +462,8 @@ The following corrections are now code-verified:
    of stopping the whole experiment. The stale proposal is discarded, the refresh updates
    occupancy only, and IK/NBV/path selection restarts from the new stopped posture.
 8. One NBV selection plus its selector-bounded path queue has a 30-second responsiveness
-   watchdog. Experimental motion also has a finite duration derived from the approved
+   budget. D029 makes it a shared cooperative deadline and records the indivisible native-
+   call boundary. Experimental motion also has a finite duration derived from the approved
    ServoJ stream and existing controller/settle limits when release timing is bypassed.
 9. `scan doctor` now parses the ES68 kinematics and stereo calibration, checks calibration
    resolution, probes the RealSense Python API, and treats a configured-but-missing OMPL
@@ -484,3 +485,70 @@ physical single-view -> first motion -> automatic next capture: still pending on
 The three skips are local-environment probes requiring PyTorch/Open3D on vale. eiai must
 still pass `scan doctor` and one guarded physical segment; an offline suite cannot prove
 camera transport, controller state, workcell placement, or physical collision clearance.
+
+## 11. D029-D031 integrated regression, visualization, and acceptance checkpoint
+
+The current uncommitted main-worktree integration is based on `a7c7286`. Three independent
+audits covered motion/NBV planning, coarse-to-fine state composition, and read-only
+visualization before main-line cross-review.
+
+Planning now separates stable camera-pose/science semantics from state-dependent robot
+feasibility. Both fin-discovery and ordinary surface candidates are re-solved from every
+accepted stopped posture; a candidate rejected at the initial view may re-enter the ranked
+queue later. Fin pose families are enumerated breadth-first across side/axis, and bounded
+search termination distinguishes complete physical exhaustion from candidate, IK, feasible
+count, or duration truncation. Historical fin evidence is verified against the immutable
+discovery revision that actually selected it.
+
+The 30-second planning/preflight value is now one cooperative absolute deadline across
+candidate generation, IK, endpoint collision, straight-path checks, occupancy queries and
+bounded RRTConnect. Expiry moves the coordinator to recoverable `MOTION_BLOCKED`. It is not
+a hard-real-time upper bound: one indivisible Pinocchio/FCL/KDL/hash/NumPy/state-read call may
+finish after expiry before the next check can stop work. No safety or information-gain
+threshold was relaxed.
+
+The composed offline runtime now verifies the intended experiment path:
+
+```text
+one hard ROI
+  -> automatic coarse candidate/approval/motion/stop/capture cycles
+  -> schema-5 coarse reference
+  -> fine bootstrap and active views
+  -> final reconstruction COMPLETE
+```
+
+Recovery continues from immutable coarse/fine evidence with a fresh cycle identity and one
+occupancy-only `SAFETY_REFRESH`; it restores no old motion/permit/map authority and does not
+request the first ROI again. A broken read-only observer cannot abort the experiment.
+
+The existing PySide supervisor now consumes a lightweight atomic
+`live_timeline/live_planning.json`. It displays the science-ranked candidate queue, active
+and selected candidate, IK/endpoint/straight/RRT status, recorded timings, exact blockers,
+selected path, and grey/blue/green candidate camera frusta beside the yellow current camera.
+It remains command-incapable. SSH X11 performance is still a deployment limitation; the
+next visualization phase is a browser/SSE observer extracted from HoloRobot's read-only
+subset, with all control routes excluded.
+
+Code verification after integration:
+
+```text
+focused planning/runtime/storage/supervision regression: 334 passed
+ruff: all checks passed
+git diff --check: passed
+full repository regression: 1294 passed, 3 skipped in 99.18 s
+physical single-view -> first motion -> automatic next capture: pending on eiai
+```
+
+The skipped tests require the optional PyTorch/Open3D packages absent from the vale test
+environment; eiai still owns CUDA/FoundationStereo and physical-device validation.
+
+The project memory and root `接受文档.md` now explicitly record the remaining gap between
+the desired one-initial-view automatic system and the commissioned implementation: exact
+per-segment approval is still required, online path safety is the reviewed HoloRobot
+fixed-step sampled contract rather than the former recursive continuous certificate, the
+remote browser/SSE observer is pending, and the integrated revision still needs its first
+physical NBV motion plus automatic post-motion capture. These are acceptance boundaries,
+not completed capabilities.
+
+Do not describe the full physical workflow as complete until eiai has produced one guarded
+motion and automatic post-motion capture with this exact integrated revision.

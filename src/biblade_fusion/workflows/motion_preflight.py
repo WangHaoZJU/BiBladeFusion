@@ -9,6 +9,10 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from biblade_fusion.calibration import HandEyeCalibration
+from biblade_fusion.core.planning_deadline import (
+    PlanningDeadlineExceeded,
+    require_planning_time,
+)
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import MotionPreflightConfig
 from biblade_fusion.diagnostics.performance_timing import performance_timed
@@ -268,11 +272,13 @@ def evaluate_endpoint_pose_consistency(
             None,
             ("endpoint_pose_consistency_es68_model_unavailable",),
         )
+    require_planning_time("before endpoint FK consistency check")
     try:
         base_t_flange = np.asarray(
             collision_checker.kinematic_model.forward_kinematics(joint_positions_rad),
             dtype=np.float64,
         )
+        require_planning_time("after endpoint FK consistency check")
         target_pose = PoseSE3("base", "tcp", target_base_t_tcp)
         predicted_pose = PoseSE3(
             "base",
@@ -315,6 +321,8 @@ def evaluate_endpoint_pose_consistency(
             tuple(tuple(float(value) for value in row) for row in predicted),
             reasons,
         )
+    except PlanningDeadlineExceeded:
+        raise
     except (OSError, TypeError, ValueError, RuntimeError) as exc:
         return EndpointPoseConsistency(
             CollisionCheckStatus.UNKNOWN,
@@ -364,6 +372,7 @@ def preflight_live_joint_segment(
         raise ValueError("Final live segment requires target_base_t_tcp_matrix")
     if not final_target and target_base_t_tcp_matrix is not None:
         raise ValueError("Intermediate live segment must not claim a view endpoint")
+    require_planning_time("before live joint segment preflight")
     evaluation_time = None
     if evaluated_at_utc is not None:
         if evaluated_at_utc.tzinfo is None:
@@ -402,6 +411,7 @@ def preflight_live_joint_segment(
             maximum_rotation_error_deg=config.maximum_endpoint_rotation_error_deg,
         )
         preflight = _apply_endpoint_gate(preflight, endpoint)
+    require_planning_time("after live joint segment preflight")
     if evaluation_time is not None:
         preflight = replace(
             preflight,

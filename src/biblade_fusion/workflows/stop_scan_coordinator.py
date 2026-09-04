@@ -28,6 +28,10 @@ import numpy as np
 
 from biblade_fusion.acquisition import SynchronizedFrameBundle
 from biblade_fusion.calibration import HandEyeCalibration
+from biblade_fusion.core.planning_deadline import (
+    PlanningDeadlineExceeded,
+    activate_planning_deadline,
+)
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     AcquisitionConfig,
@@ -108,6 +112,109 @@ class BladePlanningAssetError(StopScanError):
 
 class StopScanAbortRequested(StopScanError):
     """An asynchronous operator stop request interrupted the active transaction."""
+
+
+def _science_score_from_diagnostics(diagnostics: Sequence[str]) -> float | None:
+    for key in ("expected_scientific_gain", "expected_discovery_gain"):
+        prefix = f"{key}="
+        for diagnostic in diagnostics:
+            if diagnostic.startswith(prefix):
+                with suppress(ValueError):
+                    value = float(diagnostic.removeprefix(prefix))
+                    if math.isfinite(value):
+                        return value
+    return None
+
+
+def _science_rank_from_diagnostics(diagnostics: Sequence[str], fallback: int) -> int:
+    for diagnostic in diagnostics:
+        if diagnostic.startswith("science_rank="):
+            with suppress(ValueError):
+                value = int(diagnostic.removeprefix("science_rank="))
+                if value >= 1:
+                    return value
+    return fallback
+
+
+def _telemetry_status(value: object) -> str:
+    text = str(getattr(value, "value", value)).strip().upper()
+    if text in {"PATH_BLOCKED", "COLLISION_AT_START", "COLLISION_AT_GOAL"}:
+        return "BLOCKED"
+    if text == "PLANNER_UNAVAILABLE":
+        return "UNAVAILABLE"
+    return text if text in {"CLEAR", "BLOCKED", "ERROR", "UNAVAILABLE"} else "UNKNOWN"
+
+
+def _preflight_telemetry(preflight: object, *, duration_s: float) -> dict[str, object]:
+    """Copy already-computed preflight facts for a command-incapable observer."""
+
+    raw_diagnostics = getattr(preflight, "diagnostics", {})
+    diagnostics = raw_diagnostics if isinstance(raw_diagnostics, Mapping) else {}
+    ready = bool(getattr(preflight, "ready_for_approval", False))
+    failure_stage = str(diagnostics.get("failure_stage", ""))
+    primary_status = _telemetry_status(diagnostics.get("primary_status", "UNKNOWN"))
+    fallback_used = bool(diagnostics.get("fallback_used", False))
+    fallback_status = _telemetry_status(diagnostics.get("fallback_status", "UNKNOWN"))
+    collision = getattr(preflight, "collision", None)
+    occupancy = getattr(preflight, "occupancy", None)
+    endpoint_status = "UNKNOWN"
+    blocked_fractions = tuple(
+        getattr(report, "blocked_path_fraction", None)
+        for report in (collision, occupancy)
+        if report is not None
+    )
+    if failure_stage in {"start_endpoint", "goal_endpoint"} or any(
+        fraction in {0.0, 1.0} for fraction in blocked_fractions
+    ):
+        endpoint_status = "BLOCKED"
+    elif ready or collision is not None or occupancy is not None:
+        endpoint_status = "CLEAR"
+    straight_status = primary_status
+    if ready and not fallback_used and straight_status == "UNKNOWN":
+        straight_status = "CLEAR"
+    if fallback_used and straight_status == "UNKNOWN":
+        straight_status = "BLOCKED"
+    if "fallback_status" in diagnostics:
+        rrt_status = "CLEAR" if ready else fallback_status
+    elif (
+        ready
+        or primary_status == "CLEAR"
+        or diagnostics.get("fallback_reason") == "not_an_interior_path_block"
+    ):
+        rrt_status = "NOT_REQUIRED"
+    else:
+        rrt_status = "UNKNOWN"
+    fallback_diagnostics = diagnostics.get("fallback_diagnostics", {})
+    rrt_duration = (
+        fallback_diagnostics.get("elapsed_s")
+        if isinstance(fallback_diagnostics, Mapping)
+        else None
+    )
+    waypoints = getattr(preflight, "planning_waypoints", ())
+    blocking = tuple(str(item) for item in getattr(preflight, "blocking_reasons", ()))
+    return {
+        "ready_for_approval": ready,
+        "endpoint_status": endpoint_status,
+        "straight_path_status": straight_status,
+        "rrt_status": rrt_status,
+        "selected_path_kind": (
+            "rrtconnect" if fallback_used and ready else "straight" if ready else None
+        ),
+        "total_duration_s": max(0.0, float(duration_s)),
+        "rrt_duration_s": (
+            float(rrt_duration)
+            if isinstance(rrt_duration, (int, float))
+            and not isinstance(rrt_duration, bool)
+            and math.isfinite(float(rrt_duration))
+            and float(rrt_duration) >= 0.0
+            else None
+        ),
+        "planned_motion_duration_s": diagnostics.get("planned_servoj_duration_s"),
+        "planning_waypoint_count": len(waypoints),
+        "blocking_reasons": list(blocking),
+        "planner": diagnostics.get("planner"),
+        "failure_stage": failure_stage or None,
+    }
 
 
 class CapturePurpose(StrEnum):
@@ -1241,6 +1348,7 @@ class StopScanCoordinator:
         safety_factory: SegmentSafetyFactory,
         publisher: OccupancyGenerationPublisher,
         event_sink: RunEventSink | None = None,
+        initial_cycle_index: int = 0,
         utc_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -1292,6 +1400,8 @@ class StopScanCoordinator:
             StoredMotionEnvelopeAcceptance,
         ):
             raise ValueError("Stop coordination requires a strong motion-envelope acceptance")
+        if type(initial_cycle_index) is not int or initial_cycle_index < 0:
+            raise ValueError("Initial stop-scan cycle index must be a non-negative integer")
         self._robot = robot
         self._perception = perception
         self._selector = selector
@@ -1310,7 +1420,7 @@ class StopScanCoordinator:
         self._stop_transport_acknowledged = False
         self._stop_stationarity_evidence: StationarityEvidence | None = None
         self._phase = StopScanPhase.IDLE
-        self._cycle_index = 0
+        self._cycle_index = initial_cycle_index
         self._observation: PerceptionCycleResult | None = None
         self._observation_generation_id: str | None = None
         self._prepared: _PreparedSegmentExecution | None = None
@@ -1322,6 +1432,7 @@ class StopScanCoordinator:
         self._blocking_reasons: tuple[str, ...] = ()
         self._event_store_failure_reason: str | None = None
         self._bootstrap_motion_active = False
+        self._recovery_refresh_active = False
 
     @property
     def checkpoint(self) -> StopScanCheckpoint:
@@ -1369,6 +1480,8 @@ class StopScanCoordinator:
                 self._stop_transport_acknowledged = False
                 self._stop_stationarity_evidence = None
             self._post_motion_capture_readiness = None
+            self._bootstrap_motion_active = False
+            self._recovery_refresh_active = False
             self._transition(
                 StopScanPhase.BOOTSTRAP_MAP_REQUIRED,
                 "run_started",
@@ -1376,6 +1489,56 @@ class StopScanCoordinator:
                     "depth_backend": "foundation_stereo",
                     "bootstrap_mode": self._config.bootstrap_mode,
                     "minimum_source_views": self._occupancy_config.minimum_source_views,
+                },
+            )
+            return self.checkpoint
+
+    def start_recovery(self) -> StopScanCheckpoint:
+        """Restart from persisted evidence without restoring motion or first-view ROI state.
+
+        Recovery deliberately begins at an operator-positioned, occupancy-only refresh.
+        The old coordinator's proposal, permit, source window, and stop latch are never
+        reconstructed.  A verified recovered science generation remains the caller's
+        authority; this coordinator only rebuilds current safety-map evidence.
+        """
+
+        with self._exclusive_operation():
+            if self._phase is not StopScanPhase.IDLE:
+                raise StopScanError("Stop-scan recovery has already started")
+            if not self._config.enabled:
+                raise StopScanBlocked("Stop-and-capture coordinator is disabled")
+            if not self._occupancy_config.enabled:
+                raise StopScanBlocked("Safety occupancy mapping is disabled")
+            if self._robot_config.settle_time_s <= 0.0:
+                raise StopScanBlocked("A positive robot settle_time_s is required")
+            if self._config.settle_timeout_s < (
+                self._robot_config.settle_time_s + self._config.settle_poll_period_s
+            ):
+                raise StopScanBlocked(
+                    "Settle timeout cannot prove the configured stationary window"
+                )
+            with self._stop_request_lock, self._stop_reason_lock:
+                self._stop_requested.clear()
+                self._stop_request_reason = None
+                self._stop_transport_acknowledged = False
+                self._stop_stationarity_evidence = None
+            self._prepared = None
+            self._expected_capture_view_id = None
+            self._expected_capture_purpose = None
+            self._post_motion_capture_readiness = None
+            self._blocking_reasons = ("recovery_requires_fresh_safety_refresh",)
+            # The caller has independently replayed its persisted coarse/fine science
+            # checkpoint.  One current safety source may therefore use the same bounded
+            # accepted-static-free bootstrap policy as an uninterrupted active run.
+            self._bootstrap_motion_active = True
+            self._recovery_refresh_active = True
+            self._transition(
+                StopScanPhase.MOTION_BLOCKED,
+                "run_recovery_started",
+                {
+                    "pending_motion_restored": False,
+                    "occupancy_freshness_restored": False,
+                    "requires_safety_refresh_capture": True,
                 },
             )
             return self.checkpoint
@@ -1426,6 +1589,7 @@ class StopScanCoordinator:
                 capture_phase,
                 expected,
                 expected_purpose,
+                recovery_refresh_active=self._recovery_refresh_active,
             )
             self._prepared = None
             self._blocking_reasons = ()
@@ -1598,6 +1762,8 @@ class StopScanCoordinator:
                     next_phase is StopScanPhase.BOOTSTRAP_MOTION_READY
                 )
                 self._transition(next_phase, next_event, next_payload)
+                if next_phase is StopScanPhase.MAP_READY:
+                    self._recovery_refresh_active = False
             except StopScanAbortRequested as exc:
                 with suppress(BaseException):
                     self._perception.cancel_pending_capture(captured)
@@ -1708,7 +1874,21 @@ class StopScanCoordinator:
             )
             self._transition(StopScanPhase.PLANNING, "next_view_selection_started", {})
             try:
-                selection = self._select_next_with_timing(self._observation, generation)
+                selection_telemetry_started_s = time.monotonic()
+                with activate_planning_deadline(
+                    started_monotonic_s=planning_started_monotonic_s,
+                    maximum_duration_s=(
+                        self._config.maximum_planning_preflight_duration_s
+                    ),
+                    monotonic_clock=self._monotonic_now,
+                ):
+                    selection = self._select_next_with_timing(
+                        self._observation,
+                        generation,
+                    )
+                selection_duration_s = max(
+                    0.0, time.monotonic() - selection_telemetry_started_s
+                )
                 require_planning_budget("after next-view selection")
                 if type(selection) is not NextViewSelection:
                     raise BladePlanningAssetError("Next-view selector returned an untyped decision")
@@ -1748,6 +1928,24 @@ class StopScanCoordinator:
                 # truncating here made a cycle report "no safe path" while later,
                 # already-generated candidates were in fact collision-free.
                 candidate_queue = selection.preflight_candidates
+                candidate_queue_payload = [
+                    {
+                        "target_view_id": item.target.view_id,
+                        "rank": queue_rank,
+                        "science_rank": _science_rank_from_diagnostics(
+                            item.diagnostics, queue_rank
+                        ),
+                        "science_score": _science_score_from_diagnostics(item.diagnostics),
+                        "target_joint_positions_rad": list(
+                            item.target.joint_positions_rad
+                        ),
+                        "target_base_t_tcp_matrix": [
+                            list(row) for row in item.target.base_t_tcp_matrix
+                        ],
+                        "diagnostics": list(item.diagnostics),
+                    }
+                    for queue_rank, item in enumerate(candidate_queue, start=1)
+                ]
                 rejected: list[tuple[str, tuple[str, ...]]] = []
                 prepared: _PreparedSegmentExecution | None = None
                 selected_for_motion: NextViewSelection | None = None
@@ -1770,6 +1968,7 @@ class StopScanCoordinator:
                         generation,
                         bootstrap_mapping_prefix=bootstrap_mapping_prefix,
                     )
+                    preflight_telemetry_started_s = time.monotonic()
                     self._transition(
                         StopScanPhase.PREFLIGHTING,
                         "single_segment_preflight_started",
@@ -1789,9 +1988,25 @@ class StopScanCoordinator:
                             "reference_model_sha256": proposal.reference_model_sha256,
                             "selection_policy_sha256": proposal.selection_policy_sha256,
                             "selection_diagnostics": list(candidate.diagnostics),
+                            "selection_duration_s": selection_duration_s,
+                            "ranked_candidate_queue": candidate_queue_payload,
                         },
                     )
-                    prepared = self._safety_factory.prepare(proposal, generation)
+                    with activate_planning_deadline(
+                        started_monotonic_s=planning_started_monotonic_s,
+                        maximum_duration_s=(
+                            self._config.maximum_planning_preflight_duration_s
+                        ),
+                        monotonic_clock=self._monotonic_now,
+                    ):
+                        prepared = self._safety_factory.prepare(proposal, generation)
+                    preflight_duration_s = max(
+                        0.0, time.monotonic() - preflight_telemetry_started_s
+                    )
+                    preflight_telemetry = _preflight_telemetry(
+                        prepared.preflight,
+                        duration_s=preflight_duration_s,
+                    )
                     require_planning_budget(f"after ranked candidate {rank}")
                     self._raise_if_stop_requested()
                     self._validate_prepared_segment(prepared, generation)
@@ -1813,6 +2028,7 @@ class StopScanCoordinator:
                             "science_rank": science_rank,
                             "blocking_reasons": list(reasons),
                             "safety_thresholds_unchanged": True,
+                            "preflight": preflight_telemetry,
                         },
                     )
                 if prepared is None or proposal is None or selected_for_motion is None:
@@ -1848,6 +2064,17 @@ class StopScanCoordinator:
                     {"reason": self._blocking_reasons[0]},
                 )
                 raise
+            except PlanningDeadlineExceeded as exc:
+                self._prepared = None
+                self._blocking_reasons = (
+                    f"planning_deadline_exceeded:{type(exc).__name__}:{exc}",
+                )
+                self._transition(
+                    StopScanPhase.MOTION_BLOCKED,
+                    "planning_deadline_exceeded",
+                    {"reason": self._blocking_reasons[0]},
+                )
+                raise StopScanBlocked(str(exc)) from exc
             except Exception as exc:
                 self._prepared = None
                 self._blocking_reasons = (
@@ -1912,6 +2139,8 @@ class StopScanCoordinator:
                         for view_id, reasons in rejected
                     ],
                     "approval_prompt": prepared.executor.approval_prompt(prepared.preflight),
+                    "preflight_attempt_index": len(rejected) + 1,
+                    "preflight": preflight_telemetry,
                 },
             )
             return prepared.public_summary
@@ -2281,12 +2510,16 @@ class StopScanCoordinator:
         phase: StopScanPhase,
         expected_view_id: str | None,
         expected_purpose: CapturePurpose | None,
+        *,
+        recovery_refresh_active: bool = False,
     ) -> CapturePurpose:
         """Derive capture semantics solely from authoritative coordinator state."""
 
         if phase is StopScanPhase.BOOTSTRAP_MAP_REQUIRED:
             if expected_view_id is not None or expected_purpose is not None:
                 raise StopScanError("Bootstrap capture cannot retain a post-motion expected view")
+            if recovery_refresh_active:
+                return CapturePurpose.SAFETY_REFRESH
             return CapturePurpose.BOOTSTRAP
         if expected_view_id is not None:
             if phase not in {

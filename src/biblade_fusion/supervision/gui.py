@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
 
 from biblade_fusion.supervision.snapshot import (
+    LivePlanningUpdate,
+    PlanningProgressSnapshot,
     StoredSupervisorySnapshot,
     SupervisoryTimeline,
     discover_supervisory_snapshots,
     load_snapshot_array,
+    read_live_planning_update,
 )
 
 
@@ -35,6 +40,11 @@ class _DisplayArrays:
     depth_m: np.ndarray | None
     confidence: np.ndarray | None
     robot_self_mask: np.ndarray | None
+
+
+def _gate_text(status: str, duration_s: float | None) -> str:
+    duration = f"{duration_s:.3f}s" if duration_s is not None else "UNKNOWN"
+    return f"{status} · {duration}"
 
 
 def _load_display_arrays(stored: StoredSupervisorySnapshot) -> _DisplayArrays:
@@ -116,6 +126,7 @@ def launch_supervisory_console(
             self._title = title
             self._stored: StoredSupervisorySnapshot | None = None
             self._arrays: _DisplayArrays | None = None
+            self._planning = PlanningProgressSnapshot()
             self._last_position = None
             self._yaw = -0.65
             self._pitch = 0.48
@@ -127,9 +138,11 @@ def launch_supervisory_console(
             self,
             stored: StoredSupervisorySnapshot,
             arrays: _DisplayArrays,
+            planning: PlanningProgressSnapshot | None = None,
         ) -> None:
             self._stored = stored
             self._arrays = arrays
+            self._planning = planning or stored.snapshot.plan.planning
             self.update()
 
         def reset_view(self) -> None:
@@ -292,6 +305,13 @@ def launch_supervisory_console(
                 self._arrays.frontier,
                 self._arrays.unknown,
                 bounds,
+                *(
+                    np.asarray((candidate.target_camera_pose.matrix,), dtype=np.float64)[
+                        :, :3, 3
+                    ]
+                    for candidate in self._planning.candidates
+                    if candidate.target_camera_pose is not None
+                ),
             )
             return tuple(item for item in values if item is not None)
 
@@ -418,6 +438,44 @@ def launch_supervisory_console(
                         QPointF(float(screen[second, 0]), float(screen[second, 1])),
                     )
 
+            extent = np.asarray(self._stored.snapshot.occupancy.bounds_max_m) - np.asarray(
+                self._stored.snapshot.occupancy.bounds_min_m
+            )
+            depth = max(float(np.min(extent)) * 0.12, 0.035)
+            local = np.asarray(
+                (
+                    (0.0, 0.0, 0.0),
+                    (-0.45 * depth, -0.30 * depth, depth),
+                    (0.45 * depth, -0.30 * depth, depth),
+                    (0.45 * depth, 0.30 * depth, depth),
+                    (-0.45 * depth, 0.30 * depth, depth),
+                )
+            )
+            for candidate in self._planning.candidates:
+                pose = candidate.target_camera_pose
+                if pose is None:
+                    continue
+                matrix = np.asarray(pose.matrix, dtype=np.float64)
+                frustum = local @ matrix[:3, :3].T + matrix[:3, 3]
+                screen = project(frustum)
+                color = (
+                    QColor("#56df92")
+                    if candidate.selected
+                    else QColor("#4db3ff")
+                    if candidate.active
+                    else QColor(112, 151, 181, 120)
+                )
+                painter.setPen(QPen(color, 2.0 if candidate.active or candidate.selected else 1.0))
+                for corner in range(1, 5):
+                    painter.drawLine(
+                        QPointF(float(screen[0, 0]), float(screen[0, 1])),
+                        QPointF(float(screen[corner, 0]), float(screen[corner, 1])),
+                    )
+                painter.drawText(
+                    QPointF(float(screen[0, 0] + 4), float(screen[0, 1] - 4)),
+                    f"#{candidate.rank} {candidate.candidate_id}",
+                )
+
             snapshot = self._stored.snapshot
             legend_items = ["占用=红"]
             if arrays.free is not None:
@@ -436,6 +494,8 @@ def launch_supervisory_console(
                 legend_items.append("已记录TCP轨迹=绿（语义见数字资产）")
             if camera_pose is not None:
                 legend_items.append("黄色视锥=姿态示意（非内参尺寸）")
+            if self._planning.candidates:
+                legend_items.append("候选视锥=灰；当前=蓝；选中=绿")
             painter.setPen(QColor("#cbd5df"))
             painter.drawText(14, 46, "  ".join(legend_items[:3]))
             if len(legend_items) > 3:
@@ -582,6 +642,7 @@ def launch_supervisory_console(
             super().__init__()
             self._index = 0
             self._playing = False
+            self._live_planning_update: LivePlanningUpdate | None = None
             self.setWindowTitle(
                 "BiBladeFusion 统一监督台（只读快照/回放"
                 + ("/目录跟随，非实时避障" if follow else "")
@@ -667,6 +728,23 @@ def launch_supervisory_console(
             self.event_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
             tabs.addTab(self.event_table, "回放资产事件（非控制器流）")
 
+            self.candidate_table = QTableWidget(0, 9)
+            self.candidate_table.setHorizontalHeaderLabels(
+                (
+                    "排序",
+                    "候选视点",
+                    "科学增益",
+                    "IK / 耗时",
+                    "端点 / 耗时",
+                    "直线路径 / 耗时",
+                    "RRT / 耗时",
+                    "总耗时",
+                    "结果/原因",
+                )
+            )
+            self.candidate_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            tabs.addTab(self.candidate_table, "候选视点与规划预检")
+
             diagnostic_tab = QWidget()
             diagnostic_layout = QVBoxLayout(diagnostic_tab)
             self.diagnostic_label = QLabel()
@@ -699,12 +777,21 @@ def launch_supervisory_console(
                 self.play_button.setEnabled(False)
                 self.next_button.setEnabled(False)
                 self.position_slider.setEnabled(False)
+            if follow:
+                with suppress(ValueError):
+                    self._live_planning_update = read_live_planning_update(source_path)
             self._show_index(0)
             if follow:
                 self.follow_timer.start()
 
         def _refresh_follow(self) -> None:
             nonlocal timeline
+            try:
+                candidate_update = read_live_planning_update(source_path)
+            except ValueError:
+                candidate_update = None
+            if candidate_update is not None:
+                self._live_planning_update = candidate_update
             previous_hashes = tuple(item.content_sha256 for item in timeline.snapshots)
             try:
                 discovered = discover_supervisory_snapshots(source_path)
@@ -713,6 +800,8 @@ def launch_supervisory_console(
                 return
             discovered_hashes = tuple(item.content_sha256 for item in discovered.snapshots)
             if discovered_hashes == previous_hashes:
+                if self._index == len(timeline.snapshots) - 1:
+                    self._show_index(self._index)
                 return
             if discovered_hashes[: len(previous_hashes)] != previous_hashes:
                 self.timeline_label.setToolTip("目录跟随拒绝已发布快照被修改、删除或重新排序")
@@ -727,6 +816,35 @@ def launch_supervisory_console(
             self.position_slider.setEnabled(enabled)
             self.timeline_label.setToolTip("只读发现原子发布的回放快照；不构成在线感知或实时避障")
             self._show_index(len(timeline.snapshots) - 1 if was_at_end else self._index)
+
+        def _planning_for(
+            self,
+            stored: StoredSupervisorySnapshot,
+            index: int,
+        ) -> PlanningProgressSnapshot:
+            planning = stored.snapshot.plan.planning
+            update = self._live_planning_update
+            using_live_update = False
+            if (
+                follow
+                and index == len(timeline.snapshots) - 1
+                and update is not None
+                and update.source_session_id == stored.snapshot.source_session_id
+                and update.generated_at_utc >= stored.snapshot.created_at_utc
+            ):
+                planning = update.planning
+                using_live_update = True
+            if (
+                not using_live_update
+                or planning.phase_started_at_utc is None
+                or planning.phase not in {"planning", "preflighting"}
+            ):
+                return planning
+            elapsed = max(
+                planning.phase_elapsed_s,
+                (datetime.now(UTC) - planning.phase_started_at_utc).total_seconds(),
+            )
+            return planning.model_copy(update={"phase_elapsed_s": elapsed})
 
         def _toggle_replay(self) -> None:
             self._playing = not self._playing
@@ -755,7 +873,8 @@ def launch_supervisory_console(
             stored = timeline.snapshots[index]
             arrays = arrays_for(stored)
             snapshot = stored.snapshot
-            self.safety_scene.set_scene(stored, arrays)
+            planning = self._planning_for(stored, index)
+            self.safety_scene.set_scene(stored, arrays, planning)
             self.reconstruction_scene.set_scene(stored, arrays)
 
             state_colors = {
@@ -792,7 +911,11 @@ def launch_supervisory_console(
                 else f"{snapshot.plan.current_view_index + 1}/{snapshot.plan.total_view_count}"
             )
             self.plan_label.setText(
-                f"<b>计划 {snapshot.plan.state}</b><br>{snapshot.plan.plan_id}<br>"
+                f"<b>计划 {snapshot.plan.state}</b> · "
+                f"{planning.phase} {planning.phase_elapsed_s:.1f}s<br>"
+                f"周期 {planning.cycle_index} · 候选 {planning.candidate_count} · "
+                f"当前 {planning.active_candidate_id or '-'} · "
+                f"选中 {planning.selected_candidate_id or '-'}<br>"
                 f"进度 {plan_position} · 下一视点 {snapshot.plan.next_view_id or '-'} · "
                 + (
                     "快照绑定的计划TCP轨迹"
@@ -877,6 +1000,38 @@ def launch_supervisory_console(
                     self.event_table.setItem(row, column, QTableWidgetItem(value))
             self.event_table.resizeColumnsToContents()
 
+            self.candidate_table.setRowCount(len(planning.candidates))
+            for row, candidate in enumerate(planning.candidates):
+                marker = "✓" if candidate.selected else "▶" if candidate.active else ""
+                score = (
+                    f"{candidate.science_score:.5g}"
+                    if candidate.science_score is not None
+                    else "UNKNOWN"
+                )
+                total_duration = (
+                    f"{candidate.total_duration_s:.3f}s"
+                    if candidate.total_duration_s is not None
+                    else "PENDING"
+                )
+                reasons = "；".join(candidate.blocking_reasons)
+                values = (
+                    f"{marker} {candidate.rank} (science {candidate.science_rank})",
+                    candidate.candidate_id,
+                    score,
+                    _gate_text(candidate.ik_status, candidate.ik_duration_s),
+                    _gate_text(candidate.endpoint_status, candidate.endpoint_duration_s),
+                    _gate_text(
+                        candidate.straight_path_status,
+                        candidate.straight_path_duration_s,
+                    ),
+                    _gate_text(candidate.rrt_status, candidate.rrt_duration_s),
+                    total_duration,
+                    reasons or ("SELECTED" if candidate.selected else "-"),
+                )
+                for column, value in enumerate(values):
+                    self.candidate_table.setItem(row, column, QTableWidgetItem(value))
+            self.candidate_table.resizeColumnsToContents()
+
             reasons = tuple(
                 dict.fromkeys((*snapshot.safety.blocking_reasons, *snapshot.plan.blocking_reasons))
             )
@@ -889,12 +1044,31 @@ def launch_supervisory_console(
                 else "未知"
             )
             reconstruction_reasons = "；".join(snapshot.reconstruction.provenance_reasons) or "无"
+            selection_time = (
+                f"{planning.selection_duration_s:.3f}"
+                if planning.selection_duration_s is not None
+                else "UNKNOWN"
+            )
+            waypoint_count = (
+                str(planning.planning_waypoint_count)
+                if planning.planning_waypoint_count is not None
+                else "PENDING"
+            )
+            motion_time = (
+                f"{planning.planned_motion_duration_s:.3f}"
+                if planning.planned_motion_duration_s is not None
+                else "PENDING"
+            )
             self.diagnostic_label.setText(
                 "<b>不可绕过的显示事实</b><br>"
                 f"未知体素策略：{snapshot.safety.unknown_occupancy_policy}；"
                 f"过期地图策略：{snapshot.safety.stale_occupancy_policy}；"
                 f"反馈年龄：{feedback_age}<br>"
                 f"阻断原因：{reason_text}<br>"
+                f"规划阶段：{planning.phase}（{planning.phase_elapsed_s:.1f}s）；"
+                f"选择耗时：{selection_time}s；"
+                f"路径：{planning.selected_path_kind or 'PENDING'}；"
+                f"轨迹点：{waypoint_count}；预计运动：{motion_time}s<br>"
                 f"标定资产：{calibrations}<br>"
                 f"重建来源：{snapshot.reconstruction.provenance_status}；"
                 f"来源说明：{reconstruction_reasons}<br>"

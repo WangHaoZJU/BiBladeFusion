@@ -62,6 +62,111 @@ class TransformSnapshot(_FrozenModel):
         return value
 
 
+PlanningGateState = Literal[
+    "UNKNOWN",
+    "PENDING",
+    "RUNNING",
+    "CLEAR",
+    "BLOCKED",
+    "NOT_REQUIRED",
+    "UNAVAILABLE",
+    "ERROR",
+]
+
+
+class CandidatePlanningSnapshot(_FrozenModel):
+    """Read-only status of one already-generated, science-ranked candidate."""
+
+    candidate_id: str = Field(min_length=1)
+    rank: int = Field(ge=1)
+    science_rank: int = Field(ge=1)
+    science_score: float | None = None
+    selected: bool = False
+    active: bool = False
+    ik_status: PlanningGateState = "UNKNOWN"
+    endpoint_status: PlanningGateState = "UNKNOWN"
+    straight_path_status: PlanningGateState = "UNKNOWN"
+    rrt_status: PlanningGateState = "UNKNOWN"
+    ik_duration_s: float | None = Field(default=None, ge=0.0)
+    endpoint_duration_s: float | None = Field(default=None, ge=0.0)
+    straight_path_duration_s: float | None = Field(default=None, ge=0.0)
+    total_duration_s: float | None = Field(default=None, ge=0.0)
+    rrt_duration_s: float | None = Field(default=None, ge=0.0)
+    target_camera_pose: TransformSnapshot | None = None
+    target_tcp_pose: TransformSnapshot | None = None
+    blocking_reasons: tuple[str, ...] = ()
+    diagnostics: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _valid_candidate(self) -> CandidatePlanningSnapshot:
+        if self.science_score is not None and not np.isfinite(self.science_score):
+            raise ValueError("candidate science_score must be finite")
+        return self
+
+
+class PlanningProgressSnapshot(_FrozenModel):
+    """Small planning telemetry contract; never an approval or command surface."""
+
+    phase: str = "unknown"
+    disposition: str = "unknown"
+    cycle_index: int = Field(default=0, ge=0)
+    phase_started_at_utc: datetime | None = None
+    phase_elapsed_s: float = Field(default=0.0, ge=0.0)
+    selection_duration_s: float | None = Field(default=None, ge=0.0)
+    candidate_count: int = Field(default=0, ge=0)
+    active_candidate_id: str | None = None
+    selected_candidate_id: str | None = None
+    selected_path_kind: str | None = None
+    planned_motion_duration_s: float | None = Field(default=None, ge=0.0)
+    planning_waypoint_count: int | None = Field(default=None, ge=0)
+    latest_event_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
+    candidates: tuple[CandidatePlanningSnapshot, ...] = ()
+
+    @field_validator("phase_started_at_utc")
+    @classmethod
+    def _phase_start_is_utc(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (
+            value.utcoffset() is None or value.utcoffset().total_seconds() != 0.0
+        ):
+            raise ValueError("phase_started_at_utc must include a UTC offset")
+        return value
+
+    @model_validator(mode="after")
+    def _valid_queue(self) -> PlanningProgressSnapshot:
+        if self.candidate_count != len(self.candidates):
+            raise ValueError("candidate_count must equal the candidate queue length")
+        if len({item.rank for item in self.candidates}) != len(self.candidates):
+            raise ValueError("candidate ranks must be unique")
+        selected = tuple(item.candidate_id for item in self.candidates if item.selected)
+        active = tuple(item.candidate_id for item in self.candidates if item.active)
+        if len(selected) > 1 or len(active) > 1:
+            raise ValueError("at most one planning candidate may be selected or active")
+        if self.selected_candidate_id is not None and selected != (
+            self.selected_candidate_id,
+        ):
+            raise ValueError("selected_candidate_id must identify the selected candidate")
+        if self.active_candidate_id is not None and active != (self.active_candidate_id,):
+            raise ValueError("active_candidate_id must identify the active candidate")
+        return self
+
+
+class LivePlanningUpdate(_FrozenModel):
+    """Atomically replaced, best-effort progress sidecar for follow-mode viewers."""
+
+    schema_version: Literal[1] = 1
+    generated_at_utc: datetime
+    source_session_id: str = Field(min_length=1)
+    latest_event_sha256: str = Field(pattern=_SHA256_PATTERN)
+    planning: PlanningProgressSnapshot
+
+    @field_validator("generated_at_utc")
+    @classmethod
+    def _generated_at_is_utc(cls, value: datetime) -> datetime:
+        if value.utcoffset() is None or value.utcoffset().total_seconds() != 0.0:
+            raise ValueError("generated_at_utc must include a UTC offset")
+        return value
+
+
 def _point_array(reference: ArrayReference | None, field_name: str) -> None:
     if reference is None:
         return
@@ -280,6 +385,7 @@ class PlanSnapshot(_FrozenModel):
     next_view_id: str | None = None
     minimum_clearance_m: float | None = Field(default=None, ge=0.0)
     blocking_reasons: tuple[str, ...] = ()
+    planning: PlanningProgressSnapshot = PlanningProgressSnapshot()
 
     @model_validator(mode="after")
     def _valid_progress(self) -> PlanSnapshot:
@@ -546,6 +652,39 @@ def read_supervisory_snapshot(path: str | Path) -> StoredSupervisorySnapshot:
         )
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid supervisory snapshot {snapshot_path}: {exc}") from exc
+
+
+def read_live_planning_update(path: str | Path) -> LivePlanningUpdate:
+    """Read the optional progress sidecar without granting it scientific authority."""
+
+    candidate = Path(path).resolve()
+    if candidate.is_dir():
+        candidate = candidate / "live_planning.json"
+    if not candidate.is_file():
+        raise ValueError(f"live planning update does not exist: {candidate}")
+    try:
+        return LivePlanningUpdate.model_validate_json(candidate.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid live planning update {candidate}: {exc}") from exc
+
+
+def write_live_planning_update(path: str | Path, update: LivePlanningUpdate) -> Path:
+    """Atomically replace one diagnostic-only planning update."""
+
+    if type(update) is not LivePlanningUpdate:
+        raise TypeError("live planning update must use the typed read-only contract")
+    destination = Path(path).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    try:
+        temporary.write_text(
+            update.model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
 
 
 def load_snapshot_array(

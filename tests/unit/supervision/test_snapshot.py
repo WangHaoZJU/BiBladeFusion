@@ -8,9 +8,14 @@ import numpy as np
 import pytest
 
 from biblade_fusion.supervision import (
+    CandidatePlanningSnapshot,
+    LivePlanningUpdate,
+    PlanningProgressSnapshot,
     discover_supervisory_snapshots,
     load_snapshot_array,
+    read_live_planning_update,
     read_supervisory_snapshot,
+    write_live_planning_update,
 )
 
 
@@ -116,6 +121,59 @@ def test_snapshot_verifies_and_loads_non_pickle_array(tmp_path: Path) -> None:
     assert links is not None
     assert links.shape == (3, 3)
     assert links.flags.writeable is False
+    assert stored.snapshot.plan.planning.phase == "unknown"
+    assert stored.snapshot.plan.planning.candidates == ()
+
+
+def test_live_planning_sidecar_round_trips_candidate_gate_evidence(tmp_path: Path) -> None:
+    update = LivePlanningUpdate(
+        generated_at_utc="2026-09-04T02:00:00+00:00",
+        source_session_id="planning-test",
+        latest_event_sha256="a" * 64,
+        planning=PlanningProgressSnapshot(
+            phase="preflighting",
+            disposition="preflighting",
+            cycle_index=1,
+            phase_started_at_utc="2026-09-04T01:59:59+00:00",
+            phase_elapsed_s=1.0,
+            candidate_count=1,
+            active_candidate_id="view-01",
+            candidates=(
+                CandidatePlanningSnapshot(
+                    candidate_id="view-01",
+                    rank=1,
+                    science_rank=1,
+                    science_score=0.75,
+                    active=True,
+                    ik_status="CLEAR",
+                    endpoint_status="RUNNING",
+                    straight_path_status="RUNNING",
+                    rrt_status="PENDING",
+                ),
+            ),
+        ),
+    )
+
+    path = write_live_planning_update(tmp_path / "live_planning.json", update)
+    restored = read_live_planning_update(path)
+
+    assert restored == update
+    assert not (tmp_path / ".live_planning.json.tmp").exists()
+
+
+def test_planning_progress_rejects_inconsistent_selected_candidate() -> None:
+    with pytest.raises(ValueError, match="selected_candidate_id"):
+        PlanningProgressSnapshot(
+            candidate_count=1,
+            selected_candidate_id="view-02",
+            candidates=(
+                CandidatePlanningSnapshot(
+                    candidate_id="view-01",
+                    rank=1,
+                    science_rank=1,
+                ),
+            ),
+        )
 
 
 def test_snapshot_rejects_tampered_array(tmp_path: Path) -> None:

@@ -18,6 +18,7 @@ from biblade_fusion.robotics.collision_template import (
     es68_d435i_collision_content_hash,
     es68_d435i_robot_geometry_hash,
 )
+from biblade_fusion.storage.stop_scan_run import StopScanRunEvent
 from biblade_fusion.supervision.experiment import (
     ExperimentDisposition,
     ExperimentStatusSnapshot,
@@ -35,6 +36,7 @@ from biblade_fusion.supervision.live import (
 from biblade_fusion.supervision.snapshot import (
     discover_supervisory_snapshots,
     load_snapshot_array,
+    read_live_planning_update,
 )
 from biblade_fusion.workflows.stop_scan_coordinator import PreparedSegment
 
@@ -65,6 +67,49 @@ def _status(
         recovery_required=False,
         awaiting_external_approval=(disposition is ExperimentDisposition.WAITING_APPROVAL),
     )
+
+
+def _event(
+    *,
+    sequence: int,
+    phase: str,
+    event_type: str,
+    payload: dict[str, object],
+    previous: StopScanRunEvent | None = None,
+) -> StopScanRunEvent:
+    return StopScanRunEvent.build(
+        run_id="live-run-001",
+        sequence=sequence,
+        phase=phase,
+        cycle_index=1,
+        event_type=event_type,
+        payload=payload,
+        previous_event_sha256=(previous.event_sha256 if previous is not None else None),
+        created_at_utc=f"2026-09-04T02:00:0{sequence}+00:00",
+    )
+
+
+def _candidate_queue_payload() -> list[dict[str, object]]:
+    return [
+        {
+            "target_view_id": "view-front-01",
+            "rank": 1,
+            "science_rank": 2,
+            "science_score": 0.82,
+            "target_joint_positions_rad": [0.01, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "target_base_t_tcp_matrix": np.eye(4).tolist(),
+            "diagnostics": ["expected_scientific_gain=0.82"],
+        },
+        {
+            "target_view_id": "view-back-01",
+            "rank": 2,
+            "science_rank": 4,
+            "science_score": 0.61,
+            "target_joint_positions_rad": [0.02, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "target_base_t_tcp_matrix": np.eye(4).tolist(),
+            "diagnostics": ["expected_scientific_gain=0.61"],
+        },
+    ]
 
 
 def _collision_geometry(
@@ -278,6 +323,177 @@ def test_initial_status_is_published_atomically_and_read_only(tmp_path: Path) ->
     assert diagnostic["identity"]["snapshot_sequence"] == 0
     assert diagnostic["spans"]["live.snapshot_publication"]["count"] == 1
     assert diagnostic["spans"]["live.snapshot_commit"]["count"] == 1
+
+
+def test_planning_event_publishes_candidate_progress_before_status_snapshot(
+    tmp_path: Path,
+) -> None:
+    bridge = _bridge(tmp_path)
+    _inject_verified_display_state(bridge)
+    selected = _event(
+        sequence=0,
+        phase="planning",
+        event_type="next_view_selection_started",
+        payload={},
+    )
+    bridge.observe_event(selected)
+    started = _event(
+        sequence=1,
+        phase="preflighting",
+        event_type="single_segment_preflight_started",
+        payload={
+            "target_view_id": "view-front-01",
+            "selection_duration_s": 0.42,
+            "ranked_candidate_queue": _candidate_queue_payload(),
+        },
+        previous=selected,
+    )
+
+    bridge.observe_event(started)
+
+    update = read_live_planning_update(bridge.timeline_root)
+    assert update.latest_event_sha256 == started.event_sha256
+    assert update.planning.phase == "preflighting"
+    assert update.planning.selection_duration_s == pytest.approx(0.42)
+    assert update.planning.active_candidate_id == "view-front-01"
+    assert [item.science_score for item in update.planning.candidates] == [0.82, 0.61]
+    assert update.planning.candidates[0].ik_status == "CLEAR"
+    assert update.planning.candidates[0].straight_path_status == "RUNNING"
+    assert update.planning.candidates[0].target_camera_pose is not None
+
+
+def test_rejected_preflight_updates_gate_results_and_snapshot_replay(tmp_path: Path) -> None:
+    bridge = _bridge(tmp_path)
+    _inject_verified_display_state(bridge)
+    selected = _event(
+        sequence=0,
+        phase="planning",
+        event_type="next_view_selection_started",
+        payload={},
+    )
+    started = _event(
+        sequence=1,
+        phase="preflighting",
+        event_type="single_segment_preflight_started",
+        payload={
+            "target_view_id": "view-front-01",
+            "selection_duration_s": 0.1,
+            "ranked_candidate_queue": _candidate_queue_payload(),
+        },
+        previous=selected,
+    )
+    rejected = _event(
+        sequence=2,
+        phase="preflighting",
+        event_type="ranked_candidate_preflight_rejected",
+        payload={
+            "target_view_id": "view-front-01",
+            "preflight": {
+                "endpoint_status": "CLEAR",
+                "straight_path_status": "BLOCKED",
+                "rrt_status": "BLOCKED",
+                "total_duration_s": 0.8,
+                "rrt_duration_s": 0.2,
+                "blocking_reasons": ["occupied_path"],
+            },
+        },
+        previous=started,
+    )
+    for event in (selected, started, rejected):
+        bridge.observe_event(event)
+
+    update = read_live_planning_update(bridge.timeline_root)
+    candidate = update.planning.candidates[0]
+    assert candidate.endpoint_status == "CLEAR"
+    assert candidate.straight_path_status == "BLOCKED"
+    assert candidate.rrt_status == "BLOCKED"
+    assert candidate.blocking_reasons == ("occupied_path",)
+
+    stored = bridge.publish_status(
+        _status(
+            tmp_path / "run",
+            phase="preflighting",
+            disposition=ExperimentDisposition.READY,
+            cycle_index=1,
+        )
+    )
+    assert stored.snapshot.plan.planning.candidates[0] == candidate
+
+
+def test_waiting_approval_marks_selected_path_and_motion_summary(tmp_path: Path) -> None:
+    bridge = _bridge(tmp_path)
+    _inject_verified_display_state(bridge)
+    selected = _event(
+        sequence=0,
+        phase="planning",
+        event_type="next_view_selection_started",
+        payload={},
+    )
+    started = _event(
+        sequence=1,
+        phase="preflighting",
+        event_type="single_segment_preflight_started",
+        payload={
+            "target_view_id": "view-front-01",
+            "ranked_candidate_queue": _candidate_queue_payload(),
+        },
+        previous=selected,
+    )
+    waiting = _event(
+        sequence=2,
+        phase="waiting_approval",
+        event_type="single_segment_waiting_approval",
+        payload={
+            "target_view_id": "view-front-01",
+            "preflight": {
+                "endpoint_status": "CLEAR",
+                "straight_path_status": "BLOCKED",
+                "rrt_status": "CLEAR",
+                "selected_path_kind": "rrtconnect",
+                "total_duration_s": 0.9,
+                "rrt_duration_s": 0.3,
+                "planned_motion_duration_s": 2.4,
+                "planning_waypoint_count": 11,
+                "blocking_reasons": [],
+            },
+        },
+        previous=started,
+    )
+    for event in (selected, started, waiting):
+        bridge.observe_event(event)
+
+    planning = read_live_planning_update(bridge.timeline_root).planning
+    assert planning.selected_candidate_id == "view-front-01"
+    assert planning.active_candidate_id is None
+    assert planning.selected_path_kind == "rrtconnect"
+    assert planning.planned_motion_duration_s == pytest.approx(2.4)
+    assert planning.planning_waypoint_count == 11
+    assert planning.candidates[0].selected is True
+
+
+def test_live_planning_sidecar_failure_does_not_disable_observer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = _bridge(tmp_path)
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("synthetic read-only viewer failure")
+
+    monkeypatch.setattr(live_module, "write_live_planning_update", fail_write)
+    event = _event(
+        sequence=0,
+        phase="planning",
+        event_type="next_view_selection_started",
+        payload={},
+    )
+
+    bridge.observe_event(event)
+
+    assert bridge._events == [event]
+    assert bridge._planning_events == [event]
+    stored = bridge.publish_status(_status(tmp_path / "run"))
+    assert stored.snapshot.sequence == 0
 
 
 def test_approval_without_live_evidence_publishes_block_then_raises(tmp_path: Path) -> None:

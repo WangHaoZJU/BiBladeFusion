@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
+from biblade_fusion.core.planning_deadline import activate_planning_deadline
 from biblade_fusion.robotics.holorobot_joint_planner import (
     HoloRobotJointPlanStatus,
     HoloRobotOmplConfig,
     _anchor_ompl_solution_endpoints,
+    _bounded_native_timeout_s,
     plan_holorobot_rrtconnect,
     resample_joint_path,
 )
@@ -90,3 +93,16 @@ def test_rrtconnect_rejects_invalid_goal_before_importing_ompl() -> None:
 
     assert result.status is HoloRobotJointPlanStatus.COLLISION_AT_GOAL
     assert result.blocking_reasons == ("environment_occupancy_unknown:wrist",)
+
+
+def test_native_rrt_timeout_is_clamped_to_outer_planning_remainder() -> None:
+    now = 9.6
+
+    with activate_planning_deadline(
+        started_monotonic_s=0.0,
+        maximum_duration_s=10.0,
+        monotonic_clock=lambda: now,
+    ):
+        assert _bounded_native_timeout_s(1.0, stage="test RRT") == pytest.approx(
+            0.4
+        )

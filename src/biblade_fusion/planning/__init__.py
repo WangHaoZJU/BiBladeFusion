@@ -2,6 +2,7 @@
 
 from biblade_fusion.planning.adaptive_view_search import (
     AdaptiveCandidateAttempt,
+    AdaptiveSearchTermination,
     AdaptiveViewSearchConfig,
     AdaptiveViewSearchError,
     AdaptiveViewSearchResult,
@@ -52,6 +53,7 @@ from biblade_fusion.planning.views import (
 
 __all__ = [
     "AdaptiveCandidateAttempt",
+    "AdaptiveSearchTermination",
     "AdaptiveViewSearchConfig",
     "AdaptiveViewSearchError",
     "AdaptiveViewSearchResult",

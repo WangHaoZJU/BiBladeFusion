@@ -82,6 +82,15 @@ class _FakeCoordinator:
         self._event("run_started")
         return self._checkpoint
 
+    def start_recovery(self) -> StopScanCheckpoint:
+        self._checkpoint = _checkpoint(
+            StopScanPhase.MOTION_BLOCKED,
+            cycle_index=self._checkpoint.cycle_index,
+            blocking_reasons=("recovery_requires_fresh_safety_refresh",),
+        )
+        self._event("run_recovery_started")
+        return self._checkpoint
+
     def capture_infer_update(self, view_id: str | None = None) -> object:
         if self.capture_error is not None:
             raise self.capture_error
@@ -342,11 +351,12 @@ def test_resume_requires_stop_confirmation_and_discards_motion_authority(
 
     assert recovered.disposition is ExperimentDisposition.NEEDS_CAPTURE
     assert recovered.cycle_index == 0
+    assert recovered.phase == StopScanPhase.MOTION_BLOCKED.value
     assert coordinator.execute_count == 0
     events = read_stop_scan_run(writer.root).events
     assert events[-2].event_type == "recovery_acknowledged"
     assert events[-2].payload["pending_motion_restored"] is False
-    assert events[-1].event_type == "run_started"
+    assert events[-1].event_type == "run_recovery_started"
 
 
 def test_capture_exception_latches_block_and_persists_reason(tmp_path: Path) -> None:

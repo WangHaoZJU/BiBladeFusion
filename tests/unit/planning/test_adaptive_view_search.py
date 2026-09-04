@@ -7,6 +7,7 @@ from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import AxisAlignedBoxConfig, ViewFilterConfig
 from biblade_fusion.perception.proxy import BilateralBladeProxy
 from biblade_fusion.planning import (
+    AdaptiveSearchTermination,
     AdaptiveViewSearchConfig,
     BladeSide,
     CandidateView,
@@ -347,6 +348,57 @@ def test_report_is_json_serializable_and_explicitly_non_executable() -> None:
     assert payload["endpoint_collision_checked"] is False
     assert payload["trajectory_checked"] is False
     assert payload["summary"]["ik_feasible_count"] == 1
+    assert payload["summary"]["termination"] == "feasible_candidate_limit"
+
+
+def test_search_reports_duration_budget_without_claiming_family_exhaustion() -> None:
+    clock = iter((0.0, 2.0))
+    config = AdaptiveViewSearchConfig(
+        maximum_distance_expansions=0,
+        tilt_samples_deg=(0.0,),
+        azimuth_samples_deg=(0.0,),
+        roll_samples_deg=(0.0, 45.0),
+        maximum_search_duration_s=1.0,
+    )
+
+    result = search_adaptive_candidate_family(
+        make_nominal(),
+        make_proxy(),
+        wide_workspace_filter(),
+        (FixedChecker(np.zeros(6)),),
+        np.zeros(6),
+        config,
+        monotonic_clock=lambda: next(clock),
+    )
+
+    assert result.attempts == ()
+    assert result.truncated is True
+    assert result.termination is AdaptiveSearchTermination.DURATION_LIMIT
+
+
+def test_search_distinguishes_generated_prefix_from_exhausted_family() -> None:
+    config = AdaptiveViewSearchConfig(
+        maximum_distance_expansions=0,
+        tilt_samples_deg=(0.0,),
+        azimuth_samples_deg=(0.0,),
+        roll_samples_deg=(0.0, 45.0),
+        maximum_generated_candidates=1,
+        maximum_ik_attempts_per_family=4,
+    )
+
+    result = search_adaptive_candidate_family(
+        make_nominal(),
+        make_proxy(),
+        wide_workspace_filter(),
+        (),
+        np.zeros(6),
+        config,
+        monotonic_clock=lambda: 0.0,
+    )
+
+    assert len(result.attempts) == 1
+    assert result.truncated is True
+    assert result.termination is AdaptiveSearchTermination.GENERATED_CANDIDATE_LIMIT
 
 
 def test_report_records_endpoint_collision_filtering() -> None:

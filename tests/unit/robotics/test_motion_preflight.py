@@ -6,6 +6,10 @@ from datetime import UTC, datetime
 import numpy as np
 import pytest
 
+from biblade_fusion.core.planning_deadline import (
+    PlanningDeadlineExceeded,
+    activate_planning_deadline,
+)
 from biblade_fusion.robotics import (
     CollisionCheckStatus,
     Cs68KinematicModel,
@@ -26,9 +30,40 @@ from biblade_fusion.robotics.motion_preflight import (
     HOLOROBOT_SAMPLED_VALIDATION,
     _holorobot_sampled_configurations,
     _linear_waypoints,
+    _sample_mesh_path_holorobot_style,
     _time_parameterized_servoj_stream,
     validate_preflight_servoj_contract,
 )
+
+
+def test_sampled_mesh_path_stops_after_native_check_exhausts_total_deadline() -> None:
+    now = 0.0
+
+    class SlowSinglePoseChecker:
+        calls = 0
+
+        def check(self, _configuration):
+            nonlocal now
+            self.calls += 1
+            now = 1.1
+            return object()
+
+    slow = SlowSinglePoseChecker()
+    with (
+        activate_planning_deadline(
+            started_monotonic_s=0.0,
+            maximum_duration_s=1.0,
+            monotonic_clock=lambda: now,
+        ),
+        pytest.raises(PlanningDeadlineExceeded, match="after sampled mesh pose 0"),
+    ):
+        _sample_mesh_path_holorobot_style(
+            slow,  # type: ignore[arg-type]
+            ((0.0,) * 6, (0.1,) + (0.0,) * 5),
+            maximum_joint_step_rad=0.02,
+        )
+
+    assert slow.calls == 1
 
 
 class _SyntheticSweptEs68Checker(Es68PinocchioCollisionChecker):

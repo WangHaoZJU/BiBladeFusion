@@ -2,8 +2,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from biblade_fusion.calibration import Cs68KinematicsModel, HandEyeCalibration
+from biblade_fusion.core.planning_deadline import (
+    PlanningDeadlineExceeded,
+    activate_planning_deadline,
+)
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import KinematicsConfig
 from biblade_fusion.planning import EliteCs68IkChecker, ReachabilityState
@@ -245,6 +250,38 @@ def test_holorobot_pinocchio_seed_sweep_retains_all_distinct_branches(
     assert len(solutions) > 1
     np.testing.assert_allclose(solutions[0], seed)
     assert any(np.allclose(item, calls[1]) for item in solutions)
+
+
+def test_holorobot_pinocchio_seed_sweep_stops_at_cooperative_deadline(
+    monkeypatch,
+) -> None:
+    pinocchio_model = PinocchioCs68Model.from_urdf(
+        Cs68ModelResources.packaged().urdf_path
+    )
+    solver = _HoloRobotPinocchioIkSolver(pinocchio_model)
+    seed = np.array([0.2, -1.1, 1.0, -0.8, 0.4, 0.15])
+    calls = 0
+    now = 0.0
+
+    def exhaust_after_one_seed(_target, _controller_seed):
+        nonlocal calls, now
+        calls += 1
+        now = 1.1
+        return None
+
+    monkeypatch.setattr(solver, "_solve_single", exhaust_after_one_seed)
+
+    with (
+        activate_planning_deadline(
+            started_monotonic_s=0.0,
+            maximum_duration_s=1.0,
+            monotonic_clock=lambda: now,
+        ),
+        pytest.raises(PlanningDeadlineExceeded, match="after Pinocchio IK seed"),
+    ):
+        solver.solve_all(PoseSE3.identity("base", "flange"), seed)
+
+    assert calls == 1
 
 
 def test_holorobot_pinocchio_solve_stops_after_first_valid_seed(monkeypatch) -> None:

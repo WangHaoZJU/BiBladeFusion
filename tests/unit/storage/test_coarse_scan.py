@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -873,6 +874,166 @@ def test_generation_reader_rejects_same_count_wrong_physical_observation_id(
 
     with pytest.raises(ValueError, match="physical observation identities"):
         read_coarse_scan_generation(generation)
+
+
+def test_generation_reader_allows_new_discovery_revision_for_appended_view(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _fake_stored_view(tmp_path)
+    first_view = SimpleNamespace(
+        **{
+            **vars(first.reconstructed.view),
+            "base_t_projection_camera": PoseSE3.from_rotation_translation(
+                "base", "camera-0", np.eye(3), (0.0, 0.0, 0.5)
+            ),
+        }
+    )
+    first = replace(
+        first,
+        reconstructed=SimpleNamespace(
+            view=first_view,
+            metadata=first.reconstructed.metadata,
+        ),
+    )
+    second_root = (tmp_path / "coarse-view-2").resolve()
+    second_root.mkdir()
+    second_metadata_path = second_root / "metadata.json"
+    second_metadata_path.write_text(json.dumps(first.metadata) + "\n", encoding="utf-8")
+    second_view = SimpleNamespace(
+        **{
+            **vars(first.reconstructed.view),
+            "source_view_id": "coarse_01",
+            "source_sequence_index": 3,
+            "source_frame_number": 18,
+            "base_t_projection_camera": PoseSE3.from_rotation_translation(
+                "base", "camera-1", np.eye(3), (0.0, 0.1, 0.5)
+            ),
+        }
+    )
+    second = replace(
+        first,
+        root=second_root,
+        reconstructed=SimpleNamespace(
+            view=second_view,
+            metadata=first.reconstructed.metadata,
+        ),
+        target_view_id="coarse_01",
+        metadata_sha256=coarse_scan_module._sha256(second_metadata_path),
+        metadata_size_bytes=second_metadata_path.stat().st_size,
+    )
+    authorities = {
+        "initialization": (tmp_path / "initialization", "metadata.json"),
+        "view_plan": (tmp_path / "view-plan", "view_plan.json"),
+        "discovery_0": (tmp_path / "discovery-0", "discovery.json"),
+        "discovery_1": (tmp_path / "discovery-1", "discovery.json"),
+        "coverage_0": (tmp_path / "coverage-0", "coverage.json"),
+        "coverage_1": (tmp_path / "coverage-1", "coverage.json"),
+    }
+    for root, filename in authorities.values():
+        root.mkdir()
+        (root / filename).write_text("{}\n", encoding="utf-8")
+
+    def directory(name: str) -> dict[str, object]:
+        return coarse_scan_module._directory_record(*authorities[name])
+
+    first_generation = tmp_path / "generation-0"
+    first_generation.mkdir()
+    (first_generation / "generation.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_kind": "biblade_fusion.coarse_scan_generation",
+                "motion_authorized": False,
+                "generation_index": 0,
+                "previous_generation": None,
+                "sources": {
+                    "initialization": directory("initialization"),
+                    "view_plan": directory("view_plan"),
+                    "discovery_plan": directory("discovery_0"),
+                    "coverage": directory("coverage_0"),
+                    "coarse_model": None,
+                },
+                "views": [coarse_scan_module._directory_record(first.root, "metadata.json")],
+                "summary": {
+                    "view_count": 1,
+                    "front_view_count": 1,
+                    "back_view_count": 0,
+                    "schema5_ready": False,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    generation = tmp_path / "generation-1"
+    generation.mkdir()
+    (generation / "generation.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_kind": "biblade_fusion.coarse_scan_generation",
+                "motion_authorized": False,
+                "generation_index": 1,
+                "previous_generation": coarse_scan_module._directory_record(
+                    first_generation, "generation.json"
+                ),
+                "sources": {
+                    "initialization": directory("initialization"),
+                    "view_plan": directory("view_plan"),
+                    "discovery_plan": directory("discovery_1"),
+                    "coverage": directory("coverage_1"),
+                    "coarse_model": None,
+                },
+                "views": [
+                    coarse_scan_module._directory_record(first.root, "metadata.json"),
+                    coarse_scan_module._directory_record(second.root, "metadata.json"),
+                ],
+                "summary": {
+                    "view_count": 2,
+                    "front_view_count": 2,
+                    "back_view_count": 0,
+                    "schema5_ready": False,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    observation_ids = tuple(
+        coverage_observation_id(
+            item.reconstructed.metadata["source"]["session"],
+            item.reconstructed.view.source_view_id,
+            item.reconstructed.view.source_sequence_index,
+            item.reconstructed.view.source_frame_number,
+        )
+        for item in (first, second)
+    )
+    coverage = _fake_coverage(tmp_path, observation_ids=observation_ids)
+    coverage.metadata["previous_ledger"] = str(authorities["coverage_0"][0].resolve())
+    monkeypatch.setattr(
+        coarse_scan_module,
+        "read_coarse_scan_view",
+        lambda path: first if Path(path).resolve() == first.root else second,
+    )
+    monkeypatch.setattr(coarse_scan_module, "read_coverage_ledger", lambda _path: coverage)
+    monkeypatch.setattr(coarse_scan_module, "_assert_coverage_replays", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        initialization_module,
+        "read_initialization",
+        lambda _path: SimpleNamespace(
+            observation=SimpleNamespace(
+                proxy=SimpleNamespace(frame_T_proxy=PoseSE3.identity("base", "proxy"))
+            )
+        ),
+    )
+
+    stored = read_coarse_scan_generation(generation)
+
+    assert stored.generation_index == 1
+    assert stored.metadata["sources"]["discovery_plan"]["root"] == str(
+        authorities["discovery_1"][0].resolve()
+    )
 
 
 def test_generation_writer_rejects_coverage_bins_that_do_not_replay(

@@ -117,6 +117,7 @@ from biblade_fusion.workflows.foundation_stereo_cycle import (
 )
 from biblade_fusion.workflows.stop_scan_coordinator import (
     CapturedStopScanView,
+    CapturePurpose,
     GuardedSegmentSafetyFactory,
     NextViewSelection,
     NextViewTarget,
@@ -633,18 +634,30 @@ class CoarseSessionNextViewAdapter:
         ]
         | None = None,
         discovery_refresher: Callable[[PerceptionCycleResult], None] | None = None,
+        initial_accepted_cycle_count: int = 0,
     ) -> None:
+        if type(initial_accepted_cycle_count) is not int or initial_accepted_cycle_count < 0:
+            raise ValueError("Initial accepted coarse-cycle count must be non-negative")
         self._session = session
         self._selection_rebinder = selection_rebinder
         self._discovery_refresher = discovery_refresher
         self._pending_selection: NextViewSelection | None = None
         self._last_transition: CoarsePhaseTransition | None = None
-        self._accepted_cycle_count = 0
+        self._accepted_cycle_count = initial_accepted_cycle_count
         self._pending_transition_result: PerceptionCycleResult | None = None
         self._run_reference_model_sha256: str | None = None
         self._run_selection_policy_sha256: str | None = None
         self._checkpoint_sink: Callable[[Path], None] | None = None
-        self._last_checkpoint_generation: Path | None = None
+        recovered_generation = self._session.current_generation_path
+        if initial_accepted_cycle_count and recovered_generation is None:
+            raise ValueError(
+                "Recovered coarse-cycle count requires its persisted generation"
+            )
+        self._last_checkpoint_generation: Path | None = (
+            Path(recovered_generation).resolve()
+            if initial_accepted_cycle_count and recovered_generation is not None
+            else None
+        )
         self._pending_live_readback: _CoarseScanViewReadback | None = None
 
     @property
@@ -668,7 +681,7 @@ class CoarseSessionNextViewAdapter:
         return self._last_checkpoint_generation
 
     def bind_checkpoint_sink(self, sink: Callable[[Path], None]) -> None:
-        if self._checkpoint_sink is not None or self._accepted_cycle_count:
+        if self._checkpoint_sink is not None:
             raise UnknownBladeRuntimeError(
                 "Coarse checkpoint sink must be bound once before the first cycle"
             )
@@ -704,6 +717,12 @@ class CoarseSessionNextViewAdapter:
             # A short route may require one or more TRANSIT captures.  Those update
             # safety occupancy but intentionally do not consume the staged science
             # target.
+            if getattr(result, "purpose", None) is CapturePurpose.SAFETY_REFRESH:
+                # A recovery/safety refresh advances no blade science, but its exact
+                # MAP_READY publication may authorize evaluation of the already
+                # persisted coarse generation (including an interrupted schema-5
+                # handoff) without asking for another hard ROI.
+                self._pending_transition_result = result
             return
         self._pending_live_readback = None
         generation = Path(self._session.accept_cycle(result)).resolve()
@@ -887,6 +906,7 @@ class UnknownBladeSupervisedRuntime:
         runtime_timing_authority: RuntimeTimingAcceptanceAuthority | None = None,
         maximum_schema5_handoff_duration_s: float | None = None,
         experimental: bool = False,
+        initial_operator_bootstrap_views: int = 0,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not operator_id.strip():
@@ -898,6 +918,11 @@ class UnknownBladeSupervisedRuntime:
             or maximum_schema5_handoff_duration_s <= 0.0
         ):
             raise ValueError("Schema-5 handoff timing budget must be finite and positive")
+        if (
+            type(initial_operator_bootstrap_views) is not int
+            or initial_operator_bootstrap_views < 0
+        ):
+            raise ValueError("Initial operator-bootstrap count must be non-negative")
         if resume_phase in {
             UnknownBladeResumePhase.PREPARED,
             UnknownBladeResumePhase.FINE,
@@ -939,17 +964,18 @@ class UnknownBladeSupervisedRuntime:
         self._maximum_schema5_handoff_duration_s = maximum_schema5_handoff_duration_s
         self._experimental = experimental
         self._monotonic_clock = monotonic_clock
-        self._bootstrap_count = 0
+        self._bootstrap_count = initial_operator_bootstrap_views
         self._coarse_safety_refresh_count = 0
         self._fine_replenishment_count = 0
-        self._phase = (
-            UnknownBladeRuntimePhase.FINE_SCAN
-            if resume_phase in {
-                UnknownBladeResumePhase.PREPARED,
-                UnknownBladeResumePhase.FINE,
-            }
-            else UnknownBladeRuntimePhase.OPERATOR_BOOTSTRAP
-        )
+        if resume_phase in {
+            UnknownBladeResumePhase.PREPARED,
+            UnknownBladeResumePhase.FINE,
+        }:
+            self._phase = UnknownBladeRuntimePhase.FINE_SCAN
+        elif resume_phase is UnknownBladeResumePhase.COARSE:
+            self._phase = UnknownBladeRuntimePhase.COARSE_SCAN
+        else:
+            self._phase = UnknownBladeRuntimePhase.OPERATOR_BOOTSTRAP
         self._reference = (
             Path(recovered_reference).resolve()
             if recovered_reference is not None
@@ -1129,7 +1155,7 @@ class UnknownBladeSupervisedRuntime:
             raise UnknownBladeRuntimeError(
                 "The current runner is not awaiting an operator-positioned capture"
             )
-        selected_id = (view_id or f"operator_bootstrap_{self._bootstrap_count:03d}").strip()
+        selected_id = (view_id or f"operator_bootstrap_{status.cycle_index:06d}").strip()
         if not selected_id:
             raise ValueError("Operator bootstrap view ID must be non-empty")
         before = self._coarse_adapter.accepted_cycle_count
@@ -1229,7 +1255,7 @@ class UnknownBladeSupervisedRuntime:
             )
         selected = (
             view_id
-            or f"fine_source_refresh_{self._fine_replenishment_count:03d}"
+            or f"fine_source_refresh_{status.cycle_index:06d}"
         ).strip()
         if not selected:
             raise ValueError("Fine source-replenishment view ID must be non-empty")
@@ -1262,7 +1288,10 @@ class UnknownBladeSupervisedRuntime:
             )
         status = self._active_runner.status
         if (
-            status.phase != StopScanPhase.MOTION_BLOCKED.value
+            status.phase not in {
+                StopScanPhase.MOTION_BLOCKED.value,
+                StopScanPhase.BOOTSTRAP_MAP_REQUIRED.value,
+            }
             or status.disposition is not ExperimentDisposition.NEEDS_CAPTURE
             or status.expected_capture_view_id is not None
         ):
@@ -1270,7 +1299,7 @@ class UnknownBladeSupervisedRuntime:
                 "The coarse runner is not awaiting an operator-positioned safety refresh"
             )
         selected = (
-            view_id or f"coarse_safety_refresh_{self._coarse_safety_refresh_count:03d}"
+            view_id or f"coarse_safety_refresh_{status.cycle_index:06d}"
         ).strip()
         if not selected:
             raise ValueError("Coarse safety-refresh view ID must be non-empty")
@@ -1291,6 +1320,25 @@ class UnknownBladeSupervisedRuntime:
                 "coarse safety refresh reached an invalid coordinator disposition"
             )
         self._coarse_safety_refresh_count += 1
+        if (
+            updated.disposition is ExperimentDisposition.READY
+            and updated.phase == StopScanPhase.MAP_READY.value
+        ):
+            promotion_started_monotonic_s = self._monotonic_now()
+            try:
+                transition = self._coarse_adapter.promote_after_exact_map_ready(
+                    self._assert_exact_map_ready
+                )
+            except BaseException as exc:
+                return self._block(
+                    "coarse safety refresh could not promote its recovered science: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            if transition is not None and transition.phase is CoarsePhase.READY_FOR_FINE:
+                self._activate_fine(
+                    transition,
+                    handoff_started_monotonic_s=promotion_started_monotonic_s,
+                )
         return self.snapshot
 
     def execute_exact_approval(self, confirmation: str) -> UnknownBladeRuntimeSnapshot:
@@ -2083,8 +2131,6 @@ def open_production_unknown_blade_runtime(
         else None
     )
     root = Path(output_root).resolve()
-    if experimental and resume:
-        raise UnknownBladeRuntimeError("Experimental unknown-blade runs cannot be resumed")
     resume_plan: UnknownBladeResumePlan | None = None
     if resume:
         if not root.is_dir():
@@ -2304,10 +2350,30 @@ def open_production_unknown_blade_runtime(
                 reachability_checker=checker,
             )
 
+        recovered_coarse_generation = (
+            read_coarse_scan_generation(resume_plan.coarse_generation_path)
+            if resume_plan is not None
+            and resume_plan.coarse_generation_path is not None
+            else None
+        )
+        recovered_coarse_view_count = (
+            len(recovered_coarse_generation.views)
+            if recovered_coarse_generation is not None
+            else 0
+        )
+        recovered_operator_view_count = (
+            sum(
+                view.target_kind == "operator_seed"
+                for view in recovered_coarse_generation.views
+            )
+            if recovered_coarse_generation is not None
+            else 0
+        )
         coarse_adapter = CoarseSessionNextViewAdapter(
             coarse_session,
             selection_rebinder=rebind_coarse_selection,
             discovery_refresher=refresh_coarse_discovery,
+            initial_accepted_cycle_count=recovered_coarse_view_count,
         )
         acquirer = SynchronizedAcquirer(
             arm,
@@ -2646,6 +2712,7 @@ def open_production_unknown_blade_runtime(
                 settings.stop_and_capture.maximum_schema5_handoff_duration_s
             ),
             experimental=experimental,
+            initial_operator_bootstrap_views=recovered_operator_view_count,
         )
         try:
             yield runtime

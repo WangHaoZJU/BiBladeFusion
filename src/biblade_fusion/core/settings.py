@@ -1132,8 +1132,10 @@ class StopAndCaptureConfig(BaseModel):
         gt=0.0,
         le=300.0,
         description=(
-            "Wall-clock watchdog for one NBV selection plus its bounded ranked-path "
-            "preflight queue. This is a responsiveness limit, not a collision waiver."
+            "Cooperative wall-clock deadline for one NBV selection plus its bounded "
+            "ranked-path preflight queue. Python loops poll it and bounded native "
+            "planners receive the remaining time; it is not a hard-real-time watchdog "
+            "or a collision waiver."
         ),
     )
     allow_single_view_bootstrap_motion: bool = False

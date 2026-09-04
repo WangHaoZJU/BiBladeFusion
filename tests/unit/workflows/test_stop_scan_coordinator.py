@@ -13,6 +13,7 @@ import pytest
 
 import biblade_fusion.workflows.stop_scan_coordinator as stop_scan_module
 from biblade_fusion.acquisition import CaptureMetrics, SynchronizedFrameBundle
+from biblade_fusion.core.planning_deadline import require_planning_time
 from biblade_fusion.core.pose import PoseSE3
 from biblade_fusion.core.settings import (
     AcquisitionConfig,
@@ -694,6 +695,7 @@ def _coordinator(
     robot_motion_enabled: bool = True,
     coordinator_updates: dict[str, object] | None = None,
     occupancy_updates: dict[str, object] | None = None,
+    initial_cycle_index: int = 0,
     monotonic_clock=None,
 ):
     robot_config = RobotConfig(
@@ -754,10 +756,44 @@ def _coordinator(
         safety_factory=safety,
         publisher=publisher,
         event_sink=event_sink,
+        initial_cycle_index=initial_cycle_index,
         utc_clock=lambda: NOW,
         **coordinator_kwargs,
     )
     return coordinator, source, source, perception, safety, publisher
+
+
+def test_recovery_uses_new_cycle_and_occupancy_only_refresh(tmp_path: Path) -> None:
+    coordinator, _, _, perception, _, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[1],
+        target=_target(),
+        initial_cycle_index=8,
+        coordinator_updates={"allow_single_view_bootstrap_motion": True},
+        occupancy_updates={
+            "accepted_static_free_aabbs": (
+                {
+                    "name": "recovery_corridor",
+                    "minimum_m": (-0.2, -0.2, -0.2),
+                    "maximum_m": (0.2, 0.2, 0.2),
+                },
+            ),
+            "accepted_static_free_acceptance_id": "a" * 64,
+            "accepted_static_free_acceptance_path": tmp_path / "accepted-static-free",
+        },
+    )
+
+    started = coordinator.start_recovery()
+    assert started.phase is StopScanPhase.MOTION_BLOCKED
+    assert started.cycle_index == 8
+
+    result = coordinator.capture_infer_update("coarse_safety_refresh_000008")
+
+    assert result.purpose is CapturePurpose.SAFETY_REFRESH
+    assert result.coarse_scan_view_path is None
+    assert perception.committed == [("coarse_safety_refresh_000008", 8)]
+    assert coordinator.checkpoint.cycle_index == 9
+    assert coordinator.checkpoint.phase is StopScanPhase.BOOTSTRAP_MOTION_READY
 
 
 def _target() -> NextViewTarget:
@@ -1156,6 +1192,70 @@ def test_planning_preflight_has_a_finite_responsiveness_budget(
         coordinator.prepare_next_segment()
 
     assert coordinator.checkpoint.phase is StopScanPhase.MOTION_BLOCKED
+
+
+def test_planning_deadline_is_visible_inside_selector_and_stops_before_preflight(
+    tmp_path: Path,
+) -> None:
+    now = 0.0
+    coordinator, _, _, _, safety, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        coordinator_updates={"maximum_planning_preflight_duration_s": 1.0},
+    )
+
+    class CooperativeSelector(FakeSelector):
+        def select_next(self, observation, generation):
+            nonlocal now
+            require_planning_time("inside selector")
+            now = 1.1
+            require_planning_time("inside selector after expensive unit")
+            return super().select_next(observation, generation)
+
+    coordinator._selector = CooperativeSelector(_target())  # noqa: SLF001
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    coordinator._monotonic_clock = lambda: now  # noqa: SLF001
+
+    with pytest.raises(StopScanBlocked, match="cooperative responsiveness budget"):
+        coordinator.prepare_next_segment()
+
+    assert safety.authoritative_preflight is None
+    assert coordinator.checkpoint.phase is StopScanPhase.MOTION_BLOCKED
+    assert coordinator.checkpoint.blocking_reasons[0].startswith(
+        "planning_deadline_exceeded:"
+    )
+
+
+def test_same_planning_deadline_is_visible_inside_path_preflight(tmp_path: Path) -> None:
+    now = 0.0
+    coordinator, _, _, _, safety, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        coordinator_updates={"maximum_planning_preflight_duration_s": 1.0},
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    coordinator._monotonic_clock = lambda: now  # noqa: SLF001
+
+    def cooperative_prepare(_proposal, _generation):
+        nonlocal now
+        require_planning_time("inside path preflight")
+        now = 1.1
+        require_planning_time("inside path preflight after expensive unit")
+        raise AssertionError("deadline check must stop before a preflight is returned")
+
+    safety.prepare = cooperative_prepare  # type: ignore[method-assign]
+
+    with pytest.raises(StopScanBlocked, match="cooperative responsiveness budget"):
+        coordinator.prepare_next_segment()
+
+    assert coordinator.checkpoint.phase is StopScanPhase.MOTION_BLOCKED
+    assert coordinator.checkpoint.blocking_reasons[0].startswith(
+        "planning_deadline_exceeded:"
+    )
 
 
 def test_unconfirmed_emergency_stop_is_persisted_as_terminal_failed(
@@ -1685,15 +1785,35 @@ def test_blocked_highest_gain_candidate_falls_back_to_next_safe_path(
         for event_type, payload in sink.events
         if event_type == "ranked_candidate_preflight_rejected"
     ]
-    assert rejected == [
-        {
-            "target_view_id": "fine-front-001",
-            "preflight_attempt_index": 1,
-            "science_rank": 1,
-            "blocking_reasons": ["continuous_swept_mesh_unavailable"],
-            "safety_thresholds_unchanged": True,
-        }
+    assert len(rejected) == 1
+    assert rejected[0]["target_view_id"] == "fine-front-001"
+    assert rejected[0]["preflight_attempt_index"] == 1
+    assert rejected[0]["science_rank"] == 1
+    assert rejected[0]["blocking_reasons"] == ["continuous_swept_mesh_unavailable"]
+    assert rejected[0]["safety_thresholds_unchanged"] is True
+    telemetry = rejected[0]["preflight"]
+    assert telemetry["ready_for_approval"] is False
+    assert telemetry["endpoint_status"] == "CLEAR"
+    assert telemetry["total_duration_s"] >= 0.0
+    assert telemetry["blocking_reasons"] == ["continuous_swept_mesh_unavailable"]
+    started = next(
+        payload
+        for event_type, payload in sink.events
+        if event_type == "single_segment_preflight_started"
+    )
+    queue = started["ranked_candidate_queue"]
+    assert [item["target_view_id"] for item in queue] == [
+        "fine-front-001",
+        "fine-back-002",
     ]
+    assert [item["science_score"] for item in queue] == [0.8, 0.7]
+    waiting = next(
+        payload
+        for event_type, payload in sink.events
+        if event_type == "single_segment_waiting_approval"
+    )
+    assert waiting["preflight"]["ready_for_approval"] is True
+    assert waiting["preflight"]["selected_path_kind"] == "straight"
 
 
 def test_map_change_after_preflight_aborts_before_execute(tmp_path: Path) -> None:

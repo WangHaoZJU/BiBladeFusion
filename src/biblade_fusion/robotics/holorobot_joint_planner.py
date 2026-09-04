@@ -20,6 +20,11 @@ from typing import Any
 
 import numpy as np
 
+from biblade_fusion.core.planning_deadline import (
+    remaining_planning_time_s,
+    require_planning_time,
+)
+
 
 class HoloRobotJointPlanStatus(StrEnum):
     CLEAR = "clear"
@@ -83,6 +88,17 @@ def _joint_vector(values: Sequence[float], *, label: str) -> tuple[float, ...]:
     return joints
 
 
+def _bounded_native_timeout_s(configured_timeout_s: float, *, stage: str) -> float:
+    """Limit a cooperative native call to the active transaction remainder."""
+
+    remaining = remaining_planning_time_s(stage)
+    return (
+        float(configured_timeout_s)
+        if remaining is None
+        else min(float(configured_timeout_s), remaining)
+    )
+
+
 def resample_joint_path(
     positions: Sequence[Sequence[float]],
     *,
@@ -98,6 +114,7 @@ def resample_joint_path(
         raise ValueError("OMPL path requires at least start and goal")
     result: list[tuple[float, ...]] = [raw[0]]
     for start, goal in zip(raw[:-1], raw[1:], strict=True):
+        require_planning_time("while resampling OMPL path")
         maximum_delta = max(
             abs(end - begin) for begin, end in zip(start, goal, strict=True)
         )
@@ -200,7 +217,9 @@ def plan_holorobot_rrtconnect(
         ("start", start, HoloRobotJointPlanStatus.COLLISION_AT_START),
         ("goal", goal, HoloRobotJointPlanStatus.COLLISION_AT_GOAL),
     ):
+        require_planning_time(f"before OMPL {label} endpoint validity check")
         clear, reasons = state_validity(configuration)
+        require_planning_time(f"after OMPL {label} endpoint validity check")
         if not clear:
             return HoloRobotJointPlan(
                 status,
@@ -257,7 +276,12 @@ def plan_holorobot_rrtconnect(
     planner.setRange(config.rrt_range_rad)
     planner.setProblemDefinition(problem)
     planner.setup()
-    solved = planner.solve(config.plan_timeout_s)
+    effective_plan_timeout_s = _bounded_native_timeout_s(
+        config.plan_timeout_s,
+        stage="before OMPL RRTConnect solve",
+    )
+    solved = planner.solve(effective_plan_timeout_s)
+    require_planning_time("after OMPL RRTConnect solve")
     if not solved or not problem.hasSolution():
         return HoloRobotJointPlan(
             HoloRobotJointPlanStatus.PATH_BLOCKED,
@@ -265,6 +289,7 @@ def plan_holorobot_rrtconnect(
             diagnostics={
                 "planner": "holorobot_ompl_rrtconnect",
                 "plan_timeout_s": config.plan_timeout_s,
+                "effective_plan_timeout_s": effective_plan_timeout_s,
                 "elapsed_s": max(0.0, float(monotonic_clock()) - started),
             },
         )
@@ -272,11 +297,18 @@ def plan_holorobot_rrtconnect(
     path = problem.getSolutionPath()
     if config.simplify_path:
         simplify_timeout = min(0.25, max(0.05, config.plan_timeout_s * 0.2))
+        simplify_timeout = _bounded_native_timeout_s(
+            simplify_timeout,
+            stage="before OMPL path simplification",
+        )
         og.PathSimplifier(space_information).simplify(path, simplify_timeout)
+        require_planning_time("after OMPL path simplification")
+    require_planning_time("before reading OMPL solution path")
     raw = tuple(
         tuple(float(path.getState(index)[joint]) for joint in range(6))
         for index in range(path.getStateCount())
     )
+    require_planning_time("after reading OMPL solution path")
     raw, raw_start_drift_rad, raw_goal_drift_rad = (
         _anchor_ompl_solution_endpoints(raw, start=start, goal=goal)
     )
@@ -290,6 +322,7 @@ def plan_holorobot_rrtconnect(
         diagnostics={
             "planner": "holorobot_ompl_rrtconnect",
             "plan_timeout_s": config.plan_timeout_s,
+            "effective_plan_timeout_s": effective_plan_timeout_s,
             "rrt_range_rad": config.rrt_range_rad,
             "simplify_path": config.simplify_path,
             "raw_waypoint_count": len(raw),

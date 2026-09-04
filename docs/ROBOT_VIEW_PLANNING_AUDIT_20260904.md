@@ -18,7 +18,7 @@ RRTConnect behavior should follow HoloRobot rather than a second independent sta
 | Adaptive views | First bounded prefix starved configured tilt/roll/distance dimensions | Representative breadth-first prefix |
 | Coarse discovery | Initial joint posture froze later reachability | Immutable stopped-posture discovery revisions |
 | Fin pairs | Missing first-view opposing pair could suppress useful normal NBV | Normal information-gain views remain selectable; schema-5 fin evidence stays hard |
-| Path planning | Straight-first/bounded RRT was correct, but queue work lacked one response bound | 30 s selection+preflight watchdog; no threshold relaxation |
+| Path planning | Straight-first/bounded RRT was correct, but queue work lacked one response bound | Shared 30 s cooperative selection+preflight deadline; one native-call overrun remains possible; no threshold relaxation |
 | Execution timing | Experimental release bypass could pass `None` as segment watchdog | Finite derived watchdog from stream/controller/settle limits |
 | Recovery | `MOTION_BLOCKED` was capture-capable internally but terminal in the outer console | Explicit occupancy-only coarse `SAFETY_REFRESH` path |
 | Supervision | Read-only GUI/timeline callback could terminate acquisition or motion | Best-effort observer isolated from authority callbacks |
@@ -41,7 +41,9 @@ and experiment assets, and the operator-approved one-segment stop-and-capture st
 
 ```text
 ruff check .: passed
-python -m pytest -q: 1271 passed, 3 skipped
+focused planning/runtime/storage/supervision regression: 334 passed
+python -m pytest -q: 1294 passed, 3 skipped in 99.18 s
+git diff --check: passed
 ```
 
 The skips are optional vale environment probes for PyTorch/Open3D. No robot or camera was
@@ -55,5 +57,6 @@ outcome.
 - A CUDA kernel stuck inside a third-party FoundationStereo call cannot be safely cancelled
   in-process; the cycle reports progress and enforces timing at return/commit boundaries.
 - Production release still requires its separate science and runtime-timing acceptances.
-- Existing experimental attempts are not resumable as production evidence; preserve failed
-  outputs for diagnosis and start a fresh run for this code revision.
+- An intact experimental chain may now resume as experimental evidence after a real stop
+  and fresh occupancy-only `SAFETY_REFRESH`. It never becomes production evidence, never
+  restores an old permit/path/map, and must not resume after the physical placement changes.

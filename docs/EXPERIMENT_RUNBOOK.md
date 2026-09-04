@@ -268,13 +268,16 @@ application budget. UNKNOWN, stale/mismatched map evidence, and start/goal colli
 immediately; they are never sent to OMPL. If OMPL cannot find a detour within its budget,
 the coordinator records that candidate and continues to the next ranked endpoint.
 
-The complete NBV selection and ranked path queue has a 30-second responsiveness limit. If
-no safe automatic route exists from the current state, the console remains in the coarse
-scan and prompts for an operator-positioned safety refresh instead of terminating the
-experiment. Manually place the stopped arm at a clearly safe posture, enter exactly `c`,
-and do not provide a side label. That frame updates occupancy only; it does not count as a
-blade science view. The prior proposal is discarded and the next plan regenerates fin IK
-from the new stopped joints.
+The complete NBV selection and ranked path queue shares one 30-second cooperative
+responsiveness deadline. Python candidate/IK/collision loops poll it and OMPL receives only
+the remaining budget. This is not asynchronous thread termination: one indivisible
+Pinocchio/FCL/KDL/hash/NumPy/state-read call may finish after expiry before the next check
+stops planning. If no safe automatic route exists from the current state, the console
+remains in the coarse scan and prompts for an operator-positioned safety refresh instead
+of terminating the experiment. Manually place the stopped arm at a clearly safe posture,
+enter exactly `c`, and do not provide a side label. That frame updates occupancy only; it
+does not count as a blade science view. The prior proposal is discarded and the next plan
+regenerates fin IK from the new stopped joints.
 
 After any successful automatic capture, fin discovery is re-evaluated from that exact
 stopped posture and written under `coarse_science/fin_discovery_revisions/`. A candidate
@@ -333,7 +336,52 @@ In another terminal, use the exact output root printed by the active run:
 
 This is read-only and must not send robot commands.
 
-## 7. Evidence to collect after any failure
+The follow-mode window now includes a `候选视点与规划预检` table and camera frusta. It
+shows the science-ranked queue, active/selected candidate, IK and endpoint gates,
+straight-path and bounded-RRT results, known durations, and the exact blocking reason.
+Grey/blue/green frusta mean queued/active/selected; the current camera is yellow. A field
+without independently recorded evidence stays `UNKNOWN` or `PENDING`.
+
+Planning progress is carried by the small atomic file
+`<OUTPUT>/live_timeline/live_planning.json`; point clouds and meshes are not rewritten on
+each progress event. This sidecar and the GUI are diagnostic-only and cannot approve or
+execute motion. An observer failure must produce a warning but must not stop the scan.
+The current viewer is still PySide, so local display on eiai is preferred over slow SSH
+X11 forwarding. A browser/SSE viewer is a later read-only transport phase.
+
+## 7. Resume an interrupted experimental chain
+
+Use this only when the output chain is intact and the blade, fixture, camera mount and
+robot base have not moved. Pass the existing experiment root; do not provide a new
+`placement_id`, `run_id`, ROI or output directory:
+
+```bash
+export BBF_EXISTING_OUTPUT=/absolute/path/to/the/interrupted/experiment
+
+sudo systemd-run --wait --collect --pty \
+  --property=User=eiai \
+  --property=WorkingDirectory=/home/eiai/Documents/wh/BiBladeFusion \
+  --property=LimitRTPRIO=99 \
+  /usr/bin/env -u PYTHONPATH \
+  /home/eiai/Documents/wh/BiBladeFusion/.venv/bin/bbf \
+  scan run-unknown \
+  --experimental \
+  --resume \
+  --ray-integration-backend cuda \
+  --config configs/local.yaml \
+  --operator-id eiai \
+  --output "$BBF_EXISTING_OUTPUT"
+```
+
+Resume validates the append-only handoff chain before hardware use. It never restores an
+old proposal, approval permit, occupancy freshness, source window or in-flight segment.
+After establishing a real stopped state it asks for one operator-positioned
+`SAFETY_REFRESH` capture, allocates a new cycle/view identity, and replans from the current
+joint posture. It does not request the first-view hard ROI again and the refresh does not
+count as blade science. Do not resume when the physical placement changed; begin a fresh
+placement/run instead.
+
+## 8. Evidence to collect after any failure
 
 Do not immediately start another run. First record:
 
@@ -373,7 +421,7 @@ candidate/IK -> path preflight -> approval -> permit -> driver recovery/enable
              -> post-recovery validation -> stream -> stop/stationarity -> capture
 ```
 
-## 8. Stop rules
+## 9. Stop rules
 
 Stop and diagnose before another physical attempt when any of these occurs:
 

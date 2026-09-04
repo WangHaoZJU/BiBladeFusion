@@ -419,6 +419,62 @@ def test_unknown_scan_cli_forwards_explicit_resume(
     assert calls == [True]
 
 
+def test_unknown_scan_cli_allows_explicit_experimental_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[bool, bool]] = []
+
+    @contextmanager
+    def fake_open(
+        _settings,
+        *,
+        output_root,
+        operator_id,
+        run_id,
+        placement_id,
+        resume,
+        experimental,
+    ):
+        assert Path(output_root) == tmp_path / "existing-experimental-run"
+        assert operator_id == "operator-7"
+        assert run_id is None
+        assert placement_id is None
+        calls.append((resume, experimental))
+        yield object()
+
+    monkeypatch.setattr(
+        unknown_runtime_module,
+        "open_production_unknown_blade_runtime",
+        fake_open,
+    )
+    monkeypatch.setattr(
+        unknown_runtime_module,
+        "run_unknown_blade_operator_console",
+        lambda _runtime: 0,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "run-unknown",
+            "--config",
+            "configs/default.yaml",
+            "--output",
+            str(tmp_path / "existing-experimental-run"),
+            "--operator-id",
+            "operator-7",
+            "--experimental",
+            "--resume",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [(True, True)]
+    assert "EXPERIMENTAL:" in result.stdout
+
+
 def test_unknown_scan_cli_marks_experimental_coarse_to_fine_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

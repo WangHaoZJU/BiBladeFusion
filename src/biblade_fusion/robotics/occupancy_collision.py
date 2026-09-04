@@ -20,6 +20,10 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from biblade_fusion.core.planning_deadline import (
+    PlanningDeadlineExceeded,
+    require_planning_time,
+)
 from biblade_fusion.mapping.occupancy import (
     OccupancySnapshot,
     compute_content_hash,
@@ -401,14 +405,17 @@ class BoundOccupancyConfigurationQuery:
     ) -> OccupancyCollisionCheckResult:
         if self._closed:
             raise OccupancyEvidenceError("bound_occupancy_query_is_closed")
+        require_planning_time("before bound occupancy configuration query")
         try:
-            return self.checker._check_bound_configuration(
+            result = self.checker._check_bound_configuration(
                 self.snapshot,
                 self.evidence,
                 joint_positions_rad,
                 required_freshness_horizon_s=self.required_freshness_horizon_s,
                 stop_on_first_block=True,
             )
+        except PlanningDeadlineExceeded:
+            raise
         except (OccupancyEvidenceError, TypeError, ValueError, RuntimeError) as exc:
             return self.checker._unknown_result(
                 f"occupancy_checker_error:{exc}",
@@ -419,6 +426,8 @@ class BoundOccupancyConfigurationQuery:
                 f"occupancy_query_failed:{type(exc).__name__}:{exc}",
                 evidence=self.evidence,
             )
+        require_planning_time("after bound occupancy configuration query")
+        return result
 
     def close(self) -> None:
         if self._closed:
@@ -1020,6 +1029,7 @@ class OccupancyRobotCollisionChecker:
         expected_evidence: OccupancyMapEvidence | None = None,
         required_freshness_horizon_s: float = 0.0,
     ) -> OccupancyCollisionCheckResult:
+        require_planning_time("before occupancy configuration query")
         try:
             snapshot, evidence = self._bind_snapshot(
                 expected_evidence=expected_evidence,
@@ -1035,13 +1045,16 @@ class OccupancyRobotCollisionChecker:
                 evidence,
                 required_freshness_horizon_s=required_freshness_horizon_s,
             )
-            return result
+        except PlanningDeadlineExceeded:
+            raise
         except (OccupancyEvidenceError, TypeError, ValueError, RuntimeError) as exc:
             return self._unknown_result(f"occupancy_checker_error:{exc}")
         except Exception as exc:  # pragma: no cover - fail closed across plugin boundaries
             return self._unknown_result(
                 f"occupancy_query_failed:{type(exc).__name__}:{exc}"
             )
+        require_planning_time("after occupancy configuration query")
+        return result
 
     @contextmanager
     def bind_configuration_queries(
@@ -1102,11 +1115,14 @@ class OccupancyRobotCollisionChecker:
             raise ValueError("sampled occupancy path fractions must be monotonic")
         if not math.isfinite(step) or step <= 0.0:
             raise ValueError("maximum_joint_step_rad must be finite and positive")
+        require_planning_time("before binding sampled occupancy path")
         try:
             snapshot, evidence = self._bind_snapshot(
                 expected_evidence=None,
                 required_freshness_horizon_s=required_freshness_horizon_s,
             )
+        except PlanningDeadlineExceeded:
+            raise
         except (OccupancyEvidenceError, TypeError, ValueError, RuntimeError) as exc:
             result = self._unknown_result(f"occupancy_checker_error:{exc}")
             return JointPathOccupancyCollisionReport(
@@ -1117,6 +1133,7 @@ class OccupancyRobotCollisionChecker:
                 result=result,
                 maximum_joint_step_rad=step,
             )
+        require_planning_time("after binding sampled occupancy path")
 
         last_result: OccupancyCollisionCheckResult | None = None
         ordered_indices = (
@@ -1125,6 +1142,7 @@ class OccupancyRobotCollisionChecker:
             else tuple(range(len(samples)))
         )
         for checked_count, sample_index in enumerate(ordered_indices, start=1):
+            require_planning_time(f"before sampled occupancy pose {sample_index}")
             configuration = samples[sample_index]
             fraction = fractions[sample_index]
             try:
@@ -1135,6 +1153,8 @@ class OccupancyRobotCollisionChecker:
                     required_freshness_horizon_s=required_freshness_horizon_s,
                     stop_on_first_block=True,
                 )
+            except PlanningDeadlineExceeded:
+                raise
             except (OccupancyEvidenceError, TypeError, ValueError, RuntimeError) as exc:
                 result = self._unknown_result(
                     f"occupancy_checker_error:{exc}",
@@ -1145,6 +1165,7 @@ class OccupancyRobotCollisionChecker:
                     f"occupancy_query_failed:{type(exc).__name__}:{exc}",
                     evidence=evidence,
                 )
+            require_planning_time(f"after sampled occupancy pose {sample_index}")
             last_result = result
             if result.status is not CollisionCheckStatus.CLEAR:
                 try:
@@ -1233,6 +1254,9 @@ class OccupancyRobotCollisionChecker:
         reasons: list[str] = []
         query_diagnostics: list[dict[str, Any]] = []
         for placed in geometries:
+            require_planning_time(
+                f"before occupancy robot geometry {placed.geometry_name}"
+            )
             uncertainty = self.robot_checker.geometry_displacement_bound_m(
                 placed.geometry_index,
                 self.accepted_joint_uncertainty_rad,
@@ -1242,6 +1266,9 @@ class OccupancyRobotCollisionChecker:
                 snapshot,
                 placed,
                 required_distance_m=required_distance,
+            )
+            require_planning_time(
+                f"after occupancy robot geometry {placed.geometry_name}"
             )
             state = self._validate_query_result(query)
             query_diagnostics.append(
@@ -1881,6 +1908,9 @@ class OccupancyRobotCollisionChecker:
         accepted_unknown = int(np.count_nonzero(local == 3))
         for local_y in range(local_shape[1]):
             for local_z in range(local_shape[2]):
+                require_planning_time(
+                    f"during occupancy voxel-run scan {placed.geometry_name}"
+                )
                 row = local[:, local_y, local_z]
                 local_x = 0
                 while local_x < local_shape[0]:
@@ -1909,6 +1939,9 @@ class OccupancyRobotCollisionChecker:
                     voxel_geometry = hppfcl.Box(*dimensions)
                     voxel_transform = hppfcl.Transform3f(np.eye(3), center)
                     distance_result = hppfcl.DistanceResult()
+                    require_planning_time(
+                        f"before STL-to-voxel-run distance {placed.geometry_name}"
+                    )
                     distance = float(
                         hppfcl.distance(
                             placed.collision_geometry,
@@ -1918,6 +1951,9 @@ class OccupancyRobotCollisionChecker:
                             distance_request,
                             distance_result,
                         )
+                    )
+                    require_planning_time(
+                        f"after STL-to-voxel-run distance {placed.geometry_name}"
                     )
                     distance_queries += 1
                     if not math.isfinite(distance):
@@ -1948,6 +1984,9 @@ class OccupancyRobotCollisionChecker:
                                 index_array.astype(np.float64) + 0.5
                             ) * voxel_size
                             voxel_result = hppfcl.DistanceResult()
+                            require_planning_time(
+                                f"before STL-to-voxel distance {placed.geometry_name}"
+                            )
                             voxel_distance = float(
                                 hppfcl.distance(
                                     placed.collision_geometry,
@@ -1957,6 +1996,9 @@ class OccupancyRobotCollisionChecker:
                                     distance_request,
                                     voxel_result,
                                 )
+                            )
+                            require_planning_time(
+                                f"after STL-to-voxel distance {placed.geometry_name}"
                             )
                             distance_queries += 1
                             if voxel_distance < -1e100:
