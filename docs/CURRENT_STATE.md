@@ -947,3 +947,17 @@ capture the third independent occupancy-only safety source. That refresh does no
 blade science. Plan again from the resulting current map; paste an approval token only if the
 new proposal reaches `waiting_approval` and the displayed path agrees with the scene. If any
 physical reference moved, do not resume D038; start a new placement/run.
+
+## 21. 2026-09-05 operator moved the arm; withdraw D038 resume and start D040
+
+After commit `07172cb` was pushed, the operator reported that the robot had moved and requested
+a new run and annotation. The D038 output remains immutable first-segment and no-path evidence,
+but it is no longer the operator entry point and must not be resumed. Start from the currently
+stopped pose with a new `run_id`/output and a new formal stereo frame. Because the camera view
+changed with the arm, draw a new hard-ROI polygon on that frame; do not pass the old D038 polygon
+through `--bootstrap-polygon`.
+
+The `placement_id` may remain `blade-placement-20260901-01` only if the blade, fixture, camera
+mount, robot base and relevant workcell geometry themselves have not moved. If any of those
+changed, allocate a new placement ID as well. No old D038 proposal, permit, occupancy freshness
+or map is carried into D040.

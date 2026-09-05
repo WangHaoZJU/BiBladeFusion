@@ -531,7 +531,11 @@ process. Wait for cleanup, then use the resume command above; do not press `c`, 
 they may still offer an operator-positioned occupancy-only refresh, and that prompt accepts
 only `c` or `q`.
 
-For the intact D038 chain from 2026-09-04, the literal recovery command is:
+The following D038 recovery command is retained only as historical documentation. On
+2026-09-05 the operator reported that the arm had moved and requested a new bootstrap, so **do
+not run this D038 resume command**; use Section 4 with a new D040 `run_id` and annotation.
+
+Historical D038 command:
 
 ```bash
 cd /home/eiai/Documents/wh/BiBladeFusion
@@ -552,9 +556,7 @@ sudo systemd-run --wait --collect --pty \
   --output "$BBF_EXISTING_OUTPUT"
 ```
 
-Use it only if the listed physical references have not moved. Strict saved-data validation
-takes about one minute on the current host before live recovery begins; silence during that
-read is processing, not an input prompt.
+Do not use this archived command for the current attempt. D038 remains immutable evidence.
 
 ## 8. Evidence to collect after any failure
 
