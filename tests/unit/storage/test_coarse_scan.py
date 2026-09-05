@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -494,6 +494,562 @@ def test_projected_coarse_view_binds_exact_predecessor_generation(
         read_coarse_scan_view(output)
 
 
+def test_generation_reader_memoizes_recursive_projected_prefix_per_top_level_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Four generations replay four unique views, not all 15 prefix occurrences."""
+
+    shape = (6, 6)
+    left = np.arange(36, dtype=np.float64).reshape(shape)
+    depth = np.full(shape, 0.5, dtype=np.float64)
+    valid = np.ones(shape, dtype=np.bool_)
+    config = BootstrapForegroundConfig(
+        boundary_margin_px=1,
+        minimum_valid_pixels=1,
+        minimum_component_pixels=1,
+        minimum_mask_pixels=1,
+        minimum_mask_fraction=0.0,
+        maximum_mask_fraction=1.0,
+        minimum_seed_valid_pixels=1,
+        minimum_seed_valid_fraction=0.0,
+    )
+    bootstrap = bootstrap_blade_foreground(
+        left,
+        depth,
+        valid,
+        config,
+        BootstrapSeed.rectangle(1, 1, 4, 4, mode="hard_roi"),
+    )
+    pixels = np.argwhere(bootstrap.mask)[:, ::-1]
+    points = np.column_stack(
+        (
+            np.full(len(pixels), 0.5),
+            pixels[:, 0] * 0.01,
+            np.full(len(pixels), 0.2),
+        )
+    )
+    proxy_config = ProxyModelConfig(
+        estimated_thickness_m=0.01,
+        minimum_points=6,
+        blade_envelope_min_m=(0.0, 0.0, 0.0),
+        blade_envelope_max_m=(1.0, 1.0, 1.0),
+        minimum_envelope_retained_fraction=0.4,
+    )
+    proxy_support = coarse_scan_module.select_proxy_support(
+        points,
+        proxy_config,
+        frame="base",
+    )
+
+    common_roots: dict[str, Path] = {}
+    for name, filename in (
+        ("initialization", "metadata.json"),
+        ("view_plan", "view_plan.json"),
+    ):
+        root = tmp_path / name
+        root.mkdir()
+        (root / filename).write_text("{}\n", encoding="utf-8")
+        common_roots[name] = root
+
+    reconstructed_by_root: dict[Path, StoredReconstructedBladeView] = {}
+    foreground_by_view_id: dict[str, object] = {}
+    view_roots: list[Path] = []
+    generation_roots: list[Path] = []
+    coverage_by_root: dict[Path, SimpleNamespace] = {}
+    occupancy_integrity_sha256: dict[Path, str] = {}
+
+    def array_record(path: Path) -> dict[str, object]:
+        value = np.load(path, allow_pickle=False)
+        return {
+            "path": path.name,
+            "sha256": coarse_scan_module._sha256(path),
+            "dtype": str(value.dtype),
+            "shape": list(value.shape),
+        }
+
+    for index in range(4):
+        view_id = f"coarse_{index:02d}"
+        reconstructed_root = tmp_path / f"reconstructed-{index}"
+        stereo_root = tmp_path / f"stereo-{index}"
+        occupancy_root = tmp_path / f"occupancy-{index}"
+        view_root = tmp_path / f"coarse-view-{index}"
+        for root in (reconstructed_root, stereo_root, occupancy_root, view_root):
+            root.mkdir()
+            (root / "metadata.json").write_text("{}\n", encoding="utf-8")
+        np.save(
+            occupancy_root / "integrity.npy",
+            np.full(shape, index, dtype=np.int16),
+            allow_pickle=False,
+        )
+        np.save(
+            reconstructed_root / "integrity.npy",
+            np.full(shape, index, dtype=np.int32),
+            allow_pickle=False,
+        )
+        np.save(
+            stereo_root / "integrity.npy",
+            np.full(shape, index, dtype=np.float32),
+            allow_pickle=False,
+        )
+        (reconstructed_root / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "files": {
+                        "integrity": array_record(reconstructed_root / "integrity.npy")
+                    }
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (stereo_root / "metadata.json").write_text(
+            json.dumps(
+                {"files": {"integrity": array_record(stereo_root / "integrity.npy")}}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        occupancy_integrity_sha256[occupancy_root.resolve()] = coarse_scan_module._sha256(
+            occupancy_root / "integrity.npy"
+        )
+        view = ReconstructedBladeView(
+            view_id,
+            index,
+            index,
+            CameraIntrinsics(6, 6, 100.0, 100.0, 2.5, 2.5, "none", ()),
+            np.zeros(6),
+            PoseSE3.identity("base", "left_ir"),
+            PoseSE3.from_rotation_translation(
+                "base",
+                "left_rectified",
+                np.eye(3),
+                (0.0, 0.0, 0.5),
+            ),
+            PointCloud("base", points, pixels, shape),
+            "foundation_stereo",
+        )
+        reconstructed_by_root[reconstructed_root.resolve()] = StoredReconstructedBladeView(
+            view,
+            bootstrap.mask,
+            {
+                "source": {
+                    "session": str((tmp_path / "session").resolve()),
+                    "stereo_inference": str(stereo_root.resolve()),
+                    "view_id": view_id,
+                }
+            },
+        )
+        if index == 0:
+            foreground = bootstrap
+            guide_payload = None
+            reference_record = None
+        else:
+            predecessor = generation_roots[index - 1]
+            predecessor_metadata = predecessor / "generation.json"
+            guide = ProjectedCoarseForegroundGuide(
+                source_generation_path=predecessor.resolve(),
+                source_generation_metadata_sha256=coarse_scan_module._sha256(
+                    predecessor_metadata
+                ),
+                reference_points_content_sha256=f"{index}" * 64,
+                blade_envelope_min_m=(0.0, 0.0, 0.0),
+                blade_envelope_max_m=(1.0, 1.0, 1.0),
+            )
+            mask_count = int(np.count_nonzero(bootstrap.mask))
+            seed_count = int(np.count_nonzero(bootstrap.seed_mask))
+            foreground = ProjectedCoarseForegroundResult(
+                mask=bootstrap.mask,
+                projected_reference_mask=bootstrap.seed_mask,
+                diagnostics=ProjectedCoarseForegroundDiagnostics(
+                    image_pixel_count=bootstrap.mask.size,
+                    supplied_valid_pixel_count=bootstrap.mask.size,
+                    depth_valid_pixel_count=bootstrap.mask.size,
+                    reference_point_count=len(points),
+                    projected_reference_pixel_count=seed_count,
+                    eligible_projected_pixel_count=seed_count,
+                    predicted_depth_consistent_pixel_count=mask_count,
+                    base_envelope_pixel_count=mask_count,
+                    mask_pixel_count=mask_count,
+                    mask_fraction=mask_count / bootstrap.mask.size,
+                    projected_match_fraction=mask_count / seed_count,
+                    minimum_mask_depth_m=0.5,
+                    median_mask_depth_m=0.5,
+                    maximum_mask_depth_m=0.5,
+                ),
+                config=config,
+                guide=guide,
+                algorithm=PROJECTED_COARSE_FOREGROUND_ALGORITHM,
+                policy_sha256=projected_coarse_foreground_policy_sha256(config),
+                left_image_content_sha256=bootstrap.left_image_content_sha256,
+                depth_content_sha256=bootstrap.depth_content_sha256,
+                valid_mask_content_sha256=bootstrap.valid_mask_content_sha256,
+            )
+            guide_payload = guide.payload()
+            reference_record = coarse_scan_module._directory_record(
+                predecessor,
+                "generation.json",
+            )
+        foreground_by_view_id[view_id] = foreground
+        np.save(view_root / "mask.npy", foreground.mask, allow_pickle=False)
+        np.save(view_root / "seed_mask.npy", foreground.seed_mask, allow_pickle=False)
+        np.save(
+            view_root / "proxy_support_mask.npy",
+            proxy_support.mask,
+            allow_pickle=False,
+        )
+        view_payload = {
+            "schema_version": 3,
+            "artifact_kind": "biblade_fusion.coarse_scan_view",
+            "motion_authorized": False,
+            "target": {"view_id": view_id, "kind": "proxy_normal", "side": "front"},
+            "identity": {"view_id": view_id, "sequence_index": index, "frame_number": index},
+            "foreground": {
+                "algorithm": foreground.algorithm,
+                "config": asdict(foreground.config),
+                "seed": coarse_scan_module.bootstrap_seed_payload(foreground.seed),
+                "guide": guide_payload,
+                "policy_sha256": foreground.policy_sha256,
+                "diagnostics": asdict(foreground.diagnostics),
+                "input_content_sha256": {
+                    "left_rectified": foreground.left_image_content_sha256,
+                    "depth_m": foreground.depth_content_sha256,
+                    "integration_valid_mask": foreground.valid_mask_content_sha256,
+                },
+            },
+            "proxy_support": {
+                "configuration": proxy_config.model_dump(mode="json"),
+                "diagnostics": proxy_support.metadata_payload(),
+            },
+            "files": {
+                name: array_record(view_root / filename)
+                for name, filename in (
+                    ("mask", "mask.npy"),
+                    ("seed_mask", "seed_mask.npy"),
+                    ("proxy_support_mask", "proxy_support_mask.npy"),
+                )
+            },
+            "sources": {
+                "reconstructed_view": coarse_scan_module._directory_record(
+                    reconstructed_root,
+                    "metadata.json",
+                ),
+                "stereo_inference": coarse_scan_module._directory_record(
+                    stereo_root,
+                    "metadata.json",
+                ),
+                "occupancy_mapping": coarse_scan_module._directory_record(
+                    occupancy_root,
+                    "metadata.json",
+                ),
+                **(
+                    {"foreground_reference_generation": reference_record}
+                    if reference_record is not None
+                    else {}
+                ),
+            },
+        }
+        (view_root / "metadata.json").write_text(
+            json.dumps(view_payload) + "\n",
+            encoding="utf-8",
+        )
+        view_roots.append(view_root)
+
+        discovery_root = tmp_path / f"discovery-{index}"
+        coverage_root = tmp_path / f"coverage-{index}"
+        discovery_root.mkdir()
+        coverage_root.mkdir()
+        (discovery_root / "discovery.json").write_text("{}\n", encoding="utf-8")
+        (coverage_root / "coverage.json").write_text("{}\n", encoding="utf-8")
+        coverage_by_root[coverage_root.resolve()] = SimpleNamespace(
+            metadata={
+                "previous_ledger": (
+                    str((tmp_path / f"coverage-{index - 1}").resolve())
+                    if index
+                    else None
+                )
+            }
+        )
+        generation_root = tmp_path / f"generation-{index}"
+        generation_root.mkdir()
+        generation_payload = {
+            "schema_version": 1,
+            "artifact_kind": "biblade_fusion.coarse_scan_generation",
+            "motion_authorized": False,
+            "generation_index": index,
+            "previous_generation": (
+                coarse_scan_module._directory_record(
+                    generation_roots[index - 1],
+                    "generation.json",
+                )
+                if index
+                else None
+            ),
+            "sources": {
+                "initialization": coarse_scan_module._directory_record(
+                    common_roots["initialization"],
+                    "metadata.json",
+                ),
+                "view_plan": coarse_scan_module._directory_record(
+                    common_roots["view_plan"],
+                    "view_plan.json",
+                ),
+                "discovery_plan": coarse_scan_module._directory_record(
+                    discovery_root,
+                    "discovery.json",
+                ),
+                "coverage": coarse_scan_module._directory_record(
+                    coverage_root,
+                    "coverage.json",
+                ),
+                "coarse_model": None,
+            },
+            "views": [
+                coarse_scan_module._directory_record(root, "metadata.json")
+                for root in view_roots
+            ],
+            "summary": {
+                "view_count": index + 1,
+                "front_view_count": index + 1,
+                "back_view_count": 0,
+                "schema5_ready": False,
+            },
+        }
+        (generation_root / "generation.json").write_text(
+            json.dumps(generation_payload) + "\n",
+            encoding="utf-8",
+        )
+        generation_roots.append(generation_root)
+
+    reconstructed_reads: list[Path] = []
+    replayed_view_ids: list[str] = []
+
+    def read_reconstructed(path: str | Path) -> StoredReconstructedBladeView:
+        root = Path(path).resolve()
+        reconstructed_reads.append(root)
+        return reconstructed_by_root[root]
+
+    def replay_foreground(**kwargs: object) -> object:
+        reconstructed = kwargs["reconstructed"]
+        assert isinstance(reconstructed, StoredReconstructedBladeView)
+        view_id = reconstructed.view.source_view_id
+        replayed_view_ids.append(view_id)
+        guide = kwargs["guide"]
+        if isinstance(guide, ProjectedCoarseForegroundGuide):
+            predecessor = read_coarse_scan_generation(guide.source_generation_path)
+            assert predecessor.metadata_sha256 == guide.source_generation_metadata_sha256
+        return foreground_by_view_id[view_id]
+
+    def read_occupancy_integrity(path: str | Path) -> SimpleNamespace:
+        root = Path(path).resolve()
+        if (
+            coarse_scan_module._sha256(root / "integrity.npy")
+            != occupancy_integrity_sha256[root]
+        ):
+            raise ValueError("occupancy array checksum mismatch")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(coarse_scan_module, "read_reconstructed_view", read_reconstructed)
+    monkeypatch.setattr(coarse_scan_module, "_replay_foreground", replay_foreground)
+    monkeypatch.setattr(
+        coarse_scan_module,
+        "read_occupancy_mapping_for_replay",
+        read_occupancy_integrity,
+    )
+    monkeypatch.setattr(
+        coarse_scan_module,
+        "read_coverage_ledger",
+        lambda path: coverage_by_root[Path(path).resolve()],
+    )
+    monkeypatch.setattr(coarse_scan_module, "_assert_coverage_replays", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        initialization_module,
+        "read_initialization",
+        lambda _path: SimpleNamespace(
+            observation=SimpleNamespace(
+                proxy=SimpleNamespace(frame_T_proxy=PoseSE3.identity("base", "proxy"))
+            )
+        ),
+    )
+
+    with coarse_scan_module._strict_coarse_read_transaction():
+        first = read_coarse_scan_generation(generation_roots[-1])
+
+        assert replayed_view_ids == [f"coarse_{index:02d}" for index in range(4)]
+        assert len(reconstructed_reads) == 4
+
+        cached = read_coarse_scan_generation(generation_roots[-1])
+
+        assert cached is first
+        assert replayed_view_ids == [f"coarse_{index:02d}" for index in range(4)]
+
+        np.save(view_roots[0] / "mask.npy", ~bootstrap.mask, allow_pickle=False)
+        with pytest.raises(ValueError, match="checksum mismatch"):
+            read_coarse_scan_generation(generation_roots[-1])
+        np.save(view_roots[0] / "mask.npy", bootstrap.mask, allow_pickle=False)
+
+        reconstructed_integrity = tmp_path / "reconstructed-0" / "integrity.npy"
+        np.save(
+            reconstructed_integrity,
+            np.full(shape, 99, dtype=np.int32),
+            allow_pickle=False,
+        )
+        with pytest.raises(ValueError, match="checksum mismatch"):
+            read_coarse_scan_generation(generation_roots[-1])
+        np.save(
+            reconstructed_integrity,
+            np.full(shape, 0, dtype=np.int32),
+            allow_pickle=False,
+        )
+
+        stereo_integrity = tmp_path / "stereo-0" / "integrity.npy"
+        np.save(
+            stereo_integrity,
+            np.full(shape, 99, dtype=np.float32),
+            allow_pickle=False,
+        )
+        with pytest.raises(ValueError, match="checksum mismatch"):
+            read_coarse_scan_generation(generation_roots[-1])
+        np.save(
+            stereo_integrity,
+            np.full(shape, 0, dtype=np.float32),
+            allow_pickle=False,
+        )
+
+        occupancy_integrity = tmp_path / "occupancy-0" / "integrity.npy"
+        np.save(
+            occupancy_integrity,
+            np.full(shape, 99, dtype=np.int16),
+            allow_pickle=False,
+        )
+        with pytest.raises(ValueError, match="occupancy array checksum mismatch"):
+            read_coarse_scan_generation(generation_roots[-1])
+        np.save(
+            occupancy_integrity,
+            np.full(shape, 0, dtype=np.int16),
+            allow_pickle=False,
+        )
+
+        initialization_authority = common_roots["initialization"] / "metadata.json"
+        original_initialization = initialization_authority.read_bytes()
+        initialization_authority.write_text('{"changed":true}\n', encoding="utf-8")
+        with pytest.raises(ValueError, match="directory source changed"):
+            read_coarse_scan_generation(generation_roots[-1])
+        initialization_authority.write_bytes(original_initialization)
+
+    assert first.generation_index == 3
+    assert tuple(item.target_view_id for item in first.views) == tuple(
+        f"coarse_{index:02d}" for index in range(4)
+    )
+    assert replayed_view_ids == [f"coarse_{index:02d}" for index in range(4)]
+    assert len(reconstructed_reads) == 4
+    assert coarse_scan_module._STRICT_READ_CONTEXT.get() is None
+
+    replayed_view_ids.clear()
+    reconstructed_reads.clear()
+    second = read_coarse_scan_generation(generation_roots[-1])
+
+    assert second.metadata_sha256 == first.metadata_sha256
+    assert len(replayed_view_ids) == 4
+    assert len(reconstructed_reads) == 4
+
+    np.save(view_roots[0] / "mask.npy", ~bootstrap.mask, allow_pickle=False)
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        read_coarse_scan_generation(generation_roots[-1])
+
+
+def test_strict_read_context_rejects_conflicting_authority_record(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "view"
+    root.mkdir()
+    authority = root / "metadata.json"
+    authority.write_text('{"revision": 1}\n', encoding="utf-8")
+    first_record = coarse_scan_module._directory_record(root, "metadata.json")
+    context = coarse_scan_module._StrictReadContext()
+    resolved, first_identity = coarse_scan_module._resolve_bound_directory_record(
+        first_record,
+        expected_authority="metadata.json",
+    )
+    context.expected_views[resolved] = first_identity
+
+    authority.write_text('{"revision": 2}\n', encoding="utf-8")
+    conflicting_record = coarse_scan_module._directory_record(root, "metadata.json")
+
+    with pytest.raises(ValueError, match="conflicting authority identities"):
+        coarse_scan_module._read_bound_coarse_scan_view(conflicting_record, context)
+
+
+def test_strict_read_context_rejects_recursive_generation_cycle(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "generation"
+    root.mkdir()
+    authority = root / "generation.json"
+    authority.write_text("{}\n", encoding="utf-8")
+    content = authority.read_bytes()
+    identity = coarse_scan_module._authority_identity_from_bytes(
+        root,
+        authority="generation.json",
+        content=content,
+    )
+    context = coarse_scan_module._StrictReadContext()
+    context.generations_in_progress.add(identity)
+    token = coarse_scan_module._STRICT_READ_CONTEXT.set(context)
+    try:
+        with pytest.raises(ValueError, match="authority graph is cyclic"):
+            read_coarse_scan_generation(root)
+    finally:
+        coarse_scan_module._STRICT_READ_CONTEXT.reset(token)
+
+
+def test_strict_read_context_binds_full_occupancy_storage_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "occupancy"
+    root.mkdir()
+    mask = np.asarray(((True, False), (False, True)), dtype=np.bool_)
+    mask_path = root / "integration_valid_mask.npy"
+    np.save(mask_path, mask, allow_pickle=False)
+    metadata = {
+        "frames": [
+            {
+                "files": {
+                    "integration_valid_mask": {
+                        "path": mask_path.name,
+                        "sha256": coarse_scan_module._sha256(mask_path),
+                        "dtype": str(mask.dtype),
+                        "shape": list(mask.shape),
+                    }
+                }
+            }
+        ]
+    }
+    metadata_path = root / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+    authority = SimpleNamespace(
+        root=root.resolve(),
+        metadata_sha256=coarse_scan_module._sha256(metadata_path),
+        metadata_size_bytes=metadata_path.stat().st_size,
+    )
+    monkeypatch.setattr(coarse_scan_module, "read_occupancy_mapping", lambda _path: object())
+    monkeypatch.setattr(
+        coarse_scan_module,
+        "_bind_occupancy_storage_authority",
+        lambda _path, _stored: authority,
+    )
+
+    with coarse_scan_module._strict_coarse_read_transaction():
+        replayed = coarse_scan_module._load_final_integration_mask(root)
+        context = coarse_scan_module._STRICT_READ_CONTEXT.get()
+        assert context is not None
+        assert tuple(context.occupancy_authorities.values()) == (authority,)
+
+    np.testing.assert_array_equal(replayed, mask)
+    assert coarse_scan_module._STRICT_READ_CONTEXT.get() is None
+
+
 @pytest.mark.parametrize(
     "tamper_target",
     [
@@ -734,21 +1290,26 @@ def test_generation_writer_reuses_transaction_verified_views_without_full_read(
         lambda _path: pytest.fail("a verified predecessor must not be read again"),
     )
 
-    output = coarse_scan_module._write_coarse_scan_generation_from_verified(
-        tmp_path / "generation",
-        views=(stored_view.root,),
-        verified_views=(stored_view,),
-        coverage=tmp_path / "coverage",
-        source_initialization=tmp_path / "initialization",
-        source_view_plan=tmp_path / "view-plan",
-        source_discovery_plan=tmp_path / "discovery",
-        previous_generation=None,
-        verified_previous_generation=None,
+    output, stored_generation = (
+        coarse_scan_module._write_coarse_scan_generation_from_verified(
+            tmp_path / "generation",
+            views=(stored_view.root,),
+            verified_views=(stored_view,),
+            coverage=tmp_path / "coverage",
+            source_initialization=tmp_path / "initialization",
+            source_view_plan=tmp_path / "view-plan",
+            source_discovery_plan=tmp_path / "discovery",
+            previous_generation=None,
+            verified_previous_generation=None,
+        )
     )
 
     payload = json.loads((output / "generation.json").read_text(encoding="utf-8"))
     assert payload["summary"]["view_count"] == 1
     assert payload["views"][0]["root"] == str(stored_view.root)
+    assert stored_generation.root == output
+    assert stored_generation.views == (stored_view,)
+    assert stored_generation.metadata == payload
 
 
 @pytest.mark.parametrize("tamper_target", ("view", "occupancy_source"))

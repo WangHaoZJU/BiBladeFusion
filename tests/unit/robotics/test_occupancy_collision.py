@@ -245,7 +245,89 @@ def test_sampled_online_path_stops_after_first_blocking_robot_geometry(
     assert sampled.result.diagnostics["fail_fast"] is True
 
 
-@pytest.mark.parametrize("map_state", [OccupancyMapState.MAPPING, OccupancyMapState.STALE])
+def test_sampled_online_query_stops_inside_first_blocking_geometry(
+    checker,
+    occupancy_snapshot,
+) -> None:
+    snapshot = replace(
+        occupancy_snapshot,
+        free_indices=frozenset(),
+        free_observation_counts=(),
+        occupied_indices=frozenset({(0, 0, 0)}),
+        content_hash="",
+    )
+    occupancy = _checker(checker, snapshot)
+    placed = occupancy._robot_collision_geometries((0.0,) * 6)[0]  # noqa: SLF001
+
+    fast = occupancy._query_robot_geometry(  # noqa: SLF001
+        snapshot,
+        placed,
+        required_distance_m=0.0,
+        stop_on_first_block=True,
+    )
+    exhaustive = occupancy._query_robot_geometry(  # noqa: SLF001
+        snapshot,
+        placed,
+        required_distance_m=0.0,
+        stop_on_first_block=False,
+    )
+
+    assert fast.blocked is True
+    assert fast.query_complete is False
+    assert fast.blocking_voxel_index is not None
+    assert exhaustive.blocked is True
+    assert exhaustive.query_complete is True
+    assert fast.distance_query_count < exhaustive.distance_query_count
+    assert fast.unknown_count < exhaustive.unknown_count
+
+
+def test_repeated_voxel_query_reuses_only_snapshot_bound_immutable_layout(
+    checker,
+    occupancy_snapshot,
+) -> None:
+    snapshot = replace(
+        occupancy_snapshot,
+        free_indices=frozenset(),
+        free_observation_counts=(),
+        occupied_indices=occupancy_snapshot.free_indices,
+        content_hash="",
+    )
+    occupancy = _checker(checker, snapshot)
+    placed = occupancy._robot_collision_geometries((0.0,) * 6)[0]  # noqa: SLF001
+
+    first = occupancy._query_robot_geometry(  # noqa: SLF001
+        snapshot,
+        placed,
+        required_distance_m=0.01,
+    )
+    layout_count = len(occupancy._voxel_query_layouts)  # noqa: SLF001
+    geometry_count = len(occupancy._voxel_geometries)  # noqa: SLF001
+    second = occupancy._query_robot_geometry(  # noqa: SLF001
+        snapshot,
+        placed,
+        required_distance_m=0.01,
+    )
+
+    assert first == second
+    assert layout_count > 0
+    assert geometry_count > 0
+    assert len(occupancy._voxel_query_layouts) == layout_count  # noqa: SLF001
+    assert len(occupancy._voxel_geometries) == geometry_count  # noqa: SLF001
+
+    changed = occupancy._query_robot_geometry(  # noqa: SLF001
+        occupancy_snapshot,
+        placed,
+        required_distance_m=0.01,
+    )
+    assert changed.blocked is False
+    assert occupancy._voxel_query_layout_content_hash == (  # noqa: SLF001
+        occupancy_snapshot.content_hash
+    )
+
+
+@pytest.mark.parametrize(
+    "map_state", [OccupancyMapState.MAPPING, OccupancyMapState.STALE]
+)
 def test_non_ready_snapshot_fails_closed(
     checker, occupancy_snapshot, map_state
 ) -> None:
@@ -369,14 +451,12 @@ def test_swept_occupancy_proof_tampering_invalidates_certificate(
         result,
         proof_evidence=replace(
             result.proof_evidence,
-            certified_interval_count=result.proof_evidence.certified_interval_count
-            + 1,
+            certified_interval_count=result.proof_evidence.certified_interval_count + 1,
         ),
     )
 
     assert tampered.continuous_swept_volume_verified is True
     assert tampered.continuous_swept_volume_evidence_valid is False
-
 
 def test_swept_occupancy_map_binding_tampering_invalidates_certificate(
     checker, occupancy_snapshot
@@ -768,7 +848,9 @@ def test_adapter_accepts_real_immutable_mapping_snapshot(checker) -> None:
     assert result.evidence.semantic_attestation_valid is False
 
 
-@pytest.mark.parametrize("changed_field", ["mapping_context_hash", "quality_evidence_hash"])
+@pytest.mark.parametrize(
+    "changed_field", ["mapping_context_hash", "quality_evidence_hash"]
+)
 def test_evidence_chain_hash_change_during_query_fails_closed(
     checker, occupancy_snapshot, changed_field
 ) -> None:
@@ -795,7 +877,9 @@ def test_evidence_chain_hash_change_during_query_fails_closed(
     assert "occupancy_snapshot_changed" in result.blocking_reasons[0]
 
 
-def test_checker_requires_hash_bound_robot_geometry(checker, occupancy_snapshot) -> None:
+def test_checker_requires_hash_bound_robot_geometry(
+    checker, occupancy_snapshot
+) -> None:
     with pytest.raises(ValueError, match="hash-bound robot geometry"):
         OccupancyRobotCollisionChecker(checker, lambda: occupancy_snapshot)
 
@@ -837,9 +921,7 @@ def test_generation_driven_map_has_no_wall_clock_expiry(occupancy_snapshot) -> N
         occupancy_snapshot,
         now_utc=datetime(2036, 8, 28, 0, 10, 0, tzinfo=UTC),
         max_age_s=None,
-        authorization_started_at_utc=datetime(
-            2026, 8, 28, 0, 9, 58, tzinfo=UTC
-        ),
+        authorization_started_at_utc=datetime(2026, 8, 28, 0, 9, 58, tzinfo=UTC),
         required_freshness_horizon_s=600.0,
         verified_robot_geometry_hash="9" * 64,
     )

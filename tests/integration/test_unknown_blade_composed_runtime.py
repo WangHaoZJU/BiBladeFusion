@@ -553,7 +553,7 @@ def test_resume_allocates_new_capture_identity_and_uses_safety_refresh(
 
     def input_fn(prompt: str) -> str:
         console_prompts.append(prompt)
-        if prompt.startswith("Manually reposition"):
+        if prompt.startswith("Keep the blade, fixture, camera mount"):
             return "c"
         if prompt.startswith("Paste the exact token"):
             return "q"
@@ -578,5 +578,6 @@ def test_resume_allocates_new_capture_identity_and_uses_safety_refresh(
     assert recovered_perception.committed[0] not in perception.committed
     assert recovered_session.stage_operator_calls == 0
     assert recovered_adapter.accepted_cycle_count == 1
-    assert sum(prompt.startswith("Manually reposition") for prompt in console_prompts) == 1
+    assert sum(prompt.startswith("Keep the blade") for prompt in console_prompts) == 1
+    assert all("Manually reposition" not in prompt for prompt in console_prompts)
     assert all("hard_roi" not in prompt for prompt in console_prompts)

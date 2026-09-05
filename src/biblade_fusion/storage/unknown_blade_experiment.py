@@ -16,7 +16,10 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from biblade_fusion.diagnostics.performance_timing import performance_span
-from biblade_fusion.storage.coarse_scan import read_coarse_scan_generation
+from biblade_fusion.storage.coarse_scan import (
+    _strict_coarse_read_transaction,
+    read_coarse_scan_generation,
+)
 from biblade_fusion.storage.fine_reconstruction import (
     replay_final_fine_reconstruction,
 )
@@ -34,6 +37,7 @@ from biblade_fusion.storage.surface_coverage import read_surface_coverage_genera
 UNKNOWN_BLADE_EXPERIMENT_SCHEMA_VERSION = 1
 UNKNOWN_BLADE_EXPERIMENT_KIND = "biblade_fusion.unknown_blade_experiment_event"
 UNKNOWN_BLADE_FINE_START_PROTOCOL = "candidate_commit.stop_scan_exclusive.v2"
+UNKNOWN_BLADE_EXPERIMENTAL_ACCEPTANCE_STATUS = "experimental_unaccepted"
 _FINE_START_PREPUBLICATION_DURATION_SEMANTICS = (
     "lower_bound_sample_before_final_event_serialization"
 )
@@ -446,6 +450,7 @@ class StoredUnknownBladeExperiment:
     runtime_timing_authority: RuntimeTimingAcceptanceAuthority | None = None
     fine_start_protocol: str | None = None
     placement_id: str | None = None
+    acceptance_status: str | None = None
 
     @property
     def latest_event(self) -> UnknownBladeExperimentEvent:
@@ -520,12 +525,33 @@ class UnknownBladeExperimentWriter:
                 "Legacy single-phase fine-start chains are audit-readable only and "
                 "cannot be resumed by the production writer"
             )
-        if not production and (
-            stored.science_authority is not None
-            or stored.runtime_timing_authority is not None
-            or stored.fine_start_protocol is not None
-        ):
-            raise ValueError("Experimental coarse writer cannot carry production authorities")
+        if not production:
+            if (
+                stored.science_authority is not None
+                or stored.runtime_timing_authority is not None
+            ):
+                raise ValueError(
+                    "Experimental coarse writer cannot carry production authorities"
+                )
+            if stored.fine_start_protocol not in {
+                None,
+                UNKNOWN_BLADE_FINE_START_PROTOCOL,
+            }:
+                raise ValueError("Experimental fine-start protocol is unsupported")
+            if stored.fine_start_protocol is None:
+                if stored.acceptance_status is not None:
+                    raise ValueError(
+                        "Legacy experimental chain has an unexpected acceptance status"
+                    )
+            elif (
+                stored.acceptance_status
+                != UNKNOWN_BLADE_EXPERIMENTAL_ACCEPTANCE_STATUS
+            ):
+                raise ValueError(
+                    "Candidate-commit experimental chain must be explicitly unaccepted"
+                )
+        elif stored.acceptance_status is not None:
+            raise ValueError("Production chain cannot carry an experimental status")
         self.root = stored.root
         self.experiment_id = stored.experiment_id
         self.placement_id = stored.placement_id
@@ -587,10 +613,13 @@ class UnknownBladeExperimentWriter:
             events=(),
             science_authority=science_authority,
             runtime_timing_authority=runtime_timing_authority,
-            fine_start_protocol=(
-                UNKNOWN_BLADE_FINE_START_PROTOCOL if production else None
-            ),
+            fine_start_protocol=UNKNOWN_BLADE_FINE_START_PROTOCOL,
             placement_id=bound_placement_id,
+            acceptance_status=(
+                None
+                if production
+                else UNKNOWN_BLADE_EXPERIMENTAL_ACCEPTANCE_STATUS
+            ),
         )
         writer = cls(stored, production=production)
         writer._append(
@@ -604,9 +633,14 @@ class UnknownBladeExperimentWriter:
                     if bound_placement_id is not None
                     else {}
                 ),
+                "fine_start_protocol": UNKNOWN_BLADE_FINE_START_PROTOCOL,
                 **(
-                    {"fine_start_protocol": UNKNOWN_BLADE_FINE_START_PROTOCOL}
-                    if production
+                    {
+                        "acceptance_status": (
+                            UNKNOWN_BLADE_EXPERIMENTAL_ACCEPTANCE_STATUS
+                        )
+                    }
+                    if not production
                     else {}
                 ),
                 **(
@@ -628,13 +662,25 @@ class UnknownBladeExperimentWriter:
         return writer
 
     @classmethod
-    def resume(cls, output_dir: str | Path) -> UnknownBladeExperimentWriter:
-        return cls(read_unknown_blade_experiment(output_dir))
+    def resume(
+        cls,
+        output_dir: str | Path,
+        *,
+        production: bool = True,
+    ) -> UnknownBladeExperimentWriter:
+        return cls(read_unknown_blade_experiment(output_dir), production=production)
 
     @property
     def events(self) -> tuple[UnknownBladeExperimentEvent, ...]:
         with self._lock:
             return tuple(self._events)
+
+    @property
+    def fine_start_uses_candidate_commit(self) -> bool:
+        return (
+            self._events[0].payload.get("fine_start_protocol")
+            == UNKNOWN_BLADE_FINE_START_PROTOCOL
+        )
 
     def prepare_handoff(
         self,
@@ -934,9 +980,24 @@ class UnknownBladeExperimentWriter:
             raise ValueError("Production chains cannot use an unaccepted fine handoff")
         with self._lock:
             self._require_current_chain()
-            if self._events[-1].event_type != "handoff_prepared":
-                raise ValueError("Experimental FINE_STARTED requires PREPARED")
-            prepared = self._events[-1]
+            candidate_commit = self.fine_start_uses_candidate_commit
+            previous = self._events[-1]
+            if candidate_commit:
+                if previous.event_type != "fine_start_candidate":
+                    raise ValueError(
+                        "Experimental candidate-commit FINE_STARTED requires its candidate"
+                    )
+                candidate = previous
+                prepared = next(
+                    event
+                    for event in self._events
+                    if event.event_type == "handoff_prepared"
+                )
+            else:
+                if previous.event_type != "handoff_prepared":
+                    raise ValueError("Experimental FINE_STARTED requires PREPARED")
+                candidate = None
+                prepared = previous
             with exclusive_stop_scan_run_authority(fine_run_root):
                 fine = read_stop_scan_run(fine_run_root)
                 _validate_fine_start_bootstrap_run(
@@ -945,9 +1006,31 @@ class UnknownBladeExperimentWriter:
                 )
                 if fine.run_id != self.experiment_id:
                     raise ValueError("experimental fine run ID differs from experiment ID")
+                candidate_payload: dict[str, object] = {}
+                if candidate is not None:
+                    if (
+                        candidate.payload["prepared_event_sha256"]
+                        != prepared.event_sha256
+                        or candidate.payload["fine_run_id"] != fine.run_id
+                        or candidate.payload["fine_run_root"] != str(fine.root)
+                        or candidate.payload["fine_first_event_sha256"]
+                        != fine.events[0].event_sha256
+                        or _checkpoint_event_count(
+                            candidate.payload["fine_event_count_at_candidate"],
+                            label="experimental fine-start candidate",
+                        )
+                        != 1
+                    ):
+                        raise ValueError(
+                            "experimental fine-start candidate authority changed"
+                        )
+                    candidate_payload["fine_start_candidate_event_sha256"] = (
+                        candidate.event_sha256
+                    )
                 return self._append(
                     "fine_started",
                     {
+                        **candidate_payload,
                         "prepared_event_sha256": prepared.event_sha256,
                         "fine_run_id": fine.run_id,
                         "fine_run_root": str(fine.root),
@@ -1195,7 +1278,8 @@ def read_unknown_blade_experiment(path: str | Path) -> StoredUnknownBladeExperim
             if events and event.experiment_id != events[0].experiment_id:
                 raise ValueError("experiment ID changed within the event chain")
             events.append(event)
-        _validate_semantic_chain(tuple(events))
+        with _strict_coarse_read_transaction():
+            _validate_semantic_chain(tuple(events))
         raw_authority = events[0].payload.get("science_acceptance_authority")
         science_authority = (
             ScienceAcceptanceAuthority.from_payload(raw_authority)
@@ -1222,6 +1306,7 @@ def read_unknown_blade_experiment(path: str | Path) -> StoredUnknownBladeExperim
             runtime_timing_authority=runtime_timing_authority,
             fine_start_protocol=events[0].payload.get("fine_start_protocol"),
             placement_id=events[0].payload.get("placement_id"),
+            acceptance_status=events[0].payload.get("acceptance_status"),
         )
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise UnknownBladeExperimentFormatError(
@@ -1314,11 +1399,16 @@ def _validate_semantic_chain(events: tuple[UnknownBladeExperimentEvent, ...]) ->
     candidate_commit_init_fields = combined_authority_init_fields | {
         "fine_start_protocol"
     }
+    experimental_candidate_commit_init_fields = legacy_init_fields | {
+        "acceptance_status",
+        "fine_start_protocol",
+    }
     accepted_init_fields = {
         frozenset(legacy_init_fields),
         frozenset(authority_init_fields),
         frozenset(combined_authority_init_fields),
         frozenset(candidate_commit_init_fields),
+        frozenset(experimental_candidate_commit_init_fields),
     }
     accepted_init_fields.update(
         frozenset((*fields, "placement_id"))
@@ -1327,6 +1417,7 @@ def _validate_semantic_chain(events: tuple[UnknownBladeExperimentEvent, ...]) ->
             authority_init_fields,
             combined_authority_init_fields,
             candidate_commit_init_fields,
+            experimental_candidate_commit_init_fields,
         )
     )
     if frozenset(initialized) not in accepted_init_fields:
@@ -1337,14 +1428,26 @@ def _validate_semantic_chain(events: tuple[UnknownBladeExperimentEvent, ...]) ->
             raise ValueError("experiment placement_id must be a string")
         validate_stop_scan_run_id(placement_id)
     fine_start_protocol = initialized.get("fine_start_protocol")
-    expected_candidate_fields = candidate_commit_init_fields | (
+    acceptance_status = initialized.get("acceptance_status")
+    production_candidate_fields = candidate_commit_init_fields | (
+        {"placement_id"} if placement_id is not None else set()
+    )
+    experimental_candidate_fields = experimental_candidate_commit_init_fields | (
         {"placement_id"} if placement_id is not None else set()
     )
     if fine_start_protocol is not None and (
         fine_start_protocol != UNKNOWN_BLADE_FINE_START_PROTOCOL
-        or set(initialized) != expected_candidate_fields
+        or (
+            set(initialized) != production_candidate_fields
+            and set(initialized) != experimental_candidate_fields
+        )
     ):
         raise ValueError("experiment fine-start protocol changed")
+    if acceptance_status is not None and (
+        acceptance_status != UNKNOWN_BLADE_EXPERIMENTAL_ACCEPTANCE_STATUS
+        or set(initialized) != experimental_candidate_fields
+    ):
+        raise ValueError("experiment acceptance status changed")
     science_authority = (
         ScienceAcceptanceAuthority.from_payload(
             initialized["science_acceptance_authority"]
@@ -1363,6 +1466,14 @@ def _validate_semantic_chain(events: tuple[UnknownBladeExperimentEvent, ...]) ->
     )
     if runtime_timing_authority is not None:
         runtime_timing_authority.assert_acceptance_asset_current()
+    if acceptance_status == UNKNOWN_BLADE_EXPERIMENTAL_ACCEPTANCE_STATUS and (
+        science_authority is not None
+        or runtime_timing_authority is not None
+        or fine_start_protocol != UNKNOWN_BLADE_FINE_START_PROTOCOL
+    ):
+        raise ValueError(
+            "experimental-unaccepted chain cannot carry production authorities"
+        )
     if initialized["experiment_id"] != events[0].experiment_id:
         raise ValueError("experiment initialization ID changed")
     coarse_root = _canonical_root(initialized["coarse_run_root"], label="coarse run root")
@@ -1574,9 +1685,9 @@ def _validate_semantic_chain(events: tuple[UnknownBladeExperimentEvent, ...]) ->
         "fine_first_event_sha256",
     }
     if fine_start_protocol == UNKNOWN_BLADE_FINE_START_PROTOCOL:
-        expected_started_fields.update(
-            {"fine_start_candidate_event_sha256", "schema5_handoff_timing"}
-        )
+        expected_started_fields.add("fine_start_candidate_event_sha256")
+        if runtime_timing_authority is not None:
+            expected_started_fields.add("schema5_handoff_timing")
     elif runtime_timing_authority is not None:
         expected_started_fields.add("schema5_handoff_timing")
     if set(started_payload) != expected_started_fields:
@@ -1801,6 +1912,7 @@ def _checkpoint_event_count(value: object, *, label: str) -> int:
 
 __all__ = [
     "StoredUnknownBladeExperiment",
+    "UNKNOWN_BLADE_EXPERIMENTAL_ACCEPTANCE_STATUS",
     "UNKNOWN_BLADE_EXPERIMENT_SCHEMA_VERSION",
     "UNKNOWN_BLADE_FINE_START_PROTOCOL",
     "UnknownBladeExperimentEvent",

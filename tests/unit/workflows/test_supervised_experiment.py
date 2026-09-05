@@ -8,6 +8,7 @@ from biblade_fusion.storage.stop_scan_run import StopScanRunWriter, read_stop_sc
 from biblade_fusion.supervision.experiment import ExperimentDisposition
 from biblade_fusion.workflows.stop_scan_coordinator import (
     CapturePurpose,
+    StopScanBlocked,
     StopScanCheckpoint,
     StopScanPhase,
 )
@@ -313,6 +314,64 @@ def test_stale_occupancy_requests_safety_refresh_before_selection_or_preflight(
     assert status.blocking_reasons == ("occupancy_not_fresh_map_ready:stale",)
     assert coordinator.prepare_count == 0
     assert coordinator.execute_count == 0
+
+
+def test_planning_deadline_requires_restart_instead_of_safety_capture(
+    tmp_path: Path,
+) -> None:
+    runner, coordinator = _runner(tmp_path)
+    runner.start()
+    runner.step(view_id="bootstrap_00")
+
+    reason = (
+        "planning_deadline_exceeded:PlanningDeadlineExceeded:"
+        "planning/preflight exceeded its cooperative responsiveness budget"
+    )
+
+    def deadline_blocked() -> object:
+        coordinator.prepare_count += 1
+        coordinator._checkpoint = _checkpoint(  # noqa: SLF001
+            StopScanPhase.MOTION_BLOCKED,
+            blocking_reasons=(reason,),
+        )
+        coordinator._event("planning_deadline_exceeded")  # noqa: SLF001
+        raise StopScanBlocked(reason)
+
+    coordinator.prepare_next_segment = deadline_blocked  # type: ignore[method-assign]
+
+    status = runner.step()
+
+    assert status.phase == StopScanPhase.MOTION_BLOCKED.value
+    assert status.disposition is ExperimentDisposition.BLOCKED
+    assert status.blocking_reasons == (f"planning_restart_required:{reason}",)
+    assert coordinator.prepare_count == 1
+    assert coordinator.execute_count == 0
+    events = read_stop_scan_run(status.run_root).events
+    assert events[-2].event_type == "planning_deadline_exceeded"
+    assert events[-1].event_type == "planning_restart_required"
+    assert events[-1].payload["operator_capture_can_resolve"] is False
+    assert events[-1].payload["pending_motion_restored"] is False
+    assert events[-1].payload["resume_preserves_accepted_science"] is True
+    assert all(event.event_type != "coordinator_operation_blocked" for event in events)
+
+
+def test_non_planning_stop_scan_block_remains_terminal(tmp_path: Path) -> None:
+    runner, coordinator = _runner(
+        tmp_path,
+        capture_error=StopScanBlocked("capture evidence identity changed"),
+    )
+
+    status = runner.run_until_attention(bootstrap_view_provider=lambda _: "bootstrap_00")
+
+    assert status.disposition is ExperimentDisposition.BLOCKED
+    assert status.blocking_reasons == (
+        "coordinator_blocked:capture evidence identity changed",
+    )
+    assert coordinator.prepare_count == 0
+    assert coordinator.execute_count == 0
+    assert read_stop_scan_run(status.run_root).latest_event.event_type == (
+        "coordinator_operation_blocked"
+    )
 
 
 def test_resume_requires_stop_confirmation_and_discards_motion_authority(

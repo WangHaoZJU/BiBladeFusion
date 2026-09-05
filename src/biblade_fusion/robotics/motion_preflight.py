@@ -17,7 +17,10 @@ from biblade_fusion.core.planning_deadline import (
     require_planning_time,
 )
 from biblade_fusion.devices.robot.streaming import ServoJStream, ServoJStreamConfig
-from biblade_fusion.diagnostics.performance_timing import performance_span, performance_timed
+from biblade_fusion.diagnostics.performance_timing import (
+    performance_span,
+    performance_timed,
+)
 from biblade_fusion.robotics.holorobot_joint_planner import (
     HoloRobotJointPlanStatus,
     HoloRobotOmplConfig,
@@ -49,8 +52,8 @@ CONTINUOUS_INTERVAL_VALIDATION = "continuous_interval_v1"
 HOLOROBOT_SAMPLED_VALIDATION = "holorobot_sampled_joint_v2"
 HOLOROBOT_NATIVE_MAX_JOINT_STEP_RAD = 0.1
 HOLOROBOT_NATIVE_SEGMENT_SAMPLES = 5
-HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD = (
-    HOLOROBOT_NATIVE_MAX_JOINT_STEP_RAD / (HOLOROBOT_NATIVE_SEGMENT_SAMPLES - 1)
+HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD = HOLOROBOT_NATIVE_MAX_JOINT_STEP_RAD / (
+    HOLOROBOT_NATIVE_SEGMENT_SAMPLES - 1
 )
 
 
@@ -85,13 +88,17 @@ class JointMotionPreflight:
             and self.collision.status is CollisionCheckStatus.CLEAR
             and self.collision.result.diagnostics.get("model") == "elite_es68"
             and bool(self.collision.result.diagnostics.get("robot_geometry_hash"))
-            and bool(self.collision.result.diagnostics.get("motion_model_contract_hash"))
+            and bool(
+                self.collision.result.diagnostics.get("motion_model_contract_hash")
+            )
             and self.occupancy_required
             and self.occupancy is not None
             and self.occupancy.status is CollisionCheckStatus.CLEAR
             and self.occupancy.evidence is not None
             and self.occupancy.evidence.semantic_attestation_valid
-            and bool(self.occupancy.result.diagnostics.get("occupancy_policy_contract_hash"))
+            and bool(
+                self.occupancy.result.diagnostics.get("occupancy_policy_contract_hash")
+            )
             and self.servoj_runtime_config is not None
             and self.approval_required
         )
@@ -208,9 +215,7 @@ def _holorobot_sampled_evidence_payload(
             preflight.start_joint_positions_rad,
             preflight.goal_joint_positions_rad,
         ),
-        "planning_waypoints_sha256": _waypoints_sha256(
-            preflight.planning_waypoints
-        ),
+        "planning_waypoints_sha256": _waypoints_sha256(preflight.planning_waypoints),
         "maximum_joint_step_rad": collision.maximum_joint_step_rad,
         "occupancy_maximum_joint_step_rad": occupancy.maximum_joint_step_rad,
         "holorobot_native_max_joint_step_rad": HOLOROBOT_NATIVE_MAX_JOINT_STEP_RAD,
@@ -288,11 +293,14 @@ def _linear_waypoints(
 ) -> tuple[tuple[float, ...], ...]:
     if not math.isfinite(maximum_joint_step_rad) or maximum_joint_step_rad <= 0.0:
         raise ValueError("maximum_joint_step_rad must be finite and positive")
-    maximum_delta = max(abs(end - begin) for begin, end in zip(start, goal, strict=True))
+    maximum_delta = max(
+        abs(end - begin) for begin, end in zip(start, goal, strict=True)
+    )
     segments = max(1, math.ceil(maximum_delta / maximum_joint_step_rad))
     interior = tuple(
         tuple(
-            begin + index / segments * (end - begin) for begin, end in zip(start, goal, strict=True)
+            begin + index / segments * (end - begin)
+            for begin, end in zip(start, goal, strict=True)
         )
         for index in range(1, segments)
     )
@@ -354,7 +362,15 @@ def _time_parameterized_servoj_stream(
     speed_scaling: float,
     velocity_margin: float,
 ) -> _TimeParameterizedServoJ:
-    """Apply HoloRobot's velocity/acceleration duration rule to a joint polyline."""
+    """Build a rest-to-rest ServoJ stream for every non-collinear path segment.
+
+    HoloRobot's historical acceleration-aware generator enlarged each segment's
+    duration but then sampled it linearly.  That still commands a velocity step
+    at the first and last ServoJ tick.  Use the same reviewed joint limits to
+    construct a synchronized scalar trapezoid (or triangle) instead.  Every
+    geometric knot is reached at zero velocity, so a direction change cannot
+    introduce an unbounded acceleration impulse.
+    """
 
     if not math.isfinite(dt_s) or dt_s <= 0.0:
         raise ValueError("ServoJ dt_s must be finite and positive")
@@ -363,7 +379,11 @@ def _time_parameterized_servoj_stream(
     if not math.isfinite(velocity_margin) or not 0.0 < velocity_margin <= 1.0:
         raise ValueError("ServoJ velocity margin must be finite and in (0, 1]")
     velocities = np.asarray(maximum_velocity_rad_s, dtype=np.float64)
-    if velocities.shape != (6,) or not np.isfinite(velocities).all() or np.any(velocities <= 0.0):
+    if (
+        velocities.shape != (6,)
+        or not np.isfinite(velocities).all()
+        or np.any(velocities <= 0.0)
+    ):
         raise ValueError("Joint velocity limits must be a finite positive six-vector")
     accelerations = np.asarray(maximum_acceleration_rad_s2, dtype=np.float64)
     if (
@@ -371,7 +391,9 @@ def _time_parameterized_servoj_stream(
         or not np.isfinite(accelerations).all()
         or np.any(accelerations <= 0.0)
     ):
-        raise ValueError("Joint acceleration limits must be a finite positive six-vector")
+        raise ValueError(
+            "Joint acceleration limits must be a finite positive six-vector"
+        )
     knots = _servoj_geometric_knots(waypoints)
     scale = speed_scaling * velocity_margin
     commands: list[tuple[float, ...]] = [knots[0]]
@@ -383,25 +405,44 @@ def _time_parameterized_servoj_stream(
     for segment_index, (start, goal) in enumerate(
         zip(knots[:-1], knots[1:], strict=True)
     ):
-        segment_minimum_s = 0.0
-        segment_joint_index: int | None = None
-        segment_constraint: str | None = None
-        for joint_index, (begin, end) in enumerate(zip(start, goal, strict=True)):
-            delta = abs(end - begin)
-            if delta <= 1e-12:
-                continue
-            velocity_duration_s = delta / (velocities[joint_index] * scale)
-            acceleration_duration_s = 2.0 * math.sqrt(
-                delta / (accelerations[joint_index] * scale)
-            )
-            if velocity_duration_s > segment_minimum_s:
-                segment_minimum_s = velocity_duration_s
-                segment_joint_index = joint_index
-                segment_constraint = "velocity"
-            if acceleration_duration_s > segment_minimum_s:
-                segment_minimum_s = acceleration_duration_s
-                segment_joint_index = joint_index
-                segment_constraint = "acceleration"
+        delta = np.abs(
+            np.asarray(goal, dtype=np.float64)
+            - np.asarray(start, dtype=np.float64)
+        )
+        moving = delta > 1e-12
+        if not np.any(moving):
+            continue
+        scalar_velocity_limits = np.full(6, np.inf, dtype=np.float64)
+        scalar_acceleration_limits = np.full(6, np.inf, dtype=np.float64)
+        scalar_velocity_limits[moving] = velocities[moving] * scale / delta[moving]
+        scalar_acceleration_limits[moving] = (
+            accelerations[moving] * scale / delta[moving]
+        )
+        velocity_joint_index = int(np.argmin(scalar_velocity_limits))
+        acceleration_joint_index = int(np.argmin(scalar_acceleration_limits))
+        scalar_velocity_limit = float(scalar_velocity_limits[velocity_joint_index])
+        scalar_acceleration_limit = float(
+            scalar_acceleration_limits[acceleration_joint_index]
+        )
+
+        if scalar_velocity_limit**2 >= scalar_acceleration_limit:
+            # The velocity ceiling is not reached: accelerate over half the
+            # segment, then decelerate symmetrically.
+            acceleration_time_s = math.sqrt(1.0 / scalar_acceleration_limit)
+            cruise_time_s = 0.0
+            peak_velocity = scalar_acceleration_limit * acceleration_time_s
+            segment_minimum_s = 2.0 * acceleration_time_s
+            segment_joint_index = acceleration_joint_index
+            segment_constraint = "acceleration"
+        else:
+            acceleration_time_s = scalar_velocity_limit / scalar_acceleration_limit
+            cruise_time_s = (
+                1.0 - scalar_velocity_limit**2 / scalar_acceleration_limit
+            ) / scalar_velocity_limit
+            peak_velocity = scalar_velocity_limit
+            segment_minimum_s = 2.0 * acceleration_time_s + cruise_time_s
+            segment_joint_index = velocity_joint_index
+            segment_constraint = "velocity_and_acceleration"
         minimum_duration_s += segment_minimum_s
         if segment_minimum_s > largest_segment_minimum_s:
             largest_segment_minimum_s = segment_minimum_s
@@ -409,13 +450,38 @@ def _time_parameterized_servoj_stream(
             limiting_joint_index = segment_joint_index
             limiting_constraint = segment_constraint
         count = max(1, math.ceil(segment_minimum_s / dt_s - 1e-12))
-        commands.extend(
-            tuple(
-                begin + sample / count * (end - begin)
-                for begin, end in zip(start, goal, strict=True)
-            )
-            for sample in range(1, count)
+        sampled_duration_s = count * dt_s
+        stretch = sampled_duration_s / segment_minimum_s
+        sampled_acceleration_time_s = acceleration_time_s * stretch
+        sampled_cruise_time_s = cruise_time_s * stretch
+        sampled_peak_velocity = peak_velocity / stretch
+        sampled_acceleration = scalar_acceleration_limit / (stretch * stretch)
+        sampled_deceleration_start_s = (
+            sampled_acceleration_time_s + sampled_cruise_time_s
         )
+        for sample in range(1, count):
+            sample_time_s = sample * dt_s
+            if sample_time_s <= sampled_acceleration_time_s:
+                progress = 0.5 * sampled_acceleration * sample_time_s**2
+            elif sample_time_s <= sampled_deceleration_start_s:
+                accelerated_progress = (
+                    0.5
+                    * sampled_acceleration
+                    * sampled_acceleration_time_s**2
+                )
+                progress = accelerated_progress + sampled_peak_velocity * (
+                    sample_time_s - sampled_acceleration_time_s
+                )
+            else:
+                remaining_s = sampled_duration_s - sample_time_s
+                progress = 1.0 - 0.5 * sampled_acceleration * remaining_s**2
+            progress = min(1.0, max(0.0, progress))
+            commands.append(
+                tuple(
+                    begin + progress * (end - begin)
+                    for begin, end in zip(start, goal, strict=True)
+                )
+            )
         commands.append(goal)
     stream = ServoJStream(commands=tuple(commands), dt_s=dt_s)
     stream.validate()
@@ -450,7 +516,7 @@ def validate_preflight_servoj_contract(
         raise ValueError("Unsupported motion preflight planner contract")
     if (
         preflight.diagnostics.get("trajectory_generator")
-        != "holorobot_velocity_acceleration_limited_servoj_v2"
+        != "rest_to_rest_velocity_acceleration_limited_servoj_v3"
     ):
         raise ValueError("Unsupported motion trajectory-generator contract")
 
@@ -482,10 +548,16 @@ def validate_preflight_servoj_contract(
         raise ValueError("Execution freshness margin must be non-negative")
     raw_uncertainty = preflight.diagnostics.get("accepted_joint_uncertainty_rad")
     uncertainty = np.asarray(raw_uncertainty, dtype=np.float64)
-    if uncertainty.shape != (6,) or not np.isfinite(uncertainty).all() or np.any(uncertainty < 0.0):
+    if (
+        uncertainty.shape != (6,)
+        or not np.isfinite(uncertainty).all()
+        or np.any(uncertainty < 0.0)
+    ):
         raise ValueError("Motion preflight accepted uncertainty is invalid")
     acceptance_id = preflight.diagnostics.get("motion_envelope_acceptance_id")
-    acceptance_metadata_sha256 = preflight.diagnostics.get("motion_envelope_metadata_sha256")
+    acceptance_metadata_sha256 = preflight.diagnostics.get(
+        "motion_envelope_metadata_sha256"
+    )
     if np.any(uncertainty > 0.0):
         if any(
             not isinstance(value, str)
@@ -497,13 +569,17 @@ def validate_preflight_servoj_contract(
     elif acceptance_id is not None or acceptance_metadata_sha256 is not None:
         raise ValueError("Zero motion uncertainty cannot carry acceptance hashes")
     uncertainty_tuple = tuple(float(value) for value in uncertainty)
-    mesh_proof = preflight.collision.proof_evidence if preflight.collision is not None else None
+    mesh_proof = (
+        preflight.collision.proof_evidence if preflight.collision is not None else None
+    )
     if mesh_proof is not None and (
         mesh_proof.accepted_joint_uncertainty_rad != uncertainty_tuple
         or mesh_proof.motion_envelope_acceptance_id != acceptance_id
         or mesh_proof.motion_envelope_metadata_sha256 != acceptance_metadata_sha256
     ):
-        raise ValueError("Motion preflight mesh proof envelope differs from diagnostics")
+        raise ValueError(
+            "Motion preflight mesh proof envelope differs from diagnostics"
+        )
     occupancy_proof = (
         preflight.occupancy.proof_evidence if preflight.occupancy is not None else None
     )
@@ -512,7 +588,9 @@ def validate_preflight_servoj_contract(
         or occupancy_proof.motion_envelope_acceptance_id != acceptance_id
         or occupancy_proof.motion_envelope_metadata_sha256 != acceptance_metadata_sha256
     ):
-        raise ValueError("Motion preflight occupancy proof envelope differs from diagnostics")
+        raise ValueError(
+            "Motion preflight occupancy proof envelope differs from diagnostics"
+        )
 
     start = _joint_vector(
         preflight.start_joint_positions_rad,
@@ -555,14 +633,19 @@ def validate_preflight_servoj_contract(
         raise ValueError("Motion preflight waypoints do not reproduce")
     expected_timing = _time_parameterized_servoj_stream(
         expected_waypoints,
-        maximum_velocity_rad_s=(collision_checker.kinematic_model.joint_velocity_limits_rad_s()),
+        maximum_velocity_rad_s=(
+            collision_checker.kinematic_model.joint_velocity_limits_rad_s()
+        ),
         maximum_acceleration_rad_s2=tuple(float(value) for value in acceleration),
         dt_s=dt_s,
         speed_scaling=speed_scaling,
         velocity_margin=velocity_margin,
     )
     expected_stream = expected_timing.stream
-    if preflight.diagnostics.get("servoj_path_knot_count") != expected_timing.knot_count:
+    if (
+        preflight.diagnostics.get("servoj_path_knot_count")
+        != expected_timing.knot_count
+    ):
         raise ValueError("Motion preflight ServoJ knot count does not reproduce")
     if not math.isclose(
         diagnostic_float("minimum_dynamic_duration_s"),
@@ -687,6 +770,47 @@ def _sample_occupancy_path_holorobot_style(
     )
 
 
+def _prepare_servoj_timing(
+    waypoints: tuple[tuple[float, ...], ...],
+    *,
+    collision_checker: Cs68PinocchioCollisionChecker,
+    maximum_joint_acceleration_rad_s2: tuple[float, ...],
+    servoj_dt_s: float,
+    speed_scaling: float,
+    velocity_margin: float,
+    freshness_margin_s: float,
+    diagnostics: dict[str, Any],
+) -> tuple[_TimeParameterizedServoJ, ServoJStream, float]:
+    with performance_span("planning.servoj_stream_generation"):
+        require_planning_time("before ServoJ time parameterization")
+        timing = _time_parameterized_servoj_stream(
+            waypoints,
+            maximum_velocity_rad_s=(
+                collision_checker.kinematic_model.joint_velocity_limits_rad_s()
+            ),
+            maximum_acceleration_rad_s2=maximum_joint_acceleration_rad_s2,
+            dt_s=servoj_dt_s,
+            speed_scaling=speed_scaling,
+            velocity_margin=velocity_margin,
+        )
+        stream = timing.stream
+        require_planning_time("after ServoJ time parameterization")
+    stream_duration_s = max(0, len(stream.commands) - 1) * stream.dt_s
+    required_freshness_horizon_s = stream_duration_s + freshness_margin_s
+    diagnostics.update(
+        {
+            "servoj_path_knot_count": timing.knot_count,
+            "minimum_dynamic_duration_s": timing.minimum_duration_s,
+            "limiting_segment_index": timing.limiting_segment_index,
+            "limiting_joint_index": timing.limiting_joint_index,
+            "limiting_constraint": timing.limiting_constraint,
+            "planned_servoj_duration_s": stream_duration_s,
+            "required_freshness_horizon_s": required_freshness_horizon_s,
+        }
+    )
+    return timing, stream, required_freshness_horizon_s
+
+
 def _preflight_joint_waypoints(
     start_joint_positions_rad: ArrayLike,
     goal_joint_positions_rad: ArrayLike,
@@ -703,7 +827,14 @@ def _preflight_joint_waypoints(
     velocity_margin: float = 0.8,
     maximum_joint_acceleration_rad_s2: tuple[
         float, float, float, float, float, float
-    ] = (4.0, 4.0, 4.0, 4.0, 4.0, 4.0),
+    ] = (
+        4.0,
+        4.0,
+        4.0,
+        4.0,
+        4.0,
+        4.0,
+    ),
     execution_freshness_margin_s: float = 1.0,
     servoj_runtime_config: ServoJStreamConfig | None = None,
     accepted_joint_uncertainty_rad: tuple[float, float, float, float, float, float] = (
@@ -720,6 +851,7 @@ def _preflight_joint_waypoints(
     planning_waypoints: tuple[tuple[float, ...], ...],
     planner: str = "holorobot_conservative_linear_joint",
     planner_diagnostics: dict[str, object] | None = None,
+    prechecked_goal_collision: JointPathMeshCollisionReport | None = None,
 ) -> JointMotionPreflight:
     """Collision-check and time-parameterize one already generated joint path."""
 
@@ -741,13 +873,17 @@ def _preflight_joint_waypoints(
     )
     runtime_config.validate()
     if runtime_config.dt_s != servoj_dt_s:
-        raise ValueError("Preflight ServoJ runtime config dt_s differs from servoj_dt_s")
+        raise ValueError(
+            "Preflight ServoJ runtime config dt_s differs from servoj_dt_s"
+        )
     if (
         occupancy_checker is not None
         and not any(float(value) != 0.0 for value in accepted_joint_uncertainty_rad)
         and motion_envelope_acceptance_id is None
         and motion_envelope_metadata_sha256 is None
-        and any(value > 0.0 for value in occupancy_checker.accepted_joint_uncertainty_rad)
+        and any(
+            value > 0.0 for value in occupancy_checker.accepted_joint_uncertainty_rad
+        )
     ):
         accepted_joint_uncertainty_rad = (
             occupancy_checker.accepted_joint_uncertainty_rad
@@ -757,8 +893,14 @@ def _preflight_joint_waypoints(
             occupancy_checker.motion_envelope_metadata_sha256
         )
     uncertainty = np.asarray(accepted_joint_uncertainty_rad, dtype=np.float64)
-    if uncertainty.shape != (6,) or not np.isfinite(uncertainty).all() or np.any(uncertainty < 0.0):
-        raise ValueError("accepted_joint_uncertainty_rad must be a non-negative six-vector")
+    if (
+        uncertainty.shape != (6,)
+        or not np.isfinite(uncertainty).all()
+        or np.any(uncertainty < 0.0)
+    ):
+        raise ValueError(
+            "accepted_joint_uncertainty_rad must be a non-negative six-vector"
+        )
     acceptance_id = motion_envelope_acceptance_id
     acceptance_metadata_sha256 = motion_envelope_metadata_sha256
     if np.any(uncertainty > 0.0):
@@ -768,7 +910,9 @@ def _preflight_joint_waypoints(
             or any(character not in "0123456789abcdef" for character in value)
             for value in (acceptance_id, acceptance_metadata_sha256)
         ):
-            raise ValueError("Non-zero motion uncertainty requires acceptance/metadata SHA-256s")
+            raise ValueError(
+                "Non-zero motion uncertainty requires acceptance/metadata SHA-256s"
+            )
     elif acceptance_id is not None or acceptance_metadata_sha256 is not None:
         raise ValueError("Motion-envelope hashes cannot bind a zero uncertainty vector")
     uncertainty_tuple = tuple(float(value) for value in uncertainty)
@@ -783,14 +927,12 @@ def _preflight_joint_waypoints(
         require_continuous_occupancy_sweep = False
     diagnostics = {
         "planner": planner,
-        "trajectory_generator": "holorobot_velocity_acceleration_limited_servoj_v2",
+        "trajectory_generator": "rest_to_rest_velocity_acceleration_limited_servoj_v3",
         "maximum_joint_step_rad": maximum_joint_step_rad,
         "servoj_dt_s": servoj_dt_s,
         "speed_scaling": speed_scaling,
         "velocity_margin": velocity_margin,
-        "maximum_joint_acceleration_rad_s2": list(
-            maximum_joint_acceleration_rad_s2
-        ),
+        "maximum_joint_acceleration_rad_s2": list(maximum_joint_acceleration_rad_s2),
         "execution_freshness_margin_s": freshness_margin_s,
         "require_occupancy": bool(require_occupancy),
         "require_swept_mesh": bool(require_swept_mesh),
@@ -821,27 +963,103 @@ def _preflight_joint_waypoints(
             diagnostics=diagnostics,
             occupancy_required=bool(require_occupancy),
             swept_mesh_required=bool(require_swept_mesh),
-            continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
+            continuous_occupancy_sweep_required=bool(
+                require_continuous_occupancy_sweep
+            ),
             path_validation_mode=validation_mode,
         )
-    with performance_span("planning.mesh_collision_preflight"):
-        require_planning_time("before mesh collision preflight")
-        if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
-            collision = _sample_mesh_path_holorobot_style(
-                collision_checker,
-                waypoints,
-                maximum_joint_step_rad=maximum_joint_step_rad,
+    timing: _TimeParameterizedServoJ | None = None
+    stream: ServoJStream | None = None
+    required_freshness_horizon_s: float | None = None
+    occupancy: JointPathOccupancyCollisionReport | None = None
+    collision: JointPathMeshCollisionReport | None = None
+    if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
+        # HoloRobot applies its combined goal-state collision gate before the
+        # path planner.  Generate the cheap timing evidence first so occupancy
+        # freshness covers the complete prospective ServoJ stream, then reject
+        # an occupancy-blocked path before spending seconds on every mesh pose.
+        timing, stream, required_freshness_horizon_s = _prepare_servoj_timing(
+            waypoints,
+            collision_checker=collision_checker,
+            maximum_joint_acceleration_rad_s2=maximum_joint_acceleration_rad_s2,
+            servoj_dt_s=servoj_dt_s,
+            speed_scaling=speed_scaling,
+            velocity_margin=velocity_margin,
+            freshness_margin_s=freshness_margin_s,
+            diagnostics=diagnostics,
+        )
+        diagnostics["path_gate_order"] = "goal_mesh_then_occupancy_path_then_mesh_path"
+        if occupancy_checker is not None:
+            if (
+                occupancy_checker.accepted_joint_uncertainty_rad != uncertainty_tuple
+                or occupancy_checker.motion_envelope_acceptance_id != acceptance_id
+            ):
+                raise ValueError("Mesh and occupancy preflight motion envelopes differ")
+            with performance_span("planning.occupancy_collision_preflight"):
+                require_planning_time("before occupancy collision preflight")
+                occupancy = _sample_occupancy_path_holorobot_style(
+                    occupancy_checker,
+                    waypoints,
+                    maximum_joint_step_rad=maximum_joint_step_rad,
+                    required_freshness_horizon_s=required_freshness_horizon_s,
+                )
+                require_planning_time("after occupancy collision preflight")
+            if occupancy.status is not CollisionCheckStatus.CLEAR:
+                reasons = occupancy.result.blocking_reasons or (
+                    f"occupancy_status:{occupancy.status.value}",
+                )
+                return JointMotionPreflight(
+                    status=MotionPreflightStatus.BLOCKED,
+                    start_joint_positions_rad=start,
+                    goal_joint_positions_rad=goal,
+                    planning_waypoints=waypoints,
+                    servoj_stream=None,
+                    collision=prechecked_goal_collision,
+                    occupancy=occupancy,
+                    blocking_reasons=reasons,
+                    warnings=(),
+                    diagnostics=diagnostics,
+                    occupancy_required=bool(require_occupancy),
+                    swept_mesh_required=False,
+                    continuous_occupancy_sweep_required=False,
+                    path_validation_mode=validation_mode,
+                )
+        elif require_occupancy:
+            return JointMotionPreflight(
+                status=MotionPreflightStatus.CHECKER_UNAVAILABLE,
+                start_joint_positions_rad=start,
+                goal_joint_positions_rad=goal,
+                planning_waypoints=waypoints,
+                servoj_stream=None,
+                collision=prechecked_goal_collision,
+                occupancy=None,
+                blocking_reasons=("occupancy_checker_unavailable",),
+                warnings=(),
+                diagnostics=diagnostics,
+                occupancy_required=True,
+                swept_mesh_required=False,
+                continuous_occupancy_sweep_required=False,
+                path_validation_mode=validation_mode,
             )
-        else:
-            collision = collision_checker.check_path(
-                start,
-                goal,
-                maximum_joint_step_rad=maximum_joint_step_rad,
-                maximum_joint_path_deviation_rad=uncertainty_tuple,
-                motion_envelope_acceptance_id=acceptance_id,
-                motion_envelope_metadata_sha256=acceptance_metadata_sha256,
-            )
-        require_planning_time("after mesh collision preflight")
+    if collision is None:
+        with performance_span("planning.mesh_collision_preflight"):
+            require_planning_time("before mesh collision preflight")
+            if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
+                collision = _sample_mesh_path_holorobot_style(
+                    collision_checker,
+                    waypoints,
+                    maximum_joint_step_rad=maximum_joint_step_rad,
+                )
+            else:
+                collision = collision_checker.check_path(
+                    start,
+                    goal,
+                    maximum_joint_step_rad=maximum_joint_step_rad,
+                    maximum_joint_path_deviation_rad=uncertainty_tuple,
+                    motion_envelope_acceptance_id=acceptance_id,
+                    motion_envelope_metadata_sha256=acceptance_metadata_sha256,
+                )
+            require_planning_time("after mesh collision preflight")
     if collision.status is not CollisionCheckStatus.CLEAR:
         reasons = collision.result.blocking_reasons or (
             f"collision_status:{collision.status.value}",
@@ -853,13 +1071,15 @@ def _preflight_joint_waypoints(
             planning_waypoints=waypoints,
             servoj_stream=None,
             collision=collision,
-            occupancy=None,
+            occupancy=occupancy,
             blocking_reasons=reasons,
             warnings=(),
             diagnostics=diagnostics,
             occupancy_required=bool(require_occupancy),
             swept_mesh_required=bool(require_swept_mesh),
-            continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
+            continuous_occupancy_sweep_required=bool(
+                require_continuous_occupancy_sweep
+            ),
             path_validation_mode=validation_mode,
         )
     if require_swept_mesh and not (
@@ -880,33 +1100,23 @@ def _preflight_joint_waypoints(
             diagnostics=diagnostics,
             occupancy_required=bool(require_occupancy),
             swept_mesh_required=True,
-            continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
+            continuous_occupancy_sweep_required=bool(
+                require_continuous_occupancy_sweep
+            ),
             path_validation_mode=validation_mode,
         )
-    with performance_span("planning.servoj_stream_generation"):
-        require_planning_time("before ServoJ time parameterization")
-        velocities = collision_checker.kinematic_model.joint_velocity_limits_rad_s()
-        timing = _time_parameterized_servoj_stream(
+    if timing is None or stream is None or required_freshness_horizon_s is None:
+        timing, stream, required_freshness_horizon_s = _prepare_servoj_timing(
             waypoints,
-            maximum_velocity_rad_s=velocities,
-            maximum_acceleration_rad_s2=maximum_joint_acceleration_rad_s2,
-            dt_s=servoj_dt_s,
+            collision_checker=collision_checker,
+            maximum_joint_acceleration_rad_s2=maximum_joint_acceleration_rad_s2,
+            servoj_dt_s=servoj_dt_s,
             speed_scaling=speed_scaling,
             velocity_margin=velocity_margin,
+            freshness_margin_s=freshness_margin_s,
+            diagnostics=diagnostics,
         )
-        stream = timing.stream
-        require_planning_time("after ServoJ time parameterization")
-    stream_duration_s = max(0, len(stream.commands) - 1) * stream.dt_s
-    required_freshness_horizon_s = stream_duration_s + freshness_margin_s
-    diagnostics["servoj_path_knot_count"] = timing.knot_count
-    diagnostics["minimum_dynamic_duration_s"] = timing.minimum_duration_s
-    diagnostics["limiting_segment_index"] = timing.limiting_segment_index
-    diagnostics["limiting_joint_index"] = timing.limiting_joint_index
-    diagnostics["limiting_constraint"] = timing.limiting_constraint
-    diagnostics["planned_servoj_duration_s"] = stream_duration_s
-    diagnostics["required_freshness_horizon_s"] = required_freshness_horizon_s
-    occupancy: JointPathOccupancyCollisionReport | None = None
-    if occupancy_checker is not None:
+    if occupancy is None and occupancy_checker is not None:
         if (
             occupancy_checker.accepted_joint_uncertainty_rad != uncertainty_tuple
             or occupancy_checker.motion_envelope_acceptance_id != acceptance_id
@@ -946,7 +1156,9 @@ def _preflight_joint_waypoints(
                 diagnostics=diagnostics,
                 occupancy_required=bool(require_occupancy),
                 swept_mesh_required=bool(require_swept_mesh),
-                continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
+                continuous_occupancy_sweep_required=bool(
+                    require_continuous_occupancy_sweep
+                ),
                 path_validation_mode=validation_mode,
             )
         if require_continuous_occupancy_sweep and not (
@@ -970,7 +1182,7 @@ def _preflight_joint_waypoints(
                 continuous_occupancy_sweep_required=True,
                 path_validation_mode=validation_mode,
             )
-    elif require_occupancy:
+    elif occupancy is None and require_occupancy:
         return JointMotionPreflight(
             status=MotionPreflightStatus.CHECKER_UNAVAILABLE,
             start_joint_positions_rad=start,
@@ -984,7 +1196,9 @@ def _preflight_joint_waypoints(
             diagnostics=diagnostics,
             occupancy_required=True,
             swept_mesh_required=bool(require_swept_mesh),
-            continuous_occupancy_sweep_required=bool(require_continuous_occupancy_sweep),
+            continuous_occupancy_sweep_required=bool(
+                require_continuous_occupancy_sweep
+            ),
             path_validation_mode=validation_mode,
         )
     preflight = JointMotionPreflight(
@@ -997,9 +1211,7 @@ def _preflight_joint_waypoints(
         occupancy=occupancy,
         blocking_reasons=(),
         warnings=(
-            (
-                "online_path_uses_holorobot_fixed_step_segment_sampling",
-            )
+            ("online_path_uses_holorobot_fixed_step_segment_sampling",)
             if validation_mode == HOLOROBOT_SAMPLED_VALIDATION
             else (
                 *(
@@ -1015,12 +1227,16 @@ def _preflight_joint_waypoints(
                 *(
                     ()
                     if require_continuous_occupancy_sweep
-                    else ("continuous_swept_occupancy_disabled_offline_diagnostic_only",)
+                    else (
+                        "continuous_swept_occupancy_disabled_offline_diagnostic_only",
+                    )
                 ),
                 *(
                     ()
                     if require_occupancy
-                    else ("continuous_swept_occupancy_unavailable_offline_diagnostic_only",)
+                    else (
+                        "continuous_swept_occupancy_unavailable_offline_diagnostic_only",
+                    )
                 ),
                 *(
                     ()
@@ -1043,7 +1259,9 @@ def _preflight_joint_waypoints(
     if validation_mode == HOLOROBOT_SAMPLED_VALIDATION:
         payload = _holorobot_sampled_evidence_payload(preflight)
         if payload is None:
-            raise ValueError("HoloRobot sampled preflight lacks bound collision evidence")
+            raise ValueError(
+                "HoloRobot sampled preflight lacks bound collision evidence"
+            )
         preflight = replace(
             preflight,
             path_validation_evidence_sha256=_canonical_sha256(payload),
@@ -1085,9 +1303,7 @@ def _endpoint_blocked_preflight(
             "maximum_joint_step_rad": maximum_joint_step_rad,
             "path_validation_mode": path_validation_mode,
             "require_occupancy": require_occupancy,
-            "accepted_joint_uncertainty_rad": list(
-                accepted_joint_uncertainty_rad
-            ),
+            "accepted_joint_uncertainty_rad": list(accepted_joint_uncertainty_rad),
             "motion_envelope_acceptance_id": motion_envelope_acceptance_id,
             "motion_envelope_metadata_sha256": motion_envelope_metadata_sha256,
             "planning_waypoints_sha256": _waypoints_sha256(waypoints),
@@ -1178,7 +1394,14 @@ def preflight_linear_joint_motion(
     velocity_margin: float = 0.8,
     maximum_joint_acceleration_rad_s2: tuple[
         float, float, float, float, float, float
-    ] = (4.0, 4.0, 4.0, 4.0, 4.0, 4.0),
+    ] = (
+        4.0,
+        4.0,
+        4.0,
+        4.0,
+        4.0,
+        4.0,
+    ),
     execution_freshness_margin_s: float = 1.0,
     servoj_runtime_config: ServoJStreamConfig | None = None,
     accepted_joint_uncertainty_rad: tuple[float, float, float, float, float, float] = (
@@ -1228,6 +1451,7 @@ def preflight_linear_joint_motion(
 
     # HoloRobot rejects an invalid goal before spending time on either a direct
     # path or RRTConnect.  Preserve that ordering for the online sampled mode.
+    goal_mesh_report: JointPathMeshCollisionReport | None = None
     if (
         path_validation_mode == HOLOROBOT_SAMPLED_VALIDATION
         and collision_checker is not None
@@ -1279,6 +1503,7 @@ def preflight_linear_joint_motion(
         start,
         goal,
         planning_waypoints=waypoints,
+        prechecked_goal_collision=goal_mesh_report,
         **common,
     )
     if (
@@ -1302,8 +1527,7 @@ def preflight_linear_joint_motion(
                 "failure_stage": (
                     "goal_endpoint"
                     if any(
-                        report is not None
-                        and report.blocked_path_fraction == 1.0
+                        report is not None and report.blocked_path_fraction == 1.0
                         for report in (primary.collision, primary.occupancy)
                     )
                     else "start_endpoint_or_checker_evidence"
@@ -1401,6 +1625,7 @@ def preflight_linear_joint_motion(
             "fallback_used": True,
             "fallback_diagnostics": fallback.diagnostics or {},
         },
+        prechecked_goal_collision=goal_mesh_report,
         **common,
     )
     return verified

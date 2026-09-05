@@ -474,6 +474,10 @@ class SupervisedExperimentRunner:
             self._require_recovered()
             self._require_not_runner_blocked()
             checkpoint = self._coordinator.checkpoint
+            planning_operation = checkpoint.phase in {
+                StopScanPhase.BOOTSTRAP_MOTION_READY,
+                StopScanPhase.MAP_READY,
+            }
             try:
                 if checkpoint.phase is StopScanPhase.IDLE:
                     self._coordinator.start()
@@ -516,7 +520,30 @@ class SupervisedExperimentRunner:
                         f"Coordinator is busy in phase {checkpoint.phase.value}"
                     )
             except StopScanBlocked as exc:
-                if self.status.disposition is not ExperimentDisposition.BLOCKED:
+                current = self.status
+                if (
+                    planning_operation
+                    and current.phase == StopScanPhase.MOTION_BLOCKED.value
+                    and current.disposition is ExperimentDisposition.NEEDS_CAPTURE
+                    and self._latest_event_type() == "planning_deadline_exceeded"
+                ):
+                    # A planning deadline contains no evidence that another camera
+                    # exposure or manual reposition can resolve the failed
+                    # computation.  Keep the coordinator's typed reason, but make
+                    # the runner terminal so the outer context confirms stop and a
+                    # later process can resume from immutable science after the
+                    # performance defect has been corrected.
+                    return self._block(
+                        "planning_restart_required:"
+                        + ";".join(current.blocking_reasons),
+                        event_type="planning_restart_required",
+                        payload={
+                            "operator_capture_can_resolve": False,
+                            "pending_motion_restored": False,
+                            "resume_preserves_accepted_science": True,
+                        },
+                    )
+                if current.disposition is not ExperimentDisposition.BLOCKED:
                     return self._block(
                         f"coordinator_blocked:{exc}",
                         event_type="coordinator_operation_blocked",
@@ -746,6 +773,10 @@ class SupervisedExperimentRunner:
             self._latch_exception("status_callback_failed", exc)
             return self.status
         return snapshot
+
+    def _latest_event_type(self) -> str | None:
+        events = self._writer.events
+        return events[-1].event_type if events else None
 
     def _exclusive_operation(self):
         return _RunnerOperation(self._operation_lock)

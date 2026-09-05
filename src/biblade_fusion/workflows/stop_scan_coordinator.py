@@ -2339,10 +2339,18 @@ class StopScanCoordinator:
                 self._blocking_reasons = (
                     f"single_segment_execution_failed:{type(exc).__name__}:{exc}",
                 )
+                execution_diagnostics = getattr(exc, "diagnostics", None)
                 self._transition(
                     StopScanPhase.ABORTED,
                     "single_segment_execution_failed",
-                    {"reason": self._blocking_reasons[0]},
+                    {
+                        "reason": self._blocking_reasons[0],
+                        **(
+                            {"execution_diagnostics": execution_diagnostics}
+                            if isinstance(execution_diagnostics, dict)
+                            else {}
+                        ),
+                    },
                 )
                 raise
             self._expected_capture_view_id = prepared.proposal.capture_view_id

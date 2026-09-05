@@ -98,6 +98,7 @@ from biblade_fusion.storage.stop_scan_run import (
     validate_stop_scan_run_id,
 )
 from biblade_fusion.storage.unknown_blade_experiment import (
+    UNKNOWN_BLADE_EXPERIMENTAL_ACCEPTANCE_STATUS,
     UNKNOWN_BLADE_FINE_START_PROTOCOL,
     UnknownBladeExperimentWriter,
     read_unknown_blade_experiment,
@@ -196,6 +197,14 @@ class _CoarseSession(Protocol):
     @property
     def current_generation_path(self) -> Path | None: ...
 
+    @property
+    def endpoint_validation_binding(
+        self,
+    ) -> tuple[
+        str,
+        tuple[float, float, float, float, float, float],
+    ] | None: ...
+
     def stage_operator_capture(
         self,
         *,
@@ -239,6 +248,9 @@ class _FineRunnerFactory(Protocol):
 
 class _ExperimentHandoffChain(Protocol):
     root: Path
+
+    @property
+    def fine_start_uses_candidate_commit(self) -> bool: ...
 
     def append_coarse_checkpoint(self, *, coarse_generation: str | Path) -> object: ...
 
@@ -319,6 +331,7 @@ class UnknownBladeResumePlan:
     science_authority: ScienceAcceptanceAuthority | None = None
     runtime_timing_authority: RuntimeTimingAcceptanceAuthority | None = None
     placement_id: str | None = None
+    experimental_unaccepted: bool = False
 
 
 def _record_root(payload: object, *, label: str) -> Path:
@@ -336,10 +349,33 @@ def load_unknown_blade_resume_plan(output_root: str | Path) -> UnknownBladeResum
     experiment_root = Path(output_root).resolve()
     handoff_root = experiment_root / "experiment_handoff"
     stored = read_unknown_blade_experiment(handoff_root)
-    if getattr(stored, "fine_start_protocol", None) != UNKNOWN_BLADE_FINE_START_PROTOCOL:
+    fine_start_protocol = getattr(stored, "fine_start_protocol", None)
+    acceptance_status = getattr(stored, "acceptance_status", None)
+    stored_science_authority = getattr(stored, "science_authority", None)
+    stored_timing_authority = getattr(stored, "runtime_timing_authority", None)
+    legacy_experimental = bool(
+        fine_start_protocol is None
+        and acceptance_status is None
+        and stored_science_authority is None
+        and stored_timing_authority is None
+    )
+    explicit_experimental = (
+        acceptance_status == UNKNOWN_BLADE_EXPERIMENTAL_ACCEPTANCE_STATUS
+    )
+    if (
+        fine_start_protocol != UNKNOWN_BLADE_FINE_START_PROTOCOL
+        and not legacy_experimental
+    ):
         raise UnknownBladeRuntimeError(
             "Legacy single-phase unknown-blade chains are audit-readable only; "
             "production continuation requires the candidate-commit fine-start protocol"
+    )
+    if explicit_experimental and (
+        stored_science_authority is not None
+        or stored_timing_authority is not None
+    ):
+        raise UnknownBladeRuntimeError(
+            "Experimental resume chain unexpectedly carries production authorities"
         )
     events = stored.events
     initialized = events[0].payload
@@ -444,28 +480,47 @@ def load_unknown_blade_resume_plan(output_root: str | Path) -> UnknownBladeResum
         science_authority=getattr(stored, "science_authority", None),
         runtime_timing_authority=getattr(stored, "runtime_timing_authority", None),
         placement_id=getattr(stored, "placement_id", None),
+        experimental_unaccepted=legacy_experimental or explicit_experimental,
     )
 
 
 class CompletedUnknownBladeRuntime:
     """Read-only report for an already sealed experiment; it owns no devices."""
 
-    def __init__(self, plan: UnknownBladeResumePlan) -> None:
+    def __init__(
+        self,
+        plan: UnknownBladeResumePlan,
+        *,
+        experimental_unaccepted: bool = False,
+    ) -> None:
         if (
             plan.phase is not UnknownBladeResumePhase.COMPLETE
             or plan.fine_run_root is None
             or plan.final_reconstruction_path is None
         ):
             raise ValueError("Completed runtime requires a sealed fine resume plan")
-        if plan.science_authority is None or plan.runtime_timing_authority is None:
+        if not experimental_unaccepted and (
+            plan.science_authority is None or plan.runtime_timing_authority is None
+        ):
             raise ValueError(
                 "Production COMPLETE requires science and runtime timing authorities; "
                 "legacy chains are audit-readable only"
             )
+        if experimental_unaccepted and (
+            plan.science_authority is not None
+            or plan.runtime_timing_authority is not None
+        ):
+            raise ValueError(
+                "Experimental COMPLETE cannot carry production authorities"
+            )
         fine = read_stop_scan_run(plan.fine_run_root)
-        final = replay_final_fine_reconstruction(
-            plan.final_reconstruction_path,
-            expected_science_authority=plan.science_authority,
+        final = (
+            replay_final_fine_reconstruction(plan.final_reconstruction_path)
+            if experimental_unaccepted
+            else replay_final_fine_reconstruction(
+                plan.final_reconstruction_path,
+                expected_science_authority=plan.science_authority,
+            )
         )
         if final.root != plan.final_reconstruction_path:
             raise ValueError("Completed runtime reconstruction authority changed")
@@ -614,6 +669,30 @@ def _rebind_coarse_selection_to_current_stop(
         target=rebound[0].target,
         diagnostics=rebound[0].diagnostics,
         ranked_candidates=tuple(rebound),
+    )
+
+
+def _reuse_exact_discovery_endpoint_authority(
+    selection: NextViewSelection,
+) -> NextViewSelection:
+    """Mark that current-stop IK came from the exact in-memory discovery revision."""
+
+    rebound = tuple(
+        replace(
+            ranked,
+            diagnostics=(
+                *ranked.diagnostics,
+                "ik_rebound_to_current_stop=true",
+                "ik_rebind_source=exact_discovery_endpoint_authority",
+            ),
+        )
+        for ranked in selection.preflight_candidates
+    )
+    return replace(
+        selection,
+        target=rebound[0].target,
+        diagnostics=rebound[0].diagnostics,
+        ranked_candidates=rebound,
     )
 
 
@@ -796,7 +875,21 @@ class CoarseSessionNextViewAdapter:
                 "Coarse completion must be promoted through the schema-5 gate"
             )
         if self._selection_rebinder is not None:
-            selection = self._selection_rebinder(selection, observation)
+            trace = observation.inference_robot_state_trace
+            current = (
+                trace[-1].joint_positions_rad
+                if trace
+                else observation.stationarity_reference.joint_positions_rad
+            )
+            current_binding = tuple(float(value) for value in current)
+            endpoint_binding = self._session.endpoint_validation_binding
+            if endpoint_binding == (
+                selection.selection_policy_sha256,
+                current_binding,
+            ):
+                selection = _reuse_exact_discovery_endpoint_authority(selection)
+            else:
+                selection = self._selection_rebinder(selection, observation)
         binding = selection.reference_model_sha256
         if self._run_reference_model_sha256 is None:
             self._run_reference_model_sha256 = binding
@@ -1100,17 +1193,20 @@ class UnknownBladeSupervisedRuntime:
             try:
                 status = self._active_runner.start()
                 self._require_schema5_handoff_budget(resumed_handoff_started)
-                self._experiment_handoff.append_fine_start_candidate(
-                    fine_run_root=status.run_root,
-                )
-                self._verify_handoff_chain()
-                self._require_schema5_handoff_budget(resumed_handoff_started)
-                self._experiment_handoff.append_fine_started(
-                    timing_scope="resume_fine_start",
-                    budget_check=lambda: self._require_schema5_commit_budget(
-                        resumed_handoff_started
-                    ),
-                )
+                if self._experimental:
+                    self._append_unaccepted_fine_started(status.run_root)
+                else:
+                    self._experiment_handoff.append_fine_start_candidate(
+                        fine_run_root=status.run_root,
+                    )
+                    self._verify_handoff_chain()
+                    self._require_schema5_handoff_budget(resumed_handoff_started)
+                    self._experiment_handoff.append_fine_started(
+                        timing_scope="resume_fine_start",
+                        budget_check=lambda: self._require_schema5_commit_budget(
+                            resumed_handoff_started
+                        ),
+                    )
                 # The storage writer checked the deadline after fsync of the
                 # completed event temporary and before its atomic publication.
                 # A durable FINE_STARTED is therefore authoritative; do not add
@@ -1287,6 +1383,20 @@ class UnknownBladeSupervisedRuntime:
                 "Coarse safety refresh is available only during active coarse scan"
             )
         status = self._active_runner.status
+        if any(
+            reason.startswith(
+                (
+                    "planning_deadline_exceeded:",
+                    "planning_restart_required:",
+                )
+            )
+            for reason in status.blocking_reasons
+        ):
+            raise UnknownBladeRuntimeError(
+                "A planning deadline cannot be recovered by a SAFETY_REFRESH capture; "
+                "stop this process and resume the preserved experiment after the "
+                "planning defect is corrected"
+            )
         if (
             status.phase not in {
                 StopScanPhase.MOTION_BLOCKED.value,
@@ -1544,9 +1654,7 @@ class UnknownBladeSupervisedRuntime:
                 return
             self._require_schema5_handoff_budget(handoff_started_monotonic_s)
             if self._experimental:
-                self._experiment_handoff.append_unaccepted_fine_started(
-                    fine_run_root=fine_status.run_root,
-                )
+                self._append_unaccepted_fine_started(fine_status.run_root)
             else:
                 self._experiment_handoff.append_fine_start_candidate(
                     fine_run_root=fine_status.run_root,
@@ -1594,6 +1702,16 @@ class UnknownBladeSupervisedRuntime:
         if initial.disposition is not ExperimentDisposition.READY:
             self._block("fine handoff failed to enter a recoverable safety-map state")
             return
+
+    def _append_unaccepted_fine_started(self, fine_run_root: Path) -> None:
+        if self._experiment_handoff.fine_start_uses_candidate_commit:
+            self._experiment_handoff.append_fine_start_candidate(
+                fine_run_root=fine_run_root,
+            )
+            self._verify_handoff_chain()
+        self._experiment_handoff.append_unaccepted_fine_started(
+            fine_run_root=fine_run_root,
+        )
 
     def _monotonic_now(self) -> float:
         value = float(self._monotonic_clock())
@@ -2138,6 +2256,16 @@ def open_production_unknown_blade_runtime(
                 f"Unknown-blade resume root does not exist: {root}"
             )
         resume_plan = load_unknown_blade_resume_plan(root)
+        if resume_plan.experimental_unaccepted != experimental:
+            required_mode = (
+                "--experimental --resume"
+                if resume_plan.experimental_unaccepted
+                else "production --resume"
+            )
+            raise UnknownBladeRuntimeError(
+                "Resume mode differs from the immutable experiment INIT authority; "
+                f"use {required_mode}"
+            )
         identity = validate_stop_scan_run_id(run_id or resume_plan.experiment_id)
         if identity != resume_plan.experiment_id:
             raise UnknownBladeRuntimeError(
@@ -2161,6 +2289,12 @@ def open_production_unknown_blade_runtime(
             )
         bound_placement_id = requested_placement_id
     if resume_plan is not None and resume_plan.phase is UnknownBladeResumePhase.COMPLETE:
+        if experimental:
+            yield CompletedUnknownBladeRuntime(
+                resume_plan,
+                experimental_unaccepted=True,
+            )
+            return
         if (
             resume_plan.science_authority is None
             or resume_plan.runtime_timing_authority is None
@@ -2486,7 +2620,10 @@ def open_production_unknown_blade_runtime(
                     **coarse_runner_kwargs,
                 )
         experiment_handoff = (
-            UnknownBladeExperimentWriter.resume(root / "experiment_handoff")
+            UnknownBladeExperimentWriter.resume(
+                root / "experiment_handoff",
+                production=not experimental,
+            )
             if resume_plan is not None
             else UnknownBladeExperimentWriter.create(
                 root / "experiment_handoff",
@@ -2825,9 +2962,60 @@ def run_unknown_blade_operator_console(
             status.disposition is ExperimentDisposition.NEEDS_CAPTURE
             and status.expected_capture_view_id is None
         ):
+            if snapshot.phase is UnknownBladeRuntimePhase.COARSE_SCAN:
+                recovery_refresh = (
+                    "recovery_requires_fresh_safety_refresh"
+                    in status.blocking_reasons
+                )
+                if recovery_refresh:
+                    output_fn(
+                        "Recovered coarse science/map checkpoint requires one fresh "
+                        "occupancy-only safety capture before planning."
+                    )
+                    command = input_fn(
+                        "Keep the blade, fixture, camera mount, and stopped robot pose "
+                        "unchanged; enter c to capture one occupancy-only "
+                        "SAFETY_REFRESH, or q to stop: "
+                    )
+                else:
+                    output_fn(
+                        "Coarse motion is blocked by the current posture/occupancy: "
+                        + "; ".join(status.blocking_reasons)
+                    )
+                    command = input_fn(
+                        "Manually reposition the stopped robot to a safe useful view, "
+                        "then enter c to capture one occupancy-only SAFETY_REFRESH, "
+                        "or q to stop: "
+                    )
+                parts = command.strip().lower().split()
+                if parts == ["q"]:
+                    runtime.request_stop("operator requested stop")
+                elif parts == ["c"]:
+                    runtime.capture_coarse_safety_refresh()
+                else:
+                    output_fn("No capture: enter exactly c or q; side labels are not valid here.")
+                continue
+            if snapshot.phase is UnknownBladeRuntimePhase.FINE_SCAN:
+                output_fn(
+                    "Fine safety occupancy needs an operator-positioned source: "
+                    + "; ".join(status.blocking_reasons)
+                )
+                command = input_fn(
+                    "Manually reposition the stopped robot to a safe useful view, "
+                    "then enter c to capture one occupancy-only safety source, "
+                    "or q to stop: "
+                )
+                parts = command.strip().lower().split()
+                if parts == ["q"]:
+                    runtime.request_stop("operator requested stop")
+                elif parts == ["c"]:
+                    runtime.capture_fine_source_replenishment()
+                else:
+                    output_fn("No capture: enter exactly c or q; side labels are not valid here.")
+                continue
             command = input_fn(
-                "Manually reposition the stopped robot. Enter c, c front, c back, "
-                "or q to stop: "
+                "Manually reposition the stopped robot for blade bootstrap. "
+                "Enter c, c front, c back, or q to stop: "
             )
             parts = command.strip().lower().split()
             if parts == ["q"]:
@@ -2840,27 +3028,16 @@ def run_unknown_blade_operator_console(
                     except ValueError:
                         output_fn("Unknown side: use exactly front or back.")
                         continue
-                if snapshot.phase is UnknownBladeRuntimePhase.FINE_SCAN:
-                    if explicit_side is not None:
-                        output_fn("Fine safety replenishment does not accept a side label.")
-                        continue
-                    runtime.capture_fine_source_replenishment()
-                elif snapshot.phase is UnknownBladeRuntimePhase.COARSE_SCAN:
-                    if explicit_side is not None:
-                        output_fn("Coarse safety refresh does not accept a side label.")
-                        continue
-                    runtime.capture_coarse_safety_refresh()
-                else:
-                    first_capture = snapshot.operator_bootstrap_views == 0
-                    runtime.capture_operator_view(
-                        seed=initial_bootstrap_seed if first_capture else None,
-                        seed_provider=formal_frame_seed_provider,
-                        operator_side=(
-                            explicit_side
-                            if explicit_side is not None
-                            else initial_operator_side if first_capture else None
-                        ),
-                    )
+                first_capture = snapshot.operator_bootstrap_views == 0
+                runtime.capture_operator_view(
+                    seed=initial_bootstrap_seed if first_capture else None,
+                    seed_provider=formal_frame_seed_provider,
+                    operator_side=(
+                        explicit_side
+                        if explicit_side is not None
+                        else initial_operator_side if first_capture else None
+                    ),
+                )
             else:
                 output_fn("No capture: enter exactly c, c front, c back, or q.")
             continue

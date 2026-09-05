@@ -65,7 +65,9 @@ _SEMANTIC_VERIFIER_CONTRACT_PAYLOAD = {
     "occupancy_mapping_schema": 7,
     "snapshot_type": "biblade_fusion.mapping.occupancy.OccupancySnapshot",
     "snapshot_content_hash": "canonical_sha256_recomputed",
-    "verification": ("integrity_chain+raw_stereo_source+hand_eye+es68_fk+active_robot_rerender"),
+    "verification": (
+        "integrity_chain+raw_stereo_source+hand_eye+es68_fk+active_robot_rerender"
+    ),
     "replay_eligible": False,
 }
 OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH = hashlib.sha256(
@@ -76,6 +78,7 @@ OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH = hashlib.sha256(
         allow_nan=False,
     ).encode("utf-8")
 ).hexdigest()
+
 
 def _semantic_attestation_hash(
     *,
@@ -126,7 +129,9 @@ class OccupancySemanticAttestation:
     semantic_verifier_contract_hash: str
 
     def __init__(self, *_: object, **__: object) -> None:
-        raise TypeError("OccupancySemanticAttestation is issued only by full semantic verification")
+        raise TypeError(
+            "OccupancySemanticAttestation is issued only by full semantic verification"
+        )
 
     @property
     def attestation_hash(self) -> str:
@@ -146,8 +151,12 @@ class OccupancySemanticAttestation:
         *,
         robot_geometry_hash: str,
     ) -> None:
-        if self.semantic_verifier_contract_hash != (OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH):
-            raise OccupancyEvidenceError("occupancy_semantic_verifier_contract_is_not_current")
+        if self.semantic_verifier_contract_hash != (
+            OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH
+        ):
+            raise OccupancyEvidenceError(
+                "occupancy_semantic_verifier_contract_is_not_current"
+            )
         expected = (
             snapshot.sequence,
             snapshot.content_hash,
@@ -177,7 +186,9 @@ def _issue_occupancy_semantic_attestation(
     """Issue the strong type used by storage after full semantic verification."""
 
     if type(snapshot) is not OccupancySnapshot:
-        raise OccupancyEvidenceError("occupancy_semantic_attestation_requires_concrete_snapshot")
+        raise OccupancyEvidenceError(
+            "occupancy_semantic_attestation_requires_concrete_snapshot"
+        )
     metadata_hash = _sha256_digest(
         occupancy_metadata_sha256,
         reason="occupancy_metadata_hash_must_be_sha256",
@@ -248,7 +259,10 @@ class OccupancyMapEvidence:
             for value in digests
         ):
             return False
-        if self.semantic_verifier_contract_hash != OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH:
+        if (
+            self.semantic_verifier_contract_hash
+            != OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH
+        ):
             return False
         expected = _semantic_attestation_hash(
             occupancy_metadata_sha256=self.occupancy_metadata_sha256,
@@ -333,7 +347,8 @@ class AcceptedStaticFreeAabb:
     ) -> bool:
         tolerance = max(1e-12, snapshot.voxel_size_m * 1e-9)
         lower = tuple(
-            snapshot.origin_m[axis] + index[axis] * snapshot.voxel_size_m for axis in range(3)
+            snapshot.origin_m[axis] + index[axis] * snapshot.voxel_size_m
+            for axis in range(3)
         )
         upper = tuple(value + snapshot.voxel_size_m for value in lower)
         return all(
@@ -364,6 +379,7 @@ class _RobotGeometryVoxelQuery:
     minimum_dangerous_distance_m: float | None
     blocking_voxel_index: tuple[int, int, int] | None
     queried_count: int
+    query_complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,7 +504,9 @@ class SweptOccupancyProofEvidence:
             "trajectory_sha256": self.trajectory_sha256,
             "map_binding_sha256": self.map_binding_sha256,
             "occupancy_policy_contract_hash": self.occupancy_policy_contract_hash,
-            "robot_motion_bound_contract_sha256": (self.robot_motion_bound_contract_sha256),
+            "robot_motion_bound_contract_sha256": (
+                self.robot_motion_bound_contract_sha256
+            ),
             "motion_envelope_acceptance_id": self.motion_envelope_acceptance_id,
             "motion_envelope_metadata_sha256": self.motion_envelope_metadata_sha256,
             "accepted_joint_uncertainty_rad": list(self.accepted_joint_uncertainty_rad),
@@ -501,7 +519,9 @@ class SweptOccupancyProofEvidence:
             "geometry_voxel_distance_query_count": (
                 self.geometry_voxel_distance_query_count
             ),
-            "accepted_unknown_voxel_query_count": (self.accepted_unknown_voxel_query_count),
+            "accepted_unknown_voxel_query_count": (
+                self.accepted_unknown_voxel_query_count
+            ),
             "deepest_subdivision": self.deepest_subdivision,
             "termination_reason": self.termination_reason,
         }
@@ -520,12 +540,17 @@ class SweptOccupancyProofEvidence:
             self.evidence_sha256,
         )
         if any(
-            len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
             for value in digests
         ):
             return False
         envelope = np.asarray(self.accepted_joint_uncertainty_rad, dtype=np.float64)
-        if envelope.shape != (6,) or not np.isfinite(envelope).all() or np.any(envelope < 0.0):
+        if (
+            envelope.shape != (6,)
+            or not np.isfinite(envelope).all()
+            or np.any(envelope < 0.0)
+        ):
             return False
         if np.any(envelope > 0.0):
             acceptance_id = self.motion_envelope_acceptance_id
@@ -591,7 +616,8 @@ class JointPathOccupancyCollisionReport:
             and proof.termination_reason
             in {"all_intervals_certified", "constant_path_configuration_clear"}
             and map_evidence is not None
-            and proof.map_binding_sha256 == _occupancy_evidence_binding_sha256(map_evidence)
+            and proof.map_binding_sha256
+            == _occupancy_evidence_binding_sha256(map_evidence)
             and proof.occupancy_policy_contract_hash
             == self.result.diagnostics.get("occupancy_policy_contract_hash")
             and proof.robot_motion_bound_contract_sha256
@@ -626,7 +652,9 @@ def _normalized_created_at(value: datetime) -> str:
 
 def _sha256_digest(value: object, *, reason: str) -> str:
     text = str(value)
-    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+    if len(text) != 64 or any(
+        character not in "0123456789abcdef" for character in text
+    ):
         raise OccupancyEvidenceError(reason)
     return text
 
@@ -645,12 +673,12 @@ def occupancy_evidence_from_snapshot(
     """Validate one snapshot and return the identity bound to motion evidence."""
 
     if type(snapshot) is not OccupancySnapshot:
-        raise OccupancyEvidenceError("occupancy_snapshot_must_be_concrete_immutable_snapshot")
+        raise OccupancyEvidenceError(
+            "occupancy_snapshot_must_be_concrete_immutable_snapshot"
+        )
     if compute_content_hash(snapshot) != snapshot.content_hash:
         raise OccupancyEvidenceError("occupancy_snapshot_content_hash_mismatch")
-    if max_age_s is not None and (
-        not math.isfinite(max_age_s) or max_age_s <= 0.0
-    ):
+    if max_age_s is not None and (not math.isfinite(max_age_s) or max_age_s <= 0.0):
         raise OccupancyEvidenceError("occupancy_max_age_must_be_positive")
     if not isinstance(now_utc, datetime) or now_utc.tzinfo is None:
         raise OccupancyEvidenceError("occupancy_check_time_must_be_timezone_aware")
@@ -665,7 +693,9 @@ def occupancy_evidence_from_snapshot(
     if map_state != "map_ready" and not (
         allow_mapping_prefix and map_state == "mapping"
     ):
-        raise OccupancyEvidenceError(f"occupancy_map_not_ready:{_enum_value(snapshot.map_state)}")
+        raise OccupancyEvidenceError(
+            f"occupancy_map_not_ready:{_enum_value(snapshot.map_state)}"
+        )
     sequence = int(snapshot.sequence)
     if sequence < 0:
         raise OccupancyEvidenceError("occupancy_sequence_must_be_non_negative")
@@ -687,7 +717,9 @@ def occupancy_evidence_from_snapshot(
     )
     if semantic_attestation is not None:
         if type(semantic_attestation) is not OccupancySemanticAttestation:
-            raise OccupancyEvidenceError("occupancy_semantic_attestation_has_invalid_type")
+            raise OccupancyEvidenceError(
+                "occupancy_semantic_attestation_has_invalid_type"
+            )
         semantic_attestation.assert_matches(
             snapshot,
             robot_geometry_hash=robot_geometry_hash,
@@ -751,7 +783,9 @@ def occupancy_evidence_from_snapshot(
             else None
         ),
         semantic_attestation_hash=(
-            semantic_attestation.attestation_hash if semantic_attestation is not None else None
+            semantic_attestation.attestation_hash
+            if semantic_attestation is not None
+            else None
         ),
     )
 
@@ -789,7 +823,9 @@ class OccupancyRobotCollisionChecker:
     )
     motion_envelope_acceptance_id: str | None = None
     motion_envelope_metadata_sha256: str | None = None
-    utc_clock: Callable[[], datetime] = field(default=lambda: datetime.now(UTC), repr=False)
+    utc_clock: Callable[[], datetime] = field(
+        default=lambda: datetime.now(UTC), repr=False
+    )
     _voxel_classification_content_hash: str | None = field(
         default=None,
         init=False,
@@ -800,23 +836,50 @@ class OccupancyRobotCollisionChecker:
         init=False,
         repr=False,
     )
+    _voxel_query_layout_content_hash: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _voxel_query_layouts: dict[
+        tuple[int, int, int, int, int, int],
+        tuple[
+            int,
+            int,
+            tuple[tuple[int, int, tuple[int, int, int]], ...],
+        ],
+    ] = field(default_factory=dict, init=False, repr=False)
+    _voxel_geometry_content_hash: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _voxel_geometries: dict[
+        tuple[int, int, int, int],
+        tuple[Any, Any],
+    ] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.maximum_map_age_s is not None and (
-            not math.isfinite(self.maximum_map_age_s)
-            or self.maximum_map_age_s <= 0.0
+            not math.isfinite(self.maximum_map_age_s) or self.maximum_map_age_s <= 0.0
         ):
             raise ValueError("maximum_map_age_s must be finite and positive")
         if self.authorization_started_at_utc is not None:
             if self.authorization_started_at_utc.tzinfo is None:
                 raise ValueError("authorization_started_at_utc must be timezone-aware")
-            self.authorization_started_at_utc = self.authorization_started_at_utc.astimezone(UTC)
-        if not math.isfinite(self.additional_clearance_m) or self.additional_clearance_m < 0.0:
+            self.authorization_started_at_utc = (
+                self.authorization_started_at_utc.astimezone(UTC)
+            )
+        if (
+            not math.isfinite(self.additional_clearance_m)
+            or self.additional_clearance_m < 0.0
+        ):
             raise ValueError("additional_clearance_m must be finite and non-negative")
         if len(set(self.ignored_geometry_names)) != len(self.ignored_geometry_names):
             raise ValueError("ignored occupancy geometry names must be unique")
         if any(
-            type(item) is not AcceptedStaticFreeAabb for item in self.accepted_static_free_aabbs
+            type(item) is not AcceptedStaticFreeAabb
+            for item in self.accepted_static_free_aabbs
         ):
             raise ValueError("accepted static-free regions require strong AABB values")
         accepted_names = tuple(item.name for item in self.accepted_static_free_aabbs)
@@ -835,7 +898,9 @@ class OccupancyRobotCollisionChecker:
             self.accepted_static_free_acceptance_id is not None
             or self.accepted_static_free_mapping_context_hash is not None
         ):
-            raise ValueError("static-free acceptance identity/context require at least one AABB")
+            raise ValueError(
+                "static-free acceptance identity/context require at least one AABB"
+            )
         if (
             self.allow_mapping_prefix_in_accepted_static_free
             and not self.accepted_static_free_aabbs
@@ -856,18 +921,25 @@ class OccupancyRobotCollisionChecker:
                 reason="occupancy_verified_robot_geometry_hash_must_be_sha256",
             )
         if checker_identity is None and explicit_identity is None:
-            raise ValueError("occupancy checker requires a hash-bound robot geometry identity")
+            raise ValueError(
+                "occupancy checker requires a hash-bound robot geometry identity"
+            )
         if (
             checker_identity is not None
             and explicit_identity is not None
             and checker_identity != explicit_identity
         ):
-            raise ValueError("explicit occupancy robot geometry differs from robot checker")
+            raise ValueError(
+                "explicit occupancy robot geometry differs from robot checker"
+            )
         self.verified_robot_geometry_hash = checker_identity or explicit_identity
         if self.semantic_attestation is not None:
             if type(self.semantic_attestation) is not OccupancySemanticAttestation:
                 raise ValueError("occupancy semantic attestation has invalid type")
-            if self.semantic_attestation.robot_geometry_hash != self.verified_robot_geometry_hash:
+            if (
+                self.semantic_attestation.robot_geometry_hash
+                != self.verified_robot_geometry_hash
+            ):
                 raise ValueError(
                     "occupancy semantic attestation robot geometry differs from checker"
                 )
@@ -877,7 +949,9 @@ class OccupancyRobotCollisionChecker:
             or not np.isfinite(uncertainty).all()
             or np.any(uncertainty < 0.0)
         ):
-            raise ValueError("accepted joint uncertainty must be a non-negative six-vector")
+            raise ValueError(
+                "accepted joint uncertainty must be a non-negative six-vector"
+            )
         acceptance_id = self.motion_envelope_acceptance_id
         if np.any(uncertainty > 0.0):
             acceptance_id = _sha256_digest(
@@ -889,12 +963,18 @@ class OccupancyRobotCollisionChecker:
                 reason="motion_envelope_metadata_sha256_must_be_sha256",
             )
         elif acceptance_id is not None:
-            raise ValueError("motion-envelope identity cannot bind a zero uncertainty vector")
+            raise ValueError(
+                "motion-envelope identity cannot bind a zero uncertainty vector"
+            )
         elif self.motion_envelope_metadata_sha256 is not None:
-            raise ValueError("motion-envelope metadata cannot bind a zero uncertainty vector")
+            raise ValueError(
+                "motion-envelope metadata cannot bind a zero uncertainty vector"
+            )
         else:
             metadata_sha256 = None
-        self.accepted_joint_uncertainty_rad = tuple(float(value) for value in uncertainty)
+        self.accepted_joint_uncertainty_rad = tuple(
+            float(value) for value in uncertainty
+        )
         self.motion_envelope_acceptance_id = acceptance_id
         self.motion_envelope_metadata_sha256 = metadata_sha256
 
@@ -927,7 +1007,9 @@ class OccupancyRobotCollisionChecker:
             "schema": "biblade_fusion.occupancy_robot_collision_policy.v8",
             "backend": "hppfcl_original_stl_vs_exact_voxel_run_union",
             "path_semantic": "sampled_or_offline_continuous_original_stl_clearance",
-            "continuous_swept_volume_supported": (self.continuous_swept_volume_supported),
+            "continuous_swept_volume_supported": (
+                self.continuous_swept_volume_supported
+            ),
             "robot_geometry_hash": self.verified_robot_geometry_hash,
             "robot_motion_bound_contract_sha256": (
                 self.robot_checker.geometry_motion_bound_contract_sha256
@@ -945,7 +1027,9 @@ class OccupancyRobotCollisionChecker:
             "ignored_geometry_names": list(self.ignored_geometry_names),
             "accepted_static_free": {
                 "acceptance_id": self.accepted_static_free_acceptance_id,
-                "required_mapping_context_hash": (self.accepted_static_free_mapping_context_hash),
+                "required_mapping_context_hash": (
+                    self.accepted_static_free_mapping_context_hash
+                ),
                 "whole_voxel_aabb_containment_required": True,
                 "occupied_never_downgraded": True,
                 "aabbs": [
@@ -971,7 +1055,9 @@ class OccupancyRobotCollisionChecker:
             },
             "unknown_is_occupied": True,
             "semantic_attestation_required_for_motion": True,
-            "semantic_verifier_contract_hash": (OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH),
+            "semantic_verifier_contract_hash": (
+                OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH
+            ),
             "semantic_attestation_hash": self.semantic_attestation_hash,
         }
         encoded = json.dumps(
@@ -1014,7 +1100,9 @@ class OccupancyRobotCollisionChecker:
         *,
         required_freshness_horizon_s: float = 0.0,
     ) -> None:
-        current = self.current_evidence(required_freshness_horizon_s=required_freshness_horizon_s)
+        current = self.current_evidence(
+            required_freshness_horizon_s=required_freshness_horizon_s
+        )
         if current.binding != expected.binding:
             raise OccupancyEvidenceError(
                 "occupancy_snapshot_changed:"
@@ -1049,7 +1137,9 @@ class OccupancyRobotCollisionChecker:
             raise
         except (OccupancyEvidenceError, TypeError, ValueError, RuntimeError) as exc:
             return self._unknown_result(f"occupancy_checker_error:{exc}")
-        except Exception as exc:  # pragma: no cover - fail closed across plugin boundaries
+        except (
+            Exception
+        ) as exc:  # pragma: no cover - fail closed across plugin boundaries
             return self._unknown_result(
                 f"occupancy_query_failed:{type(exc).__name__}:{exc}"
             )
@@ -1097,17 +1187,23 @@ class OccupancyRobotCollisionChecker:
         exact frozen object, then verify the publisher still exposes the same map.
         """
 
-        samples = tuple(tuple(float(value) for value in item) for item in configurations)
+        samples = tuple(
+            tuple(float(value) for value in item) for item in configurations
+        )
         fractions = tuple(float(value) for value in path_fractions)
         step = float(maximum_joint_step_rad)
         if not samples or len(samples) != len(fractions):
             raise ValueError("sampled occupancy path requires aligned non-empty inputs")
         if any(len(item) != 6 or not np.isfinite(item).all() for item in samples):
-            raise ValueError("sampled occupancy path configurations must be finite six-vectors")
+            raise ValueError(
+                "sampled occupancy path configurations must be finite six-vectors"
+            )
         if not np.isfinite(fractions).all() or any(
             fraction < 0.0 or fraction > 1.0 for fraction in fractions
         ):
-            raise ValueError("sampled occupancy path fractions must be finite in [0, 1]")
+            raise ValueError(
+                "sampled occupancy path fractions must be finite in [0, 1]"
+            )
         if any(
             later < earlier
             for earlier, later in zip(fractions, fractions[1:], strict=False)
@@ -1233,7 +1329,10 @@ class OccupancyRobotCollisionChecker:
             allow_mapping_prefix=self.allow_mapping_prefix_in_accepted_static_free,
         )
         self._assert_static_free_acceptance_context(evidence)
-        if expected_evidence is not None and evidence.binding != expected_evidence.binding:
+        if (
+            expected_evidence is not None
+            and evidence.binding != expected_evidence.binding
+        ):
             raise OccupancyEvidenceError(
                 "occupancy_snapshot_changed_before_query:"
                 f"expected={expected_evidence.sequence}:{expected_evidence.content_hash}:"
@@ -1266,6 +1365,7 @@ class OccupancyRobotCollisionChecker:
                 snapshot,
                 placed,
                 required_distance_m=required_distance,
+                stop_on_first_block=stop_on_first_block,
             )
             require_planning_time(
                 f"after occupancy robot geometry {placed.geometry_name}"
@@ -1290,6 +1390,7 @@ class OccupancyRobotCollisionChecker:
                     "minimum_dangerous_distance_m": query.minimum_dangerous_distance_m,
                     "blocking_voxel_index": query.blocking_voxel_index,
                     "queried_count": int(query.queried_count),
+                    "query_complete": bool(query.query_complete),
                 }
             )
             if state == OccupancyQueryState.FREE.value and not bool(query.blocked):
@@ -1299,10 +1400,7 @@ class OccupancyRobotCollisionChecker:
             elif state == OccupancyQueryState.UNKNOWN.value:
                 reason = f"environment_occupancy_unknown:{placed.geometry_name}"
             else:
-                reason = (
-                    "environment_occupancy_invalid_query_state:"
-                    f"{placed.geometry_name}:{state}"
-                )
+                reason = f"environment_occupancy_invalid_query_state:{placed.geometry_name}:{state}"
             reasons.append(reason)
             # Match HoloRobot's online state/path behavior: one unsafe robot
             # geometry is already a complete veto.  Evaluating all remaining
@@ -1312,7 +1410,9 @@ class OccupancyRobotCollisionChecker:
             if stop_on_first_block:
                 break
         return OccupancyCollisionCheckResult(
-            status=(CollisionCheckStatus.BLOCKED if reasons else CollisionCheckStatus.CLEAR),
+            status=(
+                CollisionCheckStatus.BLOCKED if reasons else CollisionCheckStatus.CLEAR
+            ),
             blocking_reasons=tuple(reasons),
             evidence=evidence,
             checked_geometry_count=len(query_diagnostics),
@@ -1409,7 +1509,11 @@ class OccupancyRobotCollisionChecker:
 
         start = np.asarray(start_joint_positions_rad, dtype=np.float64)
         end = np.asarray(end_joint_positions_rad, dtype=np.float64)
-        if start.shape != (6,) or end.shape != (6,) or not np.isfinite((start, end)).all():
+        if (
+            start.shape != (6,)
+            or end.shape != (6,)
+            or not np.isfinite((start, end)).all()
+        ):
             raise ValueError("occupancy path endpoints must be finite six-vectors")
         step = float(maximum_joint_step_rad)
         if not math.isfinite(step) or step <= 0.0:
@@ -1419,7 +1523,9 @@ class OccupancyRobotCollisionChecker:
             raise ValueError("maximum_subdivision_depth must be non-negative")
         minimum_span = float(minimum_interval_joint_span_rad)
         if not math.isfinite(minimum_span) or minimum_span <= 0.0:
-            raise ValueError("minimum_interval_joint_span_rad must be finite and positive")
+            raise ValueError(
+                "minimum_interval_joint_span_rad must be finite and positive"
+            )
         segment_count = max(1, math.ceil(float(np.max(np.abs(end - start))) / step))
         evaluated = 0
         checked_geometries = 0
@@ -1446,7 +1552,9 @@ class OccupancyRobotCollisionChecker:
                 expected_evidence is not None
                 and bound_evidence.binding != expected_evidence.binding
             ):
-                raise OccupancyEvidenceError("occupancy_snapshot_changed_before_swept_query")
+                raise OccupancyEvidenceError(
+                    "occupancy_snapshot_changed_before_swept_query"
+                )
         except (OccupancyEvidenceError, TypeError, ValueError, RuntimeError) as exc:
             failure = OccupancyCollisionCheckResult(
                 status=CollisionCheckStatus.UNKNOWN,
@@ -1550,7 +1658,11 @@ class OccupancyRobotCollisionChecker:
             return "unknown_or_policy_block_at_pose"
 
         def evaluate_actual(fraction: float) -> OccupancyCollisionCheckResult:
-            nonlocal accepted_unknown_queries, checked_geometries, distance_queries, evaluated
+            nonlocal \
+                accepted_unknown_queries, \
+                checked_geometries, \
+                distance_queries, \
+                evaluated
             key = float(fraction)
             cached = checked_fractions.get(key)
             if cached is not None:
@@ -1598,7 +1710,9 @@ class OccupancyRobotCollisionChecker:
                     "swept_occupancy_proof_evidence_sha256": (evidence.evidence_sha256),
                     "swept_occupancy_termination_reason": evidence.termination_reason,
                     "accepted_unknown_voxel_query_count": (accepted_unknown_queries),
-                    "semantic_attestation_valid": (bound_evidence.semantic_attestation_valid),
+                    "semantic_attestation_valid": (
+                        bound_evidence.semantic_attestation_valid
+                    ),
                     "motion_authorized": False,
                 },
             )
@@ -1647,8 +1761,13 @@ class OccupancyRobotCollisionChecker:
                     )
                     distance_queries += query.distance_query_count
                     checked_geometries += 1
-                    accepted_unknown_queries += int(getattr(query, "accepted_unknown_count", 0))
-                    if self._validate_query_result(query) != OccupancyQueryState.FREE.value:
+                    accepted_unknown_queries += int(
+                        getattr(query, "accepted_unknown_count", 0)
+                    )
+                    if (
+                        self._validate_query_result(query)
+                        != OccupancyQueryState.FREE.value
+                    ):
                         interval_clear = False
                 if interval_clear:
                     certified += 1
@@ -1678,7 +1797,9 @@ class OccupancyRobotCollisionChecker:
             if depth >= depth_limit or joint_span <= minimum_span:
                 unknown = OccupancyCollisionCheckResult(
                     status=CollisionCheckStatus.UNKNOWN,
-                    blocking_reasons=("continuous_swept_occupancy_unproven:subdivision_limit",),
+                    blocking_reasons=(
+                        "continuous_swept_occupancy_unproven:subdivision_limit",
+                    ),
                     evidence=bound_evidence,
                     checked_geometry_count=checked_geometries,
                     diagnostics={},
@@ -1727,7 +1848,9 @@ class OccupancyRobotCollisionChecker:
                 "certified_interval_count": certified,
                 "deepest_subdivision": deepest,
                 "accepted_unknown_voxel_query_count": accepted_unknown_queries,
-                "semantic_attestation_valid": (bound_evidence.semantic_attestation_valid),
+                "semantic_attestation_valid": (
+                    bound_evidence.semantic_attestation_valid
+                ),
                 "semantic_attestation_hash": (bound_evidence.semantic_attestation_hash),
                 "required_freshness_horizon_s": required_freshness_horizon_s,
                 "motion_authorized": False,
@@ -1747,9 +1870,7 @@ class OccupancyRobotCollisionChecker:
     @staticmethod
     def _validate_query_result(query: OccupancyGeometryQueryLike) -> str:
         accepted_unknown = int(getattr(query, "accepted_unknown_count", 0))
-        separated_dangerous = int(
-            getattr(query, "separated_dangerous_count", 0)
-        )
+        separated_dangerous = int(getattr(query, "separated_dangerous_count", 0))
         counts = (
             int(query.occupied_count),
             int(query.unknown_count),
@@ -1762,11 +1883,7 @@ class OccupancyRobotCollisionChecker:
             raise OccupancyEvidenceError("occupancy_query_has_negative_count")
         occupied, unknown, free, accepted_unknown, separated_dangerous, queried = counts
         if queried <= 0 or (
-            occupied
-            + unknown
-            + free
-            + accepted_unknown
-            + separated_dangerous
+            occupied + unknown + free + accepted_unknown + separated_dangerous
             != queried
         ):
             raise OccupancyEvidenceError("occupancy_query_count_contract_invalid")
@@ -1795,7 +1912,10 @@ class OccupancyRobotCollisionChecker:
     ) -> None:
         if not self.accepted_static_free_aabbs:
             return
-        if evidence.mapping_context_hash != self.accepted_static_free_mapping_context_hash:
+        if (
+            evidence.mapping_context_hash
+            != self.accepted_static_free_mapping_context_hash
+        ):
             raise OccupancyEvidenceError(
                 "accepted_static_free_mapping_context_does_not_match_snapshot"
             )
@@ -1806,6 +1926,7 @@ class OccupancyRobotCollisionChecker:
         placed: _PlacedRobotCollisionGeometry,
         *,
         required_distance_m: float,
+        stop_on_first_block: bool = False,
     ) -> _RobotGeometryVoxelQuery:
         """Measure the original STL against exact unions of dangerous voxel runs.
 
@@ -1818,22 +1939,34 @@ class OccupancyRobotCollisionChecker:
         try:
             import hppfcl
         except ImportError as exc:  # pragma: no cover - Pinocchio already requires it
-            raise ImportError("hpp-fcl is required for exact STL occupancy checking") from exc
+            raise ImportError(
+                "hpp-fcl is required for exact STL occupancy checking"
+            ) from exc
         margin = float(required_distance_m)
         if not math.isfinite(margin) or margin < 0.0:
             raise ValueError("required STL-to-voxel distance must be non-negative")
         voxel_size = float(snapshot.voxel_size_m)
         origin = np.asarray(snapshot.origin_m, dtype=np.float64)
-        broadphase_minimum = np.asarray(
-            placed.world_aabb_minimum_m,
-            dtype=np.float64,
-        ) - margin
-        broadphase_maximum = np.asarray(
-            placed.world_aabb_maximum_m,
-            dtype=np.float64,
-        ) + margin
-        lower = np.floor((broadphase_minimum - origin) / voxel_size).astype(np.int64) - 1
-        upper = np.floor((broadphase_maximum - origin) / voxel_size).astype(np.int64) + 1
+        broadphase_minimum = (
+            np.asarray(
+                placed.world_aabb_minimum_m,
+                dtype=np.float64,
+            )
+            - margin
+        )
+        broadphase_maximum = (
+            np.asarray(
+                placed.world_aabb_maximum_m,
+                dtype=np.float64,
+            )
+            + margin
+        )
+        lower = (
+            np.floor((broadphase_minimum - origin) / voxel_size).astype(np.int64) - 1
+        )
+        upper = (
+            np.floor((broadphase_maximum - origin) / voxel_size).astype(np.int64) + 1
+        )
         distance_request = hppfcl.DistanceRequest()
         occupied = 0
         unknown = 0
@@ -1845,9 +1978,170 @@ class OccupancyRobotCollisionChecker:
         distance_queries = 0
         minimum_dangerous_distance = math.inf
         blocking_voxel: tuple[int, int, int] | None = None
-        tolerance = 1e-9
+
+        def finish_query(*, query_complete: bool) -> _RobotGeometryVoxelQuery:
+            queried = occupied + unknown + free + accepted_unknown + separated_dangerous
+            state = (
+                OccupancyQueryState.OCCUPIED
+                if occupied
+                else OccupancyQueryState.UNKNOWN
+                if unknown
+                else OccupancyQueryState.FREE
+            )
+            return _RobotGeometryVoxelQuery(
+                state=state,
+                blocked=bool(occupied or unknown),
+                occupied_count=occupied,
+                unknown_count=unknown,
+                free_count=free,
+                accepted_unknown_count=accepted_unknown,
+                outside_grid_unknown_count=outside_grid_unknown,
+                outside_acceptance_unknown_count=outside_acceptance_unknown,
+                separated_dangerous_count=separated_dangerous,
+                distance_query_count=distance_queries,
+                minimum_dangerous_distance_m=(
+                    minimum_dangerous_distance
+                    if math.isfinite(minimum_dangerous_distance)
+                    else None
+                ),
+                blocking_voxel_index=blocking_voxel,
+                queried_count=queried,
+                query_complete=query_complete,
+            )
+
+        tolerance = max(1e-12, voxel_size * 1e-9)
+        free, accepted_unknown, dangerous_runs = self._voxel_query_layout(
+            snapshot,
+            lower=lower,
+            upper=upper,
+            geometry_name=placed.geometry_name,
+        )
+        for category, run_length, first_index_tuple in dangerous_runs:
+            first_index = np.asarray(first_index_tuple, dtype=np.int64)
+            voxel_geometry, voxel_transform = self._voxel_geometry(
+                snapshot,
+                first_index=first_index_tuple,
+                run_length=run_length,
+                hppfcl=hppfcl,
+            )
+            distance_result = hppfcl.DistanceResult()
+            require_planning_time(
+                f"before STL-to-voxel-run distance {placed.geometry_name}"
+            )
+            distance = float(
+                hppfcl.distance(
+                    placed.collision_geometry,
+                    placed.transform_base,
+                    voxel_geometry,
+                    voxel_transform,
+                    distance_request,
+                    distance_result,
+                )
+            )
+            require_planning_time(
+                f"after STL-to-voxel-run distance {placed.geometry_name}"
+            )
+            distance_queries += 1
+            if not math.isfinite(distance):
+                raise ValueError(
+                    f"non-finite STL-to-voxel-run distance for {placed.geometry_name}"
+                )
+            if distance < -1e100:
+                distance = 0.0
+            minimum_dangerous_distance = min(
+                minimum_dangerous_distance,
+                distance,
+            )
+            if distance > margin + tolerance:
+                separated_dangerous += run_length
+                continue
+            # A merged run proves clear with one distance call.  If it is
+            # close, refine only that rare run to retain exact diagnostic
+            # voxel counts and the true first blocking voxel.
+            for run_offset in range(run_length):
+                index_array = first_index + np.asarray(
+                    (run_offset, 0, 0),
+                    dtype=np.int64,
+                )
+                if run_length == 1:
+                    voxel_distance = distance
+                else:
+                    voxel_result = hppfcl.DistanceResult()
+                    single_geometry, single_transform = self._voxel_geometry(
+                        snapshot,
+                        first_index=tuple(int(value) for value in index_array),
+                        run_length=1,
+                        hppfcl=hppfcl,
+                    )
+                    require_planning_time(
+                        f"before STL-to-voxel distance {placed.geometry_name}"
+                    )
+                    voxel_distance = float(
+                        hppfcl.distance(
+                            placed.collision_geometry,
+                            placed.transform_base,
+                            single_geometry,
+                            single_transform,
+                            distance_request,
+                            voxel_result,
+                        )
+                    )
+                    require_planning_time(
+                        f"after STL-to-voxel distance {placed.geometry_name}"
+                    )
+                    distance_queries += 1
+                    if voxel_distance < -1e100:
+                        voxel_distance = 0.0
+                    if not math.isfinite(voxel_distance):
+                        raise ValueError(
+                            f"non-finite STL-to-voxel distance for {placed.geometry_name}"
+                        )
+                    minimum_dangerous_distance = min(
+                        minimum_dangerous_distance,
+                        voxel_distance,
+                    )
+                if voxel_distance > margin + tolerance:
+                    separated_dangerous += 1
+                    continue
+                index = tuple(int(value) for value in index_array)
+                if category == 2:
+                    occupied += 1
+                else:
+                    unknown += 1
+                    if category == 4:
+                        outside_grid_unknown += 1
+                    else:
+                        outside_acceptance_unknown += 1
+                if blocking_voxel is None:
+                    blocking_voxel = index
+                if stop_on_first_block:
+                    return finish_query(query_complete=False)
+        return finish_query(query_complete=True)
+
+    def _voxel_query_layout(
+        self,
+        snapshot: OccupancySnapshot,
+        *,
+        lower: np.ndarray,
+        upper: np.ndarray,
+        geometry_name: str,
+    ) -> tuple[
+        int,
+        int,
+        tuple[tuple[int, int, tuple[int, int, int]], ...],
+    ]:
+        """Cache the immutable voxel classes and X runs for one integer AABB."""
+
+        if self._voxel_query_layout_content_hash != snapshot.content_hash:
+            self._voxel_query_layout_content_hash = snapshot.content_hash
+            self._voxel_query_layouts.clear()
+        key = tuple(int(value) for value in (*lower, *upper))
+        cached = self._voxel_query_layouts.get(key)
+        if cached is not None:
+            return cached
+
         # 0=in-grid UNKNOWN, 1=FREE, 2=OCCUPIED, 3=accepted UNKNOWN,
-        # 4=out-of-grid UNKNOWN.  Keeping 0 and 4 distinct preserves diagnostics
+        # 4=out-of-grid UNKNOWN. Keeping 0 and 4 distinct preserves diagnostics
         # and prevents run merging across the workspace boundary.
         local_shape = tuple(int(upper[axis] - lower[axis] + 1) for axis in range(3))
         local = np.full(local_shape, 4, dtype=np.uint8)
@@ -1867,13 +2161,14 @@ class OccupancyRobotCollisionChecker:
                 for axis in range(3)
             )
             local[target_slices] = grid[source_slices]
+        voxel_size = float(snapshot.voxel_size_m)
+        origin = np.asarray(snapshot.origin_m, dtype=np.float64)
         tolerance = max(1e-12, voxel_size * 1e-9)
         for region in self.accepted_static_free_aabbs:
             region_lower = np.asarray(
                 [
                     math.ceil(
-                        (region.minimum_m[axis] - tolerance - origin[axis])
-                        / voxel_size
+                        (region.minimum_m[axis] - tolerance - origin[axis]) / voxel_size
                     )
                     for axis in range(3)
                 ],
@@ -1882,8 +2177,7 @@ class OccupancyRobotCollisionChecker:
             region_upper = np.asarray(
                 [
                     math.floor(
-                        (region.maximum_m[axis] + tolerance - origin[axis])
-                        / voxel_size
+                        (region.maximum_m[axis] + tolerance - origin[axis]) / voxel_size
                         - 1.0
                     )
                     for axis in range(3)
@@ -1906,10 +2200,11 @@ class OccupancyRobotCollisionChecker:
 
         free = int(np.count_nonzero(local == 1))
         accepted_unknown = int(np.count_nonzero(local == 3))
+        dangerous_runs: list[tuple[int, int, tuple[int, int, int]]] = []
         for local_y in range(local_shape[1]):
             for local_z in range(local_shape[2]):
                 require_planning_time(
-                    f"during occupancy voxel-run scan {placed.geometry_name}"
+                    f"during occupancy voxel-run scan {geometry_name}"
                 )
                 row = local[:, local_y, local_z]
                 local_x = 0
@@ -1922,143 +2217,58 @@ class OccupancyRobotCollisionChecker:
                     local_x += 1
                     while local_x < local_shape[0] and int(row[local_x]) == category:
                         local_x += 1
-                    run_length = local_x - run_start
-                    first_index = np.asarray(
+                    dangerous_runs.append(
                         (
-                            int(lower[0] + run_start),
-                            int(lower[1] + local_y),
-                            int(lower[2] + local_z),
-                        ),
-                        dtype=np.int64,
-                    )
-                    dimensions = np.asarray(
-                        (run_length * voxel_size, voxel_size, voxel_size),
-                        dtype=np.float64,
-                    )
-                    center = origin + first_index * voxel_size + dimensions / 2.0
-                    voxel_geometry = hppfcl.Box(*dimensions)
-                    voxel_transform = hppfcl.Transform3f(np.eye(3), center)
-                    distance_result = hppfcl.DistanceResult()
-                    require_planning_time(
-                        f"before STL-to-voxel-run distance {placed.geometry_name}"
-                    )
-                    distance = float(
-                        hppfcl.distance(
-                            placed.collision_geometry,
-                            placed.transform_base,
-                            voxel_geometry,
-                            voxel_transform,
-                            distance_request,
-                            distance_result,
+                            category,
+                            local_x - run_start,
+                            (
+                                int(lower[0] + run_start),
+                                int(lower[1] + local_y),
+                                int(lower[2] + local_z),
+                            ),
                         )
                     )
-                    require_planning_time(
-                        f"after STL-to-voxel-run distance {placed.geometry_name}"
-                    )
-                    distance_queries += 1
-                    if not math.isfinite(distance):
-                        raise ValueError(
-                            f"non-finite STL-to-voxel-run distance for {placed.geometry_name}"
-                        )
-                    if distance < -1e100:
-                        distance = 0.0
-                    minimum_dangerous_distance = min(
-                        minimum_dangerous_distance,
-                        distance,
-                    )
-                    if distance > margin + tolerance:
-                        separated_dangerous += run_length
-                        continue
-                    # A merged run proves clear with one distance call.  If it is
-                    # close, refine only that rare run to retain exact diagnostic
-                    # voxel counts and the true first blocking voxel.
-                    for run_offset in range(run_length):
-                        index_array = first_index + np.asarray(
-                            (run_offset, 0, 0),
-                            dtype=np.int64,
-                        )
-                        if run_length == 1:
-                            voxel_distance = distance
-                        else:
-                            voxel_center = origin + (
-                                index_array.astype(np.float64) + 0.5
-                            ) * voxel_size
-                            voxel_result = hppfcl.DistanceResult()
-                            require_planning_time(
-                                f"before STL-to-voxel distance {placed.geometry_name}"
-                            )
-                            voxel_distance = float(
-                                hppfcl.distance(
-                                    placed.collision_geometry,
-                                    placed.transform_base,
-                                    hppfcl.Box(voxel_size, voxel_size, voxel_size),
-                                    hppfcl.Transform3f(np.eye(3), voxel_center),
-                                    distance_request,
-                                    voxel_result,
-                                )
-                            )
-                            require_planning_time(
-                                f"after STL-to-voxel distance {placed.geometry_name}"
-                            )
-                            distance_queries += 1
-                            if voxel_distance < -1e100:
-                                voxel_distance = 0.0
-                            if not math.isfinite(voxel_distance):
-                                raise ValueError(
-                                    "non-finite STL-to-voxel distance for "
-                                    f"{placed.geometry_name}"
-                                )
-                            minimum_dangerous_distance = min(
-                                minimum_dangerous_distance,
-                                voxel_distance,
-                            )
-                        if voxel_distance > margin + tolerance:
-                            separated_dangerous += 1
-                            continue
-                        index = tuple(int(value) for value in index_array)
-                        if category == 2:
-                            occupied += 1
-                        else:
-                            unknown += 1
-                            if category == 4:
-                                outside_grid_unknown += 1
-                            else:
-                                outside_acceptance_unknown += 1
-                        if blocking_voxel is None:
-                            blocking_voxel = index
-        queried = (
-            occupied
-            + unknown
-            + free
-            + accepted_unknown
-            + separated_dangerous
+        result = (free, accepted_unknown, tuple(dangerous_runs))
+        if len(self._voxel_query_layouts) >= 512:
+            self._voxel_query_layouts.pop(next(iter(self._voxel_query_layouts)))
+        self._voxel_query_layouts[key] = result
+        return result
+
+    def _voxel_geometry(
+        self,
+        snapshot: OccupancySnapshot,
+        *,
+        first_index: tuple[int, int, int],
+        run_length: int,
+        hppfcl: Any,
+    ) -> tuple[Any, Any]:
+        """Reuse immutable HPP-FCL voxel-run boxes within one frozen map."""
+
+        if self._voxel_geometry_content_hash != snapshot.content_hash:
+            self._voxel_geometry_content_hash = snapshot.content_hash
+            self._voxel_geometries.clear()
+        key = (*first_index, int(run_length))
+        cached = self._voxel_geometries.get(key)
+        if cached is not None:
+            return cached
+        voxel_size = float(snapshot.voxel_size_m)
+        dimensions = np.asarray(
+            (run_length * voxel_size, voxel_size, voxel_size),
+            dtype=np.float64,
         )
-        state = (
-            OccupancyQueryState.OCCUPIED
-            if occupied
-            else OccupancyQueryState.UNKNOWN
-            if unknown
-            else OccupancyQueryState.FREE
+        center = (
+            np.asarray(snapshot.origin_m, dtype=np.float64)
+            + np.asarray(first_index, dtype=np.float64) * voxel_size
+            + dimensions / 2.0
         )
-        return _RobotGeometryVoxelQuery(
-            state=state,
-            blocked=bool(occupied or unknown),
-            occupied_count=occupied,
-            unknown_count=unknown,
-            free_count=free,
-            accepted_unknown_count=accepted_unknown,
-            outside_grid_unknown_count=outside_grid_unknown,
-            outside_acceptance_unknown_count=outside_acceptance_unknown,
-            separated_dangerous_count=separated_dangerous,
-            distance_query_count=distance_queries,
-            minimum_dangerous_distance_m=(
-                minimum_dangerous_distance
-                if math.isfinite(minimum_dangerous_distance)
-                else None
-            ),
-            blocking_voxel_index=blocking_voxel,
-            queried_count=queried,
+        result = (
+            hppfcl.Box(*dimensions),
+            hppfcl.Transform3f(np.eye(3), center),
         )
+        if len(self._voxel_geometries) >= 65_536:
+            self._voxel_geometries.pop(next(iter(self._voxel_geometries)))
+        self._voxel_geometries[key] = result
+        return result
 
     def _classification_grid(self, snapshot: OccupancySnapshot) -> np.ndarray:
         cached = self._voxel_classification
@@ -2086,10 +2296,14 @@ class OccupancyRobotCollisionChecker:
         try:
             import hppfcl
         except ImportError as exc:  # pragma: no cover - Pinocchio already requires it
-            raise ImportError("hpp-fcl is required for exact STL occupancy checking") from exc
+            raise ImportError(
+                "hpp-fcl is required for exact STL occupancy checking"
+            ) from exc
         from biblade_fusion.robotics.pinocchio_collision import _require_pinocchio
 
-        joints = self.robot_checker.pinocchio_model._to_configuration(joint_positions_rad)
+        joints = self.robot_checker.pinocchio_model._to_configuration(
+            joint_positions_rad
+        )
         pin = _require_pinocchio()
         model = self.robot_checker.pinocchio_model
         pin.forwardKinematics(model.model, model.data, joints)
@@ -2139,5 +2353,7 @@ class OccupancyRobotCollisionChecker:
                 )
             )
         if not placed_geometries:
-            raise ValueError("robot occupancy checker contains no collision STL geometry")
+            raise ValueError(
+                "robot occupancy checker contains no collision STL geometry"
+            )
         return tuple(placed_geometries)

@@ -773,7 +773,7 @@ def test_coarse_science_session_creates_proxy_plan_and_discovery_from_first_view
     monkeypatch.setattr(
         coarse_module,
         "_append_coarse_scan_generation_from_verified",
-        lambda output, **_kwargs: output.resolve(),
+        lambda output, **_kwargs: (output.resolve(), SimpleNamespace()),
     )
     monkeypatch.setattr(
         coarse_module,
@@ -850,9 +850,9 @@ def test_generation_accept_reuses_one_current_and_one_predecessor_read(
 
     captured: dict[str, object] = {}
 
-    def append_generation(output: Path, **kwargs: object) -> Path:
+    def append_generation(output: Path, **kwargs: object) -> tuple[Path, object]:
         captured.update(kwargs)
-        return Path(output).resolve()
+        return Path(output).resolve(), SimpleNamespace()
 
     monkeypatch.setattr(coarse_module, "read_coarse_scan_view", read_current)
     monkeypatch.setattr(coarse_module, "read_coarse_scan_generation", read_previous)
@@ -908,6 +908,9 @@ def test_discovery_is_re_evaluated_from_latest_stopped_posture(
     initialization = (tmp_path / "initialization").resolve()
     view_plan = (tmp_path / "view-plan").resolve()
     generation = (tmp_path / "generation").resolve()
+    generation.mkdir()
+    generation_authority = generation / "generation.json"
+    generation_authority.write_text('{"generation_index":3}\n', encoding="utf-8")
     prior = CoarseDiscoveryPlan(
         FilteredViewPlan((), ()),
         "a" * 64,
@@ -941,11 +944,36 @@ def test_discovery_is_re_evaluated_from_latest_stopped_posture(
             )
         ),
     )
+    verified_generation = SimpleNamespace(
+        generation_index=3,
+        root=generation,
+        metadata_sha256=coarse_module._sha256(generation_authority),  # noqa: SLF001
+        metadata_size_bytes=generation_authority.stat().st_size,
+    )
+    session._selection_generation = verified_generation  # noqa: SLF001
+    strict_reads: list[Path] = []
+    rechecks: list[object] = []
+
+    def recheck_generation(stored: object) -> None:
+        assert stored is verified_generation
+        rechecks.append(stored)
+        if (
+            coarse_module._sha256(generation_authority)  # noqa: SLF001
+            != verified_generation.metadata_sha256
+        ):
+            raise ValueError("changed")
+
     monkeypatch.setattr(
         coarse_module,
-        "read_coarse_scan_generation",
-        lambda _path: SimpleNamespace(generation_index=3),
+        "_recheck_cached_generation_authorities",
+        recheck_generation,
     )
+
+    def read_generation(path: Path) -> object:
+        strict_reads.append(Path(path))
+        return verified_generation
+
+    monkeypatch.setattr(coarse_module, "read_coarse_scan_generation", read_generation)
     calls: list[tuple[float, ...]] = []
 
     def generate(*args: object, **kwargs: object) -> CoarseDiscoveryPlan:
@@ -971,6 +999,65 @@ def test_discovery_is_re_evaluated_from_latest_stopped_posture(
     assert session.discovery_plan is refreshed
     assert session._discovery_path is not None  # noqa: SLF001
     assert session._discovery_path.parent.name == "fin_discovery_revisions"  # noqa: SLF001
+    assert rechecks == []
+
+    selected = object()
+    consumed: list[object] = []
+
+    def select_verified(stored: object, *_args: object, **_kwargs: object) -> object:
+        consumed.append(stored)
+        return selected
+
+    monkeypatch.setattr(
+        coarse_module,
+        "_select_coarse_next_view_from_generation",
+        select_verified,
+    )
+
+    # Integrity is checked once, at final consumption.  A mutation between refresh
+    # and selection therefore remains fail-closed without replaying every source twice.
+    generation_authority.write_text('{"generation_index":4}\n', encoding="utf-8")
+    with pytest.raises(UnknownBladeCoarseError, match="authority changed on disk"):
+        session.select_next()
+    assert strict_reads == []
+    assert rechecks == [verified_generation]
+    assert consumed == []
+    assert session._selection_generation is None  # noqa: SLF001
+
+    generation_authority.write_text('{"generation_index":3}\n', encoding="utf-8")
+    session._selection_generation = verified_generation  # noqa: SLF001
+    assert session.select_next() is selected
+    assert session._selection_generation is None  # noqa: SLF001
+    assert consumed == [verified_generation]
+    assert rechecks == [verified_generation, verified_generation]
+
+
+def test_discovery_endpoint_validation_binding_requires_active_validator(
+    tmp_path: Path,
+) -> None:
+    kinematics = tmp_path / "kinematics.yaml"
+    kinematics.write_text("model: test\n", encoding="utf-8")
+    session = CoarseScienceSession(
+        settings=load_settings("configs/default.yaml"),
+        hand_eye=SimpleNamespace(),  # type: ignore[arg-type]
+        reachability_checker=_Reachable(),
+        source_kinematics=kinematics,
+        output_root=tmp_path / "science",
+    )
+    current = (0.2, -0.4, 0.6, -0.8, 1.0, -1.2)
+    session._discovery = CoarseDiscoveryPlan(  # noqa: SLF001
+        FilteredViewPlan((), ()),
+        "a" * 64,
+        current_joint_positions_rad=current,
+    )
+
+    assert session.endpoint_validation_binding is None
+
+    session._endpoint_validator = lambda _joints: EndpointConfigurationCheck(  # noqa: SLF001
+        True
+    )
+
+    assert session.endpoint_validation_binding == ("a" * 64, current)
 
 
 def test_normal_endpoint_rejected_at_bootstrap_can_enter_later_ranked_queue(
@@ -1612,12 +1699,12 @@ def test_generation_append_removes_uncommitted_coverage_before_retry(
     monkeypatch.setattr(coarse_module, "write_coverage_ledger", write_coverage)
     generation_calls = 0
 
-    def write_generation(path: Path, **_kwargs: object) -> Path:
+    def write_generation(path: Path, **_kwargs: object) -> tuple[Path, object]:
         nonlocal generation_calls
         generation_calls += 1
         if generation_calls == 1:
             raise OSError("simulated generation commit failure")
-        return Path(path).resolve()
+        return Path(path).resolve(), SimpleNamespace()
 
     monkeypatch.setattr(
         coarse_module,

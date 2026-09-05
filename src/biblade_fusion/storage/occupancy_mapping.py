@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
+import stat
 import threading
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
@@ -41,6 +43,7 @@ from biblade_fusion.robotics import (
     load_es68_flange_t_tcp,
 )
 from biblade_fusion.robotics.occupancy_collision import (
+    OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH,
     OccupancySemanticAttestation,
     _issue_occupancy_semantic_attestation,
 )
@@ -66,6 +69,16 @@ _POSE_TRANSLATION_ATOL_M = 1e-8
 _POSE_ROTATION_ATOL_DEG = 1e-5
 _SCALAR_TRANSLATION_ATOL_M = 1e-10
 _SCALAR_ROTATION_ATOL_DEG = 1e-7
+_STORAGE_AUTHORITY_FRAME_FILES = frozenset(
+    {
+        "source_depth_m",
+        "stereo_valid_mask",
+        "stereo_confidence",
+        "predicted_robot_depth_m",
+        "robot_mask",
+        "integration_valid_mask",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +168,31 @@ class _DecodedOccupancyMapping:
     stereo_roots: tuple[Path, ...]
     session_roots: tuple[Path, ...]
     hand_eye_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _OccupancyStorageFileAuthority:
+    path: Path
+    sha256: str
+    size_bytes: int
+    dtype: str | None = None
+    shape: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _OccupancyStorageAuthority:
+    """Unforgeable in-process binding from a full semantic occupancy read."""
+
+    root: Path
+    metadata_sha256: str
+    metadata_size_bytes: int
+    semantic_attestation_hash: str
+    files: tuple[_OccupancyStorageFileAuthority, ...]
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError(
+            "Occupancy storage authority is issued only after full semantic verification"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,10 +387,20 @@ def _write_occupancy_mapping_with_dependencies(
                 temporary / f"{prefix}_mapping_snapshot.json",
                 update.mapping_snapshot,
             )
-            result_path = save_occupancy_snapshot(
-                temporary / f"{prefix}_result_snapshot.json",
-                update.snapshot,
-            )
+            result_output = temporary / f"{prefix}_result_snapshot.json"
+            if index == len(updates) - 1:
+                try:
+                    result_output.hardlink_to(final_path)
+                except FileExistsError:
+                    raise
+                except OSError:
+                    # Some filesystems do not support hard links. Retain the exact
+                    # historical serialization path instead of weakening durability.
+                    result_path = save_occupancy_snapshot(result_output, update.snapshot)
+                else:
+                    result_path = result_output
+            else:
+                result_path = save_occupancy_snapshot(result_output, update.snapshot)
             stereo_path = Path(stereo_root).resolve()
             session_path = Path(session_root).resolve()
             frames.append(
@@ -518,7 +566,7 @@ def read_occupancy_mapping_for_replay(path: str | Path) -> ReplayOccupancyMappin
     collision meshes; motion preflight must call :func:`read_occupancy_mapping`.
     """
 
-    decoded = _read_occupancy_mapping_integrity(path)
+    decoded = _read_occupancy_mapping_integrity(path, replay_depth_rays=False)
     return ReplayOccupancyMapping(
         decoded.snapshot,
         decoded.context,
@@ -527,6 +575,286 @@ def read_occupancy_mapping_for_replay(path: str | Path) -> ReplayOccupancyMappin
         tuple(update.snapshot for update in decoded.updates),
         decoded.metadata,
     )
+
+
+def _bind_occupancy_storage_authority(
+    path: str | Path,
+    stored: StoredOccupancyMapping,
+) -> _OccupancyStorageAuthority:
+    """Bind exact storage bytes to one already full-semantic typed result."""
+
+    if type(stored) is not StoredOccupancyMapping:
+        raise ValueError("Occupancy storage authority requires a typed full reader result")
+    attestation = stored.semantic_attestation
+    if type(attestation) is not OccupancySemanticAttestation:
+        raise ValueError("Occupancy storage authority requires a semantic attestation")
+    if attestation.semantic_verifier_contract_hash != (
+        OCCUPANCY_SEMANTIC_VERIFIER_CONTRACT_HASH
+    ):
+        raise ValueError("Occupancy semantic verifier contract changed")
+    attestation.assert_matches(
+        stored.snapshot,
+        robot_geometry_hash=attestation.robot_geometry_hash,
+    )
+    root = Path(path).resolve()
+    metadata_path = root / "metadata.json"
+    metadata_bytes = metadata_path.read_bytes()
+    metadata_sha256 = hashlib.sha256(metadata_bytes).hexdigest()
+    if (
+        metadata_sha256 != attestation.occupancy_metadata_sha256
+        or json.loads(metadata_bytes) != stored.metadata
+    ):
+        raise ValueError("Occupancy metadata differs from its full semantic readback")
+    metadata = stored.metadata
+    if (
+        int(metadata["schema_version"]) != OCCUPANCY_MAPPING_SCHEMA_VERSION
+        or metadata.get("artifact_kind") != "biblade_fusion.occupancy_mapping"
+        or metadata.get("motion_authorized") is not False
+    ):
+        raise ValueError("Occupancy storage authority requires current schema-7 evidence")
+
+    files = [
+        _occupancy_storage_file_authority(
+            metadata_path,
+            sha256=metadata_sha256,
+            size_bytes=len(metadata_bytes),
+        )
+    ]
+    top_sources = _mapping(metadata, "sources")
+    _require_exact_keys(top_sources, {"hand_eye"}, label="artifact sources")
+    files.append(
+        _occupancy_storage_source_authority(
+            _mapping(top_sources, "hand_eye"),
+            relocation_root=root,
+        )
+    )
+    files.append(
+        _occupancy_storage_internal_authority(
+            root,
+            _mapping(metadata, "snapshot"),
+        )
+    )
+    frames = _sequence(metadata, "frames")
+    if not frames:
+        raise ValueError("Occupancy storage authority requires frame evidence")
+    for raw_frame in frames:
+        if not isinstance(raw_frame, Mapping):
+            raise ValueError("Occupancy storage frame record must be an object")
+        frame_files = _mapping(raw_frame, "files")
+        _require_exact_keys(
+            frame_files,
+            _STORAGE_AUTHORITY_FRAME_FILES,
+            label="frame storage files",
+        )
+        files.extend(
+            _occupancy_storage_internal_authority(
+                root,
+                _mapping(frame_files, name),
+                array=True,
+            )
+            for name in sorted(_STORAGE_AUTHORITY_FRAME_FILES)
+        )
+        files.extend(
+            (
+                _occupancy_storage_internal_authority(
+                    root,
+                    _mapping(raw_frame, "mapping_snapshot"),
+                ),
+                _occupancy_storage_internal_authority(
+                    root,
+                    _mapping(raw_frame, "result_snapshot"),
+                ),
+            )
+        )
+        frame_sources = _mapping(raw_frame, "sources")
+        _require_exact_keys(
+            frame_sources,
+            {"stereo_inference", "session"},
+            label="frame sources",
+        )
+        files.extend(
+            (
+                _occupancy_storage_source_authority(
+                    _mapping(frame_sources, "stereo_inference"),
+                    expected_filename="metadata.json",
+                    relocation_root=root,
+                ),
+                _occupancy_storage_source_authority(
+                    _mapping(frame_sources, "session"),
+                    expected_filename="manifest.json",
+                    relocation_root=root,
+                ),
+            )
+        )
+
+    authority = object.__new__(_OccupancyStorageAuthority)
+    for name, value in (
+        ("root", root),
+        ("metadata_sha256", metadata_sha256),
+        ("metadata_size_bytes", len(metadata_bytes)),
+        ("semantic_attestation_hash", attestation.attestation_hash),
+        ("files", tuple(files)),
+    ):
+        object.__setattr__(authority, name, value)
+    _assert_occupancy_storage_authorities_current((authority,))
+    return authority
+
+
+def _assert_occupancy_storage_authorities_current(
+    authorities: Sequence[_OccupancyStorageAuthority],
+) -> None:
+    """Stream-check exact storage bytes without rebuilding occupancy semantics."""
+
+    verified: dict[
+        Path,
+        tuple[_OccupancyStorageFileAuthority, tuple[int, int, int, int, int, int]],
+    ] = {}
+    for authority in authorities:
+        if type(authority) is not _OccupancyStorageAuthority:
+            raise ValueError("Occupancy storage authority token is not authentic")
+        if not authority.files or authority.files[0].path != (
+            authority.root / "metadata.json"
+        ):
+            raise ValueError("Occupancy storage authority root binding changed")
+        if (
+            authority.files[0].sha256 != authority.metadata_sha256
+            or authority.files[0].size_bytes != authority.metadata_size_bytes
+        ):
+            raise ValueError("Occupancy storage metadata authority changed")
+        for expected in authority.files:
+            prior = verified.get(expected.path)
+            if prior is not None:
+                if prior[0] != expected:
+                    raise ValueError(
+                        "One occupancy storage path has conflicting authority records"
+                    )
+                if _occupancy_storage_stat_identity(expected.path.stat()) != prior[1]:
+                    raise ValueError("Occupancy storage file changed after verification")
+                continue
+            identity = _stream_verify_occupancy_storage_file(expected)
+            verified[expected.path] = (expected, identity)
+    for path, (_, identity) in verified.items():
+        if _occupancy_storage_stat_identity(path.stat()) != identity:
+            raise ValueError("Occupancy storage file changed during authority verification")
+
+
+def _occupancy_storage_file_authority(
+    path: Path,
+    *,
+    sha256: str,
+    size_bytes: int | None = None,
+    dtype: str | None = None,
+    shape: tuple[int, ...] | None = None,
+) -> _OccupancyStorageFileAuthority:
+    resolved = path.resolve()
+    if _SHA256_PATTERN.fullmatch(str(sha256)) is None:
+        raise ValueError("Occupancy storage file SHA-256 is malformed")
+    actual_size = resolved.stat().st_size
+    expected_size = actual_size if size_bytes is None else int(size_bytes)
+    if expected_size < 0:
+        raise ValueError("Occupancy storage file size is invalid")
+    return _OccupancyStorageFileAuthority(
+        resolved,
+        str(sha256),
+        expected_size,
+        dtype,
+        shape,
+    )
+
+
+def _occupancy_storage_internal_authority(
+    root: Path,
+    record: Mapping[str, Any],
+    *,
+    array: bool = False,
+) -> _OccupancyStorageFileAuthority:
+    path = _contained(root, str(record["path"]))
+    dtype = None
+    shape = None
+    if array:
+        dtype = str(record["dtype"])
+        raw_shape = record["shape"]
+        if isinstance(raw_shape, (str, bytes)) or not isinstance(raw_shape, Sequence):
+            raise ValueError("Occupancy storage array shape is invalid")
+        shape = tuple(int(value) for value in raw_shape)
+        if any(value < 0 for value in shape):
+            raise ValueError("Occupancy storage array shape is invalid")
+    return _occupancy_storage_file_authority(
+        path,
+        sha256=str(record["sha256"]),
+        dtype=dtype,
+        shape=shape,
+    )
+
+
+def _occupancy_storage_source_authority(
+    record: Mapping[str, Any],
+    *,
+    expected_filename: str | None = None,
+    relocation_root: Path,
+) -> _OccupancyStorageFileAuthority:
+    path = _verify_source(
+        record,
+        expected_filename=expected_filename,
+        relocation_root=relocation_root,
+    )
+    return _occupancy_storage_file_authority(
+        path,
+        sha256=str(record["sha256"]),
+    )
+
+
+def _occupancy_storage_stat_identity(
+    value: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _stream_verify_occupancy_storage_file(
+    expected: _OccupancyStorageFileAuthority,
+) -> tuple[int, int, int, int, int, int]:
+    path = expected.path
+    path_before = path.stat()
+    if not stat.S_ISREG(path_before.st_mode):
+        raise ValueError(f"Occupancy storage authority is not a regular file: {path}")
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with path.open("rb") as stream:
+        descriptor_before = os.fstat(stream.fileno())
+        if _occupancy_storage_stat_identity(descriptor_before) != (
+            _occupancy_storage_stat_identity(path_before)
+        ):
+            raise ValueError("Occupancy storage path changed before hashing")
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+            size_bytes += len(chunk)
+        descriptor_after = os.fstat(stream.fileno())
+    path_after = path.stat()
+    identity = _occupancy_storage_stat_identity(path_before)
+    if (
+        _occupancy_storage_stat_identity(descriptor_after) != identity
+        or _occupancy_storage_stat_identity(path_after) != identity
+        or size_bytes != expected.size_bytes
+        or digest.hexdigest() != expected.sha256
+    ):
+        raise ValueError(f"Occupancy storage file authority changed: {path}")
+    if expected.dtype is not None:
+        array = np.load(path, mmap_mode="r", allow_pickle=False)
+        try:
+            if str(array.dtype) != expected.dtype or tuple(array.shape) != expected.shape:
+                raise ValueError(f"Occupancy storage array manifest changed: {path}")
+        finally:
+            del array
+        if _occupancy_storage_stat_identity(path.stat()) != identity:
+            raise ValueError("Occupancy storage array changed during header verification")
+    return identity
 
 
 def read_legacy_occupancy_mapping_for_replay(
@@ -661,7 +989,11 @@ def read_legacy_occupancy_mapping_for_replay(
         raise ValueError(f"Invalid legacy occupancy-mapping artifact {root}: {exc}") from exc
 
 
-def _read_occupancy_mapping_integrity(path: str | Path) -> _DecodedOccupancyMapping:
+def _read_occupancy_mapping_integrity(
+    path: str | Path,
+    *,
+    replay_depth_rays: bool = True,
+) -> _DecodedOccupancyMapping:
     root = Path(path).resolve()
     try:
         metadata_bytes = (root / "metadata.json").read_bytes()
@@ -774,7 +1106,12 @@ def _read_occupancy_mapping_integrity(path: str | Path) -> _DecodedOccupancyMapp
                 )
             )
 
-        _validate_update_chain(updates, occupancy_config, acquisition_config)
+        _validate_update_chain(
+            updates,
+            occupancy_config,
+            acquisition_config,
+            replay_depth_rays=replay_depth_rays,
+        )
         final_snapshot = _load_snapshot_record(root, _mapping(metadata, "snapshot"))
         if final_snapshot != updates[-1].snapshot:
             raise ValueError("final occupancy snapshot does not match the last frame result")

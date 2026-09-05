@@ -133,8 +133,16 @@ class _FakeCoarseSession:
         *,
         selections: list[NextViewSelection] | None = None,
         transitions: list[CoarsePhaseTransition] | None = None,
+        endpoint_validation_binding: (
+            tuple[
+                str,
+                tuple[float, float, float, float, float, float],
+            ]
+            | None
+        ) = None,
     ) -> None:
         self.current_generation_path = (tmp_path / "generation").resolve()
+        self.endpoint_validation_binding = endpoint_validation_binding
         self.selections = list(selections or [_selection("coarse-000")])
         self.transitions = list(transitions or [_transition(tmp_path)])
         self.select_calls = 0
@@ -219,6 +227,91 @@ def test_coarse_selection_rebinds_ik_to_current_stopped_posture() -> None:
     np.testing.assert_allclose(rebound.target.joint_positions_rad, rebound_joints)
     assert "ik_rebound_to_current_stop=true" in rebound.diagnostics
     assert rebound.ranked_candidates[0].target == rebound.target
+
+
+def test_coarse_adapter_reuses_exact_discovery_endpoint_authority(
+    tmp_path: Path,
+) -> None:
+    selection = _selection("coarse-current-stop")
+    current = (0.4, -0.7, 0.8, -1.0, 0.3, 0.2)
+    session = _FakeCoarseSession(
+        tmp_path,
+        selections=[selection],
+        endpoint_validation_binding=(selection.selection_policy_sha256, current),
+    )
+    refreshes: list[object] = []
+    rebound_calls: list[object] = []
+    adapter = CoarseSessionNextViewAdapter(
+        session,
+        discovery_refresher=refreshes.append,
+        selection_rebinder=lambda selected, observation: (
+            rebound_calls.append(observation) or selected
+        ),
+    )
+    observation = SimpleNamespace(
+        inference_robot_state_trace=(
+            SimpleNamespace(joint_positions_rad=np.asarray(current)),
+        ),
+        stationarity_reference=SimpleNamespace(
+            joint_positions_rad=np.full(6, np.nan)
+        ),
+    )
+
+    selected = adapter.select_next(observation, SimpleNamespace())
+
+    assert selected.target == selection.target
+    assert tuple(item.target for item in selected.preflight_candidates) == tuple(
+        item.target for item in selection.preflight_candidates
+    )
+    assert "ik_rebound_to_current_stop=true" in selected.diagnostics
+    assert "ik_rebind_source=exact_discovery_endpoint_authority" in selected.diagnostics
+    assert refreshes == [observation]
+    assert rebound_calls == []
+
+
+@pytest.mark.parametrize("mismatch", ["posture", "policy", "authority"])
+def test_coarse_adapter_rebinds_when_discovery_authority_is_not_exact(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    selection = _selection("coarse-current-stop")
+    current = (0.4, -0.7, 0.8, -1.0, 0.3, 0.2)
+    authority = (selection.selection_policy_sha256, current)
+    if mismatch == "posture":
+        authority = (authority[0], (*current[:-1], current[-1] + 1e-12))
+    elif mismatch == "policy":
+        authority = ("d" * 64, authority[1])
+    elif mismatch == "authority":
+        authority = None
+    session = _FakeCoarseSession(
+        tmp_path,
+        selections=[selection],
+        endpoint_validation_binding=authority,
+    )
+    rebound = replace(selection, diagnostics=("recomputed from current stop",))
+    rebound_calls: list[object] = []
+
+    def rebind(selected, observation):
+        assert selected is selection
+        rebound_calls.append(observation)
+        return rebound
+
+    adapter = CoarseSessionNextViewAdapter(
+        session,
+        discovery_refresher=lambda _observation: None,
+        selection_rebinder=rebind,
+    )
+    observation = SimpleNamespace(
+        inference_robot_state_trace=(),
+        stationarity_reference=SimpleNamespace(
+            joint_positions_rad=np.asarray(current)
+        ),
+    )
+
+    selected = adapter.select_next(observation, SimpleNamespace())
+
+    assert selected is rebound
+    assert rebound_calls == [observation]
 
 
 def test_coarse_adapter_restages_the_path_safe_ranked_fallback(tmp_path: Path) -> None:
@@ -556,10 +649,12 @@ class _FakeExperimentHandoff:
         fail_prepare: bool = False,
         fail_fine_started: bool = False,
         fail_fine_completed: bool = False,
+        fine_start_uses_candidate_commit: bool = True,
     ) -> None:
         self.fail_prepare = fail_prepare
         self.fail_fine_started = fail_fine_started
         self.fail_fine_completed = fail_fine_completed
+        self.fine_start_uses_candidate_commit = fine_start_uses_candidate_commit
         self.prepared: tuple[Path, Path] | None = None
         self.fine_run_root: Path | None = None
         self.fine_start_candidates: list[Path] = []
@@ -792,6 +887,39 @@ def test_active_runner_block_reason_is_preserved_in_outer_runtime(tmp_path: Path
     assert snapshot.blocking_reason == reason
 
 
+def test_occupancy_motion_block_remains_recoverable_in_outer_runtime(
+    tmp_path: Path,
+) -> None:
+    runtime, runner, _session = _runtime(
+        tmp_path,
+        bootstrap_motion_ready_after=1,
+    )
+    runtime.start()
+    runtime.capture_operator_view(view_id="single-initial-view")
+    reason = "no_candidate_passed_preflight:environment_occupancy_unknown:wrist_3_link_0"
+
+    def motion_blocked_run_until_attention(*, maximum_steps: int = 32):
+        assert maximum_steps > 0
+        runner._status = _status(  # noqa: SLF001
+            tmp_path,
+            ExperimentDisposition.NEEDS_CAPTURE,
+            phase="motion_blocked",
+            cycle=1,
+            blocking=(reason,),
+        )
+        return runner._status
+
+    runner.run_until_attention = motion_blocked_run_until_attention  # type: ignore[method-assign]
+
+    snapshot = runtime.advance_to_attention()
+
+    assert snapshot.phase is UnknownBladeRuntimePhase.COARSE_SCAN
+    assert snapshot.runner_status.phase == "motion_blocked"
+    assert snapshot.runner_status.disposition is ExperimentDisposition.NEEDS_CAPTURE
+    assert snapshot.runner_status.blocking_reasons == (reason,)
+    assert runner.stop_count == 0
+
+
 def test_operator_bootstrap_capture_can_directly_activate_ready_schema5(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -873,6 +1001,9 @@ def test_experimental_runtime_enters_unaccepted_fine_without_release_authorities
     assert fine_runner.start_count == 1
     assert fine_runner.capture_count == 1
     assert handoff.fine_run_root == (tmp_path / "fine" / "run").resolve()
+    assert handoff.fine_start_candidates == [
+        (tmp_path / "fine" / "run").resolve()
+    ]
     assert handoff.prepared == (
         (tmp_path / "ready-generation").resolve(),
         (tmp_path / "schema5-reference").resolve(),
@@ -1630,6 +1761,179 @@ def test_path_blocked_coarse_run_accepts_operator_safety_refresh(
     assert snapshot.runner_status.disposition is ExperimentDisposition.READY
 
 
+def test_planning_deadline_rejects_coarse_safety_refresh_api(tmp_path: Path) -> None:
+    runtime, runner, session = _runtime(tmp_path)
+    runtime.start()
+    for _ in range(3):
+        runtime.capture_operator_view()
+    runner._status = _status(  # noqa: SLF001
+        tmp_path,
+        ExperimentDisposition.NEEDS_CAPTURE,
+        phase="motion_blocked",
+        cycle=runner.capture_count,
+        blocking=(
+            "planning_deadline_exceeded:PlanningDeadlineExceeded:"
+            "cooperative responsiveness budget",
+        ),
+    )
+    rejected_before = session.reject_calls
+
+    with pytest.raises(UnknownBladeRuntimeError, match="cannot be recovered"):
+        runtime.capture_coarse_safety_refresh(view_id="wrong-refresh")
+
+    assert runner.capture_count == 3
+    assert session.reject_calls == rejected_before
+
+
+def test_console_coarse_safety_refresh_prompt_exposes_only_valid_commands(
+    tmp_path: Path,
+) -> None:
+    runtime, runner, _session = _runtime(tmp_path)
+    runtime.start()
+    for _ in range(3):
+        runtime.capture_operator_view()
+    runner._status = _status(  # noqa: SLF001
+        tmp_path,
+        ExperimentDisposition.NEEDS_CAPTURE,
+        phase="motion_blocked",
+        cycle=runner.capture_count,
+        blocking=("all ranked paths blocked by current occupancy",),
+    )
+    prompts: list[str] = []
+    outputs: list[str] = []
+
+    def stop_at_prompt(prompt: str) -> str:
+        prompts.append(prompt)
+        return "q"
+
+    runtime.start = lambda: runtime.snapshot  # type: ignore[method-assign]
+    result = run_unknown_blade_operator_console(
+        runtime,
+        input_fn=stop_at_prompt,
+        output_fn=outputs.append,
+    )
+
+    assert result == 0
+    assert len(prompts) == 1
+    assert "SAFETY_REFRESH" in prompts[0]
+    assert "front" not in prompts[0]
+    assert "back" not in prompts[0]
+    assert any("all ranked paths blocked" in line for line in outputs)
+    assert runner.capture_count == 3
+    assert runner.stop_count == 1
+
+
+def test_console_recovery_refresh_does_not_request_manual_reposition(
+    tmp_path: Path,
+) -> None:
+    runtime, runner, _session = _runtime(tmp_path)
+    runtime.start()
+    for _ in range(3):
+        runtime.capture_operator_view()
+    runner._status = _status(  # noqa: SLF001
+        tmp_path,
+        ExperimentDisposition.NEEDS_CAPTURE,
+        phase="motion_blocked",
+        cycle=runner.capture_count,
+        blocking=("recovery_requires_fresh_safety_refresh",),
+    )
+    prompts: list[str] = []
+    outputs: list[str] = []
+
+    def stop_at_prompt(prompt: str) -> str:
+        prompts.append(prompt)
+        return "q"
+
+    runtime.start = lambda: runtime.snapshot  # type: ignore[method-assign]
+    result = run_unknown_blade_operator_console(
+        runtime,
+        input_fn=stop_at_prompt,
+        output_fn=outputs.append,
+    )
+
+    assert result == 0
+    assert len(prompts) == 1
+    assert "Manually reposition" not in prompts[0]
+    assert "unchanged" in prompts[0]
+    assert "front" not in prompts[0]
+    assert "back" not in prompts[0]
+    assert any("fresh occupancy-only safety capture" in line for line in outputs)
+    assert runner.capture_count == 3
+    assert runner.stop_count == 1
+
+
+def test_console_planning_deadline_exits_without_offering_capture(
+    tmp_path: Path,
+) -> None:
+    runtime, runner, _session = _runtime(tmp_path)
+    reason = (
+        "planning_restart_required:planning_deadline_exceeded:"
+        "PlanningDeadlineExceeded:cooperative responsiveness budget"
+    )
+
+    def deadline_attention(*, maximum_steps: int = 32):
+        assert maximum_steps > 0
+        runner._status = _status(  # noqa: SLF001
+            tmp_path,
+            ExperimentDisposition.BLOCKED,
+            phase="motion_blocked",
+            cycle=runner.capture_count,
+            blocking=(reason,),
+        )
+        return runner._status
+
+    runner.run_until_attention = deadline_attention  # type: ignore[method-assign]
+    commands = iter(("c", "c", "c"))
+    prompts: list[str] = []
+    outputs: list[str] = []
+
+    def input_command(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(commands)
+
+    result = run_unknown_blade_operator_console(
+        runtime,
+        input_fn=input_command,
+        output_fn=outputs.append,
+    )
+
+    assert result == 1
+    assert len(prompts) == 3
+    assert all("blade bootstrap" in prompt for prompt in prompts)
+    assert all("SAFETY_REFRESH" not in prompt for prompt in prompts)
+    assert any(line == f"BLOCKED: {reason}" for line in outputs)
+    assert runner.stop_count == 1
+    assert runner.execute_count == 0
+
+
+def test_operator_stop_preserves_coarse_science_for_resume(tmp_path: Path) -> None:
+    handoff = _FakeExperimentHandoff()
+    runtime, runner, session = _runtime(
+        tmp_path,
+        experiment_handoff=handoff,
+        bootstrap_motion_ready_after=1,
+    )
+    runtime.start()
+    runtime.capture_operator_view(view_id="formal-bootstrap")
+    accepted_generation = session.current_generation_path
+    accepted_checkpoints = tuple(handoff.coarse_checkpoints)
+    runner._status = _status(  # noqa: SLF001
+        tmp_path,
+        ExperimentDisposition.NEEDS_CAPTURE,
+        phase="motion_blocked",
+        cycle=runner.capture_count,
+        blocking=("all ranked paths blocked by current occupancy",),
+    )
+
+    stopped = runtime.request_stop("operator requested stop")
+
+    assert stopped.phase is UnknownBladeRuntimePhase.STOPPED
+    assert stopped.current_coarse_generation_path == accepted_generation
+    assert tuple(handoff.coarse_checkpoints) == accepted_checkpoints
+    assert session.reject_calls >= 1
+    assert runner.execute_count == 0
+
+
 @pytest.mark.parametrize(
     "resume_phase",
     [UnknownBladeResumePhase.COARSE, UnknownBladeResumePhase.FINE],
@@ -2258,6 +2562,7 @@ def test_experimental_open_allows_verified_coarse_resume_before_hardware(
         coarse_run_root=(root / "runs" / "coarse").resolve(),
         coarse_generation_path=(root / "coarse-generation").resolve(),
         placement_id="blade-placement-test",
+        experimental_unaccepted=True,
     )
     calls: list[bool] = []
 
@@ -2296,6 +2601,58 @@ def test_experimental_open_allows_verified_coarse_resume_before_hardware(
         raise AssertionError("context must not open")
 
     assert calls == [False]
+
+
+@pytest.mark.parametrize(
+    ("chain_is_experimental", "requested_experimental"),
+    ((True, False), (False, True)),
+)
+def test_resume_mode_must_match_immutable_experiment_init_before_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    chain_is_experimental: bool,
+    requested_experimental: bool,
+) -> None:
+    root = tmp_path / "mode-bound-resume"
+    root.mkdir()
+    plan = UnknownBladeResumePlan(
+        experiment_root=root.resolve(),
+        experiment_id="runtime-test",
+        phase=UnknownBladeResumePhase.COARSE,
+        coarse_run_root=(root / "runs" / "coarse").resolve(),
+        experimental_unaccepted=chain_is_experimental,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "load_unknown_blade_resume_plan",
+        lambda _root: plan,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "require_unknown_blade_runtime_ready",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("immutable mode mismatch must block before readiness")
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "EliteArm",
+        lambda _settings: (_ for _ in ()).throw(
+            AssertionError("immutable mode mismatch must block before hardware")
+        ),
+    )
+
+    with (
+        pytest.raises(UnknownBladeRuntimeError, match="Resume mode differs"),
+        open_production_unknown_blade_runtime(
+            load_settings("configs/default.yaml"),
+            output_root=root,
+            operator_id="operator-1",
+            resume=True,
+            experimental=requested_experimental,
+        ),
+    ):
+        raise AssertionError("mismatched resume mode must not open")
 
 
 @pytest.mark.parametrize(
@@ -2357,6 +2714,79 @@ def test_unaccepted_completed_resume_is_rejected_before_readiness_or_hardware(
         ),
     ):
         raise AssertionError("unaccepted COMPLETE must not open")
+
+
+def test_experimental_completed_resume_replays_read_only_without_hardware(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "sealed-experimental"
+    root.mkdir()
+    final_root = (root / "reconstruction").resolve()
+    plan = UnknownBladeResumePlan(
+        experiment_root=root.resolve(),
+        experiment_id="runtime-test",
+        phase=UnknownBladeResumePhase.COMPLETE,
+        coarse_run_root=(root / "runs" / "coarse").resolve(),
+        coarse_generation_path=(root / "coarse-generation").resolve(),
+        reference_coarse_model_path=(root / "reference").resolve(),
+        fine_run_root=(root / "runs" / "fine").resolve(),
+        accepted_fine_coverage_path=(root / "coverage").resolve(),
+        final_reconstruction_path=final_root,
+        experimental_unaccepted=True,
+    )
+    terminal = SimpleNamespace(cycle_index=5, event_sha256="a" * 64)
+    replay_calls: list[Path] = []
+    monkeypatch.setattr(
+        runtime_module,
+        "load_unknown_blade_resume_plan",
+        lambda _root: plan,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "replay_final_fine_reconstruction",
+        lambda path: (
+            replay_calls.append(Path(path).resolve())
+            or SimpleNamespace(root=Path(path).resolve())
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "read_stop_scan_run",
+        lambda _root: SimpleNamespace(
+            run_id="runtime-test",
+            root=plan.fine_run_root,
+            events=(terminal,),
+            latest_event=terminal,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "require_unknown_blade_runtime_ready",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("completed experimental resume must not run readiness")
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "EliteArm",
+        lambda _settings: (_ for _ in ()).throw(
+            AssertionError("completed experimental resume must not construct hardware")
+        ),
+    )
+
+    with open_production_unknown_blade_runtime(
+        load_settings("configs/default.yaml"),
+        output_root=root,
+        operator_id="operator-1",
+        resume=True,
+        experimental=True,
+    ) as runtime:
+        snapshot = runtime.snapshot
+
+    assert snapshot.phase is UnknownBladeRuntimePhase.COMPLETE
+    assert snapshot.final_reconstruction_path == final_root
+    assert replay_calls == [final_root]
 
 
 def test_science_bound_completed_resume_replays_without_constructing_hardware(

@@ -208,7 +208,7 @@ def _state(
     )
 
 
-def test_execute_stops_after_one_exact_bounded_stream_and_writes_evidence(
+def test_execute_rebinds_live_residual_to_one_exact_bounded_stream_and_writes_evidence(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = load_settings("configs/default.yaml")
@@ -227,6 +227,13 @@ def test_execute_stops_after_one_exact_bounded_stream_and_writes_evidence(
     )
     prepared = commissioning.bind_motion_envelope_commissioning_output(prepared, tmp_path / "trial")
     calls: list[str] = []
+    live_start = np.asarray(stored.candidate.start_joint_positions_rad).copy()
+    live_start[4] += 3.2e-5
+    sealed_goal = np.asarray(stored.candidate.goal_joint_positions_rad)
+    requested_delta = float(np.max(np.abs(sealed_goal - live_start)))
+    expected_scale = stored.candidate.maximum_candidate_joint_delta_rad / requested_delta
+    expected_goal = live_start + expected_scale * (sealed_goal - live_start)
+    live_preflight_calls: list[tuple[np.ndarray, np.ndarray]] = []
 
     class FakeArm:
         def __init__(self, config) -> None:
@@ -237,7 +244,7 @@ def test_execute_stops_after_one_exact_bounded_stream_and_writes_evidence(
             self.is_enabled = False
             self._stopped = False
             self._generation = 0
-            self._joints = np.asarray(stored.candidate.start_joint_positions_rad)
+            self._joints = live_start.copy()
 
         @property
         def stop_snapshot(self):
@@ -275,6 +282,7 @@ def test_execute_stops_after_one_exact_bounded_stream_and_writes_evidence(
             calls.append("prepare")
 
         def _guarded_stream_servoj(self, stream, *, tracking_samples, **_kwargs):
+            assert len(stream.commands) == 2
             self._joints = np.asarray(stream.commands[-1])
             tracking_samples.append(
                 {
@@ -284,6 +292,19 @@ def test_execute_stops_after_one_exact_bounded_stream_and_writes_evidence(
             )
             calls.append("stream")
             return StreamServoJResult(ok=True, commands_sent=len(stream.commands))
+
+        def _guarded_settle_servoj_endpoint(self, joint_positions_rad, **kwargs):
+            assert np.asarray(joint_positions_rad) == pytest.approx(expected_goal)
+            assert kwargs["expected_stop_generation"] == self._generation
+            assert kwargs["deadline_exceeded"]() is False
+            calls.append("endpoint_settle")
+            return {
+                "settled": True,
+                "duration_s": 0.04,
+                "sample_count": 3,
+                "maximum_tracking_error_rad": 0.0,
+                "final_tracking_error_rad": 0.0,
+            }
 
         def _guarded_deadline_stop(self, **_kwargs) -> None:
             pytest.fail("watchdog must be cancelled after the short stream")
@@ -298,11 +319,21 @@ def test_execute_stops_after_one_exact_bounded_stream_and_writes_evidence(
         "fifo_scheduler",
         lambda *_args, **_kwargs: nullcontext(),
     )
-    monkeypatch.setattr(
-        commissioning,
-        "preflight_linear_joint_motion",
-        lambda *_args, **_kwargs: preflight,
-    )
+
+    def live_preflight(start, goal, **_kwargs):
+        live_preflight_calls.append(
+            (np.asarray(start, dtype=np.float64), np.asarray(goal, dtype=np.float64))
+        )
+        return SimpleNamespace(
+            status=MotionPreflightStatus.CLEAR,
+            servoj_stream=ServoJStream(
+                commands=(tuple(start), tuple(goal)),
+                dt_s=settings.motion_preflight.servoj_dt_s,
+            ),
+            collision=SimpleNamespace(continuous_swept_volume_evidence_valid=True),
+        )
+
+    monkeypatch.setattr(commissioning, "preflight_linear_joint_motion", live_preflight)
     monkeypatch.setattr(
         commissioning,
         "_wait_for_stationary_safe_window",
@@ -338,6 +369,7 @@ def test_execute_stops_after_one_exact_bounded_stream_and_writes_evidence(
         "resume",
         "prepare",
         "stream",
+        "endpoint_settle",
         "stop",
         "release",
     ]
@@ -348,7 +380,25 @@ def test_execute_stops_after_one_exact_bounded_stream_and_writes_evidence(
     assert payload["effective_limits"]["sdk_fifo_priority"] == 99
     assert payload["effective_limits"]["servoj_warmup_duration_s"] == 0.2
     assert payload["maximum_tracking_deviation_rad"] == [0.0] * 6
+    assert payload["endpoint_settle_evidence"]["settled"] is True
+    assert payload["effective_limits"]["feedback_endpoint_settle_required"] is True
     assert payload["settling_evidence"]["duration_s"] == settings.robot.settle_time_s
+    assert len(live_preflight_calls) == 1
+    assert live_preflight_calls[0][0] == pytest.approx(live_start)
+    assert live_preflight_calls[0][1] == pytest.approx(expected_goal)
+    assert payload["candidate"]["execution_goal_joint_positions_rad"] == pytest.approx(
+        expected_goal
+    )
+    assert payload["live_rebind_evidence"] == pytest.approx(
+        {
+            "live_start_error_rad": 3.2e-5,
+            "requested_live_delta_rad": requested_delta,
+            "maximum_live_delta_rad": stored.candidate.maximum_candidate_joint_delta_rad,
+            "execution_live_delta_rad": stored.candidate.maximum_candidate_joint_delta_rad,
+            "goal_scale": expected_scale,
+            "goal_rebound": True,
+        }
+    )
 
 
 def test_intentional_tracking_fault_requires_expected_early_abort_and_stop(
@@ -412,9 +462,10 @@ def test_intentional_tracking_fault_requires_expected_early_abort_and_stop(
             return None
 
         def _guarded_stream_servoj(self, stream, *, config, tracking_samples, **_kwargs):
-            assert len(stream.commands) == 10
+            assert len(stream.commands) == 24
             assert config.tracking_error_rad == 0.001
             assert config.max_consecutive_tracking_violations == 1
+            assert config.tracking_check_every_n_commands == 1
             tracking_samples.append(
                 {
                     "q_cmd": list(stream.commands[2]),
@@ -451,7 +502,18 @@ def test_intentional_tracking_fault_requires_expected_early_abort_and_stop(
         return SimpleNamespace(
             status=MotionPreflightStatus.CLEAR,
             servoj_stream=ServoJStream(
-                commands=(tuple(start), tuple(goal)),
+                commands=tuple(
+                    tuple(
+                        np.asarray(start, dtype=np.float64)
+                        + (np.asarray(goal, dtype=np.float64) - np.asarray(start, dtype=np.float64))
+                        * (
+                            2.0 * (index / 63) ** 2
+                            if index <= 31
+                            else 1.0 - 2.0 * ((63 - index) / 63) ** 2
+                        )
+                    )
+                    for index in range(64)
+                ),
                 dt_s=settings.motion_preflight.servoj_dt_s,
             ),
             collision=SimpleNamespace(continuous_swept_volume_evidence_valid=True),
@@ -490,15 +552,20 @@ def test_intentional_tracking_fault_requires_expected_early_abort_and_stop(
     live_start, live_goal = live_preflight_calls[0]
     assert np.max(np.abs(live_goal - live_start)) == pytest.approx(0.01)
     assert "TRACKING-FAULT" in prepared.approval_prompt
-    payload = commissioning.json.loads(
-        (tmp_path / "fault-trial" / "trial.json").read_text()
-    )
+    payload = commissioning.json.loads((tmp_path / "fault-trial" / "trial.json").read_text())
     assert payload["candidate"]["trial_kind"] == "intentional_tracking_fault"
-    assert payload["candidate"]["sealed_execution_goal_joint_positions_rad"] != payload[
-        "candidate"
-    ]["execution_goal_joint_positions_rad"]
+    assert (
+        payload["candidate"]["sealed_execution_goal_joint_positions_rad"]
+        != payload["candidate"]["execution_goal_joint_positions_rad"]
+    )
     assert payload["stream_result"]["abort_reason"] == "tracking_error_exceeded"
-    assert payload["effective_limits"]["maximum_fault_trial_commands"] == 10
+    assert payload["effective_limits"]["maximum_fault_trial_commands"] == 24
+    assert payload["effective_limits"]["fault_tracking_check_every_n_commands"] == 1
+    assert payload["effective_limits"]["fault_minimum_commanded_delta_rad"] == 0.002
+    assert payload["effective_limits"]["fault_maximum_commanded_delta_rad"] == 0.003
+    assert payload["fault_trial_commanded_delta_rad"] == pytest.approx(
+        2.0 * (23 / 63) ** 2 * 0.01
+    )
     assert payload["fault_detection_to_stop_acknowledgement_s"] is not None
     assert payload["ok"] is True
 
@@ -588,14 +655,19 @@ def test_reverse_revalidates_path_and_binds_direction_to_prompt(
     assert " REVERSE OUTPUT " in bound.approval_prompt
 
 
-def test_goal_hold_keeps_exact_endpoint_and_extends_duration() -> None:
-    stream = ServoJStream(commands=((0.0,) * 6, (0.02,) * 6), dt_s=0.004)
+def test_live_goal_rebind_ignores_only_float_roundoff_at_bound() -> None:
+    start = np.zeros(6, dtype=np.float64)
+    goal = np.asarray((0.020000000000000018, 0.0, 0.0, 0.0, 0.0, 0.0))
 
-    extended = commissioning._with_goal_hold(stream)
+    rebound, requested_delta, scale = commissioning._rebind_bounded_live_goal(
+        start,
+        goal,
+        maximum_joint_delta_rad=0.02,
+    )
 
-    assert extended.commands[:2] == stream.commands
-    assert extended.commands[-1] == stream.commands[-1]
-    assert len(extended.commands) == 252
+    assert requested_delta == 0.020000000000000018
+    assert scale == 1.0
+    assert rebound == pytest.approx(goal)
 
 
 def test_settle_window_ignores_one_transient_velocity_sample() -> None:

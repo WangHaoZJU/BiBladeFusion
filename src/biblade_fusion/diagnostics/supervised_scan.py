@@ -369,7 +369,7 @@ def _collision_backend_check(settings: AppSettings) -> CheckResult:
                     HOLOROBOT_EFFECTIVE_SAMPLE_STEP_RAD
                 ),
                 "servoj_trajectory_generator": (
-                    "holorobot_velocity_acceleration_limited_servoj_v2"
+                    "rest_to_rest_velocity_acceleration_limited_servoj_v3"
                 ),
                 "maximum_joint_acceleration_rad_s2": list(
                     settings.motion_preflight.maximum_joint_acceleration_rad_s2

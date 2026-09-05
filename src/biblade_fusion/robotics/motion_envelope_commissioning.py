@@ -49,7 +49,6 @@ COMMISSIONING_LIVE_START_TOLERANCE_RAD = 0.001
 COMMISSIONING_FIFO_PRIORITY = 10
 COMMISSIONING_SDK_FIFO_PRIORITY = os.sched_get_priority_max(os.SCHED_FIFO)
 COMMISSIONING_MAXIMUM_EXECUTION_DURATION_S = 3.0
-COMMISSIONING_GOAL_HOLD_DURATION_S = 1.0
 COMMISSIONING_MAXIMUM_GOAL_ERROR_RAD = 0.002
 COMMISSIONING_MAXIMUM_STATIONARY_JOINT_SPEED_RAD_S = 0.001
 COMMISSIONING_MAXIMUM_STATIONARY_TCP_SPEED = 0.001
@@ -58,7 +57,10 @@ COMMISSIONING_MAXIMUM_SETTLE_TIMEOUT_S = 5.0
 COMMISSIONING_NOMINAL_TRIAL_KIND = "nominal"
 COMMISSIONING_TRACKING_FAULT_TRIAL_KIND = "intentional_tracking_fault"
 COMMISSIONING_FAULT_TRACKING_ERROR_RAD = 0.001
-COMMISSIONING_FAULT_MAXIMUM_COMMANDS = 10
+COMMISSIONING_FAULT_MAXIMUM_COMMANDS = 24
+COMMISSIONING_FAULT_TRACKING_CHECK_EVERY_N_COMMANDS = 1
+COMMISSIONING_FAULT_MINIMUM_COMMANDED_DELTA_RAD = 0.002
+COMMISSIONING_FAULT_MAXIMUM_COMMANDED_DELTA_RAD = 0.003
 COMMISSIONING_FAULT_LIVE_START_TOLERANCE_RAD = 0.005
 COMMISSIONING_FAULT_MAXIMUM_LIVE_SEGMENT_RAD = 0.01
 
@@ -268,6 +270,26 @@ def _require_current_configuration(
         )
 
 
+def _rebind_bounded_live_goal(
+    live_start_joint_positions_rad: np.ndarray,
+    sealed_goal_joint_positions_rad: np.ndarray,
+    *,
+    maximum_joint_delta_rad: float,
+) -> tuple[np.ndarray, float, float]:
+    """Move toward the sealed goal without exceeding the physical trial bound."""
+
+    maximum_delta = float(maximum_joint_delta_rad)
+    if not math.isfinite(maximum_delta) or maximum_delta <= 0.0:
+        raise ValueError("maximum live commissioning joint delta must be positive")
+    direction = sealed_goal_joint_positions_rad - live_start_joint_positions_rad
+    requested_delta = float(np.max(np.abs(direction)))
+    if requested_delta <= 1e-12:
+        raise RobotCommandError("live commissioning start already equals its sealed goal")
+    scale = 1.0 if requested_delta <= maximum_delta + 1e-12 else maximum_delta / requested_delta
+    goal = live_start_joint_positions_rad + scale * direction
+    return goal, requested_delta, scale
+
+
 def prepare_motion_envelope_commissioning_trial(
     candidate_path: str | Path,
     settings: AppSettings,
@@ -398,9 +420,7 @@ def bind_motion_envelope_commissioning_output(
     output_binding = hashlib.sha256(str(output).encode("utf-8")).hexdigest()[:12]
     candidate_id = prepared.stored_candidate.candidate.candidate_id
     mode_token = (
-        " TRACKING-FAULT"
-        if prepared.trial_kind == COMMISSIONING_TRACKING_FAULT_TRIAL_KIND
-        else ""
+        " TRACKING-FAULT" if prepared.trial_kind == COMMISSIONING_TRACKING_FAULT_TRIAL_KIND else ""
     )
     return replace(
         prepared,
@@ -438,14 +458,6 @@ def fifo_scheduler(priority: int = COMMISSIONING_FIFO_PRIORITY) -> Iterator[None
 def probe_fifo_scheduler(priority: int = COMMISSIONING_SDK_FIFO_PRIORITY) -> None:
     with fifo_scheduler(priority):
         pass
-
-
-def _with_goal_hold(stream: ServoJStream) -> ServoJStream:
-    hold_count = max(1, math.ceil(COMMISSIONING_GOAL_HOLD_DURATION_S / stream.dt_s))
-    return ServoJStream(
-        commands=stream.commands + (stream.commands[-1],) * hold_count,
-        dt_s=stream.dt_s,
-    )
 
 
 def _tracking_deviation(
@@ -533,15 +545,16 @@ def execute_motion_envelope_commissioning_trial(
     watchdog_errors: list[str] = []
     settling_samples: list[dict[str, Any]] = []
     settling_evidence: dict[str, Any] | None = None
+    endpoint_settle_evidence: dict[str, float | int | bool] | None = None
+    live_rebind_evidence: dict[str, float | bool] | None = None
+    fault_trial_commanded_delta_rad: float | None = None
     goal_error_rad: float | None = None
     trial_started = time.monotonic()
     try:
         arm.connect(with_driver=True)
         before_state = arm.read_state()
         _require_stationary_safe_state(before_state, stage="commissioning start")
-        intentional_tracking_fault = (
-            prepared.trial_kind == COMMISSIONING_TRACKING_FAULT_TRIAL_KIND
-        )
+        intentional_tracking_fault = prepared.trial_kind == COMMISSIONING_TRACKING_FAULT_TRIAL_KIND
         live_start_tolerance = (
             COMMISSIONING_FAULT_LIVE_START_TOLERANCE_RAD
             if intentional_tracking_fault
@@ -550,27 +563,33 @@ def execute_motion_envelope_commissioning_trial(
         live_error = float(np.max(np.abs(before_state.joint_positions_rad - execution_start)))
         if live_error > live_start_tolerance:
             raise RobotCommandError(f"live start differs from candidate by {live_error:.6f} rad")
-        if intentional_tracking_fault:
-            live_direction = sealed_execution_goal - before_state.joint_positions_rad
-            live_direction_maximum = float(np.max(np.abs(live_direction)))
-            if live_direction_maximum <= 1e-12:
-                raise RobotCommandError("tracking-fault live start already equals candidate goal")
-            live_scale = min(
-                1.0,
-                COMMISSIONING_FAULT_MAXIMUM_LIVE_SEGMENT_RAD / live_direction_maximum,
-            )
-            execution_goal = before_state.joint_positions_rad + live_scale * live_direction
-        live_delta = float(np.max(np.abs(execution_goal - before_state.joint_positions_rad)))
         maximum_live_delta = (
             COMMISSIONING_FAULT_MAXIMUM_LIVE_SEGMENT_RAD
             if intentional_tracking_fault
-            else MAXIMUM_COMMISSIONING_CANDIDATE_JOINT_DELTA_RAD
+            else min(
+                MAXIMUM_COMMISSIONING_CANDIDATE_JOINT_DELTA_RAD,
+                float(candidate.maximum_candidate_joint_delta_rad),
+            )
         )
+        execution_goal, requested_live_delta, live_goal_scale = _rebind_bounded_live_goal(
+            before_state.joint_positions_rad,
+            sealed_execution_goal,
+            maximum_joint_delta_rad=maximum_live_delta,
+        )
+        live_delta = float(np.max(np.abs(execution_goal - before_state.joint_positions_rad)))
         if live_delta > maximum_live_delta + 1e-12:
             raise RobotCommandError(
                 "live commissioning delta exceeds its trial bound "
                 f"({live_delta:.6f} > {maximum_live_delta:.6f} rad)"
             )
+        live_rebind_evidence = {
+            "live_start_error_rad": live_error,
+            "requested_live_delta_rad": requested_live_delta,
+            "maximum_live_delta_rad": maximum_live_delta,
+            "execution_live_delta_rad": live_delta,
+            "goal_scale": live_goal_scale,
+            "goal_rebound": live_goal_scale < 1.0,
+        }
         live_preflight = preflight_linear_joint_motion(
             before_state.joint_positions_rad,
             execution_goal,
@@ -591,14 +610,33 @@ def execute_motion_envelope_commissioning_trial(
             or not live_preflight.collision.continuous_swept_volume_evidence_valid
         ):
             raise RobotCommandError("live commissioning segment is not continuously mesh-clear")
-        commissioning_stream = _with_goal_hold(live_preflight.servoj_stream)
+        commissioning_stream = live_preflight.servoj_stream
         if intentional_tracking_fault:
             commissioning_stream = ServoJStream(
-                commands=commissioning_stream.commands[
-                    :COMMISSIONING_FAULT_MAXIMUM_COMMANDS
-                ],
+                commands=commissioning_stream.commands[:COMMISSIONING_FAULT_MAXIMUM_COMMANDS],
                 dt_s=commissioning_stream.dt_s,
             )
+            fault_trial_commanded_delta_rad = float(
+                np.max(
+                    np.abs(
+                        np.asarray(commissioning_stream.commands, dtype=np.float64)
+                        - before_state.joint_positions_rad
+                    )
+                )
+            )
+            if (
+                fault_trial_commanded_delta_rad
+                < COMMISSIONING_FAULT_MINIMUM_COMMANDED_DELTA_RAD
+                or fault_trial_commanded_delta_rad
+                > COMMISSIONING_FAULT_MAXIMUM_COMMANDED_DELTA_RAD
+            ):
+                raise RobotCommandError(
+                    "intentional tracking-fault command window is outside its reviewed "
+                    "excursion band "
+                    f"({fault_trial_commanded_delta_rad:.6f} rad not in "
+                    f"[{COMMISSIONING_FAULT_MINIMUM_COMMANDED_DELTA_RAD:.6f}, "
+                    f"{COMMISSIONING_FAULT_MAXIMUM_COMMANDED_DELTA_RAD:.6f}] rad)"
+                )
         runtime_config = ServoJStreamConfig(
             dt_s=commissioning_stream.dt_s,
             tracking_error_rad=(
@@ -611,7 +649,11 @@ def execute_motion_envelope_commissioning_trial(
                 if intentional_tracking_fault
                 else ServoJStreamConfig().max_consecutive_tracking_violations
             ),
-            tracking_check_every_n_commands=2,
+            tracking_check_every_n_commands=(
+                COMMISSIONING_FAULT_TRACKING_CHECK_EVERY_N_COMMANDS
+                if intentional_tracking_fault
+                else ServoJStreamConfig().tracking_check_every_n_commands
+            ),
         )
         runtime_config.validate()
 
@@ -663,6 +705,13 @@ def execute_motion_envelope_commissioning_trial(
                     tracking_samples=tracking_samples,
                     deadline_exceeded=deadline_exceeded,
                 )
+                if stream_result.ok and not intentional_tracking_fault:
+                    endpoint_settle_evidence = arm._guarded_settle_servoj_endpoint(
+                        commissioning_stream.commands[-1],
+                        expected_stop_generation=generation,
+                        capability=_GUARDED_MOTION_CAPABILITY,
+                        deadline_exceeded=deadline_exceeded,
+                    )
         finally:
             watchdog.cancel()
             watchdog.join(timeout=0.5)
@@ -759,17 +808,13 @@ def execute_motion_envelope_commissioning_trial(
         "effective_limits": {
             "maximum_joint_delta_rad": MAXIMUM_COMMISSIONING_CANDIDATE_JOINT_DELTA_RAD,
             "live_start_tolerance_rad": COMMISSIONING_LIVE_START_TOLERANCE_RAD,
-            "fault_live_start_tolerance_rad": (
-                COMMISSIONING_FAULT_LIVE_START_TOLERANCE_RAD
-            ),
-            "fault_maximum_live_segment_rad": (
-                COMMISSIONING_FAULT_MAXIMUM_LIVE_SEGMENT_RAD
-            ),
+            "fault_live_start_tolerance_rad": (COMMISSIONING_FAULT_LIVE_START_TOLERANCE_RAD),
+            "fault_maximum_live_segment_rad": (COMMISSIONING_FAULT_MAXIMUM_LIVE_SEGMENT_RAD),
             "fifo_priority": COMMISSIONING_FIFO_PRIORITY,
             "sdk_fifo_priority": COMMISSIONING_SDK_FIFO_PRIORITY,
             "maximum_execution_duration_s": COMMISSIONING_MAXIMUM_EXECUTION_DURATION_S,
             "servoj_warmup_duration_s": ServoJStreamConfig().warmup_duration_s,
-            "goal_hold_duration_s": COMMISSIONING_GOAL_HOLD_DURATION_S,
+            "feedback_endpoint_settle_required": True,
             "settle_window_duration_s": settings.robot.settle_time_s,
             "settle_poll_period_s": COMMISSIONING_SETTLE_POLL_PERIOD_S,
             "maximum_settle_timeout_s": COMMISSIONING_MAXIMUM_SETTLE_TIMEOUT_S,
@@ -781,6 +826,21 @@ def execute_motion_envelope_commissioning_trial(
                 if prepared.trial_kind == COMMISSIONING_TRACKING_FAULT_TRIAL_KIND
                 else None
             ),
+            "fault_tracking_check_every_n_commands": (
+                COMMISSIONING_FAULT_TRACKING_CHECK_EVERY_N_COMMANDS
+                if prepared.trial_kind == COMMISSIONING_TRACKING_FAULT_TRIAL_KIND
+                else None
+            ),
+            "fault_minimum_commanded_delta_rad": (
+                COMMISSIONING_FAULT_MINIMUM_COMMANDED_DELTA_RAD
+                if prepared.trial_kind == COMMISSIONING_TRACKING_FAULT_TRIAL_KIND
+                else None
+            ),
+            "fault_maximum_commanded_delta_rad": (
+                COMMISSIONING_FAULT_MAXIMUM_COMMANDED_DELTA_RAD
+                if prepared.trial_kind == COMMISSIONING_TRACKING_FAULT_TRIAL_KIND
+                else None
+            ),
         },
         "before_state": _state_payload(before_state) if before_state is not None else None,
         "stop_request_state": (
@@ -788,15 +848,16 @@ def execute_motion_envelope_commissioning_trial(
         ),
         "after_state": _state_payload(after_state) if after_state is not None else None,
         "stream_result": stream_result.to_dict() if stream_result is not None else None,
+        "endpoint_settle_evidence": endpoint_settle_evidence,
+        "live_rebind_evidence": live_rebind_evidence,
+        "fault_trial_commanded_delta_rad": fault_trial_commanded_delta_rad,
         "tracking_samples": tracking_samples,
         "settling_samples": settling_samples,
         "settling_evidence": settling_evidence,
         "maximum_tracking_deviation_rad": list(tracking) if tracking is not None else None,
         "stop_drift_rad": list(stop_drift) if stop_drift is not None else None,
         "stop_acknowledgement_s": stop_acknowledgement_s,
-        "fault_detection_to_stop_acknowledgement_s": (
-            fault_detection_to_stop_acknowledgement_s
-        ),
+        "fault_detection_to_stop_acknowledgement_s": (fault_detection_to_stop_acknowledgement_s),
         "goal_error_rad": goal_error_rad,
         "watchdog_errors": watchdog_errors,
         "elapsed_s": time.monotonic() - trial_started,
@@ -819,8 +880,11 @@ def execute_motion_envelope_commissioning_trial(
 __all__ = [
     "COMMISSIONING_FIFO_PRIORITY",
     "COMMISSIONING_FAULT_MAXIMUM_COMMANDS",
+    "COMMISSIONING_FAULT_MAXIMUM_COMMANDED_DELTA_RAD",
     "COMMISSIONING_FAULT_LIVE_START_TOLERANCE_RAD",
     "COMMISSIONING_FAULT_MAXIMUM_LIVE_SEGMENT_RAD",
+    "COMMISSIONING_FAULT_MINIMUM_COMMANDED_DELTA_RAD",
+    "COMMISSIONING_FAULT_TRACKING_CHECK_EVERY_N_COMMANDS",
     "COMMISSIONING_FAULT_TRACKING_ERROR_RAD",
     "COMMISSIONING_SDK_FIFO_PRIORITY",
     "COMMISSIONING_LIVE_START_TOLERANCE_RAD",

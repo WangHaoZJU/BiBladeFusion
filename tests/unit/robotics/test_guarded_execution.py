@@ -27,7 +27,10 @@ from biblade_fusion.robotics import (
     OccupancyRobotCollisionChecker,
     preflight_linear_joint_motion,
 )
-from biblade_fusion.robotics.guarded_execution import EmergencyStopUnconfirmedError
+from biblade_fusion.robotics.guarded_execution import (
+    EmergencyStopUnconfirmedError,
+    ServoJExecutionAbortedError,
+)
 from biblade_fusion.robotics.motion_preflight import HOLOROBOT_SAMPLED_VALIDATION
 from biblade_fusion.robotics.occupancy_collision import (
     _issue_occupancy_semantic_attestation,
@@ -220,7 +223,7 @@ class FakeGuardedArm:
         assert capability is not None
         assert deadline_exceeded is None or deadline_exceeded() is False
         assert config.dt_s == stream.dt_s
-        assert tracking_samples is None
+        assert isinstance(tracking_samples, list)
         if self._stop_generation != expected_stop_generation or self.stopped:
             raise RobotMotionInterruptedError("stop generation changed before stream")
         self.events.append("stream")
@@ -653,6 +656,46 @@ def test_servoj_abort_and_stop_failure_are_reported_as_unconfirmed(
 
     assert "tracking_error" in str(raised.value.operation_error)
     assert [str(error) for error in raised.value.stop_errors] == ["writeIdle failed"]
+
+
+def test_servoj_tracking_abort_retains_numerical_context(
+    checker, occupancy_checker, clear_preflight
+) -> None:
+    arm = FakeGuardedArm()
+    executor = GuardedEliteExecutor(arm, checker, occupancy_checker)
+    permit = executor.authorize(
+        clear_preflight,
+        operator_id="operator-a",
+        confirmation=executor.approval_prompt(clear_preflight),
+    )
+
+    def aborted_stream(*_args, tracking_samples, **_kwargs):
+        tracking_samples.append(
+            {
+                "index": 7,
+                "q_cmd": [0.04] * 6,
+                "q_actual": [0.0] * 6,
+                "max_error_rad": 0.04,
+                "tracking_check": True,
+            }
+        )
+        return StreamServoJResult(
+            ok=False,
+            commands_sent=8,
+            max_tracking_error_rad=0.04,
+            abort_reason="tracking_error_exceeded",
+            last_command_index=7,
+        )
+
+    arm._guarded_stream_servoj = aborted_stream  # type: ignore[method-assign]
+
+    with pytest.raises(ServoJExecutionAbortedError) as raised:
+        executor.execute(clear_preflight, permit)
+
+    error = raised.value
+    assert "commands_sent=8" in str(error)
+    assert "max_error=0.04 rad" in str(error)
+    assert error.diagnostics["last_tracking_sample"]["index"] == 7  # type: ignore[index]
 
 
 def test_execute_rejects_stop_generation_newer_than_one_shot_permit(

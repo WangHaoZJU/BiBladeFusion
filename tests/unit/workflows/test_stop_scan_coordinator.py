@@ -31,7 +31,10 @@ from biblade_fusion.devices.robot.base import RobotState
 from biblade_fusion.devices.robot.streaming import StreamServoJResult
 from biblade_fusion.mapping import OccupancyMapState, OccupancySnapshot
 from biblade_fusion.robotics import MotionExecutionPermit
-from biblade_fusion.robotics.guarded_execution import EmergencyStopUnconfirmedError
+from biblade_fusion.robotics.guarded_execution import (
+    EmergencyStopUnconfirmedError,
+    ServoJExecutionAbortedError,
+)
 from biblade_fusion.robotics.occupancy_collision import (
     _issue_occupancy_semantic_attestation,
 )
@@ -1319,6 +1322,70 @@ def test_unconfirmed_emergency_stop_is_persisted_as_terminal_failed(
     assert len(payload["stop_failures"]) == 3
     with pytest.raises(StopScanError, match="Cannot capture from phase failed"):
         coordinator.capture_infer_update("ordinary-recovery-forbidden")
+
+
+def test_servoj_abort_diagnostics_are_persisted(tmp_path: Path) -> None:
+    class RecordingSink:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, str, dict[str, object]]] = []
+
+        def append_event(self, *, phase, cycle_index, event_type, payload):
+            del cycle_index
+            self.events.append((phase, event_type, dict(payload)))
+
+    sink = RecordingSink()
+    coordinator, _, _, _, safety, _ = _coordinator(
+        tmp_path,
+        mapping_counts=[3],
+        target=_target(),
+        event_sink=sink,
+    )
+    coordinator.start()
+    coordinator.capture_infer_update("bootstrap-ready")
+    coordinator.prepare_next_segment()
+    executor = safety.executor
+    assert executor is not None
+    last_sample = {
+        "command_index": 7,
+        "q_cmd_rad": [0.1] * 6,
+        "q_actual_rad": [0.06] * 6,
+        "max_error_rad": 0.04,
+    }
+    executor_error = ServoJExecutionAbortedError(
+        StreamServoJResult(
+            ok=False,
+            commands_sent=8,
+            max_tracking_error_rad=0.04,
+            abort_reason="tracking_error_exceeded",
+            last_command_index=7,
+        ),
+        tracking_error_rad=0.03,
+        last_tracking_sample=last_sample,
+    )
+
+    def fail_execution(*args, **kwargs):
+        del args, kwargs
+        raise executor_error
+
+    executor.execute = fail_execution  # type: ignore[method-assign]
+
+    with pytest.raises(ServoJExecutionAbortedError) as raised:
+        coordinator.execute_approved(
+            operator_id="operator",
+            confirmation="EXECUTE synthetic",
+        )
+
+    assert raised.value is executor_error
+    assert coordinator.checkpoint.phase is StopScanPhase.ABORTED
+    terminal = [event for event in sink.events if event[1] == "single_segment_execution_failed"]
+    assert len(terminal) == 1
+    phase, _, payload = terminal[0]
+    assert phase == StopScanPhase.ABORTED.value
+    diagnostics = payload["execution_diagnostics"]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["error_code"] == "servoj_execution_aborted"
+    assert diagnostics["stream_result"]["commands_sent"] == 8
+    assert diagnostics["last_tracking_sample"] == last_sample
 
 
 def test_approval_event_failure_prevents_all_motion(tmp_path: Path) -> None:

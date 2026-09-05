@@ -771,6 +771,42 @@ def test_occupancy_mapping_asset_round_trip_verifies_full_chain(tmp_path: Path) 
     )
 
 
+def test_final_snapshot_alias_retains_hash_tamper_detection(tmp_path: Path) -> None:
+    destination, _, _ = _write_asset(tmp_path)
+    metadata = json.loads((destination / "metadata.json").read_text(encoding="utf-8"))
+    final_path = destination / metadata["snapshot"]["path"]
+    result_path = destination / metadata["frames"][-1]["result_snapshot"]["path"]
+
+    assert final_path.samefile(result_path)
+    result_path.write_bytes(result_path.read_bytes() + b"\n")
+
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        read_occupancy_mapping_for_replay(destination)
+
+
+def test_final_snapshot_alias_falls_back_to_full_serialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_hardlink(self: Path, target: Path) -> None:
+        raise OSError("hard links unavailable")
+
+    monkeypatch.setattr(Path, "hardlink_to", reject_hardlink)
+
+    destination, _, dependencies = _write_asset(tmp_path)
+    metadata = json.loads((destination / "metadata.json").read_text(encoding="utf-8"))
+    final_path = destination / metadata["snapshot"]["path"]
+    result_path = destination / metadata["frames"][-1]["result_snapshot"]["path"]
+    stored = _read_occupancy_mapping_with_dependencies(
+        destination,
+        validation_dependencies=dependencies,
+    )
+
+    assert not final_path.samefile(result_path)
+    assert final_path.read_bytes() == result_path.read_bytes()
+    assert stored.motion_eligible is True
+
+
 def test_live_writer_reuses_fresh_in_process_authority_but_invalidates_on_edit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -827,6 +863,172 @@ def test_live_writer_reuses_fresh_in_process_authority_but_invalidates_on_edit(
     reread = read_occupancy_mapping(destination)
     assert reread is not written
     assert replay_calls == len(updates)
+
+
+def _bound_storage_authority(
+    tmp_path: Path,
+) -> tuple[
+    Path,
+    object,
+    occupancy_mapping_module._OccupancyStorageAuthority,
+]:
+    destination, _, dependencies = _write_asset(tmp_path)
+    stored = _read_occupancy_mapping_with_dependencies(
+        destination,
+        validation_dependencies=dependencies,
+    )
+    authority = occupancy_mapping_module._bind_occupancy_storage_authority(
+        destination,
+        stored,
+    )
+    return destination, stored, authority
+
+
+def test_storage_authority_is_strong_typed_and_has_no_cross_call_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, authority = _bound_storage_authority(tmp_path)
+    with pytest.raises(TypeError, match="issued only"):
+        occupancy_mapping_module._OccupancyStorageAuthority()
+
+    calls: list[Path] = []
+    original = occupancy_mapping_module._stream_verify_occupancy_storage_file
+
+    def count(expected):
+        calls.append(expected.path)
+        return original(expected)
+
+    monkeypatch.setattr(
+        occupancy_mapping_module,
+        "_stream_verify_occupancy_storage_file",
+        count,
+    )
+    unique_paths = {item.path for item in authority.files}
+
+    occupancy_mapping_module._assert_occupancy_storage_authorities_current(
+        (authority, authority)
+    )
+    assert len(calls) == len(unique_paths)
+
+    occupancy_mapping_module._assert_occupancy_storage_authorities_current((authority,))
+    assert len(calls) == 2 * len(unique_paths)
+
+
+@pytest.mark.parametrize(
+    "tamper_target",
+    ("metadata", "array", "snapshot", "stereo", "session", "hand_eye"),
+)
+def test_storage_authority_rejects_every_bound_file_class_tamper(
+    tmp_path: Path,
+    tamper_target: str,
+) -> None:
+    destination, stored, authority = _bound_storage_authority(tmp_path)
+    metadata = stored.metadata
+    frame = metadata["frames"][0]
+    if tamper_target == "metadata":
+        target = destination / "metadata.json"
+    elif tamper_target == "array":
+        target = destination / frame["files"]["source_depth_m"]["path"]
+    elif tamper_target == "snapshot":
+        target = destination / frame["mapping_snapshot"]["path"]
+    elif tamper_target == "stereo":
+        source = frame["sources"]["stereo_inference"]
+        target = Path(source["root"]) / source["file"]
+    elif tamper_target == "session":
+        source = frame["sources"]["session"]
+        target = Path(source["root"]) / source["file"]
+    else:
+        source = metadata["sources"]["hand_eye"]
+        target = Path(source["root"]) / source["file"]
+    target.write_bytes(target.read_bytes() + b"tampered")
+
+    with pytest.raises(ValueError, match="authority changed"):
+        occupancy_mapping_module._assert_occupancy_storage_authorities_current(
+            (authority,)
+        )
+
+
+def test_storage_authority_rejects_same_path_with_conflicting_record(
+    tmp_path: Path,
+) -> None:
+    _, _, authority = _bound_storage_authority(tmp_path)
+    conflicting_file = replace(authority.files[1], sha256="0" * 64)
+    conflicting = object.__new__(occupancy_mapping_module._OccupancyStorageAuthority)
+    for name, value in (
+        ("root", authority.root),
+        ("metadata_sha256", authority.metadata_sha256),
+        ("metadata_size_bytes", authority.metadata_size_bytes),
+        ("semantic_attestation_hash", authority.semantic_attestation_hash),
+        ("files", (authority.files[0], conflicting_file, *authority.files[2:])),
+    ):
+        object.__setattr__(conflicting, name, value)
+
+    with pytest.raises(ValueError, match="conflicting authority records"):
+        occupancy_mapping_module._assert_occupancy_storage_authorities_current(
+            (authority, conflicting)
+        )
+
+
+def test_storage_authority_does_not_deduplicate_equal_hashes_at_different_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    _, _, first = _bound_storage_authority(first_root)
+    _, _, second = _bound_storage_authority(second_root)
+    by_hash: dict[str, set[Path]] = {}
+    for item in (*first.files, *second.files):
+        by_hash.setdefault(item.sha256, set()).add(item.path)
+    assert any(len(paths) > 1 for paths in by_hash.values())
+
+    calls: list[Path] = []
+    original = occupancy_mapping_module._stream_verify_occupancy_storage_file
+
+    def count(expected):
+        calls.append(expected.path)
+        return original(expected)
+
+    monkeypatch.setattr(
+        occupancy_mapping_module,
+        "_stream_verify_occupancy_storage_file",
+        count,
+    )
+    occupancy_mapping_module._assert_occupancy_storage_authorities_current(
+        (first, second)
+    )
+
+    assert set(calls) == {item.path for item in (*first.files, *second.files)}
+
+
+def test_storage_authority_rejects_stat_change_during_stream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, authority = _bound_storage_authority(tmp_path)
+    original = occupancy_mapping_module._occupancy_storage_stat_identity
+    calls = 0
+
+    def unstable(value):
+        nonlocal calls
+        calls += 1
+        identity = original(value)
+        if calls == 2:
+            return (*identity[:-1], identity[-1] + 1)
+        return identity
+
+    monkeypatch.setattr(
+        occupancy_mapping_module,
+        "_occupancy_storage_stat_identity",
+        unstable,
+    )
+    with pytest.raises(ValueError, match="changed before hashing"):
+        occupancy_mapping_module._assert_occupancy_storage_authorities_current(
+            (authority,)
+        )
 
 
 def test_reader_relocates_synced_data_sources_only_when_hashes_match(
@@ -890,6 +1092,35 @@ def test_replay_reader_is_explicitly_unverified_and_never_motion_eligible(
     assert replay.motion_eligible is False
     assert isinstance(replay.metadata, dict)
     assert not hasattr(replay, "semantic_attestation")
+
+
+def test_replay_reader_skips_depth_ray_replay_but_full_reader_keeps_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination, _, dependencies = _write_asset(tmp_path)
+
+    class DepthRayReplayAttempted(RuntimeError):
+        pass
+
+    def reject_depth_ray_replay(*args, **kwargs) -> None:
+        raise DepthRayReplayAttempted
+
+    monkeypatch.setattr(
+        occupancy_mapping_module,
+        "_validate_replayed_mapping",
+        reject_depth_ray_replay,
+    )
+
+    replay = read_occupancy_mapping_for_replay(destination)
+
+    assert replay.verification_status == "integrity_only_unverified_for_motion"
+    assert replay.motion_eligible is False
+    with pytest.raises(DepthRayReplayAttempted):
+        _read_occupancy_mapping_with_dependencies(
+            destination,
+            validation_dependencies=dependencies,
+        )
 
 
 def test_schema7_rejects_tampered_physical_source_identity(tmp_path: Path) -> None:

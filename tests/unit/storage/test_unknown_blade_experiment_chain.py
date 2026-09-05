@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import biblade_fusion.storage.coarse_scan as coarse_scan_module
 import biblade_fusion.storage.unknown_blade_experiment as experiment_module
 from biblade_fusion.diagnostics.performance_timing import (
     PerformanceTimingRecorder,
@@ -22,6 +23,8 @@ from biblade_fusion.storage.science_acceptance import ScienceTestEnvelope
 from biblade_fusion.storage.science_authority import ScienceAcceptanceAuthority
 from biblade_fusion.storage.stop_scan_run import StopScanRunWriter
 from biblade_fusion.storage.unknown_blade_experiment import (
+    UNKNOWN_BLADE_EXPERIMENTAL_ACCEPTANCE_STATUS,
+    UNKNOWN_BLADE_FINE_START_PROTOCOL,
     UnknownBladeExperimentFormatError,
     UnknownBladeExperimentWriter,
     read_unknown_blade_experiment,
@@ -293,13 +296,95 @@ def test_experimental_coarse_writer_is_authorityless_and_audit_readable(
         reference_coarse_model=reference,
     )
     fine = _fine_run(tmp_path / "fine", "experimental-coarse-001")
+    writer.append_fine_start_candidate(fine_run_root=fine.root)
     writer.append_unaccepted_fine_started(fine_run_root=fine.root)
     stored = read_unknown_blade_experiment(writer.root)
 
     assert stored.science_authority is None
     assert stored.runtime_timing_authority is None
-    assert stored.fine_start_protocol is None
+    assert stored.fine_start_protocol == UNKNOWN_BLADE_FINE_START_PROTOCOL
+    assert stored.acceptance_status == UNKNOWN_BLADE_EXPERIMENTAL_ACCEPTANCE_STATUS
+    assert stored.events[-2].event_type == "fine_start_candidate"
     assert stored.latest_event.event_type == "fine_started"
+
+
+def test_stopped_legacy_experimental_coarse_chain_preserves_checkpoint_on_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment_id = "legacy-experimental-resume-001"
+    coarse = _run(
+        tmp_path / "coarse",
+        experiment_id,
+        event_type="accepted_candidate_capture",
+    )
+    generation = (tmp_path / "generation").resolve()
+    generation.mkdir()
+    (generation / "generation.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        experiment_module,
+        "read_coarse_scan_generation",
+        lambda path: SimpleNamespace(root=Path(path).resolve()),
+    )
+    current = UnknownBladeExperimentWriter.create(
+        tmp_path / "current",
+        experiment_id=experiment_id,
+        coarse_run_root=coarse.root,
+        placement_id="blade-placement-test",
+        production=False,
+    )
+    current.append_coarse_checkpoint(coarse_generation=generation)
+    coarse.append_event(
+        phase="aborted",
+        cycle_index=1,
+        event_type="operator_stop_observed",
+        payload={
+            "motion_authorized": False,
+            "stop_transport_acknowledged": True,
+            "stop_stationarity_verified": True,
+        },
+    )
+
+    legacy_root = (tmp_path / "legacy" / "experiment_handoff").resolve()
+    (legacy_root / "events").mkdir(parents=True)
+    initialized_payload = dict(current.events[0].payload)
+    initialized_payload.pop("fine_start_protocol")
+    initialized_payload.pop("acceptance_status")
+    initialized = experiment_module.UnknownBladeExperimentEvent.build(
+        experiment_id=experiment_id,
+        sequence=0,
+        event_type="experiment_initialized",
+        payload=initialized_payload,
+        previous_event_sha256=None,
+    )
+    checkpoint = experiment_module.UnknownBladeExperimentEvent.build(
+        experiment_id=experiment_id,
+        sequence=1,
+        event_type="coarse_checkpoint",
+        payload=dict(current.events[1].payload),
+        previous_event_sha256=initialized.event_sha256,
+    )
+    for event in (initialized, checkpoint):
+        experiment_module._write_new_json(
+            legacy_root / "events" / f"{event.sequence:08d}.json",
+            event.to_payload(),
+        )
+
+    stored = read_unknown_blade_experiment(legacy_root)
+    plan = load_unknown_blade_resume_plan(legacy_root.parent)
+    resumed = UnknownBladeExperimentWriter.resume(legacy_root, production=False)
+
+    assert stored.fine_start_protocol is None
+    assert stored.acceptance_status is None
+    assert stored.science_authority is None
+    assert stored.runtime_timing_authority is None
+    assert plan.phase is UnknownBladeResumePhase.COARSE
+    assert plan.coarse_generation_path == generation
+    assert plan.experimental_unaccepted is True
+    assert coarse.events[-1].event_type == "operator_stop_observed"
+    assert resumed.fine_start_uses_candidate_commit is False
+    with pytest.raises(ValueError, match="Production experiment writer requires"):
+        UnknownBladeExperimentWriter.resume(legacy_root)
 
 
 def test_coarse_checkpoint_incremental_validation_fails_before_event_publication(
@@ -387,10 +472,12 @@ def test_three_incremental_checkpoints_do_not_replay_verified_prefix_generations
         generation.mkdir()
         (generation / "generation.json").write_text("{}\n", encoding="utf-8")
     reads: list[Path] = []
+    read_contexts: list[object | None] = []
 
     def read_generation(path: str | Path) -> SimpleNamespace:
         root = Path(path).resolve()
         reads.append(root)
+        read_contexts.append(coarse_scan_module._STRICT_READ_CONTEXT.get())
         return SimpleNamespace(root=root)
 
     monkeypatch.setattr(
@@ -416,6 +503,26 @@ def test_three_incremental_checkpoints_do_not_replay_verified_prefix_generations
         "coarse_checkpoint",
         "coarse_checkpoint",
     ]
+
+    reads.clear()
+    read_contexts.clear()
+    stored = read_unknown_blade_experiment(writer.root)
+
+    assert stored.events == writer.events
+    assert reads == list(generations)
+    assert read_contexts[0] is not None
+    assert all(context is read_contexts[0] for context in read_contexts)
+    first_transaction_context = read_contexts[0]
+    assert coarse_scan_module._STRICT_READ_CONTEXT.get() is None
+
+    reads.clear()
+    read_contexts.clear()
+    read_unknown_blade_experiment(writer.root)
+
+    assert reads == list(generations)
+    assert read_contexts[0] is not first_transaction_context
+    assert all(context is read_contexts[0] for context in read_contexts)
+    assert coarse_scan_module._STRICT_READ_CONTEXT.get() is None
 
 
 def test_fast_event_integrity_recomputes_canonical_event_hash(

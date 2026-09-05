@@ -96,6 +96,7 @@ from biblade_fusion.storage.coarse_scan import (
     StoredCoarseScanView,
     _bind_coarse_scan_view_readback,
     _CoarseScanViewReadback,
+    _recheck_cached_generation_authorities,
     _write_coarse_scan_generation_from_verified,
     read_coarse_integration_source,
     read_coarse_scan_generation,
@@ -1137,7 +1138,7 @@ def append_coarse_scan_generation(
     if previous_generation is not None:
         with performance_span("coarse.generation_previous_read"):
             previous = read_coarse_scan_generation(previous_generation)
-    return _append_coarse_scan_generation_from_verified(
+    generation, _stored = _append_coarse_scan_generation_from_verified(
         output_dir,
         current=current,
         source_initialization=source_initialization,
@@ -1147,6 +1148,7 @@ def append_coarse_scan_generation(
         previous_generation=previous_generation,
         verified_previous_generation=previous,
     )
+    return generation
 
 
 def _append_coarse_scan_generation_from_verified(
@@ -1159,7 +1161,7 @@ def _append_coarse_scan_generation_from_verified(
     settings: AppSettings,
     previous_generation: str | Path | None,
     verified_previous_generation: StoredCoarseScanGeneration | None,
-) -> Path:
+) -> tuple[Path, StoredCoarseScanGeneration]:
     """Append using strict current/predecessor reads from this transaction."""
 
     initialization_root = Path(source_initialization).resolve()
@@ -1658,17 +1660,16 @@ def _select_candidate(
     )[0]
 
 
-def select_coarse_next_view(
-    generation_path: str | Path,
+def _select_coarse_next_view_from_generation(
+    generation: StoredCoarseScanGeneration,
     discovery: CoarseDiscoveryPlan,
     hand_eye: HandEyeCalibration,
     policy: CoarseSciencePolicy,
     *,
     require_additional_fin_evidence: bool = False,
 ) -> NextViewSelection:
-    """Return a coordinator-compatible, non-authorizing coarse selector result."""
+    """Select from one generation already verified in this planning transaction."""
 
-    generation = read_coarse_scan_generation(generation_path)
     if generation.coarse_model_path is not None:
         required = max(1, len(read_coverage_ledger(generation.coverage_path).ledger.patches))
         initialization_root = Path(
@@ -1730,6 +1731,42 @@ def select_coarse_next_view(
         selected.diagnostics,
         ranked_candidates=tuple(ranked_candidates),
     )
+
+
+def select_coarse_next_view(
+    generation_path: str | Path,
+    discovery: CoarseDiscoveryPlan,
+    hand_eye: HandEyeCalibration,
+    policy: CoarseSciencePolicy,
+    *,
+    require_additional_fin_evidence: bool = False,
+) -> NextViewSelection:
+    """Return a coordinator-compatible, non-authorizing coarse selector result."""
+
+    return _select_coarse_next_view_from_generation(
+        read_coarse_scan_generation(generation_path),
+        discovery,
+        hand_eye,
+        policy,
+        require_additional_fin_evidence=require_additional_fin_evidence,
+    )
+
+
+def _require_unchanged_generation_authority(
+    generation: StoredCoarseScanGeneration,
+    *,
+    expected_root: Path,
+) -> None:
+    if generation.root != expected_root:
+        raise UnknownBladeCoarseError(
+            "Transaction-local coarse generation differs from current generation"
+        )
+    try:
+        _recheck_cached_generation_authorities(generation)
+    except (OSError, TypeError, ValueError) as exc:
+        raise UnknownBladeCoarseError(
+            "Transaction-local coarse generation authority changed on disk"
+        ) from exc
 
 
 def finalize_coarse_generation(
@@ -2194,6 +2231,7 @@ class CoarseScienceSession:
         self._pending_foreground: CoarseForegroundResult | None = None
         self._pending_prepared: PreparedCoarseScienceView | None = None
         self._pending_live_readback: _CoarseScanViewReadback | None = None
+        self._selection_generation: StoredCoarseScanGeneration | None = None
         self._operator_capture_staged = False
         if recovered_generation is not None:
             self._recover(Path(recovered_generation).resolve())
@@ -2211,6 +2249,24 @@ class CoarseScienceSession:
     @property
     def discovery_plan(self) -> CoarseDiscoveryPlan | None:
         return self._discovery
+
+    @property
+    def endpoint_validation_binding(
+        self,
+    ) -> tuple[
+        str,
+        tuple[float, float, float, float, float, float],
+    ] | None:
+        """Bind endpoint-validated discovery joints to one exact stopped posture."""
+
+        discovery = self._discovery
+        if (
+            self._endpoint_validator is None
+            or discovery is None
+            or discovery.current_joint_positions_rad is None
+        ):
+            return None
+        return discovery.policy_sha256, discovery.current_joint_positions_rad
 
     @property
     def last_transition(self) -> CoarsePhaseTransition | None:
@@ -2271,6 +2327,7 @@ class CoarseScienceSession:
         self._view_plan = view_plan
         self._discovery_path = discovery_path
         self._discovery = discovery
+        self._selection_generation = generation
 
     def refresh_discovery(
         self,
@@ -2306,6 +2363,8 @@ class CoarseScienceSession:
         prior = self._discovery.current_joint_positions_rad
         if prior is not None and np.max(np.abs(np.asarray(current) - np.asarray(prior))) <= 1e-3:
             return
+        selection_generation = self._selection_generation
+        self._selection_generation = None
         initialization = read_initialization(self._initialization)
         view_plan = read_view_plan(self._view_plan)
         with performance_span("coarse.fin_discovery_refresh"):
@@ -2324,7 +2383,9 @@ class CoarseScienceSession:
         posture_sha256 = hashlib.sha256(
             json.dumps(current, separators=(",", ":"), allow_nan=False).encode("utf-8")
         ).hexdigest()
-        generation_index = read_coarse_scan_generation(self._generation).generation_index
+        if selection_generation is None:
+            selection_generation = read_coarse_scan_generation(self._generation)
+        generation_index = selection_generation.generation_index
         output = (
             self._output_root
             / "fin_discovery_revisions"
@@ -2350,6 +2411,10 @@ class CoarseScienceSession:
         self._reachability = reachability_checker
         self._discovery = discovery
         self._discovery_path = discovery_path
+        # ``select_next`` immediately consumes this exact strict read.  Retaining it
+        # only for the current planning transaction avoids replaying every immutable
+        # occupancy source twice while preserving one complete integrity replay.
+        self._selection_generation = selection_generation
 
     def prepare_cycle(
         self,
@@ -2679,6 +2744,7 @@ class CoarseScienceSession:
     def accept_prepared_view(self, prepared: PreparedCoarseScienceView) -> Path:
         """Append a prepared view, creating all proxy assets on the first call."""
 
+        self._selection_generation = None
         with performance_span("coarse.scan_view_readback"):
             stored = read_coarse_scan_view(prepared.coarse_view_path)
             live_readback = _bind_coarse_scan_view_readback(stored)
@@ -2697,7 +2763,7 @@ class CoarseScienceSession:
                 previous = read_coarse_scan_generation(self._generation)
                 index = previous.generation_index + 1
         output = self._output_root / "generations" / f"{index:06d}"
-        generation = _append_coarse_scan_generation_from_verified(
+        generation, selection_generation = _append_coarse_scan_generation_from_verified(
             output,
             current=stored,
             source_initialization=self._initialization,
@@ -2708,6 +2774,7 @@ class CoarseScienceSession:
             verified_previous_generation=previous,
         )
         self._generation = generation
+        self._selection_generation = selection_generation
         self._pending_live_readback = live_readback
         return generation
 
@@ -2812,6 +2879,20 @@ class CoarseScienceSession:
     def select_next(self) -> NextViewSelection:
         if self._generation is None or self._discovery is None:
             raise UnknownBladeCoarseError("Coarse session has no accepted proxy generation")
+        selection_generation = self._selection_generation
+        self._selection_generation = None
+        if selection_generation is not None:
+            _require_unchanged_generation_authority(
+                selection_generation,
+                expected_root=self._generation,
+            )
+            return _select_coarse_next_view_from_generation(
+                selection_generation,
+                self._discovery,
+                self._hand_eye,
+                self._policy,
+                require_additional_fin_evidence=self._requires_additional_fin_evidence,
+            )
         return select_coarse_next_view(
             self._generation,
             self._discovery,

@@ -565,3 +565,300 @@ The recursive interval/swept-volume implementation remains available for offline
 and acceptance studies. It is not executed by the normal online NBV loop and must not be
 used to describe online evidence as a formal continuous certificate. This wording change
 does not relax UNKNOWN, clearance, endpoint, approval, tracking or stop requirements.
+
+## D032 — Apply the complete goal-state veto before path work and preserve recoverable blocks
+
+Date: 2026-09-04
+
+Status: accepted; full offline regression complete, physical verification pending
+
+The eiai run `planning-test-20260904-190447` showed that a candidate whose goal occupancy
+was already UNKNOWN could spend several seconds on a complete mesh-path scan before that
+goal veto was reported. HoloRobot's motion cell applies its combined goal-state collision
+gate before entering the straight or fallback planner. BiBladeFusion separates original-
+mesh and occupancy backends, so the equivalent order is now: goal mesh, ServoJ duration for
+the required occupancy freshness horizon, goal-first occupancy path, then complete mesh
+path. Occupancy is evaluated goal-first and remains bound/hash-checked once at each path
+transaction boundary. A clear result still requires both complete sampled paths; a blocker
+only stops work that cannot change the hard-veto result.
+
+Online occupancy queries also stop inside the first blocking robot STL at the first exact
+voxel distance that is within the unchanged margin. That mode records `query_complete=false`
+because its counts are intentionally diagnostic prefixes. Standalone pose diagnostics keep
+the exhaustive default and record `query_complete=true`. Both modes use the original URDF/STL
+geometry, the exact voxel/run boxes, and conservative UNKNOWN-as-blocked semantics.
+
+The same run revealed that `SupervisedExperimentRunner.step()` converted the coordinator's
+recoverable planning-deadline `MOTION_BLOCKED` into a terminal runner block. The outer runtime
+then called stop and persisted `ABORTED`. A coordinator-owned `MOTION_BLOCKED` now passes
+through as `NEEDS_CAPTURE`, leaving coarse/fine runtime ownership intact so the operator can
+perform the existing occupancy-only `SAFETY_REFRESH`. Only this explicitly recoverable phase
+is preserved; other exceptions and evidence-integrity failures retain the terminal path.
+
+This decision changes evaluation order and state propagation, not safety thresholds,
+candidate ranking, the 30-second cooperative deadline, RRT conditions, approval authority,
+ServoJ tracking, stop behavior, or immutable evidence requirements.
+
+## D033 — Cache immutable occupancy query structure and short-circuit path gates by veto
+
+Date: 2026-09-04
+
+Status: accepted in code and offline replay; physical verification pending
+
+The eiai run `planning-fix-d032-20260904-193942` proved that D032 made planning expiry
+recoverable but did not provide enough timing margin. The first safe candidate was rank 11;
+reconstructing the same accepted-static-free voxel layout and identical HPP-FCL voxel-run
+boxes at hundreds of adjacent path samples consumed the remaining budget. Increasing the
+deadline, reducing sample density, shrinking the UNKNOWN region or skipping a collision gate
+would weaken or obscure the existing contract and was rejected.
+
+The occupancy checker may now reuse an integer-AABB classification/run layout and immutable
+voxel-run `Box`/`Transform3f` only while the recomputed snapshot content hash is unchanged.
+The cache does not store a robot-pose collision answer. Each pose still places the original
+URDF/STL geometry and executes exact HPP-FCL distance queries with the same clearance,
+uncertainty and UNKNOWN-as-blocked rules. Snapshot changes invalidate the structural caches.
+
+For online straight-path preflight the goal mesh remains the first veto, after which the
+complete occupancy path is evaluated before the complete mesh path. This intentionally
+differs from HoloRobot's per-waypoint mesh-then-environment order solely as a fail-fast
+optimization for the bootstrap occupancy distribution. A candidate is CLEAR only after both
+complete sampled gates pass, so their conjunction and sample density are unchanged. An
+occupancy-blocked path cannot become executable through later mesh work. OMPL state validity
+retains HoloRobot's mesh-then-occupancy order, and any returned detour is fully rechecked.
+
+Exact-attempt diagnostic replay found the same first CLEAR rank-11 candidate in `15.857475 s`
+of preflight; with the recorded `9.284594 s` selector time the planning transaction was
+`25.142069 s`, below the unchanged 30-second cooperative budget. This authorizes one new
+guarded physical attempt only; it does not itself authorize motion or replace CUDA semantic
+verification.
+
+## D034 — Use the validated Elite-A cycle and a true rest-to-rest ServoJ profile
+
+Date: 2026-09-04
+
+Status: code-verified; replacement motion-envelope acceptance required
+
+The first approved physical NBV in `planning-fix-d033-20260904-201710` passed planning,
+occupancy, collision, exact approval and permit consumption, but stopped on
+`tracking_error_exceeded`. A post-failure read-only RTSI sample found the arm stationary and
+safe at a point only about `0.187 s` along the stored 4 ms command path. The software had
+already advanced much farther before the abort. The deployed configuration used a 4 ms
+ServoJ command period and 0.1 s lookahead, whereas the same Elite-A controller at
+`192.168.6.60` has HoloRobot physical evidence for an 8 ms period, 0.03 s lookahead, 0.2 s
+warmup and 0.05 stream scaling. The `_003` acceptance trials used only a clipped 0.02 rad
+command followed by a long endpoint hold, so they did not validate sustained large-travel
+tracking and masked this mismatch.
+
+The eiai deployment therefore moves to the HoloRobot-validated `8 ms / 0.03 s / 0.05`
+settings. The `0.05` value applies both to the Elite Dashboard speed scaling used by the
+driver and to trajectory time parameterization; leaving the robot-level default at `0.3`
+would commission and execute a different controller contract. In addition, the time
+parameterizer no longer merely lengthens a linearly sampled
+segment. Each non-collinear joint-path segment now uses a synchronized triangular or
+trapezoidal scalar profile, starts and ends at zero velocity, and respects the same scaled
+per-joint velocity and acceleration limits. A path corner is a rest point. This deliberately
+corrects HoloRobot's historical duration-only acceleration approximation while retaining its
+driver lifecycle, warmup, tracking abort and endpoint-hold semantics.
+
+The tracking threshold remains `0.03 rad`; no collision, UNKNOWN, workspace, IK or approval
+gate changes. Execution now records the command count, last command index, maximum tracking
+error, threshold and final command/feedback sample in the immutable failure event. Because
+the ServoJ period, lookahead and stream scaling are part of the motion-control hash,
+`es68_d435i_motion_envelope_003` remains immutable history and must not be rebound. The local
+acceptance path/ID are cleared until a new bounded commissioning sequence measures the
+replacement contract.
+
+## D035 — Keep EliteDriver servers outside the host ephemeral-port range
+
+Date: 2026-09-04
+
+Status: deployed configuration corrected; physical retry pending
+
+The first D034 nominal commissioning execution did not connect to or move the robot.
+EliteDriver creation failed because `xray` held an established loopback connection whose
+local source port was `50002`. The host ephemeral range is `32768–60999`, so the historical
+HoloRobot ports `50001–50004` can be allocated to unrelated outgoing connections even when
+no process is listening on them. Checking only listening sockets is therefore insufficient.
+
+The eiai deployment moves all four SDK-configurable local EliteDriver endpoints to the free,
+non-ephemeral range `29001–29004`, preserving their existing role order. The SDK injects the
+configured endpoints into its external-control script, so this is a transport binding change,
+not a ServoJ timing, gain, tracking, stop, path, collision or scientific-policy change. It is
+a deliberate local divergence from HoloRobot's historical port numbers because this host runs
+the long-lived proxy. The failed trial output remains immutable, and every retry uses a new
+output-bound approval token.
+
+## D036 — Separate Dashboard scaling from trajectory scaling and settle before writeIdle
+
+Date: 2026-09-04
+
+Status: forward physical trial passed; reverse, fault trial and acceptance pending
+
+The D034 forward retry connected through the D035 ports and maintained the requested 8 ms
+host cadence without an overrun. Its ServoJ stream remained below the `0.03 rad` tracking
+abort threshold, but the arm was still moving at up to `0.009050 rad/s` after 90 trajectory
+commands plus a fixed one-second endpoint tail. Calling `writeIdle` at that point allowed
+the observed state to cross the requested endpoint and stop `0.013553 rad` away. The strict
+post-stop goal window rejected the trial as designed.
+
+The best-supported cause is a configuration-semantic mismatch in D034. HoloRobot's physical Elite-A
+registry sets the controller Dashboard `default_speed_scaling` to `1.0`; the `0.05` recorded
+in its execution artifact is the independent trajectory time-parameterization scaling.
+Applying `0.05` to both slowed controller consumption relative to the already slowed host
+stream and left queued endpoint progression at the control boundary. D036 sets only the
+Dashboard value back to `1.0`; the rest-to-rest trajectory scaling remains `0.05`, and the
+8 ms ServoJ period, 0.03 s lookahead and all tracking/collision limits remain unchanged.
+
+Commissioning also removes its special fixed-duration endpoint commands. After the exact
+preflighted stream succeeds, it now calls the same capability-gated, feedback-driven
+`_guarded_settle_servoj_endpoint` used by production execution. That loop repeatedly sends
+only the already approved endpoint and requires consecutive in-tolerance feedback before
+`writeIdle`. The separate post-stop commissioning gate still requires at most `0.002 rad`
+goal error and one continuous second below both joint/TCP velocity thresholds. No endpoint,
+tracking, stop or safety threshold was relaxed.
+
+Changing Dashboard scaling produces motion-control hash
+`3a85600d873cd05eb7738a96a832c0a216c08d5da03b851f284b1aa10016db30`.
+Because the failed trial stopped outside both sealed endpoints, neither direction of the old
+candidate is eligible for reuse. Recovery starts with a new stopped capture, occupancy and
+candidate; old candidate and trial artifacts remain immutable evidence.
+
+The first D036 forward trial then passed with 90 commands, `0.003168 rad` maximum stream
+tracking error, a feedback-settled endpoint error of `0.00003185 rad`, and maximum post-idle
+stop drift of `0.00006060 rad`. A continuous `1.009667 s` stationary window ended at
+`0.00003223 rad` goal error with zero joint/TCP speed. This is physical evidence for the
+corrected one-way control boundary, not a production authorization; reverse and intentional
+tracking-fault trials remain required before recording a replacement acceptance.
+
+## D037 — Rebind a commissioning segment to its tolerated live start without exceeding its bound
+
+Date: 2026-09-04
+
+Status: reverse physical trial passed; intentional-fault trial and acceptance pending
+
+The first reverse attempt after the D036 forward PASS was rejected before streaming. Its
+live start differed from the sealed reverse start by only `0.00003223 rad`, but J4 was on
+the adverse side of an already exact `0.02 rad` sealed segment. The live-to-sealed-goal
+distance was consequently `0.02003223 rad`. Allowing `0.001 rad` start variation while
+requiring an unchanged maximum live-to-goal distance of `0.02 rad` made the commissioning
+contract internally inconsistent.
+
+Increasing the trial bound, consuming the stale sealed stream, or ignoring the residual was
+rejected. D037 instead computes a deterministic goal from the measured, stationary live
+start toward the sealed goal and clips that direction to the smaller of the candidate's
+sealed maximum and the global `0.02 rad` limit. Intentional tracking-fault trials retain
+their separate `0.01 rad` limit. A `1e-12` numerical comparison avoids classifying the stored
+`0.020000000000000018` representation as a physical excess; it does not enlarge the motion
+bound.
+
+The rebound goal is not trusted from the old proof. The full rest-to-rest time
+parameterization and original ES68/D435i mesh continuous preflight are rerun from the exact
+measured start to that goal before driver preparation. Trial evidence records both sealed
+and actual goals plus live-start error, requested delta, executed delta and scale. HoloRobot
+uses the same `1e-3 rad` start-tolerance concept but has no commissioning-specific maximum
+physical-segment promise, so this live-bound rebind is a deliberate minimal adaptation.
+
+Replay using the exact failed reverse state returned CLEAR with a `0.02 rad` executed delta,
+90 commands, valid continuous swept evidence and `0.004175745 m` minimum certificate margin.
+The failed attempt wrote no ServoJ command and did not move the robot, so its candidate may
+be reused only with a new output-bound token. No threshold, collision rule, controller
+setting or production authorization changed.
+
+The D037 reverse retry
+`data/acceptance/d037_20260904-211858_trial_02_reverse_retry01` then passed physically. The
+live rebind converted a requested `0.02003223 rad` return into exactly `0.02000000 rad` with
+scale `0.9983909949`. The 90-command stream reported `0.003236 rad` maximum tracking error,
+the endpoint hold ended at `0.00002164 rad`, maximum post-idle drift was `0.00005387 rad`,
+and a `1.009718 s` stationary window completed with zero joint/TCP speed. The final feedback
+equals the original sealed candidate start. This validates D037 physically without granting
+production motion authority.
+
+## D038 — Make the intentional tracking-fault window reachable under rest-to-rest motion
+
+Date: 2026-09-04
+
+Status: physical fault trial passed; replacement acceptance recorded and bound
+
+The original intentional-fault commissioning mode retained a `0.001 rad` tracking threshold
+but truncated the rest-to-rest stream to ten commands. Both accepted nominal directions show
+the same early response: maximum command/feedback error through index 9 is only
+`0.00040904 rad`; the first measured samples above `0.001 rad` occur at index 15. The old
+fault mode would therefore have completed its ten-command stream normally and failed its
+expected-abort assertion. Repeating that unchanged on hardware would provide no new evidence.
+
+D038 preserves the real RTSI-derived tracking error and the existing `0.001 rad` intentional
+threshold; it does not inject a synthetic error or change the production `0.03 rad` guard.
+Only the attended fault trial checks every command and permits at most 24 commands. For the
+current `0.01 rad` continuously mesh-proven fault segment, the 64-command rest-to-rest stream
+reaches only `0.00266566 rad` by command 24. Before any ServoJ write, execution now requires
+the truncated command window to remain inside a reviewed `[0.002, 0.003] rad` excursion band;
+the measured window excursion and all bounds are stored in `trial.json`. This prevents a
+future trajectory change from silently turning the detector test into a larger move.
+
+The HoloRobot comparison confirms that the runtime abort remains the same real-feedback
+`tracking_error_exceeded` path and that `writeIdle`/stationarity semantics are unchanged.
+D038 only adapts the commissioning window to the newer rest-to-rest trajectory. Focused
+commissioning, EliteArm and acceptance tests report `69 passed`; the full repository reports
+`1306 passed, 1 skipped in 171.72 s`. Ruff and `git diff --check` pass; the skip is the
+existing CUDA-only test.
+
+The D038 physical trial
+`data/acceptance/d038_20260904-215214_trial_03_tracking_fault` passed as designed. Real RTSI
+feedback crossed `0.001 rad` at command 16, producing `tracking_error_exceeded`; the outer
+trial acknowledged stop in `0.00003152 s`, measured at most `0.00043768 rad` post-request
+drift and completed a `1.010317 s` zero-speed stationary window. The reviewed command window
+was `0.00266566 rad`; no synthetic fault or production-threshold change was used.
+
+The replacement asset is `data/acceptance/es68_d435i_motion_envelope_004`, acceptance ID
+`29624b08242d2c8ef7544cb958bf2a64335f895b719b421f792ff8c750719f9b`, metadata SHA-256
+`ce807010bc11bdf50bcfb804214f85705ad155bf3c7af16d3a214a2354722766`. Its bounds retain the
+larger per-axis tracking measurements from the prior representative-workspace evidence and
+take the per-axis maximum stop drift across that evidence and the three replacement-contract
+trials; the safety factor remains `1.5`. Unchanged collision assembly, bootstrap and emergency
+stop checks are inherited rather than repeated. The local deployment now binds this exact
+asset and restores production motion and stop-and-capture. No further commissioning trial is
+required for this control contract.
+
+## D039 — Reuse verified typed evidence within one planning transaction and resume D038 for a fresh safety source
+
+Date: 2026-09-05
+
+Status: code/offline verified; third physical occupancy source and later NBV legs pending
+
+D038 proved one complete physical NBV motion/stop/capture leg, then exceeded the cooperative
+planning deadline on its two-source occupancy prefix. The reported checkpoint near an IK or
+STL-distance call was not itself the root cause. Exact profiling found repeated strict coarse
+and occupancy replay before selection, followed by an actually path-expensive last candidate.
+
+The accepted design keeps full semantic verification at the first read/publication boundary,
+then carries private typed generation and occupancy storage authorities only inside the same
+planning transaction. Before consumption, every declared metadata, array, snapshot and source
+authority is rechecked by exact path, SHA-256 and size; NPY dtype/shape headers and stable file
+identity before/after streaming are also checked. Different paths are never deduplicated merely
+because their content hashes match, conflicting authorities for one path fail, and no authority
+survives the transaction. This is byte-preserving reuse, not a replacement for CUDA ray replay,
+FK, robot rendering or semantic verification in a new process.
+
+Discovery may reuse endpoint IK/collision only when its policy hash, exact stopped joints and
+typed generation authority match the selection transaction and an endpoint validator was
+active. Any mismatch takes the old full rebind path. Exact D038 comparison preserved the
+11-candidate order and TCP matrices; maximum solver-level joint difference was
+`2.56e-8 rad`. The selector changed from `45.89 s` to approximately `5.5 s` without changing
+science scores or vetoes.
+
+The remaining D038 deadline is a real bounded-completeness outcome, not justification for a
+larger timeout. Candidates 1-10 are rejected by UNKNOWN occupancy. Candidate 11's straight and
+RRT occupancy checks are CLEAR, but both sampled original-mesh paths end BLOCKED by forearm to
+D435i self-clearance. The full queue has no executable segment on the saved two-source map.
+Three-dimensional cuboid merging and a Python AABB clear-only prefilter were tested against the
+exact snapshot and rejected because they provided no net speedup; neither remains in production
+code.
+
+A cooperative planning deadline now persists `planning_restart_required` and terminates the
+run cleanly. It is not relabelled as `SAFETY_REFRESH`, and the console must not invite repeated
+`c front/back` input. Experimental resume revalidates the append-only chain, drops all old
+motion authority and asks for one fresh occupancy-only source while the stopped pose and entire
+physical placement remain unchanged. The robot may be recovered from whatever stopped pose is
+measured at resume, but it must not be moved between that verification and the prompted
+capture. That third independent source is the next evidence needed to make the map `MAP_READY`
+and replan; it is not fabricated from an old stereo frame and does not count as a science view.

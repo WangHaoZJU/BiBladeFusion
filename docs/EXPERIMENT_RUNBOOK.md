@@ -86,6 +86,125 @@ stream, record a new immutable output, and replace both
 `configs/local.yaml`. Do not start a moving run while `scan doctor` reports a contract
 mismatch.
 
+### 2.2 D034 ServoJ cycle correction
+
+Do not repeat `planning-fix-d033-20260904-201710` or enter a new NBV approval token with the
+superseded 4 ms control contract. That run physically stopped on accumulated tracking error;
+the post-failure read-only sample confirmed `NORMAL`, `STOPPED` and zero joint velocity.
+
+The eiai deployment must use this internally consistent set before preparing a replacement
+commissioning candidate:
+
+```yaml
+robot:
+  servoj_time_s: 0.008
+  servoj_lookahead_time_s: 0.03
+  default_speed_scaling: 1.0
+motion_preflight:
+  servoj_dt_s: 0.008
+  speed_scaling: 0.05
+```
+
+These roles must remain distinct. HoloRobot's same Elite-A registry uses Dashboard scaling
+`1.0`; its physically recorded `0.05` value is the independent trajectory time scaling. The
+0.2 s current-position warmup and 0.03 rad tracking abort remain enabled. D034 also changes
+the generated stream to a zero-velocity start/stop triangular or trapezoidal profile; D036
+holds that exact endpoint under feedback before `writeIdle`. Neither change loosens any
+collision, tracking, endpoint or stationary threshold.
+
+This is a new motion-control contract. Keep `motion_envelope_acceptance_path` and
+`motion_envelope_acceptance_id` null until forward/reverse nominal trials, the intentional
+tracking-fault stop trial, and the operator declaration have produced a new immutable
+acceptance. `scan doctor --mode unknown --experimental` must report
+`motion_preflight.motion_envelope_acceptance` missing during this interval. That failure is
+the intended motion interlock, not a reason to restore `_003`.
+
+During those commissioning trials, set both `robot.motion_enabled` and
+`stop_and_capture.enabled` to `false`. This disables the production NBV composition and
+allows only `commission motion-envelope-trial --execute` to create its one-process,
+exact-token-bound motion capability. Restore both to `true` only after the replacement
+motion-envelope acceptance path and ID have been verified and bound.
+
+Every future ServoJ failure event must include `stream_result`,
+`tracking_error_threshold_rad` and `last_tracking_sample`. Stop if any of these fields is
+missing; do not infer a controller cause from the reason label alone.
+
+The failed D034 retry
+`data/acceptance/d034_20260904-204620_trial_01_forward_retry01` must not be reused. Although
+its stream cadence and tracking threshold passed, it stopped `0.013553 rad` beyond the old
+goal. The resulting pose is `0.033553 rad` from the sealed forward start and `0.013553 rad`
+from the sealed reverse start, so both directions fail the `0.001 rad` live-start gate.
+Capture the current stopped pose and full-scene occupancy again, then prepare a new candidate
+and use a new output-bound approval token. Do not manually jog back merely to fit stale
+candidate evidence.
+
+The replacement forward trial
+`data/acceptance/d036_20260904-211858_trial_01_forward` passed. It recorded 90 commands,
+`0.003168 rad` maximum stream tracking error, `0.00003185 rad` final endpoint-hold error,
+`0.00006060 rad` maximum stop drift and a `1.009667 s` zero-speed stationary window ending
+at `0.00003223 rad` goal error. This makes the sealed reverse start eligible under the
+unchanged `0.001 rad` live-start gate, but reverse still requires a new output directory,
+its own dry-run token and an attended execution. Do not treat the forward PASS as production
+motion authorization.
+
+The first reverse output
+`data/acceptance/d036_20260904-211858_trial_02_reverse` is an immutable pre-stream failure:
+`stream_result=null`, before/after joints are identical, and no motion occurred. The live
+start was within tolerance but its ordinary `0.00003223 rad` endpoint residual made the
+distance to the exact sealed return goal `0.02003223 rad`. D037 keeps the `0.02 rad` bound,
+clips the live segment toward the sealed goal, and reruns the complete original-mesh proof.
+Exact replay gives 90 commands, `0.712 s`, CLEAR and `0.004175745 m` minimum certificate
+margin. Reuse the same candidate only with a new reverse output directory and new dry-run
+token; do not reuse the failed output. A fresh capture is unnecessary unless the arm, blade,
+fixture or camera assembly has moved since the failure.
+
+The D037 retry
+`data/acceptance/d037_20260904-211858_trial_02_reverse_retry01` passed and returned the arm
+exactly to the sealed candidate start. Its 90-command stream had `0.003236 rad` maximum
+tracking error and the post-idle stationary window passed with zero joint/TCP speed. Use the
+same candidate in `forward` direction for the remaining intentional tracking-fault trial only
+if the arm, blade, fixture and camera assembly have not moved.
+
+Do not use the pre-D038 ten-command fault window. Under the current rest-to-rest profile its
+largest measured error was only `0.00040904 rad`, below the intentional `0.001 rad` threshold,
+so it cannot validate the expected stop path. D038 keeps the real-feedback threshold but
+checks every command and allows at most 24 commands. Before streaming, the command rejects
+any truncated window outside `[0.002, 0.003] rad`; the current candidate's exact maximum is
+`0.00266566 rad`. The expected successful fault evidence is:
+
+```text
+trial_kind: intentional_tracking_fault
+stream_result.ok: false
+stream_result.abort_reason: tracking_error_exceeded
+stream_result.commands_sent: <= 24
+fault_trial_commanded_delta_rad: [0.002, 0.003]
+fault_detection_to_stop_acknowledgement_s: present and positive
+settling_evidence: continuous stationary window passed
+trial ok: true
+production_motion_authorized: false
+```
+
+An expected inner stream abort is therefore a PASS only when the outer trial confirms the
+immediate stop and stationary window. Any other abort reason or a top-level `Trial status:
+FAIL` must be preserved and diagnosed; do not record the final acceptance from it.
+
+The D038 trial passed with `tracking_error_exceeded` at command 16 and the outer stationary
+gate passed. Replacement commissioning is complete. The active eiai acceptance is
+`data/acceptance/es68_d435i_motion_envelope_004`, ID
+`29624b08242d2c8ef7544cb958bf2a64335f895b719b421f792ff8c750719f9b`. Do not schedule any
+additional commissioning trial unless the robot geometry, controller contract, workcell or
+accepted physical envelope changes.
+
+### 2.3 EliteDriver local-port collision recovery
+
+The eiai host runs a long-lived `xray` proxy that can allocate outgoing source ports from the
+Linux ephemeral range `32768–60999`. The historical Elite ports `50001–50004` are inside that
+range and produced `Address already in use` even though no listener existed. The eiai local
+configuration therefore uses `script_sender/reverse/trajectory/script_command` ports
+`29001/29002/29003/29004`. Before a motion-capable attempt, inspect both listeners and
+established connections; all four must be absent. Do not stop `xray` merely to reclaim one
+port. A connection failure output is immutable and must never be reused for retry.
+
 ## 3. Non-moving readiness check
 
 ```bash
@@ -251,10 +370,27 @@ their boundaries. They never recreate a boundary with floating-point arithmetic.
 required by the waypoint/hash identity check and prevents the one-ULP endpoint failure
 observed in `planning-test-20260904-154403`.
 
-Bound online occupancy checks stop at the first blocking robot STL, matching HoloRobot's
-fail-fast motion contract. A standalone diagnostic pose query may still enumerate all
-blocking links. The difference is diagnostic completeness only: either result is a hard
-motion veto, and no threshold or UNKNOWN policy changes.
+Bound online occupancy checks stop at the first blocking robot STL and at the first blocking
+voxel inside that STL, matching HoloRobot's fail-fast motion contract. A standalone
+diagnostic pose query may still enumerate all blocking links and voxels. Online prefix
+diagnostics record `query_complete=false`; exhaustive diagnostics record
+`query_complete=true`. The difference is diagnostic completeness only: either result is a
+hard motion veto, and no threshold or UNKNOWN policy changes.
+
+For the online sampled path, the gate order is goal mesh, ServoJ-duration/freshness binding,
+goal-first occupancy path, then the complete mesh path. This prevents an occupancy-invalid
+goal from spending several seconds on a mesh path that can no longer become executable.
+Every clear candidate still completes both mesh and occupancy sampling before an approval
+token exists.
+
+The occupancy checker may reuse voxel classification/X-run layouts and HPP-FCL voxel-run
+box transforms only within the same recomputed immutable snapshot content hash. It never
+caches a robot-pose collision answer. A map-content change invalidates the structural cache;
+each path sample still places the original robot STL and performs the exact distance checks.
+For reference, diagnostic replay of `planning-fix-d032-20260904-193942` reached its first
+CLEAR candidate at rank 11 in `25.142 s` including the run's recorded selector time. This is
+an offline timing baseline, not motion authority; a new physical run must still reach
+`waiting_approval` before the operator enters a token.
 
 The planning line must be followed by either `waiting_approval` or a typed candidate
 rejection; it no longer starts a recursive six-dimensional certificate. The active checks
@@ -336,6 +472,12 @@ In another terminal, use the exact output root printed by the active run:
 
 This is read-only and must not send robot commands.
 
+Shell variables are terminal-local. Prefer the absolute path printed by the active runtime.
+If a new terminal reports `Path '/live_timeline' does not exist`, `$BBF_RUN_ROOT` expanded to
+an empty string; either use the printed absolute path directly or export the variable in that
+same terminal. Do not copy Markdown/HTML escapes such as `\--snapshot`, `\_`, or `&#x20;` into
+the shell.
+
 The follow-mode window now includes a `候选视点与规划预检` table and camera frusta. It
 shows the science-ranked queue, active/selected candidate, IK and endpoint gates,
 straight-path and bounded-RRT results, known durations, and the exact blocking reason.
@@ -375,11 +517,44 @@ sudo systemd-run --wait --collect --pty \
 
 Resume validates the append-only handoff chain before hardware use. It never restores an
 old proposal, approval permit, occupancy freshness, source window or in-flight segment.
-After establishing a real stopped state it asks for one operator-positioned
-`SAFETY_REFRESH` capture, allocates a new cycle/view identity, and replans from the current
-joint posture. It does not request the first-view hard ROI again and the refresh does not
-count as blade science. Do not resume when the physical placement changed; begin a fresh
-placement/run instead.
+After establishing a real stopped state it asks for one `SAFETY_REFRESH`. At this recovery
+prompt, do **not** reposition the robot after its stopped pose has been verified: keep the
+blade, fixture, camera mount and robot base unchanged, then enter exactly `c` once. The capture
+receives a new cycle/view identity and planning restarts from that measured posture. It does
+not request the first-view hard ROI again and the refresh does not count as blade science.
+Do not resume when
+the physical placement changed; begin a fresh placement/run instead.
+
+A `planning_restart_required:planning_deadline_exceeded:...` blocker is terminal for that
+process. Wait for cleanup, then use the resume command above; do not press `c`, `c front` or
+`c back` repeatedly in the old process. Ordinary typed occupancy/path blockers are different:
+they may still offer an operator-positioned occupancy-only refresh, and that prompt accepts
+only `c` or `q`.
+
+For the intact D038 chain from 2026-09-04, the literal recovery command is:
+
+```bash
+cd /home/eiai/Documents/wh/BiBladeFusion
+export BBF_EXISTING_OUTPUT=/home/eiai/Documents/wh/BiBladeFusion/data/experiments/blade-placement-20260901-01-real-nbv-d038-20260904-220200
+
+sudo systemd-run --wait --collect --pty \
+  --property=User=eiai \
+  --property=WorkingDirectory=/home/eiai/Documents/wh/BiBladeFusion \
+  --property=LimitRTPRIO=99 \
+  /usr/bin/env -u PYTHONPATH \
+  /home/eiai/Documents/wh/BiBladeFusion/.venv/bin/bbf \
+  scan run-unknown \
+  --experimental \
+  --resume \
+  --ray-integration-backend cuda \
+  --config configs/local.yaml \
+  --operator-id eiai \
+  --output "$BBF_EXISTING_OUTPUT"
+```
+
+Use it only if the listed physical references have not moved. Strict saved-data validation
+takes about one minute on the current host before live recovery begins; silence during that
+read is processing, not an input prompt.
 
 ## 8. Evidence to collect after any failure
 

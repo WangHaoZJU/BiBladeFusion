@@ -81,6 +81,50 @@ class EmergencyStopUnconfirmedError(RobotCommandError):
         return type(self)(self.operation_error, (*self.stop_errors, error))
 
 
+class ServoJExecutionAbortedError(RobotCommandError):
+    """ServoJ stopped safely but must retain numerical failure context."""
+
+    error_code = "servoj_execution_aborted"
+
+    def __init__(
+        self,
+        result: StreamServoJResult,
+        *,
+        tracking_error_rad: float,
+        last_tracking_sample: dict[str, object] | None,
+    ) -> None:
+        self.result = result
+        self.tracking_error_rad = float(tracking_error_rad)
+        self.last_tracking_sample = (
+            dict(last_tracking_sample) if last_tracking_sample is not None else None
+        )
+        self.diagnostics: dict[str, object] = {
+            "error_code": self.error_code,
+            "stream_result": result.to_dict(),
+            "tracking_error_threshold_rad": self.tracking_error_rad,
+            "last_tracking_sample": self.last_tracking_sample,
+        }
+        last_error = (
+            float(self.last_tracking_sample["max_error_rad"])
+            if self.last_tracking_sample is not None
+            and self.last_tracking_sample.get("max_error_rad") is not None
+            else None
+        )
+        detail = (
+            f", last_error={last_error:.9g} rad"
+            if last_error is not None
+            else ""
+        )
+        super().__init__(
+            "ServoJ execution aborted: "
+            f"{result.abort_reason or 'unknown'} "
+            f"(commands_sent={result.commands_sent}, "
+            f"last_index={result.last_command_index}, "
+            f"max_error={result.max_tracking_error_rad:.9g} rad, "
+            f"threshold={self.tracking_error_rad:.9g} rad{detail})"
+        )
+
+
 class _ExecutionDeadlineWatchdog:
     """Poll a deadline on an independent thread and use a non-ServoJ stop path."""
 
@@ -512,6 +556,7 @@ class GuardedEliteExecutor:
                 "live robot state no longer matches preflight start "
                 f"({maximum_start_error:.6f} rad)"
             )
+        tracking_samples: list[dict[str, object]] = []
         try:
             self._occupancy_checker.assert_current_evidence(
                 expected_occupancy,
@@ -656,6 +701,7 @@ class GuardedEliteExecutor:
                 config=config,
                 expected_stop_generation=permit.stop_generation,
                 capability=_GUARDED_MOTION_CAPABILITY,
+                tracking_samples=tracking_samples,
                 deadline_exceeded=deadline_exceeded,
             )
             require_budget("during ServoJ streaming")
@@ -733,8 +779,10 @@ class GuardedEliteExecutor:
         # acknowledged the segment-boundary stop.  Stop failures propagate and
         # therefore cannot be reported as successful motion.
         if not result.ok:
-            operation_error = RobotCommandError(
-                f"ServoJ execution aborted: {result.abort_reason or 'unknown'}"
+            operation_error = ServoJExecutionAbortedError(
+                result,
+                tracking_error_rad=config.tracking_error_rad,
+                last_tracking_sample=(tracking_samples[-1] if tracking_samples else None),
             )
             try:
                 self._arm.stop()

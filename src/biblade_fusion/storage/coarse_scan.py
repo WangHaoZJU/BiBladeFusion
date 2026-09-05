@@ -12,7 +12,10 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from dataclasses import asdict, dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -44,7 +47,13 @@ from biblade_fusion.planning import BladeSide
 from biblade_fusion.storage.coarse_model import read_coarse_model_summary
 from biblade_fusion.storage.coverage import read_coverage_ledger
 from biblade_fusion.storage.initialization import INITIALIZATION_METADATA_FILENAME
-from biblade_fusion.storage.occupancy_mapping import read_occupancy_mapping
+from biblade_fusion.storage.occupancy_mapping import (
+    _assert_occupancy_storage_authorities_current,
+    _bind_occupancy_storage_authority,
+    _OccupancyStorageAuthority,
+    read_occupancy_mapping,
+    read_occupancy_mapping_for_replay,
+)
 from biblade_fusion.storage.reconstructed_view import (
     StoredReconstructedBladeView,
     read_reconstructed_view,
@@ -94,6 +103,11 @@ class StoredCoarseScanView:
     metadata: dict[str, Any]
     metadata_sha256: str
     metadata_size_bytes: int
+    occupancy_storage_authority: _OccupancyStorageAuthority | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def motion_authorized(self) -> bool:
@@ -167,6 +181,75 @@ class StoredCoarseIntegrationSource:
             raise ValueError("Coarse integration source hash is malformed")
         mask.setflags(write=False)
         object.__setattr__(self, "mask", mask)
+
+
+_DirectoryAuthorityIdentity = tuple[str, str, str, int]
+
+
+class _StrictReadContext:
+    """Memoize immutable authorities only within one top-level strict read.
+
+    Projected coarse views bind their predecessor generation.  Since each newer
+    generation also lists every accepted historical view, naively following those
+    bindings replays the same view, occupancy, and predecessor generation many
+    times.  This context is created by the outermost public reader and discarded
+    when that call returns; no result can therefore survive a later disk change.
+    """
+
+    def __init__(self) -> None:
+        self.views: dict[_DirectoryAuthorityIdentity, StoredCoarseScanView] = {}
+        self.generations: dict[
+            _DirectoryAuthorityIdentity,
+            StoredCoarseScanGeneration,
+        ] = {}
+        self.views_in_progress: set[_DirectoryAuthorityIdentity] = set()
+        self.generations_in_progress: set[_DirectoryAuthorityIdentity] = set()
+        self.expected_views: dict[Path, _DirectoryAuthorityIdentity] = {}
+        self.expected_generations: dict[Path, _DirectoryAuthorityIdentity] = {}
+        self.occupancy_authorities: dict[
+            _DirectoryAuthorityIdentity,
+            _OccupancyStorageAuthority,
+        ] = {}
+
+
+_STRICT_READ_CONTEXT: ContextVar[_StrictReadContext | None] = ContextVar(
+    "coarse_scan_strict_read_context",
+    default=None,
+)
+
+
+def _enter_strict_read_context() -> tuple[_StrictReadContext, Token | None]:
+    context = _STRICT_READ_CONTEXT.get()
+    if context is not None:
+        return context, None
+    context = _StrictReadContext()
+    return context, _STRICT_READ_CONTEXT.set(context)
+
+
+@contextmanager
+def _strict_coarse_read_transaction() -> Iterator[None]:
+    """Share strict-read proofs within one caller-defined read transaction."""
+
+    _, context_token = _enter_strict_read_context()
+    try:
+        yield
+    finally:
+        if context_token is not None:
+            _STRICT_READ_CONTEXT.reset(context_token)
+
+
+def _authority_identity_from_bytes(
+    root: Path,
+    *,
+    authority: str,
+    content: bytes,
+) -> _DirectoryAuthorityIdentity:
+    return (
+        str(root.resolve()),
+        authority,
+        hashlib.sha256(content).hexdigest(),
+        len(content),
+    )
 
 
 def _coverage_observation_ids(
@@ -298,6 +381,76 @@ def _resolve_directory_record(record: dict[str, Any]) -> Path:
     return root
 
 
+def _resolve_bound_directory_record(
+    record: dict[str, Any],
+    *,
+    expected_authority: str,
+) -> tuple[Path, _DirectoryAuthorityIdentity]:
+    """Resolve and fingerprint one record before a context-local cached read."""
+
+    root = _resolve_directory_record(record)
+    authority = Path(str(record["authority"]))
+    if authority != Path(expected_authority):
+        raise ValueError(
+            f"Coarse-scan directory source authority must be {expected_authority}"
+        )
+    return root, (
+        str(root),
+        expected_authority,
+        str(record["sha256"]),
+        int(record["size_bytes"]),
+    )
+
+
+def _read_bound_coarse_scan_view(
+    record: dict[str, Any],
+    context: _StrictReadContext,
+) -> StoredCoarseScanView:
+    root, identity = _resolve_bound_directory_record(
+        record,
+        expected_authority="metadata.json",
+    )
+    previous = context.expected_views.get(root)
+    if previous is not None and previous != identity:
+        raise ValueError("One coarse view has conflicting authority identities")
+    context.expected_views[root] = identity
+    try:
+        return read_coarse_scan_view(root)
+    finally:
+        if previous is None:
+            context.expected_views.pop(root, None)
+        else:
+            context.expected_views[root] = previous
+
+
+def _expect_bound_generation(
+    record: dict[str, Any],
+    context: _StrictReadContext,
+) -> tuple[Path, _DirectoryAuthorityIdentity | None]:
+    """Stage one exact predecessor identity for `_replay_foreground`."""
+
+    root, identity = _resolve_bound_directory_record(
+        record,
+        expected_authority="generation.json",
+    )
+    previous = context.expected_generations.get(root)
+    if previous is not None and previous != identity:
+        raise ValueError("One coarse generation has conflicting authority identities")
+    context.expected_generations[root] = identity
+    return root, previous
+
+
+def _restore_expected_generation(
+    root: Path,
+    previous: _DirectoryAuthorityIdentity | None,
+    context: _StrictReadContext,
+) -> None:
+    if previous is None:
+        context.expected_generations.pop(root, None)
+    else:
+        context.expected_generations[root] = previous
+
+
 def _stored_view_authority_records(
     view: StoredCoarseScanView,
 ) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
@@ -338,6 +491,105 @@ def _stored_generation_authority_record(
     if payload != generation.metadata:
         raise ValueError("Coarse generation metadata differs from its strict readback")
     return record
+
+
+def _recheck_cached_view_integrity(
+    view: StoredCoarseScanView,
+    *,
+    verify_occupancy: bool = True,
+) -> None:
+    """Recheck subordinate checksums without repeating CUDA ray integration."""
+
+    _stored_view_authority_records(view)
+    for record in view.metadata["files"].values():
+        _load_array(view.root, record)
+    reconstructed_root = _resolve_directory_record(
+        view.metadata["sources"]["reconstructed_view"]
+    )
+    _recheck_subordinate_array_records(reconstructed_root)
+    stereo_root = _resolve_directory_record(
+        view.metadata["sources"]["stereo_inference"]
+    )
+    _recheck_subordinate_array_records(stereo_root)
+    occupancy_root = _resolve_directory_record(
+        view.metadata["sources"]["occupancy_mapping"]
+    )
+    if not verify_occupancy:
+        return
+    authority = _bound_view_occupancy_storage_authority(view)
+    if authority is None:
+        read_occupancy_mapping_for_replay(occupancy_root)
+    else:
+        _assert_occupancy_storage_authorities_current((authority,))
+
+
+def _recheck_subordinate_array_records(root: Path) -> None:
+    """Verify one authority's declared arrays without rebuilding derived products."""
+
+    payload = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+    files = payload["files"]
+    if not isinstance(files, dict):
+        raise ValueError("Subordinate artifact array manifest must be an object")
+    for record in files.values():
+        _load_array(root, record)
+
+
+def _bound_view_occupancy_storage_authority(
+    view: StoredCoarseScanView,
+) -> _OccupancyStorageAuthority | None:
+    authority = view.occupancy_storage_authority
+    if authority is None:
+        return None
+    root, identity = _resolve_bound_directory_record(
+        view.metadata["sources"]["occupancy_mapping"],
+        expected_authority="metadata.json",
+    )
+    if (
+        authority.root != root
+        or authority.metadata_sha256 != identity[2]
+        or authority.metadata_size_bytes != identity[3]
+    ):
+        raise ValueError("Coarse view occupancy storage authority changed")
+    return authority
+
+
+def _recheck_cached_generation_authorities(
+    generation: StoredCoarseScanGeneration,
+) -> None:
+    """Recheck the immutable authority roots before reusing a typed generation."""
+
+    _stored_generation_authority_record(generation)
+    payload = generation.metadata
+    previous = payload["previous_generation"]
+    if previous is not None:
+        _resolve_directory_record(previous)
+    sources = payload["sources"]
+    for name in (
+        "initialization",
+        "view_plan",
+        "discovery_plan",
+        "coverage",
+        "coarse_model",
+    ):
+        record = sources[name]
+        if record is not None:
+            _resolve_directory_record(record)
+    occupancy_authorities: list[_OccupancyStorageAuthority] = []
+    fallback_occupancy_roots: list[Path] = []
+    for view in generation.views:
+        _recheck_cached_view_integrity(view, verify_occupancy=False)
+        authority = _bound_view_occupancy_storage_authority(view)
+        if authority is None:
+            fallback_occupancy_roots.append(
+                _resolve_directory_record(
+                    view.metadata["sources"]["occupancy_mapping"]
+                )
+            )
+        else:
+            occupancy_authorities.append(authority)
+    _assert_occupancy_storage_authorities_current(tuple(occupancy_authorities))
+    for root in fallback_occupancy_roots:
+        read_occupancy_mapping_for_replay(root)
 
 
 def _bind_coarse_scan_view_readback(
@@ -463,7 +715,17 @@ def _load_final_integration_mask(
     """Load the last integration mask only after full occupancy verification."""
 
     if verify_occupancy:
-        read_occupancy_mapping(occupancy_root)
+        occupancy = read_occupancy_mapping(occupancy_root)
+        authority = _bind_occupancy_storage_authority(occupancy_root, occupancy)
+        context = _STRICT_READ_CONTEXT.get()
+        if context is not None:
+            identity: _DirectoryAuthorityIdentity = (
+                str(authority.root),
+                "metadata.json",
+                authority.metadata_sha256,
+                authority.metadata_size_bytes,
+            )
+            context.occupancy_authorities[identity] = authority
     payload = json.loads((occupancy_root / "metadata.json").read_text(encoding="utf-8"))
     frames = payload["frames"]
     if not isinstance(frames, list) or not frames:
@@ -734,9 +996,25 @@ def write_coarse_scan_view(
 def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
     """Independently replay and verify a coarse reconstruction evidence wrapper."""
 
+    read_context, context_token = _enter_strict_read_context()
     root = Path(path).resolve()
     try:
         metadata_bytes = (root / "metadata.json").read_bytes()
+        authority_identity = _authority_identity_from_bytes(
+            root,
+            authority="metadata.json",
+            content=metadata_bytes,
+        )
+        expected_identity = read_context.expected_views.get(root)
+        if expected_identity is not None and authority_identity != expected_identity:
+            raise ValueError("Coarse view authority changed after its directory binding")
+        cached = read_context.views.get(authority_identity)
+        if cached is not None:
+            _recheck_cached_view_integrity(cached)
+            return cached
+        if authority_identity in read_context.views_in_progress:
+            raise ValueError("Coarse view authority graph is cyclic")
+        read_context.views_in_progress.add(authority_identity)
         payload = json.loads(metadata_bytes.decode("utf-8"))
         if (
             int(payload["schema_version"]) not in {1, 2, COARSE_SCAN_VIEW_SCHEMA_VERSION}
@@ -777,8 +1055,9 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
             guide_payload = foreground_payload.get("guide")
             if not isinstance(guide_payload, dict):
                 raise ValueError("Projected coarse foreground guide is missing")
-            reference_root = _resolve_directory_record(
-                sources["foreground_reference_generation"]
+            reference_root, previous_expected_generation = _expect_bound_generation(
+                sources["foreground_reference_generation"],
+                read_context,
             )
             guide = ProjectedCoarseForegroundGuide(
                 source_generation_path=reference_root,
@@ -798,15 +1077,23 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
             raise ValueError("unsupported coarse foreground algorithm")
         if foreground_payload["policy_sha256"] != expected_policy:
             raise ValueError("coarse foreground policy changed")
-        replayed = _replay_foreground(
-            stereo_root=stereo_root,
-            occupancy_root=occupancy_root,
-            config=config,
-            seed=seed,
-            algorithm=algorithm,
-            guide=guide,
-            reconstructed=reconstructed,
-        )
+        try:
+            replayed = _replay_foreground(
+                stereo_root=stereo_root,
+                occupancy_root=occupancy_root,
+                config=config,
+                seed=seed,
+                algorithm=algorithm,
+                guide=guide,
+                reconstructed=reconstructed,
+            )
+        finally:
+            if algorithm == PROJECTED_COARSE_FOREGROUND_ALGORITHM:
+                _restore_expected_generation(
+                    reference_root,
+                    previous_expected_generation,
+                    read_context,
+                )
         if (
             foreground_payload["diagnostics"] != asdict(replayed.diagnostics)
             or foreground_payload["input_content_sha256"]
@@ -854,7 +1141,19 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
         target = payload["target"]
         if str(target["kind"]) not in _COARSE_TARGET_KINDS:
             raise ValueError("coarse target kind is unsupported")
-        return StoredCoarseScanView(
+        occupancy_storage_authority = read_context.occupancy_authorities.get(
+            (
+                str(occupancy_root),
+                "metadata.json",
+                str(sources["occupancy_mapping"]["sha256"]),
+                int(sources["occupancy_mapping"]["size_bytes"]),
+            )
+        )
+        if occupancy_storage_authority is not None:
+            _assert_occupancy_storage_authorities_current(
+                (occupancy_storage_authority,)
+            )
+        stored = StoredCoarseScanView(
             root,
             reconstructed,
             replayed,
@@ -866,9 +1165,16 @@ def read_coarse_scan_view(path: str | Path) -> StoredCoarseScanView:
             payload,
             hashlib.sha256(metadata_bytes).hexdigest(),
             len(metadata_bytes),
+            occupancy_storage_authority,
         )
+        read_context.views[authority_identity] = stored
+        read_context.views_in_progress.remove(authority_identity)
+        return stored
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid coarse-scan view artifact {root}: {exc}") from exc
+    finally:
+        if context_token is not None:
+            _STRICT_READ_CONTEXT.reset(context_token)
 
 
 def write_coarse_scan_generation(
@@ -893,7 +1199,7 @@ def write_coarse_scan_generation(
         if previous_path is not None
         else None
     )
-    return _write_coarse_scan_generation_from_verified(
+    output, _stored = _write_coarse_scan_generation_from_verified(
         output_dir,
         views=views,
         verified_views=stored_views,
@@ -905,6 +1211,7 @@ def write_coarse_scan_generation(
         verified_previous_generation=previous,
         coarse_model=coarse_model,
     )
+    return output
 
 
 def _write_coarse_scan_generation_from_verified(
@@ -919,7 +1226,7 @@ def _write_coarse_scan_generation_from_verified(
     previous_generation: str | Path | None,
     verified_previous_generation: StoredCoarseScanGeneration | None,
     coarse_model: str | Path | None = None,
-) -> Path:
+) -> tuple[Path, StoredCoarseScanGeneration]:
     """Write from strict readers already completed in this append transaction.
 
     This is deliberately private and accepts typed storage objects, not arbitrary
@@ -1093,10 +1400,10 @@ def _write_coarse_scan_generation_from_verified(
                 "schema5_ready": coarse_root is not None,
             },
         }
-        (temporary / "generation.json").write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
+        metadata_bytes = (
+            json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+        ).encode("utf-8")
+        (temporary / "generation.json").write_bytes(metadata_bytes)
         # Close the transaction-local TOCTOU window without replaying occupancy
         # rays again: every typed source was fully verified above, and its bound
         # authority must still have the exact path, digest and size immediately
@@ -1121,15 +1428,44 @@ def _write_coarse_scan_generation_from_verified(
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    return output.resolve()
+    root = output.resolve()
+    return root, StoredCoarseScanGeneration(
+        root=root,
+        generation_index=generation_index,
+        views=stored_views,
+        coverage_path=coverage_root,
+        previous_generation_path=previous_path,
+        coarse_model_path=coarse_root,
+        metadata=payload,
+        metadata_sha256=hashlib.sha256(metadata_bytes).hexdigest(),
+        metadata_size_bytes=len(metadata_bytes),
+    )
 
 
 def read_coarse_scan_generation(path: str | Path) -> StoredCoarseScanGeneration:
     """Verify a generation, its exact predecessor and every immutable source."""
 
+    read_context, context_token = _enter_strict_read_context()
     root = Path(path).resolve()
     try:
         metadata_bytes = (root / "generation.json").read_bytes()
+        authority_identity = _authority_identity_from_bytes(
+            root,
+            authority="generation.json",
+            content=metadata_bytes,
+        )
+        expected_identity = read_context.expected_generations.get(root)
+        if expected_identity is not None and authority_identity != expected_identity:
+            raise ValueError(
+                "Coarse generation authority changed after its directory binding"
+            )
+        cached = read_context.generations.get(authority_identity)
+        if cached is not None:
+            _recheck_cached_generation_authorities(cached)
+            return cached
+        if authority_identity in read_context.generations_in_progress:
+            raise ValueError("Coarse generation authority graph is cyclic")
+        read_context.generations_in_progress.add(authority_identity)
         payload = json.loads(metadata_bytes.decode("utf-8"))
         if (
             int(payload["schema_version"]) != COARSE_SCAN_GENERATION_SCHEMA_VERSION
@@ -1158,7 +1494,8 @@ def read_coarse_scan_generation(path: str | Path) -> StoredCoarseScanGeneration:
         coverage_path = _resolve_directory_record(sources["coverage"])
         coverage = read_coverage_ledger(coverage_path)
         views = tuple(
-            read_coarse_scan_view(_resolve_directory_record(record)) for record in payload["views"]
+            _read_bound_coarse_scan_view(record, read_context)
+            for record in payload["views"]
         )
         _assert_coverage_replays(
             views=views,
@@ -1255,7 +1592,7 @@ def read_coarse_scan_generation(path: str | Path) -> StoredCoarseScanGeneration:
                     raise ValueError("schema-5 transition changed proxy coverage")
             elif Path(str(coverage.metadata["previous_ledger"])).resolve() != previous_coverage:
                 raise ValueError("coarse coverage predecessor differs from view predecessor")
-        return StoredCoarseScanGeneration(
+        stored = StoredCoarseScanGeneration(
             root,
             generation_index,
             views,
@@ -1266,5 +1603,11 @@ def read_coarse_scan_generation(path: str | Path) -> StoredCoarseScanGeneration:
             hashlib.sha256(metadata_bytes).hexdigest(),
             len(metadata_bytes),
         )
+        read_context.generations[authority_identity] = stored
+        read_context.generations_in_progress.remove(authority_identity)
+        return stored
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid coarse-scan generation {root}: {exc}") from exc
+    finally:
+        if context_token is not None:
+            _STRICT_READ_CONTEXT.reset(context_token)

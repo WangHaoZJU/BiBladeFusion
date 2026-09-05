@@ -221,6 +221,16 @@ def test_clear_preflight_builds_holorobot_dynamically_limited_servoj_stream(
         axis=0,
     )
     assert np.all(observed_velocity <= maximum_velocity * 0.08 * 0.8 + 1e-12)
+    interval_velocity = np.diff(commands, axis=0) / report.servoj_stream.dt_s
+    velocity_with_rest_boundaries = np.vstack(
+        [np.zeros((1, 6)), interval_velocity, np.zeros((1, 6))]
+    )
+    observed_acceleration = np.max(
+        np.abs(np.diff(velocity_with_rest_boundaries, axis=0))
+        / report.servoj_stream.dt_s,
+        axis=0,
+    )
+    assert np.all(observed_acceleration <= 4.0 * 0.08 * 0.8 + 1e-9)
     minimum_acceleration_duration_s = 2.0 * np.sqrt(0.05 / (4.0 * 0.08 * 0.8))
     actual_duration_s = (
         len(report.servoj_stream.commands) - 1
@@ -229,11 +239,34 @@ def test_clear_preflight_builds_holorobot_dynamically_limited_servoj_stream(
     assert actual_duration_s < minimum_acceleration_duration_s + 0.004 + 1e-12
     assert (
         report.diagnostics["trajectory_generator"]
-        == "holorobot_velocity_acceleration_limited_servoj_v2"
+        == "rest_to_rest_velocity_acceleration_limited_servoj_v3"
     )
     assert report.diagnostics["servoj_path_knot_count"] == 2
     assert report.diagnostics["limiting_constraint"] == "acceleration"
     assert "acceleration_limits_unavailable" not in report.warnings
+
+
+def test_servoj_time_parameterization_has_zero_speed_start_and_stop_ramps() -> None:
+    timing = _time_parameterized_servoj_stream(
+        ((0.0,) * 6, (1.0, 0.0, 0.0, 0.0, 0.0, 0.0)),
+        maximum_velocity_rad_s=(1.0,) * 6,
+        maximum_acceleration_rad_s2=(1.0,) * 6,
+        dt_s=0.01,
+        speed_scaling=1.0,
+        velocity_margin=1.0,
+    )
+
+    commands = np.asarray(timing.stream.commands)
+    velocity = np.diff(commands[:, 0]) / timing.stream.dt_s
+    acceleration = np.diff(np.concatenate([[0.0], velocity, [0.0]])) / timing.stream.dt_s
+
+    assert timing.limiting_constraint == "acceleration"
+    assert velocity[0] < velocity[len(velocity) // 2]
+    assert velocity[-1] < velocity[len(velocity) // 2]
+    assert np.max(np.abs(velocity)) <= 1.0 + 1e-12
+    assert np.max(np.abs(acceleration)) <= 1.0 + 1e-9
+    assert timing.stream.commands[0] == (0.0,) * 6
+    assert timing.stream.commands[-1] == (1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 def test_online_holorobot_preflight_samples_segments_without_continuous_proof(
@@ -304,6 +337,141 @@ def test_online_holorobot_preflight_hashes_occupancy_once_at_each_boundary(
     assert report.occupancy is not None
     assert report.occupancy.sample_count == 4
     assert calls == 2
+
+
+def test_online_holorobot_preflight_rejects_goal_occupancy_before_mesh_path(
+    checker,
+    occupancy_checker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mesh_configurations: list[tuple[float, ...]] = []
+    original_mesh_check = checker.check
+    original_occupancy_check = occupancy_checker._check_bound_configuration
+    goal = (0.1, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    def counted_mesh_check(configuration):
+        mesh_configurations.append(tuple(float(value) for value in configuration))
+        return original_mesh_check(configuration)
+
+    def goal_occupancy_block(snapshot, evidence, configuration, **kwargs):
+        clear = original_occupancy_check(
+            snapshot,
+            evidence,
+            configuration,
+            **kwargs,
+        )
+        if tuple(float(value) for value in configuration) != goal:
+            return clear
+        blocked_result = replace(
+            clear,
+            status=CollisionCheckStatus.BLOCKED,
+            blocking_reasons=("environment_occupancy_unknown:forearm_link_0",),
+        )
+        return blocked_result
+
+    monkeypatch.setattr(checker, "check", counted_mesh_check)
+    monkeypatch.setattr(
+        occupancy_checker,
+        "_check_bound_configuration",
+        goal_occupancy_block,
+    )
+
+    report = preflight_linear_joint_motion(
+        (0.0,) * 6,
+        goal,
+        collision_checker=checker,
+        occupancy_checker=occupancy_checker,
+        maximum_joint_step_rad=0.02,
+        path_validation_mode=HOLOROBOT_SAMPLED_VALIDATION,
+        enable_ompl_fallback=True,
+    )
+
+    assert report.status is MotionPreflightStatus.BLOCKED
+    assert report.blocking_reasons == ("environment_occupancy_unknown:forearm_link_0",)
+    assert report.collision is not None
+    assert report.collision.status is CollisionCheckStatus.CLEAR
+    assert report.collision.sample_count == 1
+    assert report.occupancy is not None
+    assert report.occupancy.blocked_path_fraction == 1.0
+    assert mesh_configurations == [goal]
+    assert report.diagnostics["path_gate_order"] == (
+        "goal_mesh_then_occupancy_path_then_mesh_path"
+    )
+
+
+def test_online_holorobot_preflight_completes_occupancy_before_mesh_path(
+    checker,
+    occupancy_checker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start = (0.0,) * 6
+    goal = (0.1, 0.0, 0.0, 0.0, 0.0, 0.0)
+    sampled = _holorobot_sampled_configurations(
+        _linear_waypoints(start, goal, maximum_joint_step_rad=0.02)
+    )
+    blocked_configuration = sampled[2][0]
+    mesh_configurations: list[tuple[float, ...]] = []
+    occupancy_configurations: list[tuple[float, ...]] = []
+    original_mesh_check = checker.check
+    original_occupancy_check = occupancy_checker._check_bound_configuration
+
+    def block_third_path_mesh(configuration):
+        normalized = tuple(float(value) for value in configuration)
+        mesh_configurations.append(normalized)
+        clear = original_mesh_check(configuration)
+        if normalized != blocked_configuration:
+            return clear
+        return replace(
+            clear,
+            status=CollisionCheckStatus.BLOCKED,
+            blocking_reasons=("synthetic_interior_mesh_block",),
+        )
+
+    def count_occupancy(snapshot, evidence, configuration, **kwargs):
+        occupancy_configurations.append(tuple(float(value) for value in configuration))
+        return original_occupancy_check(
+            snapshot,
+            evidence,
+            configuration,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(checker, "check", block_third_path_mesh)
+    monkeypatch.setattr(
+        occupancy_checker,
+        "_check_bound_configuration",
+        count_occupancy,
+    )
+
+    report = preflight_linear_joint_motion(
+        start,
+        goal,
+        collision_checker=checker,
+        occupancy_checker=occupancy_checker,
+        maximum_joint_step_rad=0.02,
+        path_validation_mode=HOLOROBOT_SAMPLED_VALIDATION,
+        enable_ompl_fallback=False,
+    )
+
+    assert report.status is MotionPreflightStatus.BLOCKED
+    assert report.collision is not None
+    assert report.collision.blocked_sample_index == 2
+    assert report.occupancy is not None
+    assert report.occupancy.status is CollisionCheckStatus.CLEAR
+    assert mesh_configurations == [
+        goal,
+        sampled[0][0],
+        sampled[1][0],
+        sampled[2][0],
+    ]
+    assert occupancy_configurations == [
+        goal,
+        sampled[0][0],
+        sampled[1][0],
+        sampled[2][0],
+        sampled[3][0],
+        sampled[4][0],
+    ]
 
 
 def test_online_holorobot_preflight_uses_bounded_ompl_detour(
@@ -481,7 +649,9 @@ def test_folded_goal_is_blocked_before_trajectory_generation(checker) -> None:
     assert report.status is MotionPreflightStatus.BLOCKED
     assert report.ready_for_approval is False
     assert report.servoj_stream is None
-    assert any(reason.startswith("self_collision:") for reason in report.blocking_reasons)
+    assert any(
+        reason.startswith("self_collision:") for reason in report.blocking_reasons
+    )
 
 
 def test_invalid_joint_contract_is_rejected() -> None:
@@ -558,12 +728,10 @@ def test_disabling_continuous_occupancy_sweep_is_diagnostic_only(
     assert report.continuous_occupancy_sweep_required is False
     assert report.ready_for_approval is False
     assert (
-        "continuous_swept_occupancy_disabled_offline_diagnostic_only"
-        in report.warnings
+        "continuous_swept_occupancy_disabled_offline_diagnostic_only" in report.warnings
     )
     assert (
-        "occupancy_semantic_attestation_unavailable_diagnostic_only"
-        in report.warnings
+        "occupancy_semantic_attestation_unavailable_diagnostic_only" in report.warnings
     )
 
 
