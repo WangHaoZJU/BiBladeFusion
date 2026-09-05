@@ -16,3 +16,4 @@ outputs/
 
 .env
 configs/local.yaml
+.gitnexus
